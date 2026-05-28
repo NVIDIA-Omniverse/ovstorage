@@ -1,0 +1,506 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Permission Service",
+    "description": "",
+    "contact": {
+      "name": "NVIDIA"
+    },
+    "license": {
+      "name": "LicenseRef-NvidiaProprietary",
+      "identifier": "LicenseRef-NvidiaProprietary"
+    },
+    "version": "0.0.47"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "description": "Health check to determine API availability.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": ""
+          },
+          "400": {
+            "description": "The payload was parsed correctly but the operation failed due to invalid information being provided.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorString"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Returned if the user lacks valid authentication credentials to call this API.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorString"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Returned when the client sends too many requests and needs to slow down.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorString"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Returned when an unexpected server error occurs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorString"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1beta/authorization/": {
+      "post": {
+        "tags": [
+          "authorization"
+        ],
+        "description": "Determines if the specified principal has access to perform the action on the specified resource.",
+        "operationId": "authorization",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthorizationPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Returned when the authorization information is returned successfully. The status code does not specify if access is granted, the corresponding payload must be checked instead.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthorizationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The payload was parsed correctly but the operation failed due to invalid information being provided.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorString"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Returned if the user lacks valid authentication credentials to call this API.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorString"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Returned when the user does not have access to check authorization for the specified payload.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorString"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Returned when the client sends too many requests and needs to slow down.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorString"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Returned when an unexpected server error occurs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorString"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1beta/authorization/batch/": {
+      "post": {
+        "tags": [
+          "authorization"
+        ],
+        "description": "Batched variant of POST /authorization/ API that allows checking multiple principals, actions and resources in one single request.",
+        "operationId": "authorization_batch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthorizationBatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Returned when the authorization information is returned successfully. The status code does not specify if access is granted, the corresponding payload must be checked instead.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthorizationBatchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The payload was parsed correctly but the operation failed due to invalid information being provided.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorString"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Returned if the user lacks valid authentication credentials to call this API.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorString"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Returned when the user does not have access to check authorization for the specified payload.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorString"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Returned when the client sends too many requests and needs to slow down.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorString"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Returned when an unexpected server error occurs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorString"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Action": {
+        "type": "object",
+        "required": [
+          "name",
+          "service"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 255,
+            "pattern": "^[a-zA-Z0-9_.:/-]+$"
+          },
+          "service": {
+            "type": "string",
+            "maxLength": 255,
+            "pattern": "^[a-zA-Z0-9_.:/-]+$"
+          }
+        }
+      },
+      "AuthorizationBatch": {
+        "type": "object",
+        "required": [
+          "actions"
+        ],
+        "properties": {
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Action"
+            },
+            "maxItems": 1000
+          },
+          "context": {},
+          "principal": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Principal"
+              }
+            ]
+          },
+          "resource": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Resource"
+              }
+            ],
+            "default": {
+              "id": "",
+              "type": "",
+              "data": null
+            }
+          }
+        }
+      },
+      "AuthorizationBatchCondition": {
+        "type": "string",
+        "enum": [
+          "none",
+          "or",
+          "and"
+        ]
+      },
+      "AuthorizationBatchRequest": {
+        "type": "object",
+        "required": [
+          "batches"
+        ],
+        "properties": {
+          "batches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AuthorizationBatch"
+            },
+            "maxItems": 100
+          },
+          "condition": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AuthorizationBatchCondition"
+              }
+            ]
+          }
+        }
+      },
+      "AuthorizationBatchResponse": {
+        "type": "object",
+        "required": [
+          "decisions"
+        ],
+        "properties": {
+          "decisions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/components/schemas/AuthorizationResponse"
+              },
+              "propertyNames": {
+                "type": "string",
+                "maxLength": 1000,
+                "pattern": "^[a-zA-Z0-9_.:/-]+$"
+              }
+            },
+            "default": [
+              {
+                "service:action": {
+                  "decision": "deny",
+                  "reason": "Explicit deny.",
+                  "service": "service",
+                  "action": "action"
+                }
+              }
+            ],
+            "maxItems": 100
+          },
+          "summary": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AuthorizationResponse"
+              }
+            ]
+          }
+        }
+      },
+      "AuthorizationDecision": {
+        "type": "string",
+        "enum": [
+          "deny",
+          "allow",
+          "skip"
+        ]
+      },
+      "AuthorizationPayload": {
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/Action"
+          },
+          "context": {},
+          "principal": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Principal"
+              }
+            ]
+          },
+          "resource": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Resource"
+              }
+            ],
+            "default": {
+              "id": "",
+              "type": "",
+              "data": null
+            }
+          }
+        }
+      },
+      "AuthorizationResponse": {
+        "type": "object",
+        "required": [
+          "decision"
+        ],
+        "properties": {
+          "action": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 256,
+            "pattern": "^[a-zA-Z0-9_.:/-]+$"
+          },
+          "decision": {
+            "$ref": "#/components/schemas/AuthorizationDecision"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 2048,
+            "pattern": "^[\\x20-\\x7E]+$"
+          },
+          "service": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 256,
+            "pattern": "^[a-zA-Z0-9_.:/-]+$"
+          }
+        }
+      },
+      "ErrorString": {
+        "type": "string",
+        "maxLength": 2048,
+        "pattern": "^[\\x20-\\x7E\\r\\n]+$"
+      },
+      "Principal": {
+        "type": "object",
+        "required": [
+          "sub"
+        ],
+        "properties": {
+          "info": {},
+          "sub": {
+            "type": "string",
+            "maxLength": 255,
+            "pattern": "^[^\\x00-\\x1F\\x22\\x27\\x5C]+$"
+          }
+        }
+      },
+      "Resource": {
+        "type": "object",
+        "required": [
+          "id",
+          "type"
+        ],
+        "properties": {
+          "data": {},
+          "id": {
+            "type": "string",
+            "maxLength": 2048,
+            "pattern": "^[^\\x00-\\x1F\\x22\\x27\\x5C]+$"
+          },
+          "type": {
+            "type": "string",
+            "maxLength": 255,
+            "pattern": "^[a-zA-Z0-9_.:/-]+$"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "token_jwt": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Bearer token authentication using JWT. Implements security best practices from RFC8725."
+      }
+    }
+  },
+  "security": [
+    {},
+    {
+      "token_jwt": []
+    }
+  ]
+}

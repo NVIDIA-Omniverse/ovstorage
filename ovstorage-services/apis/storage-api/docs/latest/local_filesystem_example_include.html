@@ -1,0 +1,904 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="./" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Omniverse Filesystem Storage Service &#8212; Omniverse Storage API</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="_static/custom.css?v=767de534" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-design.min.css?v=95c83b7e" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+
+
+    <script rel="preload" src="_static/modal-table.js"></script>
+    <script src="_static/documentation_options.js?v=a52ce144"></script>
+    <script src="_static/doctools.js?v=9bcbadda"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/scrollspy-patch.js?v=edc4054a"></script>
+    <script src="_static/design-tabs.js?v=f930bc37"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'local_filesystem_example_include';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = '../versions1.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0-beta.4';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            true;
+        </script>
+    <script src="_static/version-patch.js?v=3e13fdd2"></script>
+
+    <link rel="icon" href="_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Omniverse Storage API conformance tests" href="conformance_tests_include.html" />
+    <link rel="prev" title="Service examples" href="service_example_include.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+    <meta name="docbuild:last-update" content="Apr 17, 2026"/>
+
+
+  </head>
+
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="Omniverse Storage API - Home"/>
+    <img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="Omniverse Storage API - Home"/>
+  
+  
+    <p class="title logo__title">Omniverse Storage API</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+        <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://twitter.com/nvidiaomniverse" title="twitter" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-twitter fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">twitter</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.youtube.com/channel/UCSKUoczbGAcMld7HjpCR8OA" title="youtube" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-youtube fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">youtube</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.instagram.com/nvidiaomniverse" title="instagram" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-instagram fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">instagram</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.nvidia.com/en-us/omniverse/" title="www" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-solid fa-globe fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">www</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.linkedin.com/showcase/nvidia-omniverse" title="linkedin" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-linkedin fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">linkedin</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.twitch.tv/nvidiaomniverse" title="twitch" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-twitch fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">twitch</span></a>
+        </li>
+</ul></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="Omniverse Storage API - Home"/>
+    <img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="Omniverse Storage API - Home"/>
+  
+  
+    <p class="title logo__title">Omniverse Storage API</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+          <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://twitter.com/nvidiaomniverse" title="twitter" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-twitter fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">twitter</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.youtube.com/channel/UCSKUoczbGAcMld7HjpCR8OA" title="youtube" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-youtube fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">youtube</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.instagram.com/nvidiaomniverse" title="instagram" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-instagram fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">instagram</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.nvidia.com/en-us/omniverse/" title="www" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-solid fa-globe fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">www</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.linkedin.com/showcase/nvidia-omniverse" title="linkedin" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-linkedin fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">linkedin</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.twitch.tv/nvidiaomniverse" title="twitch" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-twitch fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">twitch</span></a>
+        </li>
+</ul></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="user_manual.html">Storage API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="client_example_include.html">Client examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="service_example_include.html">Service examples</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Omniverse Filesystem Storage Service</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="conformance_tests_include.html">Conformance test suite</a></li>
+<li class="toctree-l1"><a class="reference internal" href="changes.html">Changes</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Omniverse Filesystem Storage Service</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="omniverse-filesystem-storage-service">
+<h1>Omniverse Filesystem Storage Service<a class="headerlink" href="#omniverse-filesystem-storage-service" title="Link to this heading">#</a></h1>
+<p>A reference Python implementation of a storage service that serves files from a local filesystem using a content and a version tree
+to store old versions of files. This service provides both REST and gRPC interfaces for file operations, and serves as a reference implementation
+of the USD Storage API specification.</p>
+<section id="features">
+<h2>Features<a class="headerlink" href="#features" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>File operations: stat, read, write, enumerate, delete</p></li>
+<li><p>Multipart upload support for large files</p></li>
+<li><p>Directory operations: list, create, delete</p></li>
+<li><p>Versioning support: enumerate versions, read old versions</p></li>
+<li><p>Generic metadata store</p></li>
+</ul>
+</section>
+<section id="installation">
+<h2>Installation<a class="headerlink" href="#installation" title="Link to this heading">#</a></h2>
+<section id="prerequisites">
+<h3>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>Python</strong> 3.10, 3.11, or 3.12</p></li>
+<li><p><strong>Poetry</strong> package manager</p></li>
+</ul>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Create virtual environment for poetry</span>
+python<span class="w"> </span>-m<span class="w"> </span>venv<span class="w"> </span>.poetry_venv
+
+<span class="c1"># Install poetry</span>
+.poetry_venv/bin/pip<span class="w"> </span>install<span class="w"> </span>poetry
+</pre></div>
+</div>
+</section>
+<section id="build-from-source">
+<h3>Build from source<a class="headerlink" href="#build-from-source" title="Link to this heading">#</a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Install dependencies</span>
+.poetry_venv/bin/poetry<span class="w"> </span>install
+
+<span class="c1"># Run the installed entrypoint via poetry</span>
+.poetry_venv/bin/poetry<span class="w"> </span>run<span class="w"> </span>local-filesystem-service
+</pre></div>
+</div>
+<p>The results should look similar to this:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="m">2025</span>-11-18<span class="w"> </span><span class="m">11</span>:28:00,263<span class="w"> </span>-<span class="w"> </span>INFO<span class="w"> </span>-<span class="w"> </span>gRPC<span class="w"> </span>Server<span class="w"> </span>launched<span class="w"> </span>on<span class="w"> </span>port<span class="w"> </span><span class="m">50051</span>
+<span class="m">2025</span>-11-18<span class="w"> </span><span class="m">11</span>:28:00,264<span class="w"> </span>-<span class="w"> </span>INFO<span class="w"> </span>-<span class="w"> </span>Starting<span class="w"> </span>static<span class="w"> </span>server...
+<span class="m">2025</span>-11-18<span class="w"> </span><span class="m">11</span>:28:00,272<span class="w"> </span>-<span class="w"> </span>INFO<span class="w"> </span>-<span class="w"> </span>Started<span class="w"> </span>server<span class="w"> </span>process<span class="w"> </span><span class="o">[</span><span class="m">362059</span><span class="o">]</span>
+<span class="m">2025</span>-11-18<span class="w"> </span><span class="m">11</span>:28:00,272<span class="w"> </span>-<span class="w"> </span>INFO<span class="w"> </span>-<span class="w"> </span>Waiting<span class="w"> </span><span class="k">for</span><span class="w"> </span>application<span class="w"> </span>startup.
+<span class="m">2025</span>-11-18<span class="w"> </span><span class="m">11</span>:28:00,272<span class="w"> </span>-<span class="w"> </span>INFO<span class="w"> </span>-<span class="w"> </span>Application<span class="w"> </span>startup<span class="w"> </span>complete.
+<span class="m">2025</span>-11-18<span class="w"> </span><span class="m">11</span>:28:00,272<span class="w"> </span>-<span class="w"> </span>INFO<span class="w"> </span>-<span class="w"> </span>Uvicorn<span class="w"> </span>running<span class="w"> </span>on<span class="w"> </span>http://0.0.0.0:8011<span class="w"> </span><span class="o">(</span>Press<span class="w"> </span>CTRL+C<span class="w"> </span>to<span class="w"> </span>quit<span class="o">)</span>
+</pre></div>
+</div>
+</section>
+<section id="optional-advanced-poetry-setup">
+<h3>Optional: advanced poetry setup<a class="headerlink" href="#optional-advanced-poetry-setup" title="Link to this heading">#</a></h3>
+<p>You can also put the poetry command into your PATH and/or activate the virtual environment poetry as created for you to omit
+the path specifications or to run the <code class="docutils literal notranslate"><span class="pre">local-filesystem-service</span></code> command directly without poetry.</p>
+<p>To find where poetry created the environment, you run the following command, and will see an output similar to:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>$<span class="w"> </span>.poetry_venv/bin/poetry<span class="w"> </span>env<span class="w"> </span>info
+Virtualenv
+Python:<span class="w">         </span><span class="m">3</span>.10.12
+Implementation:<span class="w"> </span>CPython
+Path:<span class="w">           </span>/home/username/storage-api/filesystem_example/.venv
+Executable:<span class="w">     </span>/home/username/storage-api/filesystem_example/.venv/bin/python
+Valid:<span class="w">          </span>True
+
+Base
+Platform:<span class="w">   </span>linux
+OS:<span class="w">         </span>posix
+Python:<span class="w">     </span><span class="m">3</span>.10.12
+Path:<span class="w">       </span>/usr
+Executable:<span class="w"> </span>/usr/bin/python3.10
+</pre></div>
+</div>
+<p>In this example, the environment can be activated via</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">source</span><span class="w"> </span>/home/username/storage-api/filesystem_example/.venv/bin/activate
+</pre></div>
+</div>
+<p>Then you can run the service just with</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>local-filesystem-service
+</pre></div>
+</div>
+</section>
+</section>
+<section id="usage">
+<h2>Usage<a class="headerlink" href="#usage" title="Link to this heading">#</a></h2>
+<section id="quick-start">
+<h3>Quick Start<a class="headerlink" href="#quick-start" title="Link to this heading">#</a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Get help first!</span>
+local-filesystem-service<span class="w"> </span>--help
+
+<span class="c1"># Start with filesystem backend (default settings)</span>
+local-filesystem-service
+
+<span class="c1"># Help for the specific parameters setting up the local filesystem</span>
+local-filesystem-service<span class="w"> </span>filesystem<span class="w"> </span>--help
+
+<span class="c1"># Start with custom configuration</span>
+local-filesystem-service<span class="w"> </span>filesystem<span class="w"> </span>--static-dir<span class="w"> </span>/data/storage
+
+<span class="c1"># The service is started as a python module, so this is equivalent:</span>
+python<span class="w"> </span>-m<span class="w"> </span>local_filesystem_service<span class="w"> </span>filesystem<span class="w"> </span>--static-dir<span class="w"> </span>/data/storage
+</pre></div>
+</div>
+</section>
+<section id="service-modes">
+<h3>Service Modes<a class="headerlink" href="#service-modes" title="Link to this heading">#</a></h3>
+<p><strong>Combined Service (gRPC + REST):</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>local-filesystem-service<span class="w"> </span><span class="o">[</span>COMMON_OPTIONS<span class="o">]</span><span class="w"> </span>BACKEND<span class="w"> </span><span class="o">[</span>BACKEND_OPTIONS<span class="o">]</span>
+</pre></div>
+</div>
+<p>with BACKEND being <code class="docutils literal notranslate"><span class="pre">filesystem</span></code> as the only option in this version.</p>
+<p><strong>gRPC Only:</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># via script</span>
+local-filesystem-grpc<span class="w"> </span><span class="o">[</span>COMMON_OPTIONS<span class="o">]</span><span class="w"> </span>BACKEND<span class="w"> </span><span class="o">[</span>BACKEND_OPTIONS<span class="o">]</span>
+
+<span class="c1"># via module</span>
+python<span class="w"> </span>-m<span class="w"> </span>local_filesystem_service.grpc_service<span class="w"> </span><span class="o">[</span>COMMON_OPTIONS<span class="o">]</span><span class="w"> </span>BACKEND<span class="w"> </span><span class="o">[</span>BACKEND_OPTIONS<span class="o">]</span>
+</pre></div>
+</div>
+<p><strong>REST Only:</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># via script</span>
+local-filesystem-rest<span class="w"> </span><span class="o">[</span>COMMON_OPTIONS<span class="o">]</span><span class="w"> </span>BACKEND<span class="w"> </span><span class="o">[</span>BACKEND_OPTIONS<span class="o">]</span>
+
+<span class="c1"># via module</span>
+python<span class="w"> </span>-m<span class="w"> </span>local_filesystem_service.rest_service<span class="w"> </span><span class="o">[</span>COMMON_OPTIONS<span class="o">]</span><span class="w"> </span>BACKEND<span class="w"> </span><span class="o">[</span>BACKEND_OPTIONS<span class="o">]</span>
+</pre></div>
+</div>
+<p><strong>Note</strong>: Each backend (e.g., <code class="docutils literal notranslate"><span class="pre">filesystem</span></code>) has its own subcommand with specific options.</p>
+</section>
+<section id="cli-structure">
+<h3>CLI Structure<a class="headerlink" href="#cli-structure" title="Link to this heading">#</a></h3>
+<p><strong>Common Options</strong> (apply to all backends):</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">--grpc-port</span></code>: Port for gRPC server (default: 50051)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--http-port</span></code>: Port for HTTP/REST server (default: 8011)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--reload</span></code>: Enable auto-reload for development (REST service only)</p></li>
+</ul>
+<p><strong>Backend Subcommands</strong>:
+Each backend has its own subcommand. For example, the <code class="docutils literal notranslate"><span class="pre">filesystem</span></code> backend:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">--base-uri</span></code>: Base URI for resource addresses (default: <code class="docutils literal notranslate"><span class="pre">file-storage://fileservice</span></code>)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--static-dir</span></code>: Directory for file storage (default: system temp directory)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--folder-mode</span></code>: Folder simulation mode: <code class="docutils literal notranslate"><span class="pre">native</span></code>, <code class="docutils literal notranslate"><span class="pre">no_empty</span></code>, or <code class="docutils literal notranslate"><span class="pre">placeholder</span></code> (default: <code class="docutils literal notranslate"><span class="pre">native</span></code>)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--redirect-host</span></code>: Host for redirect URLs (default: <code class="docutils literal notranslate"><span class="pre">http://localhost</span></code>)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--redirect-port</span></code>: Port for redirect URLs (default: 8011)</p></li>
+</ul>
+<p><strong>Example</strong>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>local_filesystem_service<span class="w"> </span>--grpc-port<span class="w"> </span><span class="m">50052</span><span class="w"> </span>filesystem<span class="w"> </span>--static-dir<span class="w"> </span>/data
+</pre></div>
+</div>
+</section>
+<section id="environment-variables">
+<h3>Environment Variables<a class="headerlink" href="#environment-variables" title="Link to this heading">#</a></h3>
+<p>All CLI options can also be set via environment variables:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">FILESERVICE_STATIC_DIR</span></code>: Directory where files will be stored</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">FILESERVICE_SERVER_BASE_URI</span></code>: Base URI for the service, default is “file-storage://fileservice”</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">FILESERVICE_TEST_FOLDER_MODE</span></code>: Folder simulation mode, default is “native”</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">GRPC_SERVER_PORT</span></code>: Port for the gRPC server</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">HTTP_SERVER_PORT</span></code>: Port for the HTTP server</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">REDIRECT_HOST</span></code>: Host for redirect URLs</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">REDIRECT_PORT</span></code>: Port for redirect URLs</p></li>
+</ul>
+<p>CLI options take precedence over environment variables.</p>
+</section>
+</section>
+<section id="testing-the-service">
+<h2>Testing the Service<a class="headerlink" href="#testing-the-service" title="Link to this heading">#</a></h2>
+<p>Once started, test the service:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Test REST API</span>
+curl<span class="w"> </span>http://localhost:8011/v1beta/capabilities/services
+
+<span class="c1"># View OpenAPI documentation for a specific endpoint</span>
+open<span class="w"> </span>http://localhost:8011/v1beta/fileobject/docs
+<span class="c1"># or for the filefolder API</span>
+open<span class="w"> </span>http://localhost:8011/v1beta/filefolder/docs
+
+<span class="c1"># Test file upload, size hint is a required parameter</span>
+curl<span class="w"> </span>-X<span class="w"> </span>PUT<span class="w"> </span><span class="s2">&quot;http://localhost:8011/v1beta/fileobject/by-address/file-storage%3A%2F%2Ffileservice%2Ftest.txt?data_object_size=64&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/octet-stream&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s2">&quot;Hello World&quot;</span>
+
+<span class="c1"># Test file download</span>
+curl<span class="w"> </span>http://localhost:8011/v1beta/fileobject/by-address/file-storage%3A%2F%2Ffileservice%2Ftest.txt
+</pre></div>
+</div>
+</section>
+</section>
+<section id="building-a-docker-container">
+<h1>Building a Docker container<a class="headerlink" href="#building-a-docker-container" title="Link to this heading">#</a></h1>
+<section id="building-a-wheel">
+<h2>Building a wheel<a class="headerlink" href="#building-a-wheel" title="Link to this heading">#</a></h2>
+<p>Using poetry, you can easily make it create deployable version of the service using</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>.poetry_venv/bin/poetry<span class="w"> </span>build
+</pre></div>
+</div>
+<p>This places a wheel file which can easily be installed via Python’s <code class="docutils literal notranslate"><span class="pre">pip</span></code> command into the <code class="docutils literal notranslate"><span class="pre">dist</span></code> subdirectory by default.</p>
+</section>
+<section id="building-the-container">
+<h2>Building the container<a class="headerlink" href="#building-the-container" title="Link to this heading">#</a></h2>
+<p>With the wheel created in the <code class="docutils literal notranslate"><span class="pre">dist</span></code> folder, you can use the provided Dockerfile to create a container image using</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>build<span class="w"> </span>-f<span class="w"> </span>Dockerfile<span class="w"> </span>-t<span class="w"> </span>local-filesystem-service<span class="w"> </span>.
+</pre></div>
+</div>
+<p>and the containerized service can be run as a detached daemon while exposing the REST port at 8011 on your localhost.
+For persistent storage, mount a host directory (or PVC in Kubernetes) and set <code class="docutils literal notranslate"><span class="pre">FILESERVICE_STATIC_DIR</span></code> to the mount path:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>-d<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-p<span class="o">=</span><span class="m">8011</span>:8011<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-e<span class="w"> </span><span class="nv">FILESERVICE_STATIC_DIR</span><span class="o">=</span>/data<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-v<span class="w"> </span><span class="s2">&quot;</span><span class="k">$(</span><span class="nb">pwd</span><span class="k">)</span><span class="s2">/storage-data:/data&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>local-filesystem-service
+</pre></div>
+</div>
+<p>The image default command includes the backend subcommand (<code class="docutils literal notranslate"><span class="pre">filesystem</span></code>) so backend env vars are applied.
+If you override the container command/args, include <code class="docutils literal notranslate"><span class="pre">filesystem</span></code> explicitly.</p>
+<p>You can see it running with</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>ps
+CONTAINER<span class="w"> </span>ID<span class="w">   </span>IMAGE<span class="w">                      </span>COMMAND<span class="w">                  </span>CREATED<span class="w">         </span>STATUS<span class="w">         </span>PORTS<span class="w">                                         </span>NAMES
+52109ddea784<span class="w">   </span>local-filesystem-service<span class="w">   </span><span class="s2">&quot;local-filesystem-se…&quot;</span><span class="w">   </span><span class="m">3</span><span class="w"> </span>seconds<span class="w"> </span>ago<span class="w">   </span>Up<span class="w"> </span><span class="m">2</span><span class="w"> </span>seconds<span class="w">   </span><span class="m">0</span>.0.0.0:8011-&gt;8011/tcp,<span class="w"> </span><span class="o">[</span>::<span class="o">]</span>:8011-&gt;8011/tcp<span class="w">   </span>festive_albattani
+</pre></div>
+</div>
+<p>Verify it is running again with CURL:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>http://localhost:8011/v1beta/capabilities/services
+<span class="o">{</span><span class="s2">&quot;services&quot;</span>:<span class="o">[{</span><span class="s2">&quot;service_name&quot;</span>:<span class="s2">&quot;capabilities&quot;</span>,<span class="s2">&quot;service_versions&quot;</span>:<span class="o">[</span><span class="s2">&quot;v1beta&quot;</span><span class="o">]}</span>,
+<span class="o">{</span><span class="s2">&quot;service_name&quot;</span>:<span class="s2">&quot;fileobject&quot;</span>,<span class="s2">&quot;service_versions&quot;</span>:<span class="o">[</span><span class="s2">&quot;v1beta&quot;</span><span class="o">]}</span>,
+<span class="o">{</span><span class="s2">&quot;service_name&quot;</span>:<span class="s2">&quot;filefolder&quot;</span>,<span class="s2">&quot;service_versions&quot;</span>:<span class="o">[</span><span class="s2">&quot;v1beta&quot;</span><span class="o">]}</span>,
+<span class="o">{</span><span class="s2">&quot;service_name&quot;</span>:<span class="s2">&quot;versioning&quot;</span>,<span class="s2">&quot;service_versions&quot;</span>:<span class="o">[</span><span class="s2">&quot;v1beta&quot;</span><span class="o">]}]}</span>
+</pre></div>
+</div>
+<p>To see the “v1alpha” version services by querying the alpha version of the “capabilities” endpoint:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>http://localhost:8011/v1alpha/capabilities/services/capabilities/services
+<span class="o">{</span><span class="s2">&quot;services&quot;</span>:<span class="o">[{</span><span class="s2">&quot;service_name&quot;</span>:<span class="s2">&quot;capabilities&quot;</span>,<span class="s2">&quot;service_versions&quot;</span>:<span class="o">[</span><span class="s2">&quot;v1alpha&quot;</span>,<span class="s2">&quot;v1beta&quot;</span><span class="o">]}</span>,
+<span class="o">{</span><span class="s2">&quot;service_name&quot;</span>:<span class="s2">&quot;fileobject&quot;</span>,<span class="s2">&quot;service_versions&quot;</span>:<span class="o">[</span><span class="s2">&quot;v1alpha&quot;</span>,<span class="s2">&quot;v1beta&quot;</span><span class="o">]}</span>,
+<span class="o">{</span><span class="s2">&quot;service_name&quot;</span>:<span class="s2">&quot;filefolder&quot;</span>,<span class="s2">&quot;service_versions&quot;</span>:<span class="o">[</span><span class="s2">&quot;v1alpha&quot;</span>,<span class="s2">&quot;v1beta&quot;</span><span class="o">]}</span>,
+<span class="o">{</span><span class="s2">&quot;service_name&quot;</span>:<span class="s2">&quot;versioning&quot;</span>,<span class="s2">&quot;service_versions&quot;</span>:<span class="o">[</span><span class="s2">&quot;v1alpha&quot;</span>,<span class="s2">&quot;v1beta&quot;</span><span class="o">]}</span>,
+<span class="o">{</span><span class="s2">&quot;service_name&quot;</span>:<span class="s2">&quot;metadata&quot;</span>,<span class="s2">&quot;service_versions&quot;</span>:<span class="o">[</span><span class="s2">&quot;v1alpha&quot;</span><span class="o">]}]}</span>
+</pre></div>
+</div>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="service_example_include.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Service examples</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="conformance_tests_include.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Omniverse Storage API conformance tests</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#">Omniverse Filesystem Storage Service</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#features">Features</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#installation">Installation</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#build-from-source">Build from source</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-advanced-poetry-setup">Optional: advanced poetry setup</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#usage">Usage</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#quick-start">Quick Start</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#service-modes">Service Modes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cli-structure">CLI Structure</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#environment-variables">Environment Variables</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#testing-the-service">Testing the Service</a></li>
+</ul>
+</li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#building-a-docker-container">Building a Docker container</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#building-a-wheel">Building a wheel</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#building-the-container">Building the container</a></li>
+</ul>
+</li>
+</ul>
+
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025-2026, NVIDIA Corporation.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item"><p class="last-updated">
+  Last updated on Apr 17, 2026.
+  <br/>
+</p></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

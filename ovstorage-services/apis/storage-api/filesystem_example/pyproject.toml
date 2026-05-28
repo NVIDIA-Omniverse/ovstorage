@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+
+[tool.poetry]
+name = "omniverse-filesystem-storage-service"
+version = "1.0.0b4"
+description = "Local filesystem example implementation of NVIDIA Omniverse USD Storage API"
+readme = "README.md"
+authors = ["NVIDIA CORPORATION & AFFILIATES"]
+license = "LicenseRef-NvidiaProprietary"
+keywords = ["storage", "filesystem", "grpc", "rest", "api", "nvidia", "omniverse"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+packages = [
+    {include = "local_filesystem_service", from = "src"},
+    {include = "nvidia", from = "src"},
+]
+# Have to override the .gitignore rule for the generated protoc output. Poetry otherwise will ignore these files
+include = [{ path = 'src/nvidia', format = ["sdist", "wheel"] }]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+grpcio = ">=1.80.0"
+grpcio-tools = ">=1.80.0"
+grpcio-reflection = ">=1.80.0"
+grpc-interceptor = ">=0.15.4"
+googleapis-common-protos = ">=1.74.0"
+fastapi = ">=0.136.0"
+pydantic = ">=2.13.2"
+uvicorn = ">=0.44.0"
+PyYAML = ">=6.0.3"
+typer = ">=0.24.1"
+filelock = ">=3.29.0"
+
+[tool.poetry.group.test.dependencies]
+pytest = ">=9.0.3"
+pytest-bdd = ">=8.1.0"
+pytest-xdist = ">=3.8.0"
+requests = ">=2.33.1"
+
+[tool.poetry.group.dev.dependencies]
+black = ">=26.3.1"
+isort = ">=8.0.1"
+mypy = ">=1.20.1"
+
+[tool.poetry.scripts]
+local-filesystem-service = "local_filesystem_service.__main__:main"
+local-filesystem-grpc = "local_filesystem_service.grpc_service.__main__:main"
+local-filesystem-rest = "local_filesystem_service.rest_service.__main__:main"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

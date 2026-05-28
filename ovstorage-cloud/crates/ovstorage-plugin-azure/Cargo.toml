@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-azure"
+version = "0.1.0"
+edition = "2024"
+description = "Azure Blob Storage ovstorage backend crate."
+license = "Apache-2.0"
+
+[dependencies]
+ovstorage-plugin.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+flate2 = "1"
+hmac.workspace = true
+httpdate.workspace = true
+quick-xml.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+urlencoding.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true

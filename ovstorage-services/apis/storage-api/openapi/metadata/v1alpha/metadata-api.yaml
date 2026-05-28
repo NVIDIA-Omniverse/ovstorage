@@ -1,0 +1,123 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+
+openapi: 3.0.0
+info:
+  description: NVIDIA Omniverse Storage API Metadata service
+  title: nvidia.omniverse.storage.metadata.v1alpha
+  version: 1.0.0-beta.4
+security:
+  - bearerAuth: []
+paths:
+  /metadata/{uri}:
+    post:
+      operationId: get_metadata
+      summary: Get data object metadata by uri
+      description: Get data object metadata by uri
+      parameters:
+        - $ref: '#/components/parameters/uri'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserMetadataKeys'
+        required: true
+      responses:
+        '200':
+          description: Successful Response, data in body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserMetadataResponse'
+  /metadata/{uri}/{key}:
+    parameters:
+      - $ref: '#/components/parameters/uri'
+      - $ref: '#/components/parameters/key'
+      - $ref: '#/components/parameters/etag'
+    put:
+      summary: Update metadata at the specified uri. The uri and key are plus-quoted strings.
+      description: Update metadata of a data object at the specified uri. The uri and key are plus-quoted string.
+      operationId: update_metadata
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          headers:
+            ETag:
+              description: The ETag of the updated metadata key.
+              required: true
+              schema:
+                type: string
+                format: etag
+                maxLength: 256
+    delete:
+      summary: Delete metadata at the specified uri and metadata key. The uri and key are plus-quoted string.
+      description: Delete metadata at the specified uri and metadata key. The uri and key are plus-quoted string.
+      operationId: delete_metadata
+      responses:
+        '204':
+          description: Successful Response
+components:
+  parameters:
+    uri:
+      required: true
+      description: A metadata URI, the concrete format and semantics are storage-backend specific.
+      schema:
+        type: string
+        maxLength: 4096
+        format: uri
+      name: uri
+      in: path
+    key:
+      required: true
+      description: The identifier of a piece of metadata.
+      schema:
+        type: string
+        maxLength: 1024
+        format: key
+      name: key
+      in: path
+    etag:
+      required: false
+      description: The etag of of a metadata key to check before modifying operation.
+      schema:
+        type: string
+        maxLength: 256
+        format: etag
+      name: If-Match
+      in: header
+  schemas:
+    UserMetadataKeys:
+      description: A list of metadata keys to retrieve. Passing an empty array will cause service to retrieve all metadata keys.
+      type: array
+      maxItems: 4096
+      items:
+        type: string
+        maxLength: 1024
+    UserMetadataValue:
+      type: object
+      properties:
+        value: {}
+        etag:
+          type: string
+          maxLength: 256
+      required:
+        - etag
+    UserMetadataResponse:
+      type: object
+      title: UserMetadataResponse
+      description: A map-type to store extended metadata
+      nullable: false
+      additionalProperties:
+        $ref: '#/components/schemas/UserMetadataValue'

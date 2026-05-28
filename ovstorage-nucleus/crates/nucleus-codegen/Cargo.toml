@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "nucleus-codegen"
+version = "0.1.0"
+edition = "2024"
+description = "Build-time codegen for the vendored Nucleus IDL TypeScript interfaces."
+license = "Apache-2.0"
+
+[dependencies]
+anyhow.workspace = true
+oxc_allocator = "0.114"
+oxc_ast = "0.114"
+oxc_parser = "0.114"
+oxc_span = "0.114"
+prettyplease = "0.2"
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,636 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="./" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Omniverse Notifications APIs Developer Guide &#8212; Notifications APIs Developer Guide</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/bootstrap.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+
+  
+  <link href="_static/vendor/fontawesome/6.5.2/css/all.min.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-solid-900.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-brands-400.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-regular-400.woff2" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=a746c00c" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/nvidia-sphinx-theme.css?v=c5edffae" />
+    <link rel="stylesheet" type="text/css" href="_static/custom.css?v=7abaf8bc" />
+    <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-design.min.css?v=95c83b7e" />
+  
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b" />
+  <script src="_static/vendor/fontawesome/6.5.2/js/all.min.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+    <script src="_static/documentation_options.js?v=910b9336"></script>
+    <script src="_static/doctools.js?v=9a2dae69"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="_static/copybutton.js?v=65e89d2a"></script>
+    <script src="_static/design-tabs.js?v=f930bc37"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'index';</script>
+    <script src="_static/version-patch.js?v=c24f8c5d"></script>
+    <link rel="icon" href="_static/favicon.ico"/>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Getting Started" href="getting-started.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+    <meta name="docbuild:last-update" content="Dec 15, 2025"/>
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-primary-sidebar-checkbox"/>
+  <label class="overlay overlay-primary" for="pst-primary-sidebar-checkbox"></label>
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-secondary-sidebar-checkbox"/>
+  <label class="overlay overlay-secondary" for="pst-secondary-sidebar-checkbox"></label>
+  
+  <div class="search-button__wrapper">
+    <div class="search-button__overlay"></div>
+    <div class="search-button__search-container">
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         id="search-input"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form></div>
+  </div>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="#">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="Notifications APIs Developer Guide - Home"/>
+    <script>document.write(`<img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark" alt="Notifications APIs Developer Guide - Home"/>`);</script>
+  
+  
+    <p class="title logo__title">Notifications APIs Developer Guide</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+ <script>
+ document.write(`
+   <button class="btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<script>
+document.write(`
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"></i>
+  </button>
+`);
+</script></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+ <script>
+ document.write(`
+   <button class="btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+        
+      
+      <div class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="#">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="Notifications APIs Developer Guide - Home"/>
+    <script>document.write(`<img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark" alt="Notifications APIs Developer Guide - Home"/>`);</script>
+  
+  
+    <p class="title logo__title">Notifications APIs Developer Guide</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<script>
+document.write(`
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"></i>
+  </button>
+`);
+</script></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="getting-started.html">Getting Started</a></li>
+<li class="toctree-l1"><a class="reference internal" href="publishing-events.html">Publishing Events</a></li>
+<li class="toctree-l1"><a class="reference internal" href="consuming-events.html">Consuming Events</a></li>
+<li class="toctree-l1"><a class="reference internal" href="permissions.html">Permissions &amp; Authorization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api-reference.html">API Reference</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+  
+  <div id="rtd-footer-container"></div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none"></div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="omniverse-notifications-apis-developer-guide">
+<h1>Omniverse Notifications APIs Developer Guide<a class="headerlink" href="#omniverse-notifications-apis-developer-guide" title="Link to this heading">#</a></h1>
+<p>The Notifications Service is a distributed event messaging system that enables real-time event publishing and consumption across NVIDIA Omniverse services. It consists of two main components working together to provide a scalable, permission-aware event streaming infrastructure.</p>
+<section id="what-is-the-notifications-service">
+<h2>What is the Notifications Service?<a class="headerlink" href="#what-is-the-notifications-service" title="Link to this heading">#</a></h2>
+<p>The Notifications Service provides a way for applications to:</p>
+<ul class="simple">
+<li><p><strong>Publish events</strong> when significant actions occur (e.g., file created, user updated, workflow completed)</p></li>
+<li><p><strong>Consume events</strong> in real-time to react to changes happening across the system</p></li>
+<li><p><strong>Filter events</strong> to receive only the specific events your application cares about</p></li>
+<li><p><strong>Control access</strong> through fine-grained permissions on both publishing and consuming</p></li>
+</ul>
+</section>
+<section id="architecture-overview">
+<h2>Architecture Overview<a class="headerlink" href="#architecture-overview" title="Link to this heading">#</a></h2>
+<p>The service consists of two independent services:</p>
+<ol class="arabic simple">
+<li><p><strong>Event Aggregation Service</strong> (Publisher API) - Accepts events from publishers and routes them to RabbitMQ</p></li>
+<li><p><strong>Event Consumer Service</strong> (Consumer API) - Allows consumers to stream events from RabbitMQ with filtering and permissions</p></li>
+</ol>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go"> Your App                                                                      Your App</span>
+<span class="go"> (Publisher)         Notifications Service Infrastructure                     (Consumer)</span>
+<span class="go">     │                                                                            │</span>
+<span class="go">     │              ┌──────────────────────────────────────────┐                  │</span>
+<span class="go">     │              │                                          │                  │</span>
+<span class="go">     │              │  ┌────────────────┐    ┌─────────────┐   │                  │</span>
+<span class="go">     └─────────────&gt;│  │  Event         │───&gt;│  RabbitMQ   │   │──────────────────┘</span>
+<span class="go">                    │  │  Aggregation   │    │  (Message   │   │</span>
+<span class="go">                    │  │  Service (API) │    │   Broker)   │   │</span>
+<span class="go">                    │  └────────────────┘    └─────────────┘   │</span>
+<span class="go">                    │                              │           │</span>
+<span class="go">                    │                              ↓           │</span>
+<span class="go">                    │                        ┌─────────────┐   │</span>
+<span class="go">                    │                        │  Event      │   │</span>
+<span class="go">                    │                        │  Consumer   │   │</span>
+<span class="go">                    │                        │  Service    │   │</span>
+<span class="go">                    │                        │  (API)      │   │</span>
+<span class="go">                    │                        └─────────────┘   │</span>
+<span class="go">                    │                                          │</span>
+<span class="go">                    └──────────────────────────────────────────┘</span>
+</pre></div>
+</div>
+<p><strong>What this means:</strong></p>
+<ul class="simple">
+<li><p><strong>Your App (Publisher)</strong>: Any service you build that needs to publish events (e.g., a storage service publishing “file created” events)</p></li>
+<li><p><strong>Event Aggregation Service</strong>: The Notifications Service API that receives your published events</p></li>
+<li><p><strong>RabbitMQ</strong>: The message broker (managed by the Notifications Service)</p></li>
+<li><p><strong>Event Consumer Service</strong>: The Notifications Service API that streams events to consumers</p></li>
+<li><p><strong>Your App (Consumer)</strong>: Any service you build that needs to consume events (e.g., a thumbnail generator listening for file created events)</p></li>
+</ul>
+<p>The <strong>Notifications Service</strong> = Event Aggregation Service + RabbitMQ + Event Consumer Service (the infrastructure in the box). You just interact with the two APIs.</p>
+</section>
+<section id="key-concepts">
+<h2>Key Concepts<a class="headerlink" href="#key-concepts" title="Link to this heading">#</a></h2>
+<section id="events">
+<h3>Events<a class="headerlink" href="#events" title="Link to this heading">#</a></h3>
+<p>Events represent something that happened in your system. Each event has:</p>
+<ul class="simple">
+<li><p><strong>event_type</strong>: A string identifying the type of event (e.g., “storage.file.created”)</p></li>
+<li><p><strong>message</strong>: JSON payload containing event-specific data</p></li>
+<li><p><strong>occurred_at</strong>: Timestamp when the event occurred</p></li>
+<li><p><strong>resource</strong>: Optional path-like identifier for filtering (e.g., “/folder/subfolder/file.txt”)</p></li>
+</ul>
+</section>
+<section id="event-types-and-message-contracts">
+<h3>Event Types and Message Contracts<a class="headerlink" href="#event-types-and-message-contracts" title="Link to this heading">#</a></h3>
+<p><strong>Important</strong>: The Notifications Service is <strong>event-type agnostic</strong>. This means:</p>
+<ul class="simple">
+<li><p>The service does not know or validate the structure of your event types or message bodies</p></li>
+<li><p>Event types and message schemas are contracts between publishers and consumers</p></li>
+<li><p>Publishers and consumers must agree on:</p>
+<ul>
+<li><p>What event type strings to use</p></li>
+<li><p>What structure the message JSON should have</p></li>
+<li><p>What the resource_id paths represent</p></li>
+</ul>
+</li>
+</ul>
+<p>For example, if you’re building a thumbnail service:</p>
+<ul class="simple">
+<li><p>Define your own event types like “thumbnail.created” or “thumbnail.updated”</p></li>
+<li><p>Document the message structure (e.g., <code class="docutils literal notranslate"><span class="pre">{&quot;thumbnail_url&quot;:</span> <span class="pre">&quot;...&quot;,</span> <span class="pre">&quot;size&quot;:</span> <span class="pre">&quot;...&quot;}</span></code>)</p></li>
+<li><p>Ensure both publishers and consumers use the same schema</p></li>
+</ul>
+</section>
+<section id="durable-vs-non-durable-queues">
+<h3>Durable vs Non-Durable Queues<a class="headerlink" href="#durable-vs-non-durable-queues" title="Link to this heading">#</a></h3>
+<p>The Consumer API supports two consumption modes:</p>
+<p><strong>Non-Durable Queues</strong>:</p>
+<ul class="simple">
+<li><p>Receive only events that occur while actively connected</p></li>
+<li><p>Lightweight, no setup required</p></li>
+<li><p>Best for real-time updates where missing messages is acceptable</p></li>
+<li><p>Automatically cleaned up when disconnected</p></li>
+</ul>
+<p><strong>Durable Queues</strong>:</p>
+<ul class="simple">
+<li><p>Persist events even when disconnected</p></li>
+<li><p>Must be explicitly created before use</p></li>
+<li><p>Receive all events from the time the queue was created</p></li>
+<li><p>Best for critical event processing where no events should be missed</p></li>
+<li><p>Require explicit cleanup when no longer needed</p></li>
+</ul>
+<p>See the <a class="reference internal" href="consuming-events.html"><span class="std std-doc">Consuming Events</span></a> guide for details on when to use each type.</p>
+</section>
+<section id="resource-filtering">
+<h3>Resource Filtering<a class="headerlink" href="#resource-filtering" title="Link to this heading">#</a></h3>
+<p>Events can include a hierarchical <code class="docutils literal notranslate"><span class="pre">resource_id</span></code> (like a file path) that consumers can filter on:</p>
+<ul class="simple">
+<li><p><strong>Exact match</strong>: Only events for a specific resource</p></li>
+<li><p><strong>Prefix match (lazy)</strong>: Events for resources at a specific level</p></li>
+<li><p><strong>Prefix match (greedy)</strong>: Events for resources and all sub-levels</p></li>
+</ul>
+<p>Example:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">Resource: &quot;/projects/projectA/file.txt&quot;</span>
+
+<span class="go">Filter &quot;/projects/projectA/&quot; (greedy)  → Matches ✓</span>
+<span class="go">Filter &quot;/projects/&quot; (greedy)           → Matches ✓</span>
+<span class="go">Filter &quot;/projects/&quot; (lazy)             → No match ✗ (file is nested too deep)</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="available-apis">
+<h2>Available APIs<a class="headerlink" href="#available-apis" title="Link to this heading">#</a></h2>
+<p>Both services provide dual APIs:</p>
+<ul class="simple">
+<li><p><strong>gRPC API</strong>: High-performance, strongly-typed, ideal for service-to-service communication</p></li>
+<li><p><strong>REST API</strong>: HTTP/JSON-based, easier for testing and web clients, uses Server-Sent Events (SSE) for streaming</p></li>
+</ul>
+</section>
+<section id="documentation-structure">
+<h2>Documentation Structure<a class="headerlink" href="#documentation-structure" title="Link to this heading">#</a></h2>
+<div class="toctree-wrapper compound">
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="getting-started.html">Getting Started</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="getting-started.html#prerequisites">Prerequisites</a></li>
+<li class="toctree-l2"><a class="reference internal" href="getting-started.html#authentication">Authentication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="getting-started.html#quick-example-publish-and-consume-an-event">Quick Example: Publish and Consume an Event</a></li>
+<li class="toctree-l2"><a class="reference internal" href="getting-started.html#quick-example-grpc">Quick Example: gRPC</a></li>
+<li class="toctree-l2"><a class="reference internal" href="getting-started.html#common-patterns">Common Patterns</a></li>
+<li class="toctree-l2"><a class="reference internal" href="getting-started.html#next-steps">Next Steps</a></li>
+<li class="toctree-l2"><a class="reference internal" href="getting-started.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="publishing-events.html">Publishing Events</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="publishing-events.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="publishing-events.html#event-structure">Event Structure</a></li>
+<li class="toctree-l2"><a class="reference internal" href="publishing-events.html#publishing-a-single-event">Publishing a Single Event</a></li>
+<li class="toctree-l2"><a class="reference internal" href="publishing-events.html#batch-publishing-multiple-events">Batch Publishing Multiple Events</a></li>
+<li class="toctree-l2"><a class="reference internal" href="publishing-events.html#error-handling">Error Handling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="publishing-events.html#best-practices">Best Practices</a></li>
+<li class="toctree-l2"><a class="reference internal" href="publishing-events.html#performance-considerations">Performance Considerations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="publishing-events.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="consuming-events.html">Consuming Events</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="consuming-events.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="consuming-events.html#durable-vs-non-durable-queues">Durable vs Non-Durable Queues</a></li>
+<li class="toctree-l2"><a class="reference internal" href="consuming-events.html#consuming-with-non-durable-queues">Consuming with Non-Durable Queues</a></li>
+<li class="toctree-l2"><a class="reference internal" href="consuming-events.html#consuming-with-durable-queues">Consuming with Durable Queues</a></li>
+<li class="toctree-l2"><a class="reference internal" href="consuming-events.html#resource-filtering">Resource Filtering</a></li>
+<li class="toctree-l2"><a class="reference internal" href="consuming-events.html#error-handling">Error Handling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="consuming-events.html#best-practices">Best Practices</a></li>
+<li class="toctree-l2"><a class="reference internal" href="consuming-events.html#complete-example-thumbnail-generation-service">Complete Example: Thumbnail Generation Service</a></li>
+<li class="toctree-l2"><a class="reference internal" href="consuming-events.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="permissions.html">Permissions &amp; Authorization</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="permissions.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="permissions.html#authentication">Authentication</a></li>
+<li class="toctree-l2"><a class="reference internal" href="permissions.html#publishing-permissions">Publishing Permissions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="permissions.html#consuming-permissions">Consuming Permissions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="permissions.html#storage-events-special-docs-permissions">Storage Events: Special “Docs” Permissions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="permissions.html#fine-grained-permissions-for-arbitrary-event-types">Fine-Grained Permissions for Arbitrary Event Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="permissions.html#permissions-decision-flow">Permissions Decision Flow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="permissions.html#summary-table">Summary Table</a></li>
+<li class="toctree-l2"><a class="reference internal" href="permissions.html#configuration-examples">Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="permissions.html#best-practices">Best Practices</a></li>
+<li class="toctree-l2"><a class="reference internal" href="permissions.html#troubleshooting">Troubleshooting</a></li>
+<li class="toctree-l2"><a class="reference internal" href="permissions.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api-reference.html">API Reference</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api-reference.html#api-types">API Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api-reference.html#event-aggregation-service-publisher-api">Event Aggregation Service (Publisher API)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api-reference.html#publisher-grpc-api">Publisher gRPC API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api-reference.html#publisher-rest-api">Publisher REST API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api-reference.html#event-consumer-service-consumer-api">Event Consumer Service (Consumer API)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api-reference.html#consumer-grpc-api">Consumer gRPC API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api-reference.html#consumer-rest-api">Consumer REST API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api-reference.html#error-handling">Error Handling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api-reference.html#protocol-buffer-files">Protocol Buffer Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api-reference.html#openapi-specifications">OpenAPI Specifications</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api-reference.html#rate-limits-and-quotas">Rate Limits and Quotas</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api-reference.html#versioning">Versioning</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api-reference.html#service-health">Service Health</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api-reference.html#metrics-and-monitoring">Metrics and Monitoring</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api-reference.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+</ul>
+</div>
+</section>
+<section id="quick-links">
+<h2>Quick Links<a class="headerlink" href="#quick-links" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="getting-started.html"><span class="std std-doc">Getting Started Guide</span></a> - Set up and run your first example</p></li>
+<li><p><a class="reference internal" href="publishing-events.html"><span class="std std-doc">Publishing Events</span></a> - Learn how to publish events (REST and gRPC)</p></li>
+<li><p><a class="reference internal" href="consuming-events.html"><span class="std std-doc">Consuming Events</span></a> - Learn how to consume events (REST and gRPC)</p></li>
+<li><p><a class="reference internal" href="permissions.html"><span class="std std-doc">Permissions &amp; Authorization</span></a> - Understanding access control</p></li>
+<li><p><a class="reference internal" href="api-reference.html"><span class="std std-doc">API Reference</span></a> - Detailed API documentation</p></li>
+</ul>
+</section>
+<section id="support-and-contributing">
+<h2>Support and Contributing<a class="headerlink" href="#support-and-contributing" title="Link to this heading">#</a></h2>
+<p>For questions, issues, or contributions, please contact the Omniverse Notifications Service team.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="right-next"
+       href="getting-started.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Getting Started</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <div class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-is-the-notifications-service">What is the Notifications Service?</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#architecture-overview">Architecture Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#key-concepts">Key Concepts</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#events">Events</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#event-types-and-message-contracts">Event Types and Message Contracts</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#durable-vs-non-durable-queues">Durable vs Non-Durable Queues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#resource-filtering">Resource Filtering</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#available-apis">Available APIs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#documentation-structure">Documentation Structure</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quick-links">Quick Links</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#support-and-contributing">Support and Contributing</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script src="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b"></script>
+<script src="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2024-2025, NVIDIA Corporation.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item"><p class="last-updated">
+  Last updated on Dec 15, 2025.
+  <br/>
+</p></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

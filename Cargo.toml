@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[workspace]
+resolver = "2"
+members = ["xtask"]
+exclude = [
+    "ovstorage-cloud",
+    "ovstorage-core",
+    "ovstorage-nucleus",
+    "ovstorage-remote",
+    "ovstorage-services-client",
+]
+
+[workspace.lints.rust]
+future_incompatible = { level = "warn", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+unused_imports = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+redundant_clone = "deny"
+clone_on_copy = "deny"
+needless_collect = "warn"
+large_enum_variant = "warn"

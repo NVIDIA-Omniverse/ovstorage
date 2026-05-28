@@ -1,0 +1,1331 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="./" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Permissions &amp; Authorization &#8212; Notifications APIs Developer Guide</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/bootstrap.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+
+  
+  <link href="_static/vendor/fontawesome/6.5.2/css/all.min.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-solid-900.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-brands-400.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-regular-400.woff2" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=a746c00c" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/nvidia-sphinx-theme.css?v=c5edffae" />
+    <link rel="stylesheet" type="text/css" href="_static/custom.css?v=7abaf8bc" />
+    <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-design.min.css?v=95c83b7e" />
+  
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b" />
+  <script src="_static/vendor/fontawesome/6.5.2/js/all.min.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+    <script src="_static/documentation_options.js?v=910b9336"></script>
+    <script src="_static/doctools.js?v=9a2dae69"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="_static/copybutton.js?v=65e89d2a"></script>
+    <script src="_static/design-tabs.js?v=f930bc37"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'permissions';</script>
+    <script src="_static/version-patch.js?v=c24f8c5d"></script>
+    <link rel="icon" href="_static/favicon.ico"/>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="API Reference" href="api-reference.html" />
+    <link rel="prev" title="Consuming Events" href="consuming-events.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+    <meta name="docbuild:last-update" content="Dec 15, 2025"/>
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-primary-sidebar-checkbox"/>
+  <label class="overlay overlay-primary" for="pst-primary-sidebar-checkbox"></label>
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-secondary-sidebar-checkbox"/>
+  <label class="overlay overlay-secondary" for="pst-secondary-sidebar-checkbox"></label>
+  
+  <div class="search-button__wrapper">
+    <div class="search-button__overlay"></div>
+    <div class="search-button__search-container">
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         id="search-input"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form></div>
+  </div>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="Notifications APIs Developer Guide - Home"/>
+    <script>document.write(`<img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark" alt="Notifications APIs Developer Guide - Home"/>`);</script>
+  
+  
+    <p class="title logo__title">Notifications APIs Developer Guide</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+ <script>
+ document.write(`
+   <button class="btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<script>
+document.write(`
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"></i>
+  </button>
+`);
+</script></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+ <script>
+ document.write(`
+   <button class="btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <div class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="Notifications APIs Developer Guide - Home"/>
+    <script>document.write(`<img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark" alt="Notifications APIs Developer Guide - Home"/>`);</script>
+  
+  
+    <p class="title logo__title">Notifications APIs Developer Guide</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<script>
+document.write(`
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"></i>
+  </button>
+`);
+</script></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="getting-started.html">Getting Started</a></li>
+<li class="toctree-l1"><a class="reference internal" href="publishing-events.html">Publishing Events</a></li>
+<li class="toctree-l1"><a class="reference internal" href="consuming-events.html">Consuming Events</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Permissions &amp; Authorization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api-reference.html">API Reference</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+  
+  <div id="rtd-footer-container"></div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page">Permissions...</li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="permissions-authorization">
+<h1>Permissions &amp; Authorization<a class="headerlink" href="#permissions-authorization" title="Link to this heading">#</a></h1>
+<p>This guide explains how authentication and authorization work in the Notifications Service, including special cases for storage events and configurable per-event-type permissions.</p>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
+<p>The Notifications Service integrates with a permissions API to control:</p>
+<ul class="simple">
+<li><p><strong>Who can publish</strong> events of specific types</p></li>
+<li><p><strong>Who can create, delete, and consume from durable queues</strong></p></li>
+<li><p><strong>Who can consume specific events</strong> from non-durable queues</p></li>
+<li><p><strong>Fine-grained access control</strong> based on event content</p></li>
+</ul>
+</section>
+<section id="authentication">
+<h2>Authentication<a class="headerlink" href="#authentication" title="Link to this heading">#</a></h2>
+<p>All requests to both the Event Aggregation Service and Event Consumer Service require authentication via bearer tokens.</p>
+<section id="including-auth-token">
+<h3>Including Auth Token<a class="headerlink" href="#including-auth-token" title="Link to this heading">#</a></h3>
+<p><strong>REST API</strong>:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">Authorization: Bearer YOUR_JWT_TOKEN</span>
+</pre></div>
+</div>
+<p><strong>gRPC</strong>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">metadata</span> <span class="o">=</span> <span class="p">[(</span><span class="s1">&#39;authorization&#39;</span><span class="p">,</span> <span class="s1">&#39;Bearer YOUR_JWT_TOKEN&#39;</span><span class="p">)]</span>
+<span class="n">stub</span><span class="o">.</span><span class="n">PublishEvent</span><span class="p">(</span><span class="n">request</span><span class="p">,</span> <span class="n">metadata</span><span class="o">=</span><span class="n">metadata</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="token-expiration">
+<h3>Token Expiration<a class="headerlink" href="#token-expiration" title="Link to this heading">#</a></h3>
+<p><strong>Important</strong>: Tokens can expire <strong>while you’re streaming events</strong>. When this happens:</p>
+<ol class="arabic simple">
+<li><p>The stream will terminate with a 401 (UNAUTHENTICATED) error</p></li>
+<li><p>Your client must refresh the token</p></li>
+<li><p>Reconnect with the fresh token</p>
+<ul class="simple">
+<li><p><strong>Non-durable queues</strong>: Use the <code class="docutils literal notranslate"><span class="pre">reconnect_token</span></code> to avoid missing events</p></li>
+<li><p><strong>Durable queues</strong>: Simply reconnect with the same <code class="docutils literal notranslate"><span class="pre">queue_id</span></code></p></li>
+</ul>
+</li>
+</ol>
+<p>See the <a class="reference internal" href="consuming-events.html#authorization-errors-during-streaming"><span class="std std-ref">Consuming Events guide</span></a> for code examples.</p>
+</section>
+</section>
+<section id="publishing-permissions">
+<h2>Publishing Permissions<a class="headerlink" href="#publishing-permissions" title="Link to this heading">#</a></h2>
+<section id="event-type-permissions">
+<h3>Event Type Permissions<a class="headerlink" href="#event-type-permissions" title="Link to this heading">#</a></h3>
+<p>To publish an event, the authenticated principal must have permission for that specific event type.</p>
+<p>The Event Aggregation Service checks permissions using:</p>
+<ul class="simple">
+<li><p><strong>Action</strong>: <code class="docutils literal notranslate"><span class="pre">publish-event</span></code></p></li>
+<li><p><strong>Resource Type</strong>: <code class="docutils literal notranslate"><span class="pre">EventType</span></code></p></li>
+<li><p><strong>Resource ID</strong>: The event_type string (e.g., “storage.file.created”)</p></li>
+</ul>
+</section>
+<section id="example-policy">
+<h3>Example Policy<a class="headerlink" href="#example-policy" title="Link to this heading">#</a></h3>
+<p>In your permissions service (e.g., Cedar policy):</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">// Allow user to publish storage events</span>
+<span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;user@example.com&quot;,</span>
+<span class="go">  action == Action::&quot;event-aggregation-service:publish-event&quot;,</span>
+<span class="go">  resource == EventType::&quot;storage.file.created&quot;</span>
+<span class="go">);</span>
+
+<span class="go">// Allow a service to publish workflow events</span>
+<span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;workflow-service&quot;,</span>
+<span class="go">  action == Action::&quot;event-aggregation-service:publish-event&quot;,</span>
+<span class="go">  resource == EventType::&quot;workflow.completed&quot;</span>
+<span class="go">);</span>
+</pre></div>
+</div>
+</section>
+<section id="rest-example">
+<h3>REST Example<a class="headerlink" href="#rest-example" title="Link to this heading">#</a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>https://your-aggregation-service.example.com/api/v1beta/events<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer YOUR_TOKEN&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;event&quot;: {</span>
+<span class="s1">      &quot;event_type&quot;: &quot;myapp.user.created&quot;,</span>
+<span class="s1">      ...</span>
+<span class="s1">    }</span>
+<span class="s1">  }&#39;</span>
+</pre></div>
+</div>
+<p>If the principal doesn’t have <code class="docutils literal notranslate"><span class="pre">publish-event</span></code> permission for <code class="docutils literal notranslate"><span class="pre">EventType::&quot;myapp.user.created&quot;</span></code>, you’ll receive:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP 403 Forbidden</span>
+<span class="go">{</span>
+<span class="go">  &quot;detail&quot;: &quot;Not allowed to publish events of type myapp.user.created&quot;</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+</section>
+<section id="configuration">
+<h3>Configuration<a class="headerlink" href="#configuration" title="Link to this heading">#</a></h3>
+<p>The Event Aggregation Service is configured via environment variables:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">OMNI_EVENTS_PERMISSIONS_ENDPOINT</span></code></p></td>
+<td><p>URL of the permissions service. If not set, permissions checks are <strong>disabled</strong>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">OMNI_EVENTS_PERMISSIONS_TTL_SECONDS</span></code></p></td>
+<td><p>Cache TTL for permissions checks (default: 600)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Example</strong>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">OMNI_EVENTS_PERMISSIONS_ENDPOINT</span><span class="o">=</span>https://permissions.example.com
+<span class="nv">OMNI_EVENTS_PERMISSIONS_TTL_SECONDS</span><span class="o">=</span><span class="m">300</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="consuming-permissions">
+<h2>Consuming Permissions<a class="headerlink" href="#consuming-permissions" title="Link to this heading">#</a></h2>
+<p>Consuming permissions are more complex because they involve:</p>
+<ol class="arabic simple">
+<li><p>General permissions for queue management</p></li>
+<li><p>Special handling for storage events</p></li>
+<li><p>Optional fine-grained per-event-type permissions</p></li>
+</ol>
+<section id="durable-queue-permissions">
+<h3>Durable Queue Permissions<a class="headerlink" href="#durable-queue-permissions" title="Link to this heading">#</a></h3>
+<p>To work with durable queues, principals need specific permissions:</p>
+<section id="create-durable-queue">
+<h4>Create Durable Queue<a class="headerlink" href="#create-durable-queue" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p><strong>Action</strong>: <code class="docutils literal notranslate"><span class="pre">create-durable-queues</span></code></p></li>
+<li><p><strong>Resource</strong>: None (service-level permission)</p></li>
+</ul>
+<p><strong>Policy Example</strong>:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;thumbnail-service&quot;,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:create-durable-queues&quot;</span>
+<span class="go">);</span>
+</pre></div>
+</div>
+</section>
+<section id="consume-from-durable-queue">
+<h4>Consume from Durable Queue<a class="headerlink" href="#consume-from-durable-queue" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p><strong>Action</strong>: <code class="docutils literal notranslate"><span class="pre">consume-durable-queues</span></code></p></li>
+<li><p><strong>Resource</strong>: None (service-level permission)</p></li>
+</ul>
+<p><strong>Policy Example</strong>:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;thumbnail-service&quot;,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:consume-durable-queues&quot;</span>
+<span class="go">);</span>
+</pre></div>
+</div>
+</section>
+<section id="delete-durable-queue">
+<h4>Delete Durable Queue<a class="headerlink" href="#delete-durable-queue" title="Link to this heading">#</a></h4>
+<ul class="simple">
+<li><p><strong>Action</strong>: <code class="docutils literal notranslate"><span class="pre">delete-durable-queues</span></code></p></li>
+<li><p><strong>Resource</strong>: None (service-level permission)</p></li>
+</ul>
+<p><strong>Policy Example</strong>:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;thumbnail-service&quot;,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:delete-durable-queues&quot;</span>
+<span class="go">);</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="durable-queue-event-permissions">
+<h3>Durable Queue Event Permissions<a class="headerlink" href="#durable-queue-event-permissions" title="Link to this heading">#</a></h3>
+<p>When consuming from a durable queue, <strong>additional permissions checks</strong> are performed on individual events based on their event type.</p>
+<p><strong>For storage events</strong>, the service checks:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">storage.file.created</span></code> → Action: <code class="docutils literal notranslate"><span class="pre">consume-all-storage-create-events</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">storage.file.deleted</span></code> → Action: <code class="docutils literal notranslate"><span class="pre">consume-all-storage-delete-events</span></code></p></li>
+</ul>
+<p><strong>Policy Example</strong>:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">// Allow thumbnail service to consume all file creation events</span>
+<span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;thumbnail-service&quot;,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:consume-all-storage-create-events&quot;</span>
+<span class="go">);</span>
+</pre></div>
+</div>
+<p><strong>For non-storage events</strong> with configured permissions (see the Fine-Grained Permissions for Arbitrary Event Types section below), the action and resource from the configuration are used.</p>
+</section>
+<section id="non-durable-queue-permissions">
+<h3>Non-Durable Queue Permissions<a class="headerlink" href="#non-durable-queue-permissions" title="Link to this heading">#</a></h3>
+<p>Non-durable queues don’t require special queue management permissions, but <strong>every event</strong> is checked for permissions before being delivered.</p>
+<p>This is where the sophisticated permission models come into play:</p>
+<ol class="arabic simple">
+<li><p><strong>Storage events</strong>: Use storage-API-based “docs” permissions</p></li>
+<li><p><strong>Configured event types</strong>: Use permissions API with configured actions</p></li>
+<li><p><strong>Unconfigured event types</strong>: No permissions check (allowed by default)</p></li>
+</ol>
+</section>
+</section>
+<section id="storage-events-special-docs-permissions">
+<h2>Storage Events: Special “Docs” Permissions<a class="headerlink" href="#storage-events-special-docs-permissions" title="Link to this heading">#</a></h2>
+<p>Storage events have special handling because they relate to files and directories that have their own access control in the Storage API.</p>
+<section id="storage-event-types">
+<h3>Storage Event Types<a class="headerlink" href="#storage-event-types" title="Link to this heading">#</a></h3>
+<p>The following event types are treated as storage events:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">omni.storage.created</span></code> - File created</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">omni.storage.deleted</span></code> - File deleted</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">omni.storage.dir_created</span></code> - Directory created</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">omni.storage.dir_deleted</span></code> - Directory deleted</p></li>
+</ul>
+<p>(Note: The actual event type strings may vary based on your storage service configuration)</p>
+</section>
+<section id="how-storage-permissions-work">
+<h3>How Storage Permissions Work<a class="headerlink" href="#how-storage-permissions-work" title="Link to this heading">#</a></h3>
+<p><strong>For non-durable queues</strong>, the Event Consumer Service queries the <strong>Storage API</strong> to check if the user has access to the files/directories in the events.</p>
+<p>This is sometimes called <strong>“docs” permissions</strong> because it’s based on the actual documents/files the user can access in storage.</p>
+<section id="for-storage-file-created-events">
+<h4>For <code class="docutils literal notranslate"><span class="pre">storage.file.created</span></code> Events<a class="headerlink" href="#for-storage-file-created-events" title="Link to this heading">#</a></h4>
+<p>When a file is created:</p>
+<ol class="arabic simple">
+<li><p>The consumer service checks if the user has access to the <strong>parent directory</strong></p></li>
+<li><p>If they have any files in that directory (i.e., they can “see” the directory), they receive the event</p></li>
+<li><p>The file is added to a cache so that if it’s deleted later, the service knows they should receive the delete event</p></li>
+</ol>
+</section>
+<section id="for-storage-file-deleted-events">
+<h4>For <code class="docutils literal notranslate"><span class="pre">storage.file.deleted</span></code> Events<a class="headerlink" href="#for-storage-file-deleted-events" title="Link to this heading">#</a></h4>
+<p>When a file is deleted:</p>
+<ol class="arabic simple">
+<li><p>The service checks if the user had access to that file (from the cache or by checking the parent directory)</p></li>
+<li><p>If they had access, they receive the delete event</p></li>
+<li><p>The file is removed from the cache</p></li>
+</ol>
+</section>
+<section id="for-storage-dir-created-events">
+<h4>For <code class="docutils literal notranslate"><span class="pre">storage.dir_created</span></code> Events<a class="headerlink" href="#for-storage-dir-created-events" title="Link to this heading">#</a></h4>
+<p>When a directory is created:</p>
+<ol class="arabic simple">
+<li><p>The service checks if the user has access to the <strong>parent directory</strong></p></li>
+<li><p>It queries the Storage API to see if they have any files in the <strong>new directory</strong></p></li>
+<li><p>If they have files in the new directory, they receive the event</p></li>
+<li><p>The directory is added to the cache</p></li>
+</ol>
+</section>
+<section id="for-storage-dir-deleted-events">
+<h4>For <code class="docutils literal notranslate"><span class="pre">storage.dir_deleted</span></code> Events<a class="headerlink" href="#for-storage-dir-deleted-events" title="Link to this heading">#</a></h4>
+<p>When a directory is deleted:</p>
+<ol class="arabic simple">
+<li><p>The service checks if the user had access to the directory (from the cache)</p></li>
+<li><p>It checks if they still have files in that “deleted” directory (in case it’s a synthetic delete event)</p></li>
+<li><p>If the directory was truly deleted for them, they receive the event</p></li>
+<li><p>The directory is removed from the cache</p></li>
+</ol>
+</section>
+</section>
+<section id="why-docs-permissions">
+<h3>Why “Docs” Permissions?<a class="headerlink" href="#why-docs-permissions" title="Link to this heading">#</a></h3>
+<p>This approach ensures that:</p>
+<ul class="simple">
+<li><p>Users only see events for files they have access to</p></li>
+<li><p>A user creating a file in a shared folder only sees that event if they can access the folder</p></li>
+<li><p>Delete events are only sent if the user could see the file/directory in the first place</p></li>
+<li><p>Permissions are enforced at the storage layer, not duplicated in the events system</p></li>
+</ul>
+</section>
+<section id="configuration-for-storage-events">
+<h3>Configuration for Storage Events<a class="headerlink" href="#configuration-for-storage-events" title="Link to this heading">#</a></h3>
+<p>The Event Consumer Service needs to know which Storage API endpoints to query:</p>
+<p><strong>Environment Variable</strong>: <code class="docutils literal notranslate"><span class="pre">OMNI_EVENTS_PERMISSIONS_YAML_FILE_PATH</span></code></p>
+<p><strong>YAML Configuration File</strong>:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">storage_permissions_endpoints</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">https://storage-api-1.example.com</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">https://storage-api-2.example.com</span>
+</pre></div>
+</div>
+<p><strong>Example</strong>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">OMNI_EVENTS_PERMISSIONS_YAML_FILE_PATH</span><span class="o">=</span>/etc/event-consumer/permissions.yml
+</pre></div>
+</div>
+<p><strong>In the YAML file</strong> (<code class="docutils literal notranslate"><span class="pre">/etc/event-consumer/permissions.yml</span></code>):</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">storage_permissions_endpoints</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">https://azure-blob-storage-api.example.com</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">https://s3-storage-api.example.com</span>
+</pre></div>
+</div>
+<p>Currently, the first endpoint in the list is used. In the future, routing rules will determine which endpoint to use based on the event’s <code class="docutils literal notranslate"><span class="pre">resource_id</span></code>.</p>
+</section>
+<section id="storage-permissions-with-durable-queues">
+<h3>Storage Permissions with Durable Queues<a class="headerlink" href="#storage-permissions-with-durable-queues" title="Link to this heading">#</a></h3>
+<p><strong>Important difference</strong>: When using <strong>durable queues</strong>, storage events don’t use the Storage API “docs” permissions.</p>
+<p>Instead, they use simple action-based permissions:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">storage.file.created</span></code> → <code class="docutils literal notranslate"><span class="pre">consume-all-storage-create-events</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">storage.file.deleted</span></code> → <code class="docutils literal notranslate"><span class="pre">consume-all-storage-delete-events</span></code></p></li>
+</ul>
+<p><strong>Why?</strong> Durable queues are typically used by services (not end users) that need to process all storage events, not just those for files they own.</p>
+<p><strong>Policy Example</strong>:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">// Thumbnail service can consume all file creation events</span>
+<span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;thumbnail-service&quot;,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:consume-all-storage-create-events&quot;</span>
+<span class="go">);</span>
+
+<span class="go">// Audit service can consume all file deletion events</span>
+<span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;audit-service&quot;,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:consume-all-storage-delete-events&quot;</span>
+<span class="go">);</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="fine-grained-permissions-for-arbitrary-event-types">
+<h2>Fine-Grained Permissions for Arbitrary Event Types<a class="headerlink" href="#fine-grained-permissions-for-arbitrary-event-types" title="Link to this heading">#</a></h2>
+<p>For non-storage event types, you can configure <strong>fine-grained permissions</strong> that check not just the event type, but also the <strong>resource_id</strong> from the event.</p>
+<section id="when-to-use-fine-grained-permissions">
+<h3>When to Use Fine-Grained Permissions<a class="headerlink" href="#when-to-use-fine-grained-permissions" title="Link to this heading">#</a></h3>
+<p>Use fine-grained permissions when:</p>
+<ul class="simple">
+<li><p>Different users should see different events of the same type</p></li>
+<li><p>Events relate to resources with their own access control (like files, projects, workspaces)</p></li>
+<li><p>You need to enforce permissions based on the event’s <code class="docutils literal notranslate"><span class="pre">resource_id</span></code></p></li>
+</ul>
+<p><strong>Examples</strong>:</p>
+<ul class="simple">
+<li><p>A user should only see <code class="docutils literal notranslate"><span class="pre">project.updated</span></code> events for projects they have access to</p></li>
+<li><p>A user should only see <code class="docutils literal notranslate"><span class="pre">thumbnail.generated</span></code> events for their own files</p></li>
+<li><p>A user should only see <code class="docutils literal notranslate"><span class="pre">notification.created</span></code> events for notifications sent to them</p></li>
+</ul>
+</section>
+<section id="id1">
+<h3>Configuration<a class="headerlink" href="#id1" title="Link to this heading">#</a></h3>
+<p>Fine-grained permissions are configured via a YAML file specified by the <code class="docutils literal notranslate"><span class="pre">OMNI_EVENTS_PERMISSIONS_YAML_FILE_PATH</span></code> environment variable.</p>
+<p><strong>Environment Variable</strong>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">OMNI_EVENTS_PERMISSIONS_YAML_FILE_PATH</span><span class="o">=</span>/etc/event-consumer/permissions.yml
+</pre></div>
+</div>
+<p><strong>YAML Configuration File</strong>:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">event_permissions</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">event_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">project.updated</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read-project</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">event_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">thumbnail.generated</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read-thumbnail</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">event_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">notification.created</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read-notification</span>
+</pre></div>
+</div>
+</section>
+<section id="how-it-works">
+<h3>How It Works<a class="headerlink" href="#how-it-works" title="Link to this heading">#</a></h3>
+<p>For each event of a configured type:</p>
+<ol class="arabic simple">
+<li><p>The Event Consumer Service makes a permissions API call</p></li>
+<li><p>It uses the configured <code class="docutils literal notranslate"><span class="pre">action</span></code></p></li>
+<li><p>It uses the event’s <code class="docutils literal notranslate"><span class="pre">resource_id</span></code> as the resource ID</p></li>
+<li><p>The resource type is always <code class="docutils literal notranslate"><span class="pre">EventResourceId</span></code></p></li>
+<li><p>If the principal has permission, the event is delivered; otherwise, it’s filtered out</p></li>
+</ol>
+</section>
+<section id="permissions-api-call">
+<h3>Permissions API Call<a class="headerlink" href="#permissions-api-call" title="Link to this heading">#</a></h3>
+<p>When consuming an event like:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;event_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;project.updated&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;resource_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;/projects/project-123&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;message&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>The service makes this permissions check:</p>
+<ul class="simple">
+<li><p><strong>Principal</strong>: The authenticated user</p></li>
+<li><p><strong>Action</strong>: <code class="docutils literal notranslate"><span class="pre">read-project</span></code> (from config)</p></li>
+<li><p><strong>Resource Type</strong>: <code class="docutils literal notranslate"><span class="pre">EventResourceId</span></code></p></li>
+<li><p><strong>Resource ID</strong>: <code class="docutils literal notranslate"><span class="pre">/projects/project-123</span></code> (from event)</p></li>
+</ul>
+</section>
+<section id="policy-examples">
+<h3>Policy Examples<a class="headerlink" href="#policy-examples" title="Link to this heading">#</a></h3>
+<p><strong>Scoped Policy</strong> (using resource_id):</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">// Allow user to see events for project-123</span>
+<span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;user@example.com&quot;,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:read-project&quot;,</span>
+<span class="go">  resource == EventResourceId::&quot;/projects/project-123&quot;</span>
+<span class="go">);</span>
+</pre></div>
+</div>
+<p><strong>Global Policy</strong> (ignoring resource_id):</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">// Allow admin to see all project events</span>
+<span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;admin@example.com&quot;,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:read-project&quot;</span>
+<span class="go">);</span>
+</pre></div>
+</div>
+<p><strong>Hierarchical Policy</strong>:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">// Allow user to see events for any project they own</span>
+<span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;user@example.com&quot;,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:read-project&quot;,</span>
+<span class="go">  resource == EventResourceId</span>
+<span class="go">)</span>
+<span class="go">when {</span>
+<span class="go">  resource in Principal::&quot;user@example.com&quot;</span>
+<span class="go">};</span>
+</pre></div>
+</div>
+</section>
+<section id="complete-configuration-example">
+<h3>Complete Configuration Example<a class="headerlink" href="#complete-configuration-example" title="Link to this heading">#</a></h3>
+<p><strong>YAML file</strong> (<code class="docutils literal notranslate"><span class="pre">/etc/event-consumer/permissions.yml</span></code>):</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># Storage API endpoints for &quot;docs&quot; permissions</span>
+<span class="nt">storage_permissions_endpoints</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">https://storage-api.example.com</span>
+
+<span class="c1"># Fine-grained event permissions</span>
+<span class="nt">event_permissions</span><span class="p">:</span>
+<span class="w">  </span><span class="c1"># Project events</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">event_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">project.created</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read-project</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">event_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">project.updated</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read-project</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">event_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">project.deleted</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read-project</span>
+<span class="w">  </span>
+<span class="w">  </span><span class="c1"># Thumbnail events</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">event_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">thumbnail.generated</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read-thumbnail</span>
+<span class="w">  </span>
+<span class="w">  </span><span class="c1"># Notification events  </span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">event_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">notification.created</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read-notification</span>
+<span class="w">  </span>
+<span class="w">  </span><span class="c1"># Workflow events</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">event_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">workflow.completed</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read-workflow</span>
+</pre></div>
+</div>
+<p><strong>Corresponding Policies</strong>:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">// User can see their own project events</span>
+<span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;user@example.com&quot;,</span>
+<span class="go">  action in [</span>
+<span class="go">    Action::&quot;event-consumer-service:read-project&quot;</span>
+<span class="go">  ],</span>
+<span class="go">  resource == EventResourceId</span>
+<span class="go">)</span>
+<span class="go">when {</span>
+<span class="go">  // Check if resource (project) is owned by user</span>
+<span class="go">  resource.owner == principal.id</span>
+<span class="go">};</span>
+
+<span class="go">// User can see thumbnails for files they can access</span>
+<span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;user@example.com&quot;,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:read-thumbnail&quot;,</span>
+<span class="go">  resource == EventResourceId</span>
+<span class="go">)</span>
+<span class="go">when {</span>
+<span class="go">  // Check via storage permissions</span>
+<span class="go">  resource.accessible_by(principal)</span>
+<span class="go">};</span>
+
+<span class="go">// All users can see notification events for their own notifications</span>
+<span class="go">permit(</span>
+<span class="go">  principal,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:read-notification&quot;,</span>
+<span class="go">  resource == EventResourceId</span>
+<span class="go">)</span>
+<span class="go">when {</span>
+<span class="go">  resource.recipient == principal.id</span>
+<span class="go">};</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="permissions-decision-flow">
+<h2>Permissions Decision Flow<a class="headerlink" href="#permissions-decision-flow" title="Link to this heading">#</a></h2>
+<p>Here’s how permissions are checked when consuming events:</p>
+<section id="non-durable-queues">
+<h3>Non-Durable Queues<a class="headerlink" href="#non-durable-queues" title="Link to this heading">#</a></h3>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">┌─────────────────────────────────────────┐</span>
+<span class="go">│ Event Received                          │</span>
+<span class="go">└────────────────┬────────────────────────┘</span>
+<span class="go">                 │</span>
+<span class="go">                 ▼</span>
+<span class="go">┌─────────────────────────────────────────┐</span>
+<span class="go">│ Is it a storage event?                  │</span>
+<span class="go">│ (storage.created, storage.deleted, etc) │</span>
+<span class="go">└────────┬─────────────────────┬──────────┘</span>
+<span class="go">         │ Yes                 │ No</span>
+<span class="go">         ▼                     ▼</span>
+<span class="go">┌────────────────────┐  ┌──────────────────────────┐</span>
+<span class="go">│ Check Storage API  │  │ Is event_type configured │</span>
+<span class="go">│ &quot;docs&quot; permissions │  │ in permissions.yml?      │</span>
+<span class="go">└────────┬───────────┘  └──────┬──────────────┬────┘</span>
+<span class="go">         │                     │ Yes          │ No</span>
+<span class="go">         │                     ▼              ▼</span>
+<span class="go">         │            ┌────────────────┐  ┌────────────┐</span>
+<span class="go">         │            │ Check          │  │ Allow      │</span>
+<span class="go">         │            │ permissions    │  │ (no check) │</span>
+<span class="go">         │            │ API with       │  └────────────┘</span>
+<span class="go">         │            │ configured     │</span>
+<span class="go">         │            │ action +       │</span>
+<span class="go">         │            │ resource_id    │</span>
+<span class="go">         │            └────────┬───────┘</span>
+<span class="go">         │                     │</span>
+<span class="go">         ▼                     ▼</span>
+<span class="go">┌─────────────────────────────────────────┐</span>
+<span class="go">│ Allow or Deny?                          │</span>
+<span class="go">└────────┬─────────────────────┬──────────┘</span>
+<span class="go">         │ Allow               │ Deny</span>
+<span class="go">         ▼                     ▼</span>
+<span class="go">┌────────────────┐    ┌───────────────────┐</span>
+<span class="go">│ Deliver Event  │    │ Filter Out Event  │</span>
+<span class="go">└────────────────┘    └───────────────────┘</span>
+</pre></div>
+</div>
+</section>
+<section id="durable-queues">
+<h3>Durable Queues<a class="headerlink" href="#durable-queues" title="Link to this heading">#</a></h3>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">┌─────────────────────────────────────────┐</span>
+<span class="go">│ Event Received                          │</span>
+<span class="go">└────────────────┬────────────────────────┘</span>
+<span class="go">                 │</span>
+<span class="go">                 ▼</span>
+<span class="go">┌─────────────────────────────────────────┐</span>
+<span class="go">│ Is it a storage event?                  │</span>
+<span class="go">└────────┬─────────────────────┬──────────┘</span>
+<span class="go">         │ Yes                 │ No</span>
+<span class="go">         ▼                     ▼</span>
+<span class="go">┌────────────────────┐  ┌──────────────────────────┐</span>
+<span class="go">│ Check:             │  │ Is event_type configured │</span>
+<span class="go">│ - storage.created  │  │ in permissions.yml?      │</span>
+<span class="go">│   → consume-all-   │  └──────┬──────────────┬────┘</span>
+<span class="go">│     storage-create │         │ Yes          │ No</span>
+<span class="go">│     -events        │         ▼              ▼</span>
+<span class="go">│ - storage.deleted  │  ┌────────────────┐ ┌───────┐</span>
+<span class="go">│   → consume-all-   │  │ Check perms    │ │ Allow │</span>
+<span class="go">│     storage-delete │  │ API with       │ └───────┘</span>
+<span class="go">│     -events        │  │ action +       │</span>
+<span class="go">└────────┬───────────┘  │ resource_id    │</span>
+<span class="go">         │              └────────┬───────┘</span>
+<span class="go">         │                       │</span>
+<span class="go">         ▼                       ▼</span>
+<span class="go">┌─────────────────────────────────────────┐</span>
+<span class="go">│ Allow or Deny?                          │</span>
+<span class="go">└────────┬─────────────────────┬──────────┘</span>
+<span class="go">         │ Allow               │ Deny</span>
+<span class="go">         ▼                     ▼</span>
+<span class="go">┌────────────────┐    ┌───────────────────┐</span>
+<span class="go">│ Deliver Event  │    │ Filter Out Event  │</span>
+<span class="go">└────────────────┘    └───────────────────┘</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="summary-table">
+<h2>Summary Table<a class="headerlink" href="#summary-table" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Scenario</p></th>
+<th class="head"><p>Queue Type</p></th>
+<th class="head"><p>Event Type</p></th>
+<th class="head"><p>Permission Check</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Create queue</p></td>
+<td><p>Durable</p></td>
+<td><p>N/A</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">create-durable-queues</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Delete queue</p></td>
+<td><p>Durable</p></td>
+<td><p>N/A</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">delete-durable-queues</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Consume from queue</p></td>
+<td><p>Durable</p></td>
+<td><p>N/A</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">consume-durable-queues</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Storage create event</p></td>
+<td><p>Durable</p></td>
+<td><p>storage.*</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">consume-all-storage-create-events</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Storage delete event</p></td>
+<td><p>Durable</p></td>
+<td><p>storage.*</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">consume-all-storage-delete-events</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Storage event</p></td>
+<td><p>Non-durable</p></td>
+<td><p>storage.*</p></td>
+<td><p>Storage API “docs” permissions</p></td>
+</tr>
+<tr class="row-even"><td><p>Configured event</p></td>
+<td><p>Either</p></td>
+<td><p>Any</p></td>
+<td><p>Configured action + EventResourceId</p></td>
+</tr>
+<tr class="row-odd"><td><p>Unconfigured event</p></td>
+<td><p>Either</p></td>
+<td><p>Any</p></td>
+<td><p>No check (allowed)</p></td>
+</tr>
+<tr class="row-even"><td><p>Publishing</p></td>
+<td><p>N/A</p></td>
+<td><p>Any</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">publish-event</span></code> with EventType</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="configuration-examples">
+<h2>Configuration Examples<a class="headerlink" href="#configuration-examples" title="Link to this heading">#</a></h2>
+<section id="example-1-thumbnail-service-durable-queue">
+<h3>Example 1: Thumbnail Service (Durable Queue)<a class="headerlink" href="#example-1-thumbnail-service-durable-queue" title="Link to this heading">#</a></h3>
+<p>The thumbnail service needs to process all file creation events.</p>
+<p><strong>Permissions Policies</strong>:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;thumbnail-service&quot;,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:create-durable-queues&quot;</span>
+<span class="go">);</span>
+
+<span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;thumbnail-service&quot;,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:consume-durable-queues&quot;</span>
+<span class="go">);</span>
+
+<span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;thumbnail-service&quot;,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:consume-all-storage-create-events&quot;</span>
+<span class="go">);</span>
+</pre></div>
+</div>
+<p><strong>No YAML configuration needed</strong> - the service uses simple action-based permissions.</p>
+</section>
+<section id="example-2-user-dashboard-non-durable-queue">
+<h3>Example 2: User Dashboard (Non-Durable Queue)<a class="headerlink" href="#example-2-user-dashboard-non-durable-queue" title="Link to this heading">#</a></h3>
+<p>A web dashboard shows users file events for files they have access to.</p>
+<p><strong>Permissions Policies</strong>:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">// No special policies needed - users use their existing storage permissions</span>
+<span class="go">// The Event Consumer Service will query the Storage API to check access</span>
+</pre></div>
+</div>
+<p><strong>YAML Configuration</strong> (<code class="docutils literal notranslate"><span class="pre">/etc/event-consumer/permissions.yml</span></code>):</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">storage_permissions_endpoints</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">https://storage-api.example.com</span>
+</pre></div>
+</div>
+</section>
+<section id="example-3-project-notification-service-non-durable-fine-grained">
+<h3>Example 3: Project Notification Service (Non-Durable + Fine-Grained)<a class="headerlink" href="#example-3-project-notification-service-non-durable-fine-grained" title="Link to this heading">#</a></h3>
+<p>A service that shows users events for projects they have access to.</p>
+<p><strong>Permissions Policies</strong>:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">permit(</span>
+<span class="go">  principal,</span>
+<span class="go">  action in [</span>
+<span class="go">    Action::&quot;event-consumer-service:read-project&quot;</span>
+<span class="go">  ],</span>
+<span class="go">  resource == EventResourceId</span>
+<span class="go">)</span>
+<span class="go">when {</span>
+<span class="go">  // User has access if they&#39;re a member of the project</span>
+<span class="go">  resource.members.contains(principal.id)</span>
+<span class="go">};</span>
+</pre></div>
+</div>
+<p><strong>YAML Configuration</strong>:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">event_permissions</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">event_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">project.created</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read-project</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">event_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">project.updated</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read-project</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">event_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">project.deleted</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read-project</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">event_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">project.member.added</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read-project</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="best-practices">
+<h2>Best Practices<a class="headerlink" href="#best-practices" title="Link to this heading">#</a></h2>
+<section id="use-service-accounts-for-durable-queues">
+<h3>1. Use Service Accounts for Durable Queues<a class="headerlink" href="#use-service-accounts-for-durable-queues" title="Link to this heading">#</a></h3>
+<p>Create dedicated service principals for services using durable queues:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;service:thumbnail-generator&quot;,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:create-durable-queues&quot;</span>
+<span class="go">);</span>
+</pre></div>
+</div>
+</section>
+<section id="document-your-permission-requirements">
+<h3>2. Document Your Permission Requirements<a class="headerlink" href="#document-your-permission-requirements" title="Link to this heading">#</a></h3>
+<p>When defining new event types, document what permissions are needed:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">Event Type: project.updated</span>
+
+<span class="sd">Publishing Permission:</span>
+<span class="sd">  - Action: publish-event</span>
+<span class="sd">  - Resource: EventType::&quot;project.updated&quot;</span>
+
+<span class="sd">Consuming Permission (fine-grained):</span>
+<span class="sd">  - Action: read-project</span>
+<span class="sd">  - Resource: EventResourceId (project&#39;s resource_id)</span>
+<span class="sd">  </span>
+<span class="sd">Example policy:</span>
+<span class="sd">  permit(</span>
+<span class="sd">    principal,</span>
+<span class="sd">    action == Action::&quot;event-consumer-service:read-project&quot;,</span>
+<span class="sd">    resource == EventResourceId</span>
+<span class="sd">  )</span>
+<span class="sd">  when { resource.members.contains(principal.id) };</span>
+<span class="sd">&quot;&quot;&quot;</span>
+</pre></div>
+</div>
+</section>
+<section id="test-permissions-thoroughly">
+<h3>3. Test Permissions Thoroughly<a class="headerlink" href="#test-permissions-thoroughly" title="Link to this heading">#</a></h3>
+<p>Test both positive and negative cases:</p>
+<ul class="simple">
+<li><p>Can authorized users publish/consume?</p></li>
+<li><p>Are unauthorized users properly denied?</p></li>
+<li><p>Do permissions work correctly after token refresh?</p></li>
+<li><p>Are fine-grained permissions enforced correctly?</p></li>
+</ul>
+</section>
+<section id="monitor-permission-denials">
+<h3>4. Monitor Permission Denials<a class="headerlink" href="#monitor-permission-denials" title="Link to this heading">#</a></h3>
+<p>Log and monitor permission denials to detect:</p>
+<ul class="simple">
+<li><p>Misconfigured policies</p></li>
+<li><p>Users attempting unauthorized access</p></li>
+<li><p>Services missing required permissions</p></li>
+</ul>
+</section>
+<section id="use-hierarchical-policies-where-appropriate">
+<h3>5. Use Hierarchical Policies Where Appropriate<a class="headerlink" href="#use-hierarchical-policies-where-appropriate" title="Link to this heading">#</a></h3>
+<p>For resource hierarchies, use hierarchical policies:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">// Allow user to see events for anything in their workspace</span>
+<span class="go">permit(</span>
+<span class="go">  principal == Principal::&quot;user@example.com&quot;,</span>
+<span class="go">  action == Action::&quot;event-consumer-service:read-file&quot;,</span>
+<span class="go">  resource == EventResourceId</span>
+<span class="go">)</span>
+<span class="go">when {</span>
+<span class="go">  resource.path.startsWith(&quot;/workspaces/&quot; + principal.workspace_id + &quot;/&quot;)</span>
+<span class="go">};</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="troubleshooting">
+<h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading">#</a></h2>
+<section id="permission-denied-when-publishing">
+<h3>“Permission denied” when publishing<a class="headerlink" href="#permission-denied-when-publishing" title="Link to this heading">#</a></h3>
+<p><strong>Check</strong>:</p>
+<ol class="arabic simple">
+<li><p>Is <code class="docutils literal notranslate"><span class="pre">OMNI_EVENTS_PERMISSIONS_ENDPOINT</span></code> configured?</p></li>
+<li><p>Does your principal have <code class="docutils literal notranslate"><span class="pre">publish-event</span></code> permission for the EventType?</p></li>
+<li><p>Is your auth token valid and not expired?</p></li>
+</ol>
+</section>
+<section id="permission-denied-when-creating-durable-queue">
+<h3>“Permission denied” when creating durable queue<a class="headerlink" href="#permission-denied-when-creating-durable-queue" title="Link to this heading">#</a></h3>
+<p><strong>Check</strong>:</p>
+<ol class="arabic simple">
+<li><p>Does your principal have <code class="docutils literal notranslate"><span class="pre">create-durable-queues</span></code> permission?</p></li>
+<li><p>Is your auth token valid?</p></li>
+</ol>
+</section>
+<section id="not-receiving-storage-events-non-durable">
+<h3>Not receiving storage events (non-durable)<a class="headerlink" href="#not-receiving-storage-events-non-durable" title="Link to this heading">#</a></h3>
+<p><strong>Check</strong>:</p>
+<ol class="arabic simple">
+<li><p>Is <code class="docutils literal notranslate"><span class="pre">storage_permissions_endpoints</span></code> configured correctly in the YAML file?</p></li>
+<li><p>Does the Storage API show that the user has access to files in the relevant directories?</p></li>
+<li><p>Are the event types correct? (Check the actual event type strings used by your storage service)</p></li>
+</ol>
+</section>
+<section id="not-receiving-events-with-fine-grained-permissions">
+<h3>Not receiving events with fine-grained permissions<a class="headerlink" href="#not-receiving-events-with-fine-grained-permissions" title="Link to this heading">#</a></h3>
+<p><strong>Check</strong>:</p>
+<ol class="arabic simple">
+<li><p>Is the event_type configured in the <code class="docutils literal notranslate"><span class="pre">event_permissions</span></code> section of the YAML file?</p></li>
+<li><p>Does your policy grant the configured action for the resource_id in the events?</p></li>
+<li><p>Is the <code class="docutils literal notranslate"><span class="pre">resource_id</span></code> in the events formatted as expected?</p></li>
+</ol>
+</section>
+<section id="token-expiring-during-stream">
+<h3>Token expiring during stream<a class="headerlink" href="#token-expiring-during-stream" title="Link to this heading">#</a></h3>
+<p><strong>Solution</strong>: Implement automatic token refresh and reconnection. See <a class="reference internal" href="consuming-events.html#authorization-errors-during-streaming"><span class="std std-ref">Consuming Events - Error Handling</span></a>.</p>
+</section>
+</section>
+<section id="next-steps">
+<h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>Review <a class="reference internal" href="publishing-events.html"><span class="std std-doc">Publishing Events</span></a> to understand how to publish with proper authorization</p></li>
+<li><p>Review <a class="reference internal" href="consuming-events.html"><span class="std std-doc">Consuming Events</span></a> to understand queue types and consumption patterns</p></li>
+<li><p>Check the <a class="reference internal" href="api-reference.html"><span class="std std-doc">API Reference</span></a> for complete API documentation</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="consuming-events.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Consuming Events</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="api-reference.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">API Reference</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <div class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#authentication">Authentication</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#including-auth-token">Including Auth Token</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#token-expiration">Token Expiration</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#publishing-permissions">Publishing Permissions</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#event-type-permissions">Event Type Permissions</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#example-policy">Example Policy</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rest-example">REST Example</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#configuration">Configuration</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#consuming-permissions">Consuming Permissions</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#durable-queue-permissions">Durable Queue Permissions</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#create-durable-queue">Create Durable Queue</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#consume-from-durable-queue">Consume from Durable Queue</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#delete-durable-queue">Delete Durable Queue</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#durable-queue-event-permissions">Durable Queue Event Permissions</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#non-durable-queue-permissions">Non-Durable Queue Permissions</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#storage-events-special-docs-permissions">Storage Events: Special “Docs” Permissions</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#storage-event-types">Storage Event Types</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#how-storage-permissions-work">How Storage Permissions Work</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#for-storage-file-created-events">For <code class="docutils literal notranslate"><span class="pre">storage.file.created</span></code> Events</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#for-storage-file-deleted-events">For <code class="docutils literal notranslate"><span class="pre">storage.file.deleted</span></code> Events</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#for-storage-dir-created-events">For <code class="docutils literal notranslate"><span class="pre">storage.dir_created</span></code> Events</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#for-storage-dir-deleted-events">For <code class="docutils literal notranslate"><span class="pre">storage.dir_deleted</span></code> Events</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#why-docs-permissions">Why “Docs” Permissions?</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#configuration-for-storage-events">Configuration for Storage Events</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#storage-permissions-with-durable-queues">Storage Permissions with Durable Queues</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#fine-grained-permissions-for-arbitrary-event-types">Fine-Grained Permissions for Arbitrary Event Types</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#when-to-use-fine-grained-permissions">When to Use Fine-Grained Permissions</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Configuration</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#how-it-works">How It Works</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#permissions-api-call">Permissions API Call</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#policy-examples">Policy Examples</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#complete-configuration-example">Complete Configuration Example</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#permissions-decision-flow">Permissions Decision Flow</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#non-durable-queues">Non-Durable Queues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#durable-queues">Durable Queues</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#summary-table">Summary Table</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#configuration-examples">Configuration Examples</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#example-1-thumbnail-service-durable-queue">Example 1: Thumbnail Service (Durable Queue)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#example-2-user-dashboard-non-durable-queue">Example 2: User Dashboard (Non-Durable Queue)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#example-3-project-notification-service-non-durable-fine-grained">Example 3: Project Notification Service (Non-Durable + Fine-Grained)</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#best-practices">Best Practices</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#use-service-accounts-for-durable-queues">1. Use Service Accounts for Durable Queues</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#document-your-permission-requirements">2. Document Your Permission Requirements</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#test-permissions-thoroughly">3. Test Permissions Thoroughly</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#monitor-permission-denials">4. Monitor Permission Denials</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#use-hierarchical-policies-where-appropriate">5. Use Hierarchical Policies Where Appropriate</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#permission-denied-when-publishing">“Permission denied” when publishing</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#permission-denied-when-creating-durable-queue">“Permission denied” when creating durable queue</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#not-receiving-storage-events-non-durable">Not receiving storage events (non-durable)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#not-receiving-events-with-fine-grained-permissions">Not receiving events with fine-grained permissions</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#token-expiring-during-stream">Token expiring during stream</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#next-steps">Next Steps</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script src="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b"></script>
+<script src="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2024-2025, NVIDIA Corporation.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item"><p class="last-updated">
+  Last updated on Dec 15, 2025.
+  <br/>
+</p></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

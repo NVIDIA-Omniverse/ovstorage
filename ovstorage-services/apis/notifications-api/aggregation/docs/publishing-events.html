@@ -1,0 +1,1134 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="./" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Publishing Events &#8212; Notifications APIs Developer Guide</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/bootstrap.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+
+  
+  <link href="_static/vendor/fontawesome/6.5.2/css/all.min.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-solid-900.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-brands-400.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-regular-400.woff2" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=a746c00c" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/nvidia-sphinx-theme.css?v=c5edffae" />
+    <link rel="stylesheet" type="text/css" href="_static/custom.css?v=7abaf8bc" />
+    <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-design.min.css?v=95c83b7e" />
+  
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b" />
+  <script src="_static/vendor/fontawesome/6.5.2/js/all.min.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+    <script src="_static/documentation_options.js?v=910b9336"></script>
+    <script src="_static/doctools.js?v=9a2dae69"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="_static/copybutton.js?v=65e89d2a"></script>
+    <script src="_static/design-tabs.js?v=f930bc37"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'publishing-events';</script>
+    <script src="_static/version-patch.js?v=c24f8c5d"></script>
+    <link rel="icon" href="_static/favicon.ico"/>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Consuming Events" href="consuming-events.html" />
+    <link rel="prev" title="Getting Started" href="getting-started.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+    <meta name="docbuild:last-update" content="Dec 15, 2025"/>
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-primary-sidebar-checkbox"/>
+  <label class="overlay overlay-primary" for="pst-primary-sidebar-checkbox"></label>
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-secondary-sidebar-checkbox"/>
+  <label class="overlay overlay-secondary" for="pst-secondary-sidebar-checkbox"></label>
+  
+  <div class="search-button__wrapper">
+    <div class="search-button__overlay"></div>
+    <div class="search-button__search-container">
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         id="search-input"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form></div>
+  </div>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="Notifications APIs Developer Guide - Home"/>
+    <script>document.write(`<img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark" alt="Notifications APIs Developer Guide - Home"/>`);</script>
+  
+  
+    <p class="title logo__title">Notifications APIs Developer Guide</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+ <script>
+ document.write(`
+   <button class="btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<script>
+document.write(`
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"></i>
+  </button>
+`);
+</script></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+ <script>
+ document.write(`
+   <button class="btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <div class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="Notifications APIs Developer Guide - Home"/>
+    <script>document.write(`<img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark" alt="Notifications APIs Developer Guide - Home"/>`);</script>
+  
+  
+    <p class="title logo__title">Notifications APIs Developer Guide</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<script>
+document.write(`
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"></i>
+  </button>
+`);
+</script></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="getting-started.html">Getting Started</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Publishing Events</a></li>
+<li class="toctree-l1"><a class="reference internal" href="consuming-events.html">Consuming Events</a></li>
+<li class="toctree-l1"><a class="reference internal" href="permissions.html">Permissions &amp; Authorization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api-reference.html">API Reference</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+  
+  <div id="rtd-footer-container"></div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page">Publishing Events</li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="publishing-events">
+<h1>Publishing Events<a class="headerlink" href="#publishing-events" title="Link to this heading">#</a></h1>
+<p>This guide covers how to publish events to the Notifications Service using both the REST API and gRPC API.</p>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
+<p>The Event Aggregation Service accepts events from publishers and routes them to consumers through RabbitMQ. Publishers can send individual events or batch multiple events for better performance.</p>
+</section>
+<section id="event-structure">
+<h2>Event Structure<a class="headerlink" href="#event-structure" title="Link to this heading">#</a></h2>
+<p>Every event consists of the following fields:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Required</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">event_type</span></code></p></td>
+<td><p>string</p></td>
+<td><p>Yes</p></td>
+<td><p>A unique identifier for the type of event (e.g., “storage.file.created”)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">message</span></code></p></td>
+<td><p>JSON object</p></td>
+<td><p>Yes</p></td>
+<td><p>The event payload - structure is defined by you</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">occurred_at</span></code></p></td>
+<td><p>timestamp</p></td>
+<td><p>Yes</p></td>
+<td><p>When the event occurred (ISO 8601 format)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">resource</span></code></p></td>
+<td><p>object</p></td>
+<td><p>No</p></td>
+<td><p>Optional resource identifier for filtering</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<section id="event-type">
+<h3>Event Type<a class="headerlink" href="#event-type" title="Link to this heading">#</a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">event_type</span></code> is a string that identifies what kind of event this is. <strong>You define your own event types</strong> - the Notifications Service doesn’t validate or enforce any particular naming scheme.</p>
+<p><strong>Recommended conventions</strong>:</p>
+<ul class="simple">
+<li><p>Use dot notation: <code class="docutils literal notranslate"><span class="pre">service.entity.action</span></code> (e.g., “storage.file.created”)</p></li>
+<li><p>Be consistent across your organization</p></li>
+<li><p>Document your event types</p></li>
+<li><p>Use lowercase</p></li>
+<li><p>Be specific enough to allow filtering but not so specific that you have too many types</p></li>
+</ul>
+<p>Examples:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">storage.file.created</span>
+<span class="go">storage.file.deleted</span>
+<span class="go">storage.directory.created</span>
+<span class="go">project.workflow.completed</span>
+<span class="go">user.permission.updated</span>
+<span class="go">thumbnail.generated</span>
+</pre></div>
+</div>
+</section>
+<section id="message">
+<h3>Message<a class="headerlink" href="#message" title="Link to this heading">#</a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">message</span></code> field contains the actual event payload as a JSON object. <strong>The structure is entirely up to you</strong> - define it based on what information consumers need.</p>
+<p><strong>Important</strong>: The Notifications Service does not validate or know anything about your message structure. It’s a contract between your publishers and consumers.</p>
+<p><strong>Best practices</strong>:</p>
+<ul class="simple">
+<li><p>Document your message schema for each event type</p></li>
+<li><p>Include enough information for consumers to process the event</p></li>
+<li><p>Keep messages reasonably sized (avoid embedding large binary data)</p></li>
+<li><p>Use consistent field naming across event types</p></li>
+<li><p>Include identifiers that allow consumers to fetch more data if needed</p></li>
+</ul>
+<p>Example message schemas:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="c1">// storage.file.created</span>
+<span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;file_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;document.pdf&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;file_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1024576</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;mime_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;application/pdf&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;uploaded_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;user@example.com&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;checksum&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;sha256:abc123...&quot;</span>
+<span class="p">}</span>
+
+<span class="c1">// project.workflow.completed</span>
+<span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;workflow_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;wf-12345&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;workflow_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Rendering Pipeline&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;duration_seconds&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">3600</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;output_location&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;/renders/output.mp4&quot;</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="occurred-at">
+<h3>Occurred At<a class="headerlink" href="#occurred-at" title="Link to this heading">#</a></h3>
+<p>An ISO 8601 timestamp indicating when the event occurred. Always use UTC.</p>
+<p>Format: <code class="docutils literal notranslate"><span class="pre">YYYY-MM-DDTHH:MM:SSZ</span></code></p>
+<p>Example: <code class="docutils literal notranslate"><span class="pre">2024-10-16T14:30:00Z</span></code></p>
+</section>
+<section id="resource-optional">
+<h3>Resource (Optional)<a class="headerlink" href="#resource-optional" title="Link to this heading">#</a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">resource</span></code> field contains a hierarchical identifier (like a file path) that consumers can use for filtering.</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;resource_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;/folder/subfolder/file.txt&quot;</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>Resource IDs should be:</p>
+<ul class="simple">
+<li><p>Path-like (slash-separated)</p></li>
+<li><p>Hierarchical (broader to more specific)</p></li>
+<li><p>Consistent across your event types</p></li>
+</ul>
+<p>Examples:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">/projects/projectA/file.txt</span>
+<span class="go">/users/12345</span>
+<span class="go">/workspaces/ws-001/render/output.mp4</span>
+</pre></div>
+</div>
+<p>If you omit the resource field, it’s equivalent to including a resource that has <code class="docutils literal notranslate"><span class="pre">resource_id=&quot;&quot;</span></code>.</p>
+</section>
+</section>
+<section id="publishing-a-single-event">
+<h2>Publishing a Single Event<a class="headerlink" href="#publishing-a-single-event" title="Link to this heading">#</a></h2>
+<section id="rest-api">
+<h3>REST API<a class="headerlink" href="#rest-api" title="Link to this heading">#</a></h3>
+<p><strong>Endpoint</strong>: <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/api/v1beta/events</span></code></p>
+<p><strong>Example</strong>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>https://your-aggregation-service.example.com/api/v1beta/events<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer YOUR_TOKEN&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;event&quot;: {</span>
+<span class="s1">      &quot;event_type&quot;: &quot;storage.file.created&quot;,</span>
+<span class="s1">      &quot;message&quot;: {</span>
+<span class="s1">        &quot;file_name&quot;: &quot;document.pdf&quot;,</span>
+<span class="s1">        &quot;file_size&quot;: 1024576,</span>
+<span class="s1">        &quot;mime_type&quot;: &quot;application/pdf&quot;,</span>
+<span class="s1">        &quot;uploaded_by&quot;: &quot;user@example.com&quot;</span>
+<span class="s1">      },</span>
+<span class="s1">      &quot;occurred_at&quot;: &quot;2024-10-16T14:30:00Z&quot;,</span>
+<span class="s1">      &quot;resource&quot;: {</span>
+<span class="s1">        &quot;resource_id&quot;: &quot;/uploads/documents/document.pdf&quot;</span>
+<span class="s1">      }</span>
+<span class="s1">    }</span>
+<span class="s1">  }&#39;</span>
+</pre></div>
+</div>
+<p><strong>Response (Success)</strong>:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;result&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;event&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;event_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;storage.file.created&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;message&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;file_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;document.pdf&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;file_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1024576</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;mime_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;application/pdf&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;uploaded_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;user@example.com&quot;</span>
+<span class="w">      </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;occurred_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2024-10-16T14:30:00Z&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;resource&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;resource_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;/uploads/documents/document.pdf&quot;</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="nt">&quot;success&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p><strong>Response (Failure)</strong>:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;result&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;event&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* event details */</span><span class="w"> </span><span class="p">},</span>
+<span class="w">    </span><span class="nt">&quot;success&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;failure_reason&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Unable to connect to message broker&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="grpc-api">
+<h3>gRPC API<a class="headerlink" href="#grpc-api" title="Link to this heading">#</a></h3>
+<p><strong>RPC</strong>: <code class="docutils literal notranslate"><span class="pre">PublishEvent</span></code></p>
+<p><strong>Python Example</strong>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span> <span class="nn">grpc</span>
+<span class="kn">from</span> <span class="nn">google.protobuf.timestamp_pb2</span> <span class="kn">import</span> <span class="n">Timestamp</span>
+<span class="kn">from</span> <span class="nn">google.protobuf.struct_pb2</span> <span class="kn">import</span> <span class="n">Struct</span>
+<span class="kn">from</span> <span class="nn">datetime</span> <span class="kn">import</span> <span class="n">datetime</span>
+<span class="kn">from</span> <span class="nn">nvidia.omniverse.notifications.publisher.v1beta</span> <span class="kn">import</span> <span class="n">event_publisher_pb2</span>
+<span class="kn">from</span> <span class="nn">nvidia.omniverse.notifications.publisher.v1beta</span> <span class="kn">import</span> <span class="n">event_publisher_pb2_grpc</span>
+
+<span class="c1"># Setup channel and stub</span>
+<span class="n">channel</span> <span class="o">=</span> <span class="n">grpc</span><span class="o">.</span><span class="n">secure_channel</span><span class="p">(</span>
+    <span class="s1">&#39;your-aggregation-service.example.com:50051&#39;</span><span class="p">,</span>
+    <span class="n">grpc</span><span class="o">.</span><span class="n">ssl_channel_credentials</span><span class="p">()</span>
+<span class="p">)</span>
+<span class="n">stub</span> <span class="o">=</span> <span class="n">event_publisher_pb2_grpc</span><span class="o">.</span><span class="n">EventPublishingServiceStub</span><span class="p">(</span><span class="n">channel</span><span class="p">)</span>
+
+<span class="c1"># Create message</span>
+<span class="n">message</span> <span class="o">=</span> <span class="n">Struct</span><span class="p">()</span>
+<span class="n">message</span><span class="o">.</span><span class="n">update</span><span class="p">({</span>
+    <span class="s1">&#39;file_name&#39;</span><span class="p">:</span> <span class="s1">&#39;document.pdf&#39;</span><span class="p">,</span>
+    <span class="s1">&#39;file_size&#39;</span><span class="p">:</span> <span class="mi">1024576</span><span class="p">,</span>
+    <span class="s1">&#39;mime_type&#39;</span><span class="p">:</span> <span class="s1">&#39;application/pdf&#39;</span><span class="p">,</span>
+    <span class="s1">&#39;uploaded_by&#39;</span><span class="p">:</span> <span class="s1">&#39;user@example.com&#39;</span>
+<span class="p">})</span>
+
+<span class="c1"># Create timestamp</span>
+<span class="n">timestamp</span> <span class="o">=</span> <span class="n">Timestamp</span><span class="p">()</span>
+<span class="n">timestamp</span><span class="o">.</span><span class="n">FromDatetime</span><span class="p">(</span><span class="n">datetime</span><span class="p">(</span><span class="mi">2024</span><span class="p">,</span> <span class="mi">10</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">14</span><span class="p">,</span> <span class="mi">30</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>
+
+<span class="c1"># Create event</span>
+<span class="n">event</span> <span class="o">=</span> <span class="n">event_publisher_pb2</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span>
+    <span class="n">event_type</span><span class="o">=</span><span class="s1">&#39;storage.file.created&#39;</span><span class="p">,</span>
+    <span class="n">message</span><span class="o">=</span><span class="n">message</span><span class="p">,</span>
+    <span class="n">occurred_at</span><span class="o">=</span><span class="n">timestamp</span><span class="p">,</span>
+    <span class="n">resource</span><span class="o">=</span><span class="n">event_publisher_pb2</span><span class="o">.</span><span class="n">EventResource</span><span class="p">(</span>
+        <span class="n">resource_id</span><span class="o">=</span><span class="s1">&#39;/uploads/documents/document.pdf&#39;</span>
+    <span class="p">)</span>
+<span class="p">)</span>
+
+<span class="c1"># Publish</span>
+<span class="n">request</span> <span class="o">=</span> <span class="n">event_publisher_pb2</span><span class="o">.</span><span class="n">PublishEventRequest</span><span class="p">(</span><span class="n">event</span><span class="o">=</span><span class="n">event</span><span class="p">)</span>
+<span class="n">metadata</span> <span class="o">=</span> <span class="p">[(</span><span class="s1">&#39;authorization&#39;</span><span class="p">,</span> <span class="sa">f</span><span class="s1">&#39;Bearer </span><span class="si">{</span><span class="n">YOUR_TOKEN</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">)]</span>
+
+<span class="k">try</span><span class="p">:</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="n">stub</span><span class="o">.</span><span class="n">PublishEvent</span><span class="p">(</span><span class="n">request</span><span class="p">,</span> <span class="n">metadata</span><span class="o">=</span><span class="n">metadata</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">success</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Event published successfully&quot;</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Failed: </span><span class="si">{</span><span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">failure_reason</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="k">except</span> <span class="n">grpc</span><span class="o">.</span><span class="n">RpcError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;RPC failed: </span><span class="si">{</span><span class="n">e</span><span class="o">.</span><span class="n">code</span><span class="p">()</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">e</span><span class="o">.</span><span class="n">details</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+<p><strong>Go Example</strong>:</p>
+<div class="highlight-go notranslate"><div class="highlight"><pre><span></span><span class="kn">package</span><span class="w"> </span><span class="nx">main</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="s">&quot;context&quot;</span>
+<span class="w">    </span><span class="s">&quot;time&quot;</span>
+<span class="w">    </span>
+<span class="w">    </span><span class="s">&quot;google.golang.org/grpc&quot;</span>
+<span class="w">    </span><span class="s">&quot;google.golang.org/grpc/credentials&quot;</span>
+<span class="w">    </span><span class="s">&quot;google.golang.org/protobuf/types/known/structpb&quot;</span>
+<span class="w">    </span><span class="s">&quot;google.golang.org/protobuf/types/known/timestamppb&quot;</span>
+<span class="w">    </span>
+<span class="w">    </span><span class="nx">pb</span><span class="w"> </span><span class="s">&quot;nvidia/omniverse/notifications/publisher/v1beta&quot;</span>
+<span class="p">)</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="nx">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// Setup connection</span>
+<span class="w">    </span><span class="nx">creds</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">credentials</span><span class="p">.</span><span class="nx">NewTLS</span><span class="p">(</span><span class="o">&amp;</span><span class="nx">tls</span><span class="p">.</span><span class="nx">Config</span><span class="p">{})</span>
+<span class="w">    </span><span class="nx">conn</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">grpc</span><span class="p">.</span><span class="nx">Dial</span><span class="p">(</span>
+<span class="w">        </span><span class="s">&quot;your-aggregation-service.example.com:50051&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">grpc</span><span class="p">.</span><span class="nx">WithTransportCredentials</span><span class="p">(</span><span class="nx">creds</span><span class="p">),</span>
+<span class="w">    </span><span class="p">)</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">panic</span><span class="p">(</span><span class="nx">err</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">defer</span><span class="w"> </span><span class="nx">conn</span><span class="p">.</span><span class="nx">Close</span><span class="p">()</span>
+<span class="w">    </span>
+<span class="w">    </span><span class="nx">client</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">pb</span><span class="p">.</span><span class="nx">NewEventPublishingServiceClient</span><span class="p">(</span><span class="nx">conn</span><span class="p">)</span>
+<span class="w">    </span>
+<span class="w">    </span><span class="c1">// Create message</span>
+<span class="w">    </span><span class="nx">message</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">structpb</span><span class="p">.</span><span class="nx">NewStruct</span><span class="p">(</span><span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="kd">interface</span><span class="p">{}{</span>
+<span class="w">        </span><span class="s">&quot;file_name&quot;</span><span class="p">:</span><span class="w">   </span><span class="s">&quot;document.pdf&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="s">&quot;file_size&quot;</span><span class="p">:</span><span class="w">   </span><span class="mi">1024576</span><span class="p">,</span>
+<span class="w">        </span><span class="s">&quot;mime_type&quot;</span><span class="p">:</span><span class="w">   </span><span class="s">&quot;application/pdf&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="s">&quot;uploaded_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;user@example.com&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="p">})</span>
+<span class="w">    </span>
+<span class="w">    </span><span class="c1">// Create event</span>
+<span class="w">    </span><span class="nx">event</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">pb</span><span class="p">.</span><span class="nx">Event</span><span class="p">{</span>
+<span class="w">        </span><span class="nx">EventType</span><span class="p">:</span><span class="w">  </span><span class="s">&quot;storage.file.created&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">Message</span><span class="p">:</span><span class="w">    </span><span class="nx">message</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">OccurredAt</span><span class="p">:</span><span class="w"> </span><span class="nx">timestamppb</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="nx">time</span><span class="p">.</span><span class="nx">Now</span><span class="p">()),</span>
+<span class="w">        </span><span class="nx">Resource</span><span class="p">:</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">pb</span><span class="p">.</span><span class="nx">EventResource</span><span class="p">{</span>
+<span class="w">            </span><span class="nx">ResourceId</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/uploads/documents/document.pdf&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span>
+<span class="w">    </span><span class="c1">// Publish</span>
+<span class="w">    </span><span class="nx">ctx</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">context</span><span class="p">.</span><span class="nx">Background</span><span class="p">()</span>
+<span class="w">    </span><span class="c1">// Add auth metadata</span>
+<span class="w">    </span><span class="nx">ctx</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">metadata</span><span class="p">.</span><span class="nx">AppendToOutgoingContext</span><span class="p">(</span><span class="nx">ctx</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;authorization&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;Bearer &quot;</span><span class="o">+</span><span class="nx">YOUR_TOKEN</span><span class="p">)</span>
+<span class="w">    </span>
+<span class="w">    </span><span class="nx">resp</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">client</span><span class="p">.</span><span class="nx">PublishEvent</span><span class="p">(</span><span class="nx">ctx</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">pb</span><span class="p">.</span><span class="nx">PublishEventRequest</span><span class="p">{</span>
+<span class="w">        </span><span class="nx">Event</span><span class="p">:</span><span class="w"> </span><span class="nx">event</span><span class="p">,</span>
+<span class="w">    </span><span class="p">})</span>
+<span class="w">    </span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">panic</span><span class="p">(</span><span class="nx">err</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">Result</span><span class="p">.</span><span class="nx">Success</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">println</span><span class="p">(</span><span class="s">&quot;Event published successfully&quot;</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nb">println</span><span class="p">(</span><span class="s">&quot;Failed:&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">Result</span><span class="p">.</span><span class="nx">FailureReason</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="batch-publishing-multiple-events">
+<h2>Batch Publishing Multiple Events<a class="headerlink" href="#batch-publishing-multiple-events" title="Link to this heading">#</a></h2>
+<p>When you need to publish multiple events, use batch publishing for better performance. Events in a batch are published in parallel.</p>
+<section id="id1">
+<h3>REST API<a class="headerlink" href="#id1" title="Link to this heading">#</a></h3>
+<p><strong>Endpoint</strong>: <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/api/v1beta/events/batch</span></code></p>
+<p><strong>Example</strong>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>https://your-aggregation-service.example.com/api/v1beta/events/batch<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer YOUR_TOKEN&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;events&quot;: [</span>
+<span class="s1">      {</span>
+<span class="s1">        &quot;event_type&quot;: &quot;storage.file.created&quot;,</span>
+<span class="s1">        &quot;message&quot;: {</span>
+<span class="s1">          &quot;file_name&quot;: &quot;document1.pdf&quot;</span>
+<span class="s1">        },</span>
+<span class="s1">        &quot;occurred_at&quot;: &quot;2024-10-16T14:30:00Z&quot;,</span>
+<span class="s1">        &quot;resource&quot;: {</span>
+<span class="s1">          &quot;resource_id&quot;: &quot;/uploads/document1.pdf&quot;</span>
+<span class="s1">        }</span>
+<span class="s1">      },</span>
+<span class="s1">      {</span>
+<span class="s1">        &quot;event_type&quot;: &quot;storage.file.created&quot;,</span>
+<span class="s1">        &quot;message&quot;: {</span>
+<span class="s1">          &quot;file_name&quot;: &quot;document2.pdf&quot;</span>
+<span class="s1">        },</span>
+<span class="s1">        &quot;occurred_at&quot;: &quot;2024-10-16T14:30:01Z&quot;,</span>
+<span class="s1">        &quot;resource&quot;: {</span>
+<span class="s1">          &quot;resource_id&quot;: &quot;/uploads/document2.pdf&quot;</span>
+<span class="s1">        }</span>
+<span class="s1">      },</span>
+<span class="s1">      {</span>
+<span class="s1">        &quot;event_type&quot;: &quot;storage.file.created&quot;,</span>
+<span class="s1">        &quot;message&quot;: {</span>
+<span class="s1">          &quot;file_name&quot;: &quot;document3.pdf&quot;</span>
+<span class="s1">        },</span>
+<span class="s1">        &quot;occurred_at&quot;: &quot;2024-10-16T14:30:02Z&quot;,</span>
+<span class="s1">        &quot;resource&quot;: {</span>
+<span class="s1">          &quot;resource_id&quot;: &quot;/uploads/document3.pdf&quot;</span>
+<span class="s1">        }</span>
+<span class="s1">      }</span>
+<span class="s1">    ]</span>
+<span class="s1">  }&#39;</span>
+</pre></div>
+</div>
+<p><strong>Response</strong>:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;results&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;event&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* event 1 */</span><span class="w"> </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;success&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;event&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* event 2 */</span><span class="w"> </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;success&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;event&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* event 3 */</span><span class="w"> </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;success&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;failure_reason&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Failed to publish to exchange&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p><strong>Important</strong>: Always check the <code class="docutils literal notranslate"><span class="pre">results</span></code> array - some events may succeed while others fail.</p>
+</section>
+<section id="id2">
+<h3>gRPC API<a class="headerlink" href="#id2" title="Link to this heading">#</a></h3>
+<p><strong>RPC</strong>: <code class="docutils literal notranslate"><span class="pre">BatchPublishEvents</span></code></p>
+<p><strong>Python Example</strong>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span> <span class="nn">grpc</span>
+<span class="kn">from</span> <span class="nn">google.protobuf.timestamp_pb2</span> <span class="kn">import</span> <span class="n">Timestamp</span>
+<span class="kn">from</span> <span class="nn">google.protobuf.struct_pb2</span> <span class="kn">import</span> <span class="n">Struct</span>
+<span class="kn">from</span> <span class="nn">nvidia.omniverse.notifications.publisher.v1beta</span> <span class="kn">import</span> <span class="n">event_publisher_pb2</span>
+<span class="kn">from</span> <span class="nn">nvidia.omniverse.notifications.publisher.v1beta</span> <span class="kn">import</span> <span class="n">event_publisher_pb2_grpc</span>
+
+<span class="c1"># Setup channel and stub</span>
+<span class="n">channel</span> <span class="o">=</span> <span class="n">grpc</span><span class="o">.</span><span class="n">secure_channel</span><span class="p">(</span>
+    <span class="s1">&#39;your-aggregation-service.example.com:50051&#39;</span><span class="p">,</span>
+    <span class="n">grpc</span><span class="o">.</span><span class="n">ssl_channel_credentials</span><span class="p">()</span>
+<span class="p">)</span>
+<span class="n">stub</span> <span class="o">=</span> <span class="n">event_publisher_pb2_grpc</span><span class="o">.</span><span class="n">EventPublishingServiceStub</span><span class="p">(</span><span class="n">channel</span><span class="p">)</span>
+
+<span class="c1"># Create multiple events</span>
+<span class="n">events</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">3</span><span class="p">):</span>
+    <span class="n">message</span> <span class="o">=</span> <span class="n">Struct</span><span class="p">()</span>
+    <span class="n">message</span><span class="o">.</span><span class="n">update</span><span class="p">({</span>
+        <span class="s1">&#39;file_name&#39;</span><span class="p">:</span> <span class="sa">f</span><span class="s1">&#39;document</span><span class="si">{</span><span class="n">i</span><span class="o">+</span><span class="mi">1</span><span class="si">}</span><span class="s1">.pdf&#39;</span>
+    <span class="p">})</span>
+    
+    <span class="n">timestamp</span> <span class="o">=</span> <span class="n">Timestamp</span><span class="p">()</span>
+    <span class="n">timestamp</span><span class="o">.</span><span class="n">GetCurrentTime</span><span class="p">()</span>
+    
+    <span class="n">event</span> <span class="o">=</span> <span class="n">event_publisher_pb2</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span>
+        <span class="n">event_type</span><span class="o">=</span><span class="s1">&#39;storage.file.created&#39;</span><span class="p">,</span>
+        <span class="n">message</span><span class="o">=</span><span class="n">message</span><span class="p">,</span>
+        <span class="n">occurred_at</span><span class="o">=</span><span class="n">timestamp</span><span class="p">,</span>
+        <span class="n">resource</span><span class="o">=</span><span class="n">event_publisher_pb2</span><span class="o">.</span><span class="n">EventResource</span><span class="p">(</span>
+            <span class="n">resource_id</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;/uploads/document</span><span class="si">{</span><span class="n">i</span><span class="o">+</span><span class="mi">1</span><span class="si">}</span><span class="s1">.pdf&#39;</span>
+        <span class="p">)</span>
+    <span class="p">)</span>
+    <span class="n">events</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">event</span><span class="p">)</span>
+
+<span class="c1"># Batch publish</span>
+<span class="n">request</span> <span class="o">=</span> <span class="n">event_publisher_pb2</span><span class="o">.</span><span class="n">BatchPublishEventsRequest</span><span class="p">()</span>
+<span class="k">for</span> <span class="n">event</span> <span class="ow">in</span> <span class="n">events</span><span class="p">:</span>
+    <span class="n">request</span><span class="o">.</span><span class="n">events</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">event</span><span class="p">)</span>
+<span class="n">metadata</span> <span class="o">=</span> <span class="p">[(</span><span class="s1">&#39;authorization&#39;</span><span class="p">,</span> <span class="sa">f</span><span class="s1">&#39;Bearer </span><span class="si">{</span><span class="n">YOUR_TOKEN</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">)]</span>
+
+<span class="k">try</span><span class="p">:</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="n">stub</span><span class="o">.</span><span class="n">BatchPublishEvents</span><span class="p">(</span><span class="n">request</span><span class="p">,</span> <span class="n">metadata</span><span class="o">=</span><span class="n">metadata</span><span class="p">)</span>
+    
+    <span class="c1"># Check each result</span>
+    <span class="k">for</span> <span class="n">idx</span><span class="p">,</span> <span class="n">result</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">results</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">result</span><span class="o">.</span><span class="n">success</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Event </span><span class="si">{</span><span class="n">idx</span><span class="o">+</span><span class="mi">1</span><span class="si">}</span><span class="s2"> published successfully&quot;</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Event </span><span class="si">{</span><span class="n">idx</span><span class="o">+</span><span class="mi">1</span><span class="si">}</span><span class="s2"> failed: </span><span class="si">{</span><span class="n">result</span><span class="o">.</span><span class="n">failure_reason</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            
+<span class="k">except</span> <span class="n">grpc</span><span class="o">.</span><span class="n">RpcError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;RPC failed: </span><span class="si">{</span><span class="n">e</span><span class="o">.</span><span class="n">code</span><span class="p">()</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">e</span><span class="o">.</span><span class="n">details</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="error-handling">
+<h2>Error Handling<a class="headerlink" href="#error-handling" title="Link to this heading">#</a></h2>
+<section id="common-error-codes">
+<h3>Common Error Codes<a class="headerlink" href="#common-error-codes" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>HTTP Status / gRPC Code</p></th>
+<th class="head"><p>Meaning</p></th>
+<th class="head"><p>Action</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>401 / UNAUTHENTICATED</p></td>
+<td><p>Authentication failed</p></td>
+<td><p>Check your token is valid and not expired</p></td>
+</tr>
+<tr class="row-odd"><td><p>403 / PERMISSION_DENIED</p></td>
+<td><p>Not authorized to publish this event type</p></td>
+<td><p>Check permissions configuration</p></td>
+</tr>
+<tr class="row-even"><td><p>400 / INVALID_ARGUMENT</p></td>
+<td><p>Invalid request format</p></td>
+<td><p>Check your event structure matches the schema</p></td>
+</tr>
+<tr class="row-odd"><td><p>503 / RESOURCE_EXHAUSTED</p></td>
+<td><p>Service temporarily overloaded</p></td>
+<td><p>Retry with exponential backoff</p></td>
+</tr>
+<tr class="row-even"><td><p>500 / INTERNAL</p></td>
+<td><p>Server error</p></td>
+<td><p>Check service health, contact support</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="retry-logic">
+<h3>Retry Logic<a class="headerlink" href="#retry-logic" title="Link to this heading">#</a></h3>
+<p>Implement retry logic with exponential backoff for transient failures:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span> <span class="nn">time</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Callable</span>
+
+<span class="k">def</span> <span class="nf">publish_with_retry</span><span class="p">(</span>
+    <span class="n">publish_func</span><span class="p">:</span> <span class="n">Callable</span><span class="p">,</span>
+    <span class="n">max_retries</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">3</span><span class="p">,</span>
+    <span class="n">initial_delay</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Retry publishing with exponential backoff.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">delay</span> <span class="o">=</span> <span class="n">initial_delay</span>
+    
+    <span class="k">for</span> <span class="n">attempt</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">max_retries</span><span class="p">):</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">response</span> <span class="o">=</span> <span class="n">publish_func</span><span class="p">()</span>
+            
+            <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">success</span><span class="p">:</span>
+                <span class="k">return</span> <span class="kc">True</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Publish failed: </span><span class="si">{</span><span class="n">response</span><span class="o">.</span><span class="n">result</span><span class="o">.</span><span class="n">failure_reason</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                <span class="k">return</span> <span class="kc">False</span>
+                
+        <span class="k">except</span> <span class="n">grpc</span><span class="o">.</span><span class="n">RpcError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">e</span><span class="o">.</span><span class="n">code</span><span class="p">()</span> <span class="o">==</span> <span class="n">grpc</span><span class="o">.</span><span class="n">StatusCode</span><span class="o">.</span><span class="n">RESOURCE_EXHAUSTED</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">attempt</span> <span class="o">&lt;</span> <span class="n">max_retries</span> <span class="o">-</span> <span class="mi">1</span><span class="p">:</span>
+                    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Service overloaded, retrying in </span><span class="si">{</span><span class="n">delay</span><span class="si">}</span><span class="s2">s...&quot;</span><span class="p">)</span>
+                    <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="n">delay</span><span class="p">)</span>
+                    <span class="n">delay</span> <span class="o">*=</span> <span class="mi">2</span>  <span class="c1"># Exponential backoff</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Max retries exceeded&quot;</span><span class="p">)</span>
+                    <span class="k">return</span> <span class="kc">False</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="c1"># Don&#39;t retry for other errors</span>
+                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Non-retriable error: </span><span class="si">{</span><span class="n">e</span><span class="o">.</span><span class="n">code</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                <span class="k">return</span> <span class="kc">False</span>
+    
+    <span class="k">return</span> <span class="kc">False</span>
+
+<span class="c1"># Usage</span>
+<span class="k">def</span> <span class="nf">publish</span><span class="p">():</span>
+    <span class="k">return</span> <span class="n">stub</span><span class="o">.</span><span class="n">PublishEvent</span><span class="p">(</span><span class="n">request</span><span class="p">,</span> <span class="n">metadata</span><span class="o">=</span><span class="n">metadata</span><span class="p">)</span>
+
+<span class="n">success</span> <span class="o">=</span> <span class="n">publish_with_retry</span><span class="p">(</span><span class="n">publish</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="best-practices">
+<h2>Best Practices<a class="headerlink" href="#best-practices" title="Link to this heading">#</a></h2>
+<section id="choose-appropriate-event-granularity">
+<h3>1. Choose Appropriate Event Granularity<a class="headerlink" href="#choose-appropriate-event-granularity" title="Link to this heading">#</a></h3>
+<p><strong>Too granular</strong>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Publishing separate events for every field change</span>
+<span class="n">publish_event</span><span class="p">(</span><span class="s2">&quot;user.email.changed&quot;</span><span class="p">,</span> <span class="p">{</span><span class="o">...</span><span class="p">})</span>
+<span class="n">publish_event</span><span class="p">(</span><span class="s2">&quot;user.name.changed&quot;</span><span class="p">,</span> <span class="p">{</span><span class="o">...</span><span class="p">})</span>
+<span class="n">publish_event</span><span class="p">(</span><span class="s2">&quot;user.phone.changed&quot;</span><span class="p">,</span> <span class="p">{</span><span class="o">...</span><span class="p">})</span>
+</pre></div>
+</div>
+<p><strong>Better</strong>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Single event for the update with changed fields in message</span>
+<span class="n">publish_event</span><span class="p">(</span><span class="s2">&quot;user.updated&quot;</span><span class="p">,</span> <span class="p">{</span>
+    <span class="s2">&quot;user_id&quot;</span><span class="p">:</span> <span class="s2">&quot;123&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;changed_fields&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;email&quot;</span><span class="p">,</span> <span class="s2">&quot;name&quot;</span><span class="p">,</span> <span class="s2">&quot;phone&quot;</span><span class="p">],</span>
+    <span class="s2">&quot;new_values&quot;</span><span class="p">:</span> <span class="p">{</span><span class="o">...</span><span class="p">}</span>
+<span class="p">})</span>
+</pre></div>
+</div>
+</section>
+<section id="include-timestamps-accurately">
+<h3>2. Include Timestamps Accurately<a class="headerlink" href="#include-timestamps-accurately" title="Link to this heading">#</a></h3>
+<p>Use the actual time the event occurred, not when you’re publishing it:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Good</span>
+<span class="n">occurred_at</span> <span class="o">=</span> <span class="n">user_created_timestamp</span>
+
+<span class="c1"># Bad</span>
+<span class="n">occurred_at</span> <span class="o">=</span> <span class="n">datetime</span><span class="o">.</span><span class="n">utcnow</span><span class="p">()</span>  <span class="c1"># Time of publishing, not event occurrence</span>
+</pre></div>
+</div>
+</section>
+<section id="use-resource-ids-consistently">
+<h3>3. Use Resource IDs Consistently<a class="headerlink" href="#use-resource-ids-consistently" title="Link to this heading">#</a></h3>
+<p>Establish conventions for resource IDs across your organization:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Good - consistent path structure</span>
+<span class="s2">&quot;/users/</span><span class="si">{user_id}</span><span class="s2">&quot;</span>
+<span class="s2">&quot;/projects/</span><span class="si">{project_id}</span><span class="s2">/files/</span><span class="si">{file_id}</span><span class="s2">&quot;</span>
+<span class="s2">&quot;/workspaces/</span><span class="si">{workspace_id}</span><span class="s2">&quot;</span>
+
+<span class="c1"># Bad - inconsistent</span>
+<span class="s2">&quot;user-123&quot;</span>
+<span class="s2">&quot;project_456/file789&quot;</span>
+<span class="s2">&quot;/workspace:ws-001&quot;</span>
+</pre></div>
+</div>
+</section>
+<section id="batch-when-possible">
+<h3>4. Batch When Possible<a class="headerlink" href="#batch-when-possible" title="Link to this heading">#</a></h3>
+<p>If publishing multiple events at once, use batch publishing:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Good - batch publish</span>
+<span class="n">events</span> <span class="o">=</span> <span class="p">[</span><span class="n">create_event</span><span class="p">(</span><span class="n">file</span><span class="p">)</span> <span class="k">for</span> <span class="n">file</span> <span class="ow">in</span> <span class="n">uploaded_files</span><span class="p">]</span>
+<span class="n">batch_publish</span><span class="p">(</span><span class="n">events</span><span class="p">)</span>
+
+<span class="c1"># Bad - individual publishes in a loop</span>
+<span class="k">for</span> <span class="n">file</span> <span class="ow">in</span> <span class="n">uploaded_files</span><span class="p">:</span>
+    <span class="n">publish_event</span><span class="p">(</span><span class="n">create_event</span><span class="p">(</span><span class="n">file</span><span class="p">))</span>  <span class="c1"># Slower</span>
+</pre></div>
+</div>
+</section>
+<section id="handle-partial-batch-failures">
+<h3>5. Handle Partial Batch Failures<a class="headerlink" href="#handle-partial-batch-failures" title="Link to this heading">#</a></h3>
+<p>When batch publishing, some events may succeed while others fail:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">response</span> <span class="o">=</span> <span class="n">stub</span><span class="o">.</span><span class="n">BatchPublishEvents</span><span class="p">(</span><span class="n">request</span><span class="p">,</span> <span class="n">metadata</span><span class="o">=</span><span class="n">metadata</span><span class="p">)</span>
+
+<span class="n">failed_events</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="n">result</span><span class="o">.</span><span class="n">event</span> <span class="k">for</span> <span class="n">result</span> <span class="ow">in</span> <span class="n">response</span><span class="o">.</span><span class="n">results</span> 
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">result</span><span class="o">.</span><span class="n">success</span>
+<span class="p">]</span>
+
+<span class="k">if</span> <span class="n">failed_events</span><span class="p">:</span>
+    <span class="c1"># Log failures, retry, or handle them appropriately</span>
+    <span class="n">log_failed_events</span><span class="p">(</span><span class="n">failed_events</span><span class="p">)</span>
+    <span class="c1"># Maybe retry just the failed events</span>
+    <span class="n">retry_publish</span><span class="p">(</span><span class="n">failed_events</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="keep-messages-reasonably-sized">
+<h3>6. Keep Messages Reasonably Sized<a class="headerlink" href="#keep-messages-reasonably-sized" title="Link to this heading">#</a></h3>
+<p>Don’t embed large payloads in events:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Bad - embedding large binary data</span>
+<span class="n">publish_event</span><span class="p">(</span><span class="s2">&quot;image.processed&quot;</span><span class="p">,</span> <span class="p">{</span>
+    <span class="s2">&quot;image_data&quot;</span><span class="p">:</span> <span class="n">base64_encode</span><span class="p">(</span><span class="n">large_image</span><span class="p">)</span>  <span class="c1"># Don&#39;t do this!</span>
+<span class="p">})</span>
+
+<span class="c1"># Good - reference the data</span>
+<span class="n">publish_event</span><span class="p">(</span><span class="s2">&quot;image.processed&quot;</span><span class="p">,</span> <span class="p">{</span>
+    <span class="s2">&quot;image_url&quot;</span><span class="p">:</span> <span class="s2">&quot;https://storage.example.com/images/123.jpg&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;thumbnail_url&quot;</span><span class="p">:</span> <span class="s2">&quot;https://storage.example.com/thumbs/123.jpg&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;size_bytes&quot;</span><span class="p">:</span> <span class="mi">1024576</span>
+<span class="p">})</span>
+</pre></div>
+</div>
+</section>
+<section id="document-your-events">
+<h3>7. Document Your Events<a class="headerlink" href="#document-your-events" title="Link to this heading">#</a></h3>
+<p>Maintain documentation of your event types and message schemas:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">Event Type: storage.file.created</span>
+
+<span class="sd">Description: Published when a new file is uploaded to storage</span>
+
+<span class="sd">Message Schema:</span>
+<span class="sd">{</span>
+<span class="sd">    &quot;file_name&quot;: str,           # Name of the file</span>
+<span class="sd">    &quot;file_size&quot;: int,           # Size in bytes</span>
+<span class="sd">    &quot;mime_type&quot;: str,           # MIME type of the file</span>
+<span class="sd">    &quot;uploaded_by&quot;: str,         # Email of uploader</span>
+<span class="sd">    &quot;checksum&quot;: str,            # SHA-256 checksum (optional)</span>
+<span class="sd">    &quot;metadata&quot;: dict            # Additional metadata (optional)</span>
+<span class="sd">}</span>
+
+<span class="sd">Resource ID Format: /path/to/file</span>
+<span class="sd">Example: /uploads/2024/10/document.pdf</span>
+<span class="sd">&quot;&quot;&quot;</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="performance-considerations">
+<h2>Performance Considerations<a class="headerlink" href="#performance-considerations" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Batch publishing</strong>: Use for multiple events (faster than individual publishes)</p></li>
+<li><p><strong>Connection pooling</strong>: Reuse gRPC channels/connections instead of creating new ones for each publish</p></li>
+<li><p><strong>Async publishing</strong>: If your language/framework supports it, publish asynchronously</p></li>
+<li><p><strong>Message size</strong>: Keep messages under 100KB for optimal performance</p></li>
+</ul>
+</section>
+<section id="next-steps">
+<h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>Learn how to <a class="reference internal" href="consuming-events.html"><span class="std std-doc">Consume Events</span></a></p></li>
+<li><p>Understand <a class="reference internal" href="permissions.html"><span class="std std-doc">Permissions &amp; Authorization</span></a> for publishing</p></li>
+<li><p>Review the <a class="reference internal" href="api-reference.html"><span class="std std-doc">API Reference</span></a> for complete API details</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="getting-started.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Getting Started</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="consuming-events.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Consuming Events</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <div class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#event-structure">Event Structure</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#event-type">Event Type</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#message">Message</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#occurred-at">Occurred At</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#resource-optional">Resource (Optional)</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#publishing-a-single-event">Publishing a Single Event</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rest-api">REST API</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#grpc-api">gRPC API</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#batch-publishing-multiple-events">Batch Publishing Multiple Events</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">REST API</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">gRPC API</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#error-handling">Error Handling</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#common-error-codes">Common Error Codes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#retry-logic">Retry Logic</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#best-practices">Best Practices</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#choose-appropriate-event-granularity">1. Choose Appropriate Event Granularity</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#include-timestamps-accurately">2. Include Timestamps Accurately</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#use-resource-ids-consistently">3. Use Resource IDs Consistently</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#batch-when-possible">4. Batch When Possible</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#handle-partial-batch-failures">5. Handle Partial Batch Failures</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#keep-messages-reasonably-sized">6. Keep Messages Reasonably Sized</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#document-your-events">7. Document Your Events</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-considerations">Performance Considerations</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#next-steps">Next Steps</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script src="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b"></script>
+<script src="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2024-2025, NVIDIA Corporation.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item"><p class="last-updated">
+  Last updated on Dec 15, 2025.
+  <br/>
+</p></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

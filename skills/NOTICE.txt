@@ -1,0 +1,16 @@
+© NVIDIA Corporation.
+
+The ovstorage agent skills under this directory (ovstorage-user-*,
+ovstorage-operator-*, ovstorage-contributor-*) are licensed under the
+Creative Commons Attribution 4.0
+International License (CC BY 4.0). This is distinct from the repository's
+source code, which is licensed under Apache-2.0 (see top-level LICENSE).
+
+Except where otherwise noted, the skills (including examples, recipes,
+JSON formats, and related materials) are licensed under the Creative
+Commons Attribution 4.0 International License (CC BY 4.0).
+
+You are free to share and adapt this material, including for commercial
+purposes, provided you give appropriate credit to NVIDIA Corporation,
+provide a link to the CC BY 4.0 license, and indicate if changes were made.
+For full terms, see https://creativecommons.org/licenses/by/4.0/.

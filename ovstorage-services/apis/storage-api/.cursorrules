@@ -1,0 +1,134 @@
+# Cursor AI Rules for NVIDIA Omniverse Storage API Implementation
+
+## Project Context
+This is the NVIDIA Omniverse Storage API package containing:
+- gRPC and REST API specifications for storage services
+- A Python reference implementation with pluggable backends
+- Conformance tests for validating implementations
+
+## Key Files to Reference
+When implementing storage backends, always reference:
+- `filesystem_example/src/local_filesystem_service/backends/storage_backend_interface.py` - The interface ALL backends must implement
+- `filesystem_example/src/local_filesystem_service/filesystem/file_system_provider.py` - Reference implementation showing correct patterns
+
+## Implementation Guidelines
+
+### For Python Backend Implementations:
+1. Inherit from `StorageBackendInterface`
+2. Use `@register_backend("name")` decorator to register the factory function
+3. Use `@register_backend_cli("name")` for CLI argument registration
+4. Follow the error handling patterns from `file_system_provider.py`:
+   - Raise `FileNotFoundError` for missing resources
+   - Raise `PermissionError` for access denied
+   - Raise `ValueError` for invalid arguments
+   - Raise `IsADirectoryError` when file operation targets directory
+
+### Resource Address vs Identity:
+- **Resource Address**: Mutable URI pointing to a location (e.g., `s3://bucket/path/file.usd`)
+- **Resource Identity**: Immutable ID for a specific version (opaque to clients, typically base64-encoded)
+
+### Versioning Model:
+- Every write creates a new immutable version
+- Address always points to latest version
+- Old versions accessible via identity
+- The Resource Identity must be a URI
+
+### Folder Model
+- The Storage API knows 3 different folder modes, the reference implementation allows to simulate all three, but
+a concrete storage service just needs to pick one, the one which matches the chosen storage backends behavior best.
+I.e. a filesystem most likely wants to choose native folder mode, while a git backend might choose "no empty" as there
+is no way to express folder existence without a file, while a BLOB store might chose to do hybrid, though this is more complex
+to implement (it might get away with  no_empty).
+
+
+### Method Implementation Priority:
+When creating a new backend, implement in this order:
+1. `base_uri` property, `is_address_valid()`, `is_version_address()`
+2. `exists()`, `is_file()`, `is_dir()`
+3. `stat()`, `stat_identity()`
+4. `read_from_address()`, `read_from_identity()`
+5. `write_version()`
+6. `list()`, `enumerate()`
+7. `create_folder()`, `remove_empty_folder()`
+8. `remove_by_address()`, `obliterate()`
+9. `enumerate_versions()`
+10. Metadata operations
+11. Copy/move operations
+12. Redirect and multipart upload support
+
+### Testing:
+Use the test runner script for easy testing:
+```bash
+# Quick full test run
+./run_tests.sh
+
+# Test specific functionality
+./run_tests.sh -k "stat" --verbose
+
+# Debug a failing test
+./run_tests.sh -k "enumerate" --no-parallel --verbose
+
+# Force restart if ports are busy
+./run_tests.sh --force
+```
+
+### gRPC Status Codes:
+- `OK` - Success
+- `NOT_FOUND` - Resource doesn't exist
+- `PERMISSION_DENIED` - Access denied
+- `INVALID_ARGUMENT` - Bad parameters
+- `ALREADY_EXISTS` - Resource already exists
+
+### REST HTTP Status Codes:
+- `200` - Success with body
+- `201` - Created (successful write)
+- `204` - Success no body (stat, delete)
+- `300` - Redirect response
+- `400` - Invalid argument
+- `403` - Permission denied
+- `404` - Not found
+- `409` - Already exists
+
+## Common Patterns
+
+### Identity Encoding Pattern:
+```python
+import base64
+import json
+
+def create_identity(storage_specific_data: dict) -> str:
+    return f"scheme://authority/" + base64.urlsafe_b64encode(
+        json.dumps(storage_specific_data).encode()
+    ).decode()
+```
+
+### Error Handling Pattern:
+```python
+def stat(self, resource_address: str) -> VersionInfo:
+    if not self.is_address_valid(resource_address):
+        raise ValueError(f"Invalid address: {resource_address}")
+    if not self.exists(resource_address):
+        raise FileNotFoundError(f"Resource not found: {resource_address}")
+    if self.is_dir(resource_address):
+        raise IsADirectoryError(f"{resource_address} is a directory")
+    # ... implementation
+```
+
+## Do NOT:
+- Parse resource identities in client code (they're opaque)
+- Skip implementing abstract methods (all are required)
+- Forget thread safety for concurrent access
+- Ignore the `previous_version` parameter if the service decided it supports optimistic locking
+- Return wrong status codes (conformance tests check these)
+
+## Proto Files Location:
+- `proto/nvidia/omniverse/storage/fileobject/v1beta/` - File operations
+- `proto/nvidia/omniverse/storage/filefolder/v1beta/` - Folder operations
+- `proto/nvidia/omniverse/storage/capabilities/v1beta/` - Service discovery
+- `proto/nvidia/omniverse/storage/versioning/v1beta/` - Version listing
+
+## OpenAPI Files Location:
+- `openapi/fileobject/v1beta/fileobject-api.yaml`
+- `openapi/filefolder/v1beta/filefolder-api.yaml`
+- `openapi/capabilities/v1beta/capabilities-api.yaml`
+- `openapi/versioning/v1beta/versioning-api.yaml`

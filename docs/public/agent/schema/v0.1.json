@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ovstorage.example.com/agent/schema/v0.1.json",
+  "title": "ovstorage agent envelope v0.1",
+  "type": "object",
+  "required": ["v", "ok", "operation"],
+  "properties": {
+    "v": {
+      "type": "string",
+      "const": "0.1"
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "operation": {
+      "type": "string"
+    },
+    "operation_id": {
+      "type": "string"
+    },
+    "backend": {
+      "type": "string"
+    },
+    "resource": {
+      "type": "string"
+    },
+    "result": {},
+    "error": {
+      "$ref": "#/$defs/EnvelopeError"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "required": ["result"],
+        "not": {
+          "required": ["error"]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": false
+          }
+        }
+      },
+      "then": {
+        "required": ["error"],
+        "not": {
+          "required": ["result"]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "EnvelopeError": {
+      "type": "object",
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "next_action": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

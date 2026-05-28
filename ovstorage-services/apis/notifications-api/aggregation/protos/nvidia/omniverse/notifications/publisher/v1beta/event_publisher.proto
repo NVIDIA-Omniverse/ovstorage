@@ -1,0 +1,138 @@
+//SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+//
+//NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+//property and proprietary rights in and to this material, related
+//documentation and any modifications thereto. Any use, reproduction,
+//disclosure or distribution of this material and related documentation
+//without an express license agreement from NVIDIA CORPORATION or
+//its affiliates is strictly prohibited.
+
+syntax = "proto3";
+
+package nvidia.omniverse.notifications.publisher.v1beta;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/nvidia/omniverse/notifications/publisher/v1beta";
+option java_multiple_files = true;
+option java_outer_classname = "EventPublisherProto";
+option java_package = "com.nvidia.omniverse.notifications.publisher.v1beta";
+
+// The service used for publishing events
+service EventPublishingService {
+  // A simple RPC for publishing an arbitrary events.
+  //
+  // A RESOURCE_EXHAUSTED status code may be returned if a given k8s pod has an exhausted channel
+  // pool, and the client should automatically try to reconnect until they
+  // get a pod with available channels.
+  rpc PublishEvent(PublishEventRequest) returns (PublishEventResponse) {}
+
+  // A simple RPC for publishing one or more arbitrary events in parallel.
+  //
+  // A RESOURCE_EXHAUSTED status code may be returned if a given k8s pod has an exhausted channel
+  // pool, and the client should automatically try to reconnect until they
+  // get a pod with available channels.
+  rpc BatchPublishEvents(BatchPublishEventsRequest) returns (BatchPublishEventsResponse) {}
+}
+
+// The request object sent when publishing a single event.
+message PublishEventRequest {
+  // the event to publish
+  Event event = 1;
+}
+
+// The request object sent when publishing events.
+// When multiple events are sent they are published
+// into the message broker in parallel for faster
+// performance.
+message BatchPublishEventsRequest {
+  // the events that should be published
+  repeated Event events = 1;
+}
+
+// The event object that encapsulates all event data
+message Event {
+  // A string that defines the event type.
+  // Services that use the notification aggregation service will
+  // typically define their own event types, so this is
+  // not an enum of known values.
+  string event_type = 1;
+
+  // JSON event message
+  google.protobuf.Struct message = 2;
+
+  // timestamp for when the event occurred
+  google.protobuf.Timestamp occurred_at = 3;
+
+  // Optional: used to identify a resource that the event is concerned with.
+  // This can be used by consumer clients for filtering of messages, beyond
+  // just filtering by event_type.
+  //
+  // NOTE: if the resource is omitted, then it is the equivalent of
+  // passing a resource with resource_id="". Please see the event-consumer-service's
+  // proto file for documentation of filtering messages that have a blank resource_id.
+  EventResource resource = 4;
+}
+
+// The resource that the event is concerned with.
+message EventResource {
+  // A path like string (slash separated) that consumers can
+  // use for filtering events. Each word that is separated by a
+  // slash is something that a consumer could filter by.
+  //
+  // E.g., in the case of Storage API, consumers will want to filter
+  // on file paths, but the resource doesn't need to be an actual "path".
+  //
+  // Say there are two storage events,
+  // one that is for a file at a path s3://a/b/c/astronaut.usd
+  // and one that is for a file at a path s3://d/other_file.usd.
+  //
+  // When publishing, the Storage API could publish two events,
+  // and the two resource strings could be:
+  //
+  //    filter_key = "/a/b/c/astronaut.usd"
+  //
+  //    and
+  //
+  //    filter_key = "/d/other_file.usd"
+  //
+  // A consumer could then specify that they only want to consume events
+  // for a specific set of resources. A consumer would use a "resource_filter"
+  // in the Notification Consumer API, such as:
+  //
+  //    {
+  //      "filter_type": "FILTER_TYPE_STARTS_WITH_LAZY",
+  //      "resource_id": "/a/b/"
+  //    }
+  //
+  // and then they would get the event for astronaut.usd,
+  // but not for other_file.usd
+  string resource_id = 1;
+}
+
+// The result from when an event publish is attempted
+message PublishingResult {
+  // the event that was published
+  Event event = 1;
+
+  // whether or not publishing was successful
+  bool success = 2;
+
+  // if publishing failed, failure_reason contains the reason
+  string failure_reason = 3;
+}
+
+// The response when an event is successfully published
+message PublishEventResponse {
+  // The result from when an event publish is attempted
+  PublishingResult result = 1;
+}
+
+// The response when events are successfully published
+message BatchPublishEventsResponse {
+  // The results from all of the publishing attempts
+  // for each request/event in the batch
+  repeated PublishingResult results = 1;
+}

@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-broker"
+version = "0.1.0"
+edition = "2024"
+description = "Broker backend plugin for ovstorage."
+license = "Apache-2.0"
+
+[dependencies]
+ovstorage = { version = "0.1.0", path = "../../../ovstorage-core/crates/ovstorage" }
+ovstorage-broker-protocol = { version = "0.1.0", path = "../ovstorage-broker-protocol" }
+ovstorage-plugin.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+hyper-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tokio-stream.workspace = true
+tonic = { workspace = true, features = ["tls-roots"] }
+tower.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Exposes `BrokerClientBackend::new_for_tests`, a hidden constructor that
+# wires a pre-built `BrokerClientTransport` directly into the per-backend
+# cache cell. Used by `tests/precondition.rs` to drive the SPI surface
+# against a recording transport without standing up a gRPC fake-server.
+# Not part of the public API; gated so release builds never see it.
+_test_support = []
+
+[dev-dependencies]
+# Self-reference activates the `_test_support` feature for the
+# integration tests under `tests/`, which need the hidden
+# `BrokerClientBackend::new_for_tests` constructor. cargo-deny rejects
+# wildcard version specifiers, so the version is pinned explicitly.
+ovstorage-plugin-broker = { version = "0.1.0", path = ".", features = ["_test_support"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-authz"
+version = "0.1.0"
+edition = "2024"
+description = "Authorization plugin SPI for ovstorage brokered mode."
+license = "Apache-2.0"
+build = "build.rs"
+
+[dependencies]
+async-trait.workspace = true
+libloading.workspace = true
+ovstorage-plugin.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }
+tokio-util.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+cbindgen.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

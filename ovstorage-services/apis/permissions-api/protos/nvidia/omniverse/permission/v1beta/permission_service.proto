@@ -1,0 +1,192 @@
+//SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+//
+//NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+//property and proprietary rights in and to this material, related
+//documentation and any modifications thereto. Any use, reproduction,
+//disclosure or distribution of this material and related documentation
+//without an express license agreement from NVIDIA CORPORATION or
+//its affiliates is strictly prohibited.
+
+syntax = "proto3";
+package nvidia.omniverse.permission.v1beta;
+
+import "google/protobuf/struct.proto";
+
+option go_package = "github.com/nvidia/omniverse/permissions/v1beta";
+option java_multiple_files = true;
+option java_outer_classname = "PermissionServiceProto";
+option java_package = "com.nvidia.omniverse.permissions.v1beta";
+
+// Defines APIs for checking authorization rules for other services.
+service PermissionService {
+  // Checks if the specified principal is allowed
+  // to run an operation on the specified object.
+  rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+
+  // Checks if all specified actions are allowed.
+  rpc CheckPermissionBatch(CheckPermissionBatchRequest) returns (CheckPermissionBatchResponse);
+}
+
+// The message for request for checking if the specified principal (user or service)
+// has access to perform a service operation.
+message CheckPermissionRequest {
+  // The info about a user or a service that tries to perform an operation.
+  // Can be omitted if included in the token passed in the Authorization header.
+  optional Principal principal = 1;
+
+  // An operation to be performed.
+  Action action = 2;
+
+  // An object representing a resource that the principal tries to operate on.
+  optional Resource resource = 3;
+
+  // Extra information about the operation,
+  // e.g. the ID address and geolocation of the caller.
+  optional google.protobuf.Struct context = 4;
+}
+
+// Represents the information about the authorized principal.
+message Principal {
+  // The unique identifier of this principal (the "sub" claim from the token).
+  string sub = 1;
+
+  // Other information from the principal token.
+  google.protobuf.Struct info = 2;
+}
+
+// Represents the information about the authorized operation.
+message Action {
+  // The operation name.
+  string name = 1;
+
+  // The service name where the operation will be performed.
+  string service = 2;
+}
+
+// Represents the information about a resource being used for authorization
+message Resource {
+  // Unique identifier of this resource.
+  string id = 1;
+
+  // The type used for resource classification.
+  string type = 2;
+
+  // Resource information that may be required to evaluate the authorization policy.
+  optional google.protobuf.Struct data = 3;
+}
+
+// The message with authorization check results.
+// Returns the authorization decision and optionally the reason why this decision has been made.
+message CheckPermissionResponse {
+  // Defines if the request is allowed or denied for the principal
+  Decision decision = 1;
+
+  // The message returned for explicit denials.
+  // If omitted, then "deny" is implicit - the service could not find any rules for the specified request.
+  optional string reason = 2;
+}
+
+// Defines an authorization decision that must be taken by the service
+enum Decision {
+  // Unset value.
+  DECISION_UNSPECIFIED = 0;
+
+  // Defines an explicit or implicit "deny" decision.
+  // The corresponding reason field can be checked to determine if deny is explicit.
+  DECISION_DENY = 1;
+
+  // Defines an explicit "allow" decision.
+  DECISION_ALLOW = 2;
+
+  // Defines that action evaluation has been skipped due to a condition match.
+  DECISION_SKIP = 3;
+}
+
+// The message for making multiple authorization checks in one single request.
+// This is a batched version of CheckPermissionRequest message.
+message CheckPermissionBatchRequest {
+  // Specifies how batches and actions must be evaluated
+  optional Condition condition = 1;
+
+  // Defines multiple authorization requests done by CheckPermissionBatch rpc
+  repeated CheckPermissionBatch batches = 2;
+}
+
+// Defines the condition specifying how batches and actions in CheckPermissionBatchRequest
+// must be evaluated.
+enum Condition {
+  // Evaluates all requests in batches similarly to individual requests.
+  // The summary is compiled similarly to "and" condition but does not stop the evaluation
+  // after first "deny".
+  CONDITION_UNSPECIFIED = 0;
+
+  // Checks if any of the actions is allowed.
+  CONDITION_OR = 1;
+
+  // Checks if all specified actions are allowed.
+  // Stops after the first "deny" decision.
+  CONDITION_AND = 2;
+}
+
+// Represents one authorization check done in CheckPermissionBatchRequest.
+message CheckPermissionBatch {
+  // The info about a user or a service that tries to perform an operation.
+  // Can be omitted if included in the token passed in the Authorization header.
+  optional Principal principal = 1;
+
+  // Operations checked for the principal against the specified resource.
+  repeated Action actions = 2;
+
+  // A JSON object representing a resource that the principal tries to operate on.
+  optional Resource resource = 3;
+
+  // Extra information about the operation,
+  // e.g. the ID address and geolocation of the caller.
+  optional google.protobuf.Struct context = 4;
+}
+
+// The message with batched authorization results for CheckPermissionBatchRequest.
+message CheckPermissionBatchResponse {
+  // The summary decision about all actions in all batches
+  // specified in CheckPermissionBatchRequest
+  optional CheckPermissionBatchResponseSummary summary = 1;
+
+  // Defines responses for each batch specified in CheckPermissionBatchRequest
+  // (the order is preserved).
+  repeated ResourceActionDecisionBatch decisions = 2;
+}
+
+// The summary for all authorization checks made in CheckPermissionBatchRequest.
+// Specified only if `condition` is set in CheckPermissionBatchRequest.
+message CheckPermissionBatchResponseSummary {
+  // Defines if the request is allowed or denied for all actions specified
+  // in CheckPermissionBatchRequest
+  Decision decision = 1;
+
+  // The message returned for explicit denials.
+  // If omitted, then "deny" is implicit - the service could not find any rules for the specified request.
+  optional string reason = 2;
+}
+
+// The message that contains results for CheckPermissionBatch.
+message ResourceActionDecisionBatch {
+  // Represents a decision for each action specified in CheckPermissionBatch.
+  repeated ResourceActionDecision results = 1;
+}
+
+// The message that contains results for one service action check made in CheckPermissionBatch message.
+message ResourceActionDecision {
+  // An operation name specified in CheckPermissionBatch.
+  string action = 1;
+
+  // The service name specified in `action` for CheckPermissionBatch.
+  string service = 2;
+
+  // Defines if the request is allowed or denied for the specified action
+  Decision decision = 3;
+
+  // The message returned for explicit denials.
+  // If omitted, then "deny" is implicit - the service could not find any rules for the specified request.
+  optional string reason = 4;
+}

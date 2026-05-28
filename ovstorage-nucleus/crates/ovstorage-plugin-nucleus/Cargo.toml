@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-nucleus"
+version = "0.1.0"
+edition = "2024"
+description = "Native Omniverse Nucleus ovstorage backend crate."
+license = "Apache-2.0"
+
+[dependencies]
+ovstorage-plugin.workspace = true
+nucleus-transport = { version = "0.1.0", path = "../nucleus-transport" }
+nucleus-auth = { version = "0.1.0", path = "../nucleus-auth" }
+nucleus-discovery = { version = "0.1.0", path = "../nucleus-discovery" }
+nucleus-client = { version = "0.1.0", path = "../nucleus-client" }
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true

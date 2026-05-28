@@ -1,0 +1,341 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION &
+# AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+
+openapi: 3.1.0
+info:
+  title: Event Publishing API
+  description: "\n    REST API for publishing events to the notification service.\n\
+    \n    Use this API to publish individual events or batch publish multiple events.\n\
+    \    Events are routed to consumers based on their filter subscriptions.\n    "
+  version: 1.0.0-beta-1
+paths:
+  /api/v1beta/events:
+    post:
+      summary: Publish Event
+      description: Publishes a single event to the notification service. The event
+        will be routed to all appropriate consumers based on their filter subscriptions.
+      operationId: publish_event_api_v1beta_events_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishEventRequest'
+        required: true
+      responses:
+        '200':
+          description: Event successfully published
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublishEventResponse'
+        '400':
+          description: Bad Request - Invalid event data. Check that all required fields
+            are present and valid.
+        '422':
+          description: Unprocessable Entity - Validation error
+        '500':
+          description: Internal Server Error
+        '401':
+          description: Unauthorized - The request requires valid authentication credentials.
+            This typically indicates a missing, invalid, or expired authentication
+            token.
+        '403':
+          description: Forbidden - The authenticated user does not have permission
+            to access this resource or perform this operation.
+        '503':
+          description: Service Unavailable - The server's channel pool is exhausted.
+            This is a temporary condition. Clients should retry the request with exponential
+            backoff until the error no longer occurs.
+      security:
+      - HTTPBearer: []
+  /api/v1beta/events/batch:
+    post:
+      summary: Batch Publish Events
+      description: Publishes multiple events to the notification service in parallel.
+        Each event will be routed to all appropriate consumers based on their filter
+        subscriptions. This endpoint is more efficient than making multiple individual
+        publish requests.
+      operationId: batch_publish_events_api_v1beta_events_batch_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchPublishEventsRequest'
+        required: true
+      responses:
+        '200':
+          description: Events processed. Check the results list for individual publish
+            outcomes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchPublishEventsResponse'
+        '400':
+          description: Bad Request - Invalid request. The request must contain at
+            least one event.
+        '422':
+          description: Unprocessable Entity - Validation error
+        '429':
+          description: Too Many Requests - Rate limit exceeded
+        '500':
+          description: Internal Server Error
+        '401':
+          description: Unauthorized - The request requires valid authentication credentials.
+            This typically indicates a missing, invalid, or expired authentication
+            token.
+        '403':
+          description: Forbidden - The authenticated user does not have permission
+            to access this resource or perform this operation.
+        '503':
+          description: Service Unavailable - The server's channel pool is exhausted.
+            This is a temporary condition. Clients should retry the request with exponential
+            backoff until the error no longer occurs.
+      security:
+      - HTTPBearer: []
+  /api/v1beta/health:
+    get:
+      summary: Health Check
+      description: Health check endpoint for the API
+      operationId: health_check_api_v1beta_health_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+components:
+  schemas:
+    BatchPublishEventsRequest:
+      properties:
+        events:
+          items:
+            $ref: '#/components/schemas/Event'
+          type: array
+          maxItems: 1000
+          title: Events
+          description: The events that should be published
+          examples:
+          - - event_type: storage.file.created
+              message:
+                filename: doc1.pdf
+              occurred_at: '2024-10-23T12:34:56Z'
+              resource:
+                resource_id: /folder/doc1.pdf
+            - event_type: storage.file.created
+              message:
+                filename: doc2.pdf
+              occurred_at: '2024-10-23T12:34:57Z'
+              resource:
+                resource_id: /folder/doc2.pdf
+      type: object
+      required:
+      - events
+      title: BatchPublishEventsRequest
+      description: 'Request model for publishing multiple events in a batch.
+
+
+        When multiple events are sent, they are published into the message
+
+        broker in parallel for faster performance.'
+    BatchPublishEventsResponse:
+      properties:
+        results:
+          items:
+            $ref: '#/components/schemas/PublishingResult'
+          type: array
+          maxItems: 1000
+          title: Results
+          description: The results from all of the publishing attempts for each request/event
+            in the batch
+      type: object
+      required:
+      - results
+      title: BatchPublishEventsResponse
+      description: Response model for publishing multiple events.
+    Event:
+      properties:
+        event_type:
+          type: string
+          maxLength: 256
+          pattern: ^[a-zA-Z0-9._-]+$
+          title: Event Type
+          description: A string that defines the event type. Services that use the
+            notification aggregation service will typically define their own event
+            types.
+          examples:
+          - storage.file.created
+          - project.updated
+        message:
+          additionalProperties: true
+          type: object
+          title: Message
+          description: JSON event message containing the event payload. The structure
+            of this message is determined by the event type.
+          examples:
+          - action: created
+            user: john@example.com
+        occurred_at:
+          type: string
+          maxLength: 64
+          pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$
+          title: Occurred At
+          description: Timestamp for when the event occurred. Must be provided in
+            ISO 8601 format (e.g., '2024-10-23T12:34:56Z').
+          examples:
+          - '2024-10-23T12:34:56Z'
+        resource:
+          anyOf:
+          - $ref: '#/components/schemas/EventResource'
+          - type: 'null'
+          description: Optional resource identifier that the event is concerned with.
+            Used by consumer clients for filtering messages beyond just filtering
+            by event_type. If omitted, it is equivalent to passing a resource with
+            resource_id=''.
+      type: object
+      required:
+      - event_type
+      - message
+      - occurred_at
+      title: Event
+      description: An event object that encapsulates all event data.
+    EventResource:
+      properties:
+        resource_id:
+          type: string
+          maxLength: 2048
+          title: Resource Id
+          description: A path-like string (slash separated) that consumers can use
+            for filtering events. For example, in the case of a Storage API, this
+            could be a file path like '/folder/subfolder/file.txt'
+          examples:
+          - /folder/file.txt
+          - /projects/project1/
+      type: object
+      required:
+      - resource_id
+      title: EventResource
+      description: 'The resource that an event is concerned with.
+
+
+        A path-like string (slash separated) that consumers can use for
+
+        filtering events. Each word separated by a slash is something that
+
+        a consumer could filter by.'
+    HealthResponse:
+      properties:
+        status:
+          type: string
+          maxLength: 10
+          title: Status
+          default: healthy
+      type: object
+      title: HealthResponse
+      description: Health check response.
+    PublishEventRequest:
+      properties:
+        event:
+          $ref: '#/components/schemas/Event'
+          description: The event to publish
+          examples:
+          - event_type: storage.file.created
+            message:
+              filename: document.pdf
+              size: 1024
+            occurred_at: '2024-10-23T12:34:56Z'
+            resource:
+              resource_id: /folder/document.pdf
+      type: object
+      required:
+      - event
+      title: PublishEventRequest
+      description: Request model for publishing a single event.
+    PublishEventResponse:
+      properties:
+        result:
+          $ref: '#/components/schemas/PublishingResult'
+          description: The result from the publish attempt
+      type: object
+      required:
+      - result
+      title: PublishEventResponse
+      description: Response model for publishing a single event.
+    PublishingResult:
+      properties:
+        event:
+          $ref: '#/components/schemas/Event'
+          description: The event that was published or attempted to be published
+        success:
+          type: boolean
+          title: Success
+          description: Whether or not publishing was successful
+        failure_reason:
+          anyOf:
+          - type: string
+            maxLength: 1024
+          - type: 'null'
+          title: Failure Reason
+          description: If publishing failed, this contains the reason for failure
+      type: object
+      required:
+      - event
+      - success
+      title: PublishingResult
+      description: The result from when an event publish is attempted.
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+              maxLength: 256
+            - type: integer
+              format: int32
+              minimum: 0
+              maximum: 2147483647
+          type: array
+          maxItems: 100
+          title: Location
+        msg:
+          type: string
+          maxLength: 1024
+          title: Message
+        type:
+          type: string
+          maxLength: 256
+          title: Error Type
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          maxItems: 100
+          title: Detail
+      type: object
+      title: HTTPValidationError
+  securitySchemes:
+    HTTPBearer:
+      type: http
+      scheme: bearer
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Bearer token authentication using JWT. Implements security best
+        practices from RFC8725.

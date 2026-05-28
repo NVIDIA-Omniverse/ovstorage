@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-cache"
+version = "0.1.0"
+edition = "2024"
+description = "Local cache primitives for ovstorage."
+license = "Apache-2.0"
+
+[dependencies]
+fs2.workspace = true
+ovstorage-plugin = { version = "0.1.0", path = "../ovstorage-plugin" }
+metrics.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+fs2.workspace = true
+tempfile.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

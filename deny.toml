@@ -1,0 +1,99 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Repo-wide cargo-deny policy. Shared by active ovstorage workspaces via
+# xtask passing `--config <repo>/deny.toml` to each invocation.
+#
+# Schema docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Check all targets, not just the host. Catches deps that pull in
+# different transitive trees on Linux vs. Windows vs. WASM.
+all-features = true
+
+[advisories]
+# Fail the build on RUSTSEC advisories. `unmaintained = "workspace"`
+# limits noise to direct + workspace deps; transitive unmaintained
+# crates are warned rather than failed (until they become a real CVE).
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+# The shared deny.toml is consumed by all 5 workspaces; an advisory we
+# ignore is only encountered in the workspace(s) that actually pull the
+# affected crate. Suppress the "not detected" warning from every other
+# workspace.
+unused-ignored-advisory = "allow"
+ignore = [
+    # PyO3 0.21 `PyString::from_object` may forward unterminated `&str`
+    # to CPython. We never call that function — the Python bindings only
+    # use our own `info_from_object` helper plus `PyDict::set_item` and
+    # `Bound<PyDict>::get_item` paths. PyO3 0.21 → 0.24 is a breaking
+    # upgrade; revisit once we plan that migration. Tracked here, not
+    # silently dropped.
+    { id = "RUSTSEC-2025-0020", reason = "unused vulnerable API; pyo3 0.24 migration tracked separately" },
+]
+
+[licenses]
+version = 2
+# Same shared-config noise reduction as in [advisories]: a license in
+# `allow` (or an exception) that no crate uses in this workspace would
+# otherwise warn per workspace.
+unused-allowed-license = "allow"
+unused-license-exception = "allow"
+# Allowlist. Add a license here only after confirming it's compatible
+# with `Apache-2.0` distribution. Order is irrelevant.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    # `webpki-roots` (transitive via reqwest/hyper-rustls/opentelemetry)
+    # is the Mozilla CA bundle redistributed under CDLA-Permissive-2.0.
+    # Permissive license; compatible with proprietary distribution.
+    "CDLA-Permissive-2.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[[licenses.exceptions]]
+# Add per-crate exceptions here as `{ name = "...", allow = ["..."] }`
+# when a transitive dep ships under a license that we'd rather not
+# globally allow but is acceptable for this single dep.
+name = "ring"
+allow = ["LicenseRef-ring"]
+
+[[licenses.clarify]]
+# `ring` ships an unconventional license file; tell cargo-deny how to
+# treat it instead of refusing the crate outright.
+name = "ring"
+expression = "LicenseRef-ring"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+# Duplicate-version checking is off pending an explicit dedup pass.
+# The dep tree currently has ~95 split crates (bitflags 1/2, windows-*,
+# rand-family, etc.) that are pulled by transitive deps we don't
+# control. Flip to "warn" or "deny" alongside that dedup work, once
+# every duplicate can be either pinned in `[workspace.dependencies]`
+# or allowlisted in `skip = [...]` below with a one-line reason.
+multiple-versions = "allow"
+wildcards = "deny"
+highlight = "simplest-path"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

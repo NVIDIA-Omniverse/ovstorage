@@ -1,0 +1,184 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Signed in · ovstorage</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f5f0;
+    --fg: #1c1917;
+    --muted: #78716c;
+    --rule: rgba(28,25,23,0.10);
+    --chip-bg: rgba(28,25,23,0.05);
+    --chip-fg: #44403c;
+    --accent: #5a7a4f;
+    --btn-bg: #1c1917;
+    --btn-fg: #f7f5f0;
+    --btn-hover: #292524;
+    --kbd-bg: rgba(28,25,23,0.06);
+    --kbd-fg: #57534e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0c0a09;
+      --fg: #f5f5f4;
+      --muted: #a8a29e;
+      --rule: rgba(245,245,244,0.10);
+      --chip-bg: rgba(245,245,244,0.06);
+      --chip-fg: #d6d3d1;
+      --accent: #9bbf91;
+      --btn-bg: #f5f5f4;
+      --btn-fg: #0c0a09;
+      --btn-hover: #e7e5e4;
+      --kbd-bg: rgba(245,245,244,0.08);
+      --kbd-fg: #a8a29e;
+    }
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: ui-sans-serif, -apple-system, "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    display: grid;
+    place-items: center;
+    padding: 56px 28px;
+  }
+  main {
+    width: 100%;
+    max-width: 520px;
+    padding-left: 28px;
+    border-left: 1px solid var(--rule);
+    animation: rise 640ms cubic-bezier(0.2,0.7,0.2,1) both;
+  }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .eyebrow {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--accent);
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    margin: 0 0 28px;
+  }
+  .eyebrow svg { display: block; }
+  h1 {
+    font-family: ui-serif, "Iowan Old Style", "Hoefler Text", "Apple Garamond", Georgia, "Times New Roman", serif;
+    font-weight: 500;
+    font-size: clamp(40px, 6.4vw, 60px);
+    line-height: 1.04;
+    letter-spacing: -0.022em;
+    margin: 0 0 22px;
+  }
+  p {
+    font-size: 15.5px;
+    line-height: 1.6;
+    color: var(--muted);
+    margin: 0 0 14px;
+    max-width: 46ch;
+  }
+  p strong {
+    color: var(--fg);
+    font-weight: 500;
+  }
+  .host {
+    font-family: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, monospace;
+    font-size: 13px;
+    padding: 2px 7px;
+    border-radius: 5px;
+    background: var(--chip-bg);
+    color: var(--chip-fg);
+    white-space: nowrap;
+  }
+  .actions {
+    margin-top: 38px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  button {
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    letter-spacing: -0.005em;
+    padding: 11px 18px;
+    border-radius: 8px;
+    border: 0;
+    background: var(--btn-bg);
+    color: var(--btn-fg);
+    cursor: pointer;
+    transition: background 120ms ease, transform 80ms ease;
+  }
+  button:hover { background: var(--btn-hover); }
+  button:active { transform: translateY(1px); }
+  button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+  }
+  kbd {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+    padding: 3px 7px;
+    border-radius: 5px;
+    background: var(--kbd-bg);
+    color: var(--kbd-fg);
+    letter-spacing: 0.02em;
+  }
+  footer {
+    margin-top: 64px;
+    font-size: 12px;
+    color: var(--muted);
+    letter-spacing: 0.02em;
+  }
+  footer .mark {
+    color: var(--fg);
+    font-weight: 600;
+    letter-spacing: -0.005em;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    main { animation: none; }
+  }
+</style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 12.5l5 5 11-12"/>
+      </svg>
+      Access granted
+    </div>
+    <h1>All set.</h1>
+    <p>Your app has the credential it needs. You can close this tab and return to where you started.</p>
+    {{idp_host_line}}
+    <div class="actions">
+      <button type="button" onclick="window.close()" autofocus>Close this tab</button>
+      <kbd id="close-shortcut">Ctrl+W</kbd>
+    </div>
+    <footer><span class="mark">ovstorage</span> &middot; sign-in complete</footer>
+  </main>
+  <script>
+    (function () {
+      var nav = window.navigator || {};
+      var hint = (nav.userAgentData && nav.userAgentData.platform) || nav.platform || '';
+      var ua = nav.userAgent || '';
+      var isMac = /mac/i.test(hint) || /Macintosh/.test(ua);
+      var el = document.getElementById('close-shortcut');
+      if (el) el.textContent = isMac ? '⌘W' : 'Ctrl+W';
+    })();
+  </script>
+</body>
+</html>

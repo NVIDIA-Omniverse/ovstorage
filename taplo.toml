@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Repo-wide TOML formatting config consumed by `taplo fmt`. CI runs
+# `make fmt-toml-check` (taplo fmt --check); local devs run
+# `make fmt-toml` to write the formatted output back.
+
+include = ["**/*.toml"]
+# `target/` directories are build output. Tracked `.cargo/config.toml`
+# files (repo root and per-workspace) DO get formatted — they're real
+# checked-in config and should obey the project's TOML style like
+# everything else.
+exclude = ["**/target/**"]
+
+[formatting]
+# Modest knobs that read well on a 100-col terminal and keep
+# inline tables compact.
+align_entries = false
+align_comments = true
+array_trailing_comma = true
+array_auto_expand = true
+array_auto_collapse = true
+column_width = 100
+compact_arrays = true
+compact_inline_tables = false
+indent_string = "    "
+trailing_newline = true
+reorder_keys = false
+reorder_arrays = false

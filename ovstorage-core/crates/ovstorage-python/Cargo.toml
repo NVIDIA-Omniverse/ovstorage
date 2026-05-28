@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-python"
+version = "0.1.0"
+edition = "2024"
+description = "Python bindings for ovstorage."
+license = "Apache-2.0"
+
+[features]
+# Opt-in for downstreams that override the workspace `pyo3` to drop
+# `extension-module`, allowing the Rust unit-test block in `src/lib.rs`
+# to compile + link as a normal cargo test binary. Default builds keep
+# `extension-module` (required for the wheel) and skip those tests.
+no-extension-module-link = []
+
+[dependencies]
+ovstorage-rust = { package = "ovstorage", version = "0.1.0", path = "../ovstorage" }
+futures.workspace = true
+pyo3.workspace = true
+pyo3-async-runtimes.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lib]
+name = "ovstorage_python"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+# Default `pyo3` enables `extension-module`, which leaves the CPython
+# symbols undefined at link time. That is correct for the wheel (the
+# host interpreter resolves them at load) but breaks `cargo test`,
+# which produces a standalone binary the linker insists on satisfying.
+# The Rust-level tests are gated behind the `no-extension-module-link`
+# feature for downstreams that swap pyo3 to drop `extension-module`;
+# routine `cargo test` skips this crate entirely. Functional coverage
+# lives in `tests/*.py`, run via pytest.
+test = false
+doctest = false
+
+[lints]
+workspace = true

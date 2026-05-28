@@ -1,0 +1,856 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="./" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>REST API &#8212; USD Storage Permission API</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/bootstrap.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+
+  
+  <link href="_static/vendor/fontawesome/6.5.2/css/all.min.css?digest=dfe6caa3a7d634c4db9b" rel="stylesheet" />
+  <link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-solid-900.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-brands-400.woff2" />
+<link rel="preload" as="font" type="font/woff2" crossorigin href="_static/vendor/fontawesome/6.5.2/webfonts/fa-regular-400.woff2" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=a746c00c" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/nvidia-sphinx-theme.css?v=c5edffae" />
+    <link rel="stylesheet" type="text/css" href="_static/custom.css?v=7abaf8bc" />
+    <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-design.min.css?v=95c83b7e" />
+  
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b" />
+  <script src="_static/vendor/fontawesome/6.5.2/js/all.min.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+    <script src="_static/documentation_options.js?v=910b9336"></script>
+    <script src="_static/doctools.js?v=9a2dae69"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="_static/copybutton.js?v=65e89d2a"></script>
+    <script src="_static/design-tabs.js?v=f930bc37"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'rest-api';</script>
+    <script src="_static/version-patch.js?v=c24f8c5d"></script>
+    <link rel="icon" href="_static/favicon.ico"/>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="gRPC Specification" href="grpc.html" />
+    <link rel="prev" title="Authorization for a service principal" href="authorization-for-a-service-principal.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+    <meta name="docbuild:last-update" content="Mar 03, 2026"/>
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-primary-sidebar-checkbox"/>
+  <label class="overlay overlay-primary" for="pst-primary-sidebar-checkbox"></label>
+  
+  <input type="checkbox"
+          class="sidebar-toggle"
+          id="pst-secondary-sidebar-checkbox"/>
+  <label class="overlay overlay-secondary" for="pst-secondary-sidebar-checkbox"></label>
+  
+  <div class="search-button__wrapper">
+    <div class="search-button__overlay"></div>
+    <div class="search-button__search-container">
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         id="search-input"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form></div>
+  </div>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="USD Storage Permission API - Home"/>
+    <script>document.write(`<img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark" alt="USD Storage Permission API - Home"/>`);</script>
+  
+  
+    <p class="title logo__title">USD Storage Permission API</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+ <script>
+ document.write(`
+   <button class="btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<script>
+document.write(`
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"></i>
+  </button>
+`);
+</script></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+ <script>
+ document.write(`
+   <button class="btn search-button-field search-button__button" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <span class="search-button__default-text">Search</span>
+    <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+   </button>
+ `);
+ </script>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <div class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="USD Storage Permission API - Home"/>
+    <script>document.write(`<img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark" alt="USD Storage Permission API - Home"/>`);</script>
+  
+  
+    <p class="title logo__title">USD Storage Permission API</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<script>
+document.write(`
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button" title="light/dark" aria-label="light/dark" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="theme-switch fa-solid fa-sun fa-lg" data-mode="light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg" data-mode="dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"></i>
+  </button>
+`);
+</script></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="authorization-for-a-user-principal.html">Authorization for a user principal</a></li>
+<li class="toctree-l1"><a class="reference internal" href="authorization-for-a-service-principal.html">Authorization for a service principal</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">REST API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="grpc.html">gRPC Specification</a></li>
+<li class="toctree-l1"><a class="reference internal" href="database-configuration.html">Database Configuration</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+  
+  <div id="rtd-footer-container"></div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page">REST API</li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="rest-api">
+<h1>REST API<a class="headerlink" href="#rest-api" title="Link to this heading">#</a></h1>
+<p>The Permission Service provides two endpoints for applications and services:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1beta/authorization/</span></code> – checks if the specified principal has access to perform an action on the specified resource;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1beta/authorization/batch/</span></code> – checks if the principal has access to perform a list of specified actions;</p></li>
+</ul>
+<p>The key words “MUST”, “MUST NOT”, “REQUIRED”, “SHALL”, “SHALL NOT”, “SHOULD”, “SHOULD NOT”, “RECOMMENDED”,  “MAY”, and “OPTIONAL” in this section are to be interpreted as described in <a class="reference external" href="https://datatracker.ietf.org/doc/html/rfc2119">RFC 2119</a>.</p>
+<section id="post-v1beta-authorization">
+<h2>POST /v1beta/authorization/<a class="headerlink" href="#post-v1beta-authorization" title="Link to this heading">#</a></h2>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">POST /v1beta/authorization/ HTTP/1.1</span>
+<span class="go">Authorization: Bearer &lt;accessToken&gt;</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">   &quot;principal&quot;: &lt;a valid JSON object with &quot;sub&quot; field&gt;,</span>
+<span class="go">   &quot;action&quot;: &lt;a valid JSON object with &quot;name&quot; and &quot;service&quot; fields&gt;,</span>
+<span class="go">   &quot;resource&quot;: &lt;a valid JSON object with &quot;id&quot;, &quot;type&quot; and &quot;data&quot; fields&gt;,</span>
+<span class="go">   &quot;context&quot;: &lt;any valid JSON object&gt;</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p>This API checks if the specified principal has access to perform the action on the specified resource.</p>
+<p>The access token passed in the Authorization header MUST be a valid token received from the Identity Provider (either a user or service ID token).
+Customers MAY use different authentication like Basic Auth, API Keys or SAML2, and change how authentication information is passed to the Permission API and other services.</p>
+<p>The underlying authorization system MAY support passing a payload in the <code class="docutils literal notranslate"><span class="pre">principal</span></code> field for a user different from the caller
+(e.g. the system administrator checking if a user has permissions to perform some operation).
+If this is not supported, the permission service MUST return an 403 error indicating that the caller is unauthorized to check permissions for the specified principal (see below).</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">action</span></code> field is a JSON object that must contain two fields – <code class="docutils literal notranslate"><span class="pre">&quot;name&quot;</span></code> to specify the action name and <code class="docutils literal notranslate"><span class="pre">&quot;service&quot;</span></code> to specify the service name where the action will be performed.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">resource</span></code> field is a JSON object that must contain three fields called <code class="docutils literal notranslate"><span class="pre">&quot;id&quot;</span></code> to specify the unique resource identifier,
+<code class="docutils literal notranslate"><span class="pre">&quot;type&quot;</span></code> to specify the type of resource used for authorization (used by the Permission Service internally) and <code class="docutils literal notranslate"><span class="pre">&quot;data&quot;</span></code> to provide resource information that can be used to evaluate principal permissions.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">context</span></code> field is optional and MAY be omitted.
+The reference implementation won’t utilize this field but customers MAY update services to send additional request information that can be required for authorization evaluation.</p>
+<p>The request example:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">POST /v1beta/authorization/ HTTP/1.1</span>
+<span class="go">Authorization: Bearer eyJraWQiOiJvYXV0aC1zaWduL[...]cc5IgUXhY66ML-CZVlRw</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">   &quot;principal&quot;: {&quot;sub&quot;: &quot;DdxA9xDiqdUbv&quot;, &quot;email&quot;: &quot;user@test.com&quot;, &quot;exp&quot;: 1727821346329},</span>
+<span class="go">   &quot;action&quot;: {</span>
+<span class="go">      &quot;name&quot;: &quot;read&quot;,</span>
+<span class="go">      &quot;service&quot;: &quot;storage&quot;</span>
+<span class="go">   },</span>
+<span class="go">   &quot;resource&quot;: {</span>
+<span class="go">      &quot;id&quot;: &quot;/Projects/Scene.usd&quot;,</span>
+<span class="go">      &quot;type&quot;: &quot;File&quot;,</span>
+<span class="go">      &quot;data&quot;: {</span>
+<span class="go">         &quot;resourceIdentity&quot;: &quot;/Projects/Scene.usd&quot;,</span>
+<span class="go">         &quot;metadata&quot;: {</span>
+<span class="go">            &quot;size&quot;: 1024,</span>
+<span class="go">         }</span>
+<span class="go">      }</span>
+<span class="go">   },</span>
+<span class="go">   &quot;context&quot;: {</span>
+<span class="go">      &quot;ip&quot;: &quot;127.0.0.1&quot;,</span>
+<span class="go">      &quot;location&quot;: {&quot;lat&quot;: 54.32, &quot;lon&quot;: 33.44}</span>
+<span class="go">   }</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">principal</span></code> field MAY be omitted if its content is the same as the payload of the token specified in the Authorization header:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">GET /v1beta/authorization/ HTTP/1.1</span>
+<span class="go">Authorization: Bearer eyJraWQiOiJvYXV0aC1zaWduL[...]cc5IgUXhY66ML-CZVlRw</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">   &quot;action&quot;: {</span>
+<span class="go">      &quot;name&quot;: &quot;download&quot;,</span>
+<span class="go">      &quot;service&quot;: &quot;storage&quot;</span>
+<span class="go">   },</span>
+<span class="go">   &quot;resource&quot;: {</span>
+<span class="go">      &quot;id&quot;: &quot;/Projects/Scene.usd&quot;,</span>
+<span class="go">      &quot;type&quot;: &quot;File&quot;,</span>
+<span class="go">      &quot;data&quot;: {</span>
+<span class="go">         &quot;resourceIdentity&quot;: &quot;/Projects/Scene.usd&quot;,</span>
+<span class="go">         &quot;metadata&quot;: {</span>
+<span class="go">            &quot;size&quot;: 1024,</span>
+<span class="go">            &quot;timestamp&quot;: 1726640120432</span>
+<span class="go">         }</span>
+<span class="go">      }</span>
+<span class="go">   }</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p>The success response returns 200 HTTP status with the following body:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP/1.1 200 OK</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">   &quot;decision&quot;: &quot;allow&quot;</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p>If the specified action is unauthorized for the principal, returns an HTTP 200 response with the following body:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP/1.1 200 OK</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">   &quot;decision&quot;: &quot;deny&quot;</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<section id="error-conditions">
+<h3>Error conditions<a class="headerlink" href="#error-conditions" title="Link to this heading">#</a></h3>
+<p>The following error conditions are defined:</p>
+<p>Missing, invalid, or expired bearer or principal token</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP/1.1 401 Unauthorized</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">    &quot;detail&quot;: &quot;The principal token is expired.&quot;</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p>The request body is invalid (missing required fields or fields represented in a wrong format)</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP/1.1 422 Unprocessable Content</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">    &quot;detail&quot;: &quot;&#39;principal&#39; field is required.&quot;</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p>The caller is unauthorized to make the permission check for the specified principal</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP/1.1 403 Forbidden</span>
+<span class="go">Content-Type: application/json</span>
+</pre></div>
+</div>
+<p>The request body is larger than the maximum value specified for the service</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP/1.1 413 Payload Too Large</span>
+<span class="go">Content-Type: application/json</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="post-v1beta-authorization-batch">
+<h2>POST /v1beta/authorization/batch/<a class="headerlink" href="#post-v1beta-authorization-batch" title="Link to this heading">#</a></h2>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">POST /v1beta/authorization/batch/ HTTP/1.1</span>
+<span class="go">Authorization: Bearer &lt;idToken&gt;</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">  &quot;condition&quot;: “none|and|or”</span>
+<span class="go">  &quot;batches&quot;: [</span>
+<span class="go">     {</span>
+<span class="go">        &quot;principal&quot;: &lt;any valid JSON object&gt;,</span>
+<span class="go">        &quot;actions&quot;: [&lt;a valid JSON object with &quot;name&quot; and &quot;service&quot; fields&gt;, ..., &lt;a valid JSON object with &quot;name&quot; and &quot;service&quot; fields&gt;],</span>
+<span class="go">        &quot;resource&quot;: &lt;a valid JSON object with &quot;id&quot;, &quot;type&quot; and &quot;data&quot; fields&gt;,</span>
+<span class="go">        &quot;context&quot;: &lt;any valid JSON object&gt;</span>
+<span class="go">     },</span>
+<span class="go">     ...</span>
+<span class="go">     {</span>
+<span class="go">        &quot;principal&quot;: &lt;any valid JSON object&gt;,</span>
+<span class="go">        &quot;actions&quot;: [&lt;a valid JSON object with &quot;name&quot; and &quot;service&quot; fields&gt;, ..., &lt;a valid JSON object with &quot;name&quot; and &quot;service&quot; fields&gt;],</span>
+<span class="go">        &quot;resource&quot;: &lt;a valid JSON object with &quot;id&quot;, &quot;type&quot; and &quot;data&quot; fields&gt;,</span>
+<span class="go">        &quot;context&quot;: &lt;any valid JSON object&gt;</span>
+<span class="go">     }</span>
+<span class="go">  ]</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p>This API is a batched variant of <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1beta/authorization/</span></code> API and allows checking multiple principals, actions and resources in one single request.
+Instead of passing the same resource multiple times, the client SHOULD specify all actions that need to be checked for a resource in one PARC object.</p>
+<p>Accepts a list of PARC objects and returns 200 HTTP status with the request summary and the decisions map.
+Each decision can contain an optional reason field with the message describing the explicit deny reason.</p>
+<p>The access token passed in the Authorization header MUST be a valid token received from the Identity Provider (either a user or service ID token).
+Customers MAY use different authentication like Basic Auth, API Keys or SAML2, and change how authentication information is passed to the Permission API and other services.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">condition</span></code> field allows clients specifying how batches need to be analyzed and how the summary field needs to be calculated by the service:</p>
+<ul class="simple">
+<li><p>“none” – Evaluates all requests in batches independently, same way as if the client would send separate authorization requests. The summary field MUST be omitted from the response.</p></li>
+<li><p>“and” – Checks if all specified actions in batches are allowed and stops the request evaluation after the first “deny” decision. All skipped actions will have the decision field specified to “skip”.</p></li>
+<li><p>“or” – Checks if any of the specified actions in batches are allowed and stops the request evaluation after the first “allow” decision. All skipped actions will have the decision field specified to “skip”.</p></li>
+</ul>
+<p>If <code class="docutils literal notranslate"><span class="pre">condition</span></code> is not specified, then “none” condition is used by default and the summary field is not used.</p>
+<p>Example:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP/1.1 200 OK</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">   &quot;summary&quot;: {“decision”: &quot;deny&quot;},</span>
+<span class="go">   &quot;decisions&quot;: [</span>
+<span class="go">      {</span>
+<span class="go">         &quot;&lt;service&gt;:&lt;action&gt;&quot;: {&quot;decision&quot;: &quot;allow&quot;}, </span>
+<span class="go">         ..., </span>
+<span class="go">         &quot;&lt;service&gt;:&lt;action&gt;&quot;: {&quot;decision&quot;: &quot;deny&quot;, &quot;reason&quot;: &quot;Invalid request.&quot;}</span>
+<span class="go">      },</span>
+<span class="go">      ...,</span>
+<span class="go">      {</span>
+<span class="go">         &quot;&lt;service&gt;:&lt;action&gt;&quot;: {&quot;decision&quot;: &quot;allow&quot;}, </span>
+<span class="go">         ..., </span>
+<span class="go">         &quot;&lt;service&gt;:&lt;action&gt;&quot;: {&quot;decision&quot;: &quot;deny&quot;}</span>
+<span class="go">      },</span>
+<span class="go">   ]</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p>The underlying authorization system MAY support passing a payload in the principal field for a user different from the caller
+(e.g. the system administrator checking if a user has permissions to perform some operation).
+If this is not supported, the permission service MUST return an 403 error indicating that the caller is unauthorized to check permissions for the specified principal (see below).</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">principal</span></code> field in each batch MAY be omitted if its content is the same as the payload of the token specified in the Authorization header.</p>
+<section id="examples">
+<h3>Examples<a class="headerlink" href="#examples" title="Link to this heading">#</a></h3>
+<p>Check that the specified user has access to multiple actions for a resource</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">POST /v1/authorization/batch HTTP/1.1</span>
+<span class="go">Authorization: Bearer &quot;eyJraWQiOiJvYXV0aC1zaWduL[...]cc5IgUXhY66ML-CZVlRw&quot;</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">  &quot;batches&quot;: [</span>
+<span class="go">    {</span>
+<span class="go">      &quot;principal&quot;: {&quot;sub&quot;: &quot;DdxA9xDiqdUbv&quot;, &quot;email&quot;: &quot;user@test.com&quot;, &quot;exp&quot;: 1727821346329},</span>
+<span class="go">      &quot;actions&quot;: [</span>
+<span class="go">         {&quot;name&quot;: &quot;read&quot;, &quot;service&quot;: &quot;storage&quot;},</span>
+<span class="go">         {&quot;name&quot;: &quot;write&quot;, &quot;service&quot;: &quot;storage&quot;},</span>
+<span class="go">         {&quot;name&quot;: &quot;set&quot;, &quot;service&quot;: &quot;tags&quot;},</span>
+<span class="go">         {&quot;name&quot;: &quot;get&quot;, &quot;service&quot;: &quot;tags&quot;}</span>
+<span class="go">      ],</span>
+<span class="go">      &quot;resource&quot;: {</span>
+<span class="go">         &quot;id&quot;: &quot;/Projects/Scene.usd&quot;,</span>
+<span class="go">         &quot;type&quot;: &quot;File&quot;,</span>
+<span class="go">         &quot;data&quot;: {</span>
+<span class="go">            &quot;resourceIdentity&quot;: &quot;/Projects/Scene.usd&quot;,</span>
+<span class="go">            &quot;metadata&quot;: {</span>
+<span class="go">                &quot;size&quot;: 1024,</span>
+<span class="go">                &quot;timestamp&quot;: 1726640120432</span>
+<span class="go">            }</span>
+<span class="go">        }</span>
+<span class="go">      }</span>
+<span class="go">    }</span>
+<span class="go">  ]</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p>Response:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP/1.1 200 OK</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">  &quot;decisions&quot;: [</span>
+<span class="go">    {</span>
+<span class="go">      &quot;storage:read&quot;: {&quot;decision: &quot;allow&quot;},</span>
+<span class="go">      &quot;storage:write&quot;: {&quot;decision: &quot;deny&quot;}, </span>
+<span class="go">      &quot;tags:set&quot;: {&quot;decision: &quot;deny&quot;, &quot;reason&quot;: &quot;Invalid action.&quot;}, </span>
+<span class="go">      &quot;tags:get&quot;: {&quot;decision: &quot;allow&quot;} </span>
+<span class="go">    }</span>
+<span class="go">  ]</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p>Check that the current user has storage:read access to any of the specified resources</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">POST /v1/authorization/batch HTTP/1.1</span>
+<span class="go">Authorization: Bearer &quot;eyJraWQiOiJvYXV0aC1zaWduL[...]cc5IgUXhY66ML-CZVlRw&quot;</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">  &quot;condition&quot;: &quot;or&quot;,</span>
+<span class="go">  &quot;batches&quot;: [</span>
+<span class="go">    {</span>
+<span class="go">      &quot;actions&quot;: [{&quot;name&quot;: &quot;read&quot;, &quot;service&quot;: &quot;storage&quot;}],</span>
+<span class="go">      &quot;resource&quot;: {</span>
+<span class="go">        &quot;id&quot;: &quot;/Projects/Astronaut/Astronaut.usd&quot;,</span>
+<span class="go">        &quot;type&quot;: &quot;File&quot;,</span>
+<span class="go">        &quot;data&quot;: {</span>
+<span class="go">          &quot;resourceIdentity&quot;: &quot;/Projects/Astronaut/Astronaut.usd&quot;,</span>
+<span class="go">          &quot;metadata&quot;: {</span>
+<span class="go">            &quot;size&quot;: 28563210,</span>
+<span class="go">            &quot;timestamp&quot;: 1726640120432</span>
+<span class="go">           }</span>
+<span class="go">         }</span>
+<span class="go">       }</span>
+<span class="go">     },</span>
+<span class="go">     {</span>
+<span class="go">       &quot;actions&quot;: [{&quot;name&quot;: &quot;read&quot;, &quot;service&quot;: &quot;storage&quot;}],</span>
+<span class="go">       &quot;resource&quot;: {</span>
+<span class="go">         &quot;id&quot;: &quot;/Projects/Marbles/Marbles_Assets.usd&quot;,</span>
+<span class="go">         &quot;type&quot;: &quot;File&quot;,</span>
+<span class="go">         &quot;data&quot;: {</span>
+<span class="go">           &quot;resourceIdentity&quot;: &quot;/Projects/Marbles/Marbles_Assets.usd&quot;,</span>
+<span class="go">           &quot;metadata&quot;: {</span>
+<span class="go">             &quot;size&quot;: 47104,</span>
+<span class="go">             &quot;timestamp&quot;: 1726640120432</span>
+<span class="go">           }</span>
+<span class="go">         }</span>
+<span class="go">       }</span>
+<span class="go">     }</span>
+<span class="go">   ]</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p>Response:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP/1.1 200 OK</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">   &quot;summary&quot;: {“decision”: &quot;allow&quot;},</span>
+<span class="go">   &quot;decisions&quot;: [</span>
+<span class="go">      {“storage:read&quot;: {&quot;decision: &quot;allow&quot;}},</span>
+<span class="go">      {&quot;storage:read&quot;: {&quot;decision: &quot;skip&quot;}}</span>
+<span class="go">   ]</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p>Check that the current user has access to all specified actions for a resource</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">POST /v1/authorization/batch HTTP/1.1</span>
+<span class="go">Authorization: Bearer &quot;eyJraWQiOiJvYXV0aC1zaWduL[...]cc5IgUXhY66ML-CZVlRw&quot;</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">  &quot;condition&quot;: &quot;and&quot;,</span>
+<span class="go">  &quot;batches&quot;: [</span>
+<span class="go">    {</span>
+<span class="go">      &quot;actions&quot;: [</span>
+<span class="go">         {&quot;name&quot;: &quot;read&quot;, &quot;service&quot;: &quot;storage&quot;},</span>
+<span class="go">         {&quot;name&quot;: &quot;write&quot;, &quot;service&quot;: &quot;storage&quot;},</span>
+<span class="go">         {&quot;name&quot;: &quot;set&quot;, &quot;service&quot;: &quot;tags&quot;},</span>
+<span class="go">         {&quot;name&quot;: &quot;get&quot;, &quot;service&quot;: &quot;tags&quot;}</span>
+<span class="go">      ],</span>
+<span class="go">      &quot;resource&quot;: {</span>
+<span class="go">         &quot;id&quot;: &quot;/Projects/Scene.usd&quot;,</span>
+<span class="go">         &quot;type&quot;: &quot;File&quot;,</span>
+<span class="go">         &quot;data&quot;: {</span>
+<span class="go">            &quot;resourceIdentity&quot;: &quot;/Projects/Scene.usd&quot;,</span>
+<span class="go">            &quot;metadata&quot;: {</span>
+<span class="go">                &quot;size&quot;: 1024,</span>
+<span class="go">                &quot;timestamp&quot;: 1726640120432</span>
+<span class="go">            }</span>
+<span class="go">        }</span>
+<span class="go">      }</span>
+<span class="go">    }</span>
+<span class="go">  ]</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p>Response:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP/1.1 200 OK</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">  &quot;summary&quot;: {&quot;decision&quot;: “deny”}</span>
+<span class="go">  &quot;decisions&quot;: [</span>
+<span class="go">    {</span>
+<span class="go">      &quot;storage:read&quot;: {&quot;decision: &quot;allow&quot;},</span>
+<span class="go">      &quot;storage:write&quot;: {&quot;decision: &quot;deny&quot;}, </span>
+<span class="go">      &quot;tags:set&quot;: {&quot;decision: &quot;skip&quot;}, </span>
+<span class="go">      &quot;tags:get&quot;: {&quot;decision: &quot;skip&quot;} </span>
+<span class="go">    }</span>
+<span class="go">  ]</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+</section>
+<section id="id1">
+<h3>Error conditions<a class="headerlink" href="#id1" title="Link to this heading">#</a></h3>
+<p>The following error conditions are defined:</p>
+<p><strong>Missing, invalid, or expired bearer or principal token</strong></p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP/1.1 401 Unauthorized</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">   &quot;detail&quot;: &quot;The principal token is expired.&quot;</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p><strong>The request body is invalid (missing required fields or fields represented in a wrong format)</strong></p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP/1.1 422 Unprocessable Content</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">    &quot;detail&quot;: &quot;&#39;principal&#39; field is required.&quot;</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p><strong>The caller is unauthorized to make the permission check for the specified principal</strong></p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP/1.1 403 Forbidden</span>
+<span class="go">Content-Type: application/json</span>
+</pre></div>
+</div>
+<p><strong>The request body is larger than the maximum value specified for the service</strong></p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP/1.1 413 Payload Too Large</span>
+<span class="go">Content-Type: application/json</span>
+
+<span class="go">{</span>
+<span class="go">   &quot;detail&quot;: &quot;Maximum allowed size is 4MB&quot;</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+<p><strong>The resource quota has been exhausted - the client sent too many requests and must slow down</strong>
+The service MAY send the Retry-After header to indicate that requests will be allowed for this client again in the specified amount of seconds.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">HTTP/1.1 429 Too Many Requests</span>
+<span class="go">Content-Type: application/json</span>
+<span class="go">Retry-After: 3600</span>
+
+<span class="go">{</span>
+<span class="go">    &quot;detail&quot;: &quot;Too many requests have been set. Try again later.&quot;</span>
+<span class="go">}</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="see-next">
+<h2>See next<a class="headerlink" href="#see-next" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="grpc.html"><span class="std std-doc">gRPC specification</span></a></p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="authorization-for-a-service-principal.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Authorization for a service principal</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="grpc.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">gRPC Specification</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <div class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#post-v1beta-authorization">POST /v1beta/authorization/</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#error-conditions">Error conditions</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#post-v1beta-authorization-batch">POST /v1beta/authorization/batch/</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#examples">Examples</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Error conditions</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#see-next">See next</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script src="_static/scripts/bootstrap.js?digest=dfe6caa3a7d634c4db9b"></script>
+<script src="_static/scripts/pydata-sphinx-theme.js?digest=dfe6caa3a7d634c4db9b"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2024-2026, NVIDIA Corporation.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item"><p class="last-updated">
+  Last updated on Mar 03, 2026.
+  <br/>
+</p></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

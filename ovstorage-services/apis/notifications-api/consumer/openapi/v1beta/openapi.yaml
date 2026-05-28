@@ -1,0 +1,1059 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION &
+# AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+
+openapi: 3.1.0
+info:
+  title: Event Consumer API
+  description: "\n    REST API for streaming events from the notification service.\n\
+    \    Use this API to stream events in real-time using Server-Sent Events (SSE)\n\
+    \    "
+  version: 1.0.0-beta-1
+paths:
+  /api/v1beta/events/stream:
+    get:
+      summary: Stream Events
+      description: 'Starts a streaming session to receive events using a non-durable
+        queue. This means that only events that occur while connected will be consumed.
+
+
+        **Note on Authorization During Streaming:**
+
+        Authorization errors (401 or 403) can occur at any time during the streaming
+        session, not just at the initial connection. For example, if an authentication
+        token expires while the stream is active, the server will terminate the connection
+        with an authorization error. Clients must handle this by reconnecting to the
+        same queue with refreshed credentials. For non-durable queues, use the reconnect_token
+        or Last-Event-ID to reconnect to the same queue. For durable queues, simply
+        reconnect using the same queue_id.'
+      operationId: stream_events_api_v1beta_events_stream_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: reconnect_token
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            maxLength: 1024
+          - type: 'null'
+          description: 'Token for reconnecting to the same queue after disconnect.
+            This is sent by the client when it is doing a manual reconnection, e.g.
+            after a 401 error.
+
+
+            Also can be used to consume from the same queue in parallel by multiple
+            simultaneous clients
+
+
+            NOTE: the queues have a TTL that is configurable and has a 20 second default.'
+          title: Reconnect Token
+        description: 'Token for reconnecting to the same queue after disconnect. This
+          is sent by the client when it is doing a manual reconnection, e.g. after
+          a 401 error.
+
+
+          Also can be used to consume from the same queue in parallel by multiple
+          simultaneous clients
+
+
+          NOTE: the queues have a TTL that is configurable and has a 20 second default.'
+      - name: filter_groups
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            maxLength: 65536
+          - type: 'null'
+          description: "URL-encoded JSON string containing an array of FilterGroup\
+            \ objects.\nEach FilterGroup defines filters to apply to events based\
+            \ on the event type and optionally the resource id of the messages.\n\
+            If omitted, all events will be received.\n\nIf using a reconnect_token\
+            \ to reconnect, then this field should be omitted unless\ntrying to change\
+            \ the filters from previous values.\n\n**NOTE**: If you are using this\
+            \ request to change which\n      filters are being used, you must also\
+            \ include the previous filter groups in\n      the \"previous_filter_groups\"\
+            \ field.\n\n**Example 1: Basic filter with a single resource filter**\n\
+            ```json\n[\n  {\n    \"event_type\": \"my.event.type\",\n    \"filters\"\
+            : [\n      {\n        \"filter_type\": \"starts_with_greedy\",\n     \
+            \   \"resource_id\": \"folder/\"\n      }\n    ]\n  }\n]\n```\n\n**Example\
+            \ 2: Filter with multiple resource filters (OR logic)**\n```json\n[\n\
+            \  {\n    \"event_type\": \"my.event.type\",\n    \"filters\": [\n   \
+            \   {\n        \"filter_type\": \"starts_with_lazy\",\n        \"resource_id\"\
+            : \"folder1/\"\n      },\n      {\n        \"filter_type\": \"eq\",\n\
+            \        \"resource_id\": \"specific/path\"\n      }\n    ]\n  }\n]\n\
+            ```\n\n**Example 3: Multiple event types with different filters**\n```json\n\
+            [\n  {\n    \"event_type\": \"storage.created\",\n    \"filters\": [\n\
+            \      {\n        \"filter_type\": \"starts_with_greedy\",\n        \"\
+            resource_id\": \"uploads/\"\n      }\n    ]\n  },\n  {\n    \"event_type\"\
+            : \"storage.deleted\",\n    \"filters\": [\n      {\n        \"filter_type\"\
+            : \"starts_with_lazy\",\n        \"resource_id\": \"temp/\"\n      }\n\
+            \    ]\n  }\n]\n```\n\nSee the **FilterGroup**, **ResourceFilter**, and\
+            \ **FilterType** schemas in the Components section below for the complete\
+            \ structure and field descriptions."
+          title: Filter Groups
+        description: "URL-encoded JSON string containing an array of FilterGroup objects.\n\
+          Each FilterGroup defines filters to apply to events based on the event type\
+          \ and optionally the resource id of the messages.\nIf omitted, all events\
+          \ will be received.\n\nIf using a reconnect_token to reconnect, then this\
+          \ field should be omitted unless\ntrying to change the filters from previous\
+          \ values.\n\n**NOTE**: If you are using this request to change which\n \
+          \     filters are being used, you must also include the previous filter\
+          \ groups in\n      the \"previous_filter_groups\" field.\n\n**Example 1:\
+          \ Basic filter with a single resource filter**\n```json\n[\n  {\n    \"\
+          event_type\": \"my.event.type\",\n    \"filters\": [\n      {\n        \"\
+          filter_type\": \"starts_with_greedy\",\n        \"resource_id\": \"folder/\"\
+          \n      }\n    ]\n  }\n]\n```\n\n**Example 2: Filter with multiple resource\
+          \ filters (OR logic)**\n```json\n[\n  {\n    \"event_type\": \"my.event.type\"\
+          ,\n    \"filters\": [\n      {\n        \"filter_type\": \"starts_with_lazy\"\
+          ,\n        \"resource_id\": \"folder1/\"\n      },\n      {\n        \"\
+          filter_type\": \"eq\",\n        \"resource_id\": \"specific/path\"\n   \
+          \   }\n    ]\n  }\n]\n```\n\n**Example 3: Multiple event types with different\
+          \ filters**\n```json\n[\n  {\n    \"event_type\": \"storage.created\",\n\
+          \    \"filters\": [\n      {\n        \"filter_type\": \"starts_with_greedy\"\
+          ,\n        \"resource_id\": \"uploads/\"\n      }\n    ]\n  },\n  {\n  \
+          \  \"event_type\": \"storage.deleted\",\n    \"filters\": [\n      {\n \
+          \       \"filter_type\": \"starts_with_lazy\",\n        \"resource_id\"\
+          : \"temp/\"\n      }\n    ]\n  }\n]\n```\n\nSee the **FilterGroup**, **ResourceFilter**,\
+          \ and **FilterType** schemas in the Components section below for the complete\
+          \ structure and field descriptions."
+      - name: previous_filter_groups
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            maxLength: 65536
+          - type: 'null'
+          description: 'Optional. Similar to filter_groups, a URL-encoded JSON string
+            containing an array of FilterGroup objects.
+
+
+            If this request is being used to update which filters are being used,
+
+            in addition to specifying the new filter groups with the
+
+            "filter_groups" field, this field must be included and should contain
+
+            the previous filter groups.
+
+
+            See the **FilterGroup**, **ResourceFilter**, and **FilterType** schemas
+            in the Components section below for the complete structure and field descriptions.'
+          title: Previous Filter Groups
+        description: 'Optional. Similar to filter_groups, a URL-encoded JSON string
+          containing an array of FilterGroup objects.
+
+
+          If this request is being used to update which filters are being used,
+
+          in addition to specifying the new filter groups with the
+
+          "filter_groups" field, this field must be included and should contain
+
+          the previous filter groups.
+
+
+          See the **FilterGroup**, **ResourceFilter**, and **FilterType** schemas
+          in the Components section below for the complete structure and field descriptions.'
+      responses:
+        '200':
+          description: Server-Sent Events stream
+          content:
+            text/event-stream:
+              schema:
+                properties:
+                  event:
+                    default: event
+                    maxLength: 256
+                    title: Event
+                    type: string
+                  data:
+                    description: Model representing a full event payload.
+                    properties:
+                      event_type:
+                        description: Type of event - defined by the publisher
+                        maxLength: 1024
+                        title: Event Type
+                        type: string
+                      principal_identity:
+                        default: ''
+                        description: Principal who published event
+                        maxLength: 1024
+                        title: Principal Identity
+                        type: string
+                      occurred_at:
+                        description: Time at which event was generated
+                        format: date-time
+                        maxLength: 64
+                        title: Occurred At
+                        type: string
+                      published_at:
+                        description: Time at which event was published
+                        format: date-time
+                        maxLength: 64
+                        title: Published At
+                        type: string
+                      message:
+                        additionalProperties: true
+                        description: Body of event
+                        title: Message
+                        type: object
+                    required:
+                    - event_type
+                    - occurred_at
+                    - published_at
+                    - message
+                    title: EventData
+                    type: object
+                required:
+                - data
+                title: ConsumeEvent
+                type: object
+        '400':
+          description: Invalid filter_groups parameter
+        '401':
+          description: Unauthorized - The request requires valid authentication credentials.
+            This typically indicates a missing, invalid, or expired authentication
+            token.
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '403':
+          description: Forbidden - The authenticated user does not have permission
+            to access this resource or perform this operation.
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '429':
+          description: Too Many Requests - Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '503':
+          description: Service Unavailable - The server's channel pool is exhausted.
+            This is a temporary condition. Clients should retry the request with exponential
+            backoff until the error no longer occurs.
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1beta/events/stream-durable:
+    get:
+      summary: Stream Durable Events
+      description: 'Starts a streaming session to receive events using a durable queue.
+        This means any events that occurred since the queue was created with a call
+        to the CreateDurableQueue endpoint will be received, even if the events occur
+        while the client is disconnected.
+
+
+        **Note on Authorization During Streaming:**
+
+        Authorization errors (401 or 403) can occur at any time during the streaming
+        session, not just at the initial connection. For example, if an authentication
+        token expires while the stream is active, the server will terminate the connection
+        with an authorization error. Clients must handle this by reconnecting to the
+        same queue with refreshed credentials. For non-durable queues, use the reconnect_token
+        or Last-Event-ID to reconnect to the same queue. For durable queues, simply
+        reconnect using the same queue_id.'
+      operationId: stream_durable_events_api_v1beta_events_stream_durable_get
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: queue_id
+        in: query
+        required: true
+        schema:
+          type: string
+          maxLength: 256
+          description: The queue_id which was created with a call to CreateDurableQueue,
+            and identifies the queue used for consuming durable events.
+          title: Queue Id
+        description: The queue_id which was created with a call to CreateDurableQueue,
+          and identifies the queue used for consuming durable events.
+      responses:
+        '200':
+          description: Server-Sent Events stream
+          content:
+            text/event-stream:
+              schema:
+                properties:
+                  event:
+                    default: event
+                    maxLength: 256
+                    title: Event
+                    type: string
+                  data:
+                    description: Model representing a full event payload.
+                    properties:
+                      event_type:
+                        description: Type of event - defined by the publisher
+                        maxLength: 1024
+                        title: Event Type
+                        type: string
+                      principal_identity:
+                        default: ''
+                        description: Principal who published event
+                        maxLength: 1024
+                        title: Principal Identity
+                        type: string
+                      occurred_at:
+                        description: Time at which event was generated
+                        format: date-time
+                        maxLength: 64
+                        title: Occurred At
+                        type: string
+                      published_at:
+                        description: Time at which event was published
+                        format: date-time
+                        maxLength: 64
+                        title: Published At
+                        type: string
+                      message:
+                        additionalProperties: true
+                        description: Body of event
+                        title: Message
+                        type: object
+                    required:
+                    - event_type
+                    - occurred_at
+                    - published_at
+                    - message
+                    title: EventData
+                    type: object
+                required:
+                - data
+                title: ConsumeEvent
+                type: object
+        '400':
+          description: Invalid queue_id parameter
+        '404':
+          description: Queue not found
+        '401':
+          description: Unauthorized - The request requires valid authentication credentials.
+            This typically indicates a missing, invalid, or expired authentication
+            token.
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '403':
+          description: Forbidden - The authenticated user does not have permission
+            to access this resource or perform this operation.
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '429':
+          description: Too Many Requests - Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '503':
+          description: Service Unavailable - The server's channel pool is exhausted.
+            This is a temporary condition. Clients should retry the request with exponential
+            backoff until the error no longer occurs.
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1beta/queues/durable:
+    post:
+      summary: Create Durable Queue
+      description: Creates a durable queue which will immediately begin receiving
+        and queuing up messages for later consumption. The durable queue will exist
+        until it is explicitly deleted with a call to the DeleteDurableQueue endpoint.
+        A config object will be returned that includes an ID that must be reused as
+        an argument in all future ConsumeDurableEvents calls.
+      operationId: create_durable_queue_api_v1beta_queues_durable_post
+      security:
+      - HTTPBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDurableQueueRequest'
+      responses:
+        '200':
+          description: Queue created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateDurableQueueResponse'
+        '400':
+          description: Invalid request
+        '401':
+          description: Unauthorized - The request requires valid authentication credentials.
+            This typically indicates a missing, invalid, or expired authentication
+            token.
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '403':
+          description: Forbidden - The authenticated user does not have permission
+            to access this resource or perform this operation.
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '429':
+          description: Too Many Requests - Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '503':
+          description: Service Unavailable - The server's channel pool is exhausted.
+            This is a temporary condition. Clients should retry the request with exponential
+            backoff until the error no longer occurs.
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      summary: Delete Durable Queue
+      description: Deletes a durable consumer queue. This is called if a durable consumer
+        queue was created and used, and it is no longer required. This typically only
+        happens if the consumer client is being taken down permanently.
+      operationId: delete_durable_queue_api_v1beta_queues_durable_delete
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: queue_id
+        in: query
+        required: true
+        schema:
+          type: string
+          maxLength: 256
+          description: The queue_id identifies the durable queue to delete. It was
+            created with a call to the CreateDurableQueue endpoint.
+          title: Queue Id
+        description: The queue_id identifies the durable queue to delete. It was created
+          with a call to the CreateDurableQueue endpoint.
+      responses:
+        '200':
+          description: Queue deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteDurableQueueResponse'
+        '400':
+          description: Invalid request
+        '404':
+          description: Queue not found
+        '401':
+          description: Unauthorized - The request requires valid authentication credentials.
+            This typically indicates a missing, invalid, or expired authentication
+            token.
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '403':
+          description: Forbidden - The authenticated user does not have permission
+            to access this resource or perform this operation.
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '429':
+          description: Too Many Requests - Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '503':
+          description: Service Unavailable - The server's channel pool is exhausted.
+            This is a temporary condition. Clients should retry the request with exponential
+            backoff until the error no longer occurs.
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    patch:
+      summary: Update Durable Queue
+      description: Updates the filtering on an existing durable queue that was created
+        using CreateDurableQueue. The filters will be updated without losing messages.
+        This may be preferable to deleting and re-creating the durable queue, which
+        may result in lost messages.
+      operationId: update_durable_queue_api_v1beta_queues_durable_patch
+      security:
+      - HTTPBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDurableQueueRequest'
+      responses:
+        '200':
+          description: Queue updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateDurableQueueResponse'
+        '400':
+          description: Invalid request
+        '404':
+          description: Queue not found
+        '401':
+          description: Unauthorized - The request requires valid authentication credentials.
+            This typically indicates a missing, invalid, or expired authentication
+            token.
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '403':
+          description: Forbidden - The authenticated user does not have permission
+            to access this resource or perform this operation.
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '429':
+          description: Too Many Requests - Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                description: Standard error response model for API governance.
+                properties:
+                  detail:
+                    description: Error details
+                    maxLength: 1024
+                    title: Detail
+                    type: string
+                required:
+                - detail
+                title: ErrorResponse
+                type: object
+        '503':
+          description: Service Unavailable - The server's channel pool is exhausted.
+            This is a temporary condition. Clients should retry the request with exponential
+            backoff until the error no longer occurs.
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1beta/health:
+    get:
+      summary: Health Check
+      description: Health check endpoint for the API
+      operationId: health_check_api_v1beta_health_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /api/v1beta/metrics/channel-pool:
+    get:
+      summary: Channel Pool Metrics
+      description: Returns the current channel pool utilization metrics. This endpoint
+        is used by the autoscaler to make scaling decisions based on the channel pool
+        capacity.
+      operationId: channel_pool_metrics_api_v1beta_metrics_channel_pool_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChannelPoolMetricsResponse'
+components:
+  schemas:
+    ChannelPoolMetricsResponse:
+      properties:
+        utilization_percent:
+          type: integer
+          maximum: 100.0
+          minimum: 0.0
+          title: Utilization Percent
+          description: Percentage of channel pool capacity in use (0-100)
+        channels_in_use:
+          type: integer
+          maximum: 10000.0
+          minimum: 0.0
+          title: Channels In Use
+          description: Number of channels currently in use
+        channels_total:
+          type: integer
+          maximum: 10000.0
+          minimum: 0.0
+          title: Channels Total
+          description: Maximum number of channels available in the pool
+      type: object
+      required:
+      - utilization_percent
+      - channels_in_use
+      - channels_total
+      title: ChannelPoolMetricsResponse
+      description: Response model for channel pool metrics endpoint.
+      examples:
+      - channels_in_use: 75
+        channels_total: 100
+        utilization_percent: 75
+    CreateDurableQueueRequest:
+      properties:
+        filter_groups:
+          items:
+            $ref: '#/components/schemas/FilterGroup'
+          type: array
+          maxItems: 100
+          title: Filter Groups
+          description: Filter groups that define the sets of filters to apply to events
+            based on the resource id of the messages. If omitted or empty, all events
+            for an event type are added to the queue for later consumption.
+      type: object
+      title: CreateDurableQueueRequest
+      description: Request model for creating a durable queue.
+    CreateDurableQueueResponse:
+      properties:
+        queue_id:
+          type: string
+          maxLength: 256
+          title: Queue Id
+          description: The queue_id identifies the durable queue. This ID must be
+            persisted somewhere and sent on all ConsumeDurableEvents calls.
+      type: object
+      required:
+      - queue_id
+      title: CreateDurableQueueResponse
+      description: Response model for creating a durable queue.
+    DeleteDurableQueueResponse:
+      properties:
+        success:
+          type: boolean
+          title: Success
+          description: Indicates whether the queue was successfully deleted
+          default: true
+      type: object
+      title: DeleteDurableQueueResponse
+      description: Response model for deleting a durable queue.
+    FilterGroup:
+      properties:
+        event_type:
+          description: Event type for this filter. Other services that publish events
+            will define unique event types.
+          maxLength: 1024
+          minLength: 1
+          title: Event Type
+          type: string
+        filters:
+          description: 'Optional: the filters for filtering on resource id (filters
+            use OR logic). If no resource filters are supplied then messages will
+            only be filtered by event_type.'
+          items:
+            $ref: '#/components/schemas/ResourceFilter'
+          maxItems: 100
+          title: Filters
+          type: array
+      required:
+      - event_type
+      - filters
+      title: FilterGroup
+      type: object
+    FilterType:
+      type: string
+      enum:
+      - unspecified
+      - eq
+      - starts_with_lazy
+      - starts_with_greedy
+      title: FilterType
+      description: "FilterType specifies the matching strategy for the resource filter.\n\
+        \n- unspecified: The default, unspecified filter type. This will\n  default\
+        \ to eq behavior.\n- eq: Performs an exact match on the resource_id.\n- starts_with_lazy:\
+        \ Performs a \"starts with\" match (lazy).\n  For example, a filter for \"\
+        folder_1\" would match\n  \"folder_1/file.txt\" but not \"folder_10/file.txt\"\
+        .\n- starts_with_greedy: Performs a \"starts with\" match (greedy).\n  For\
+        \ example, a filter for \"folder_1\" would match\n  \"folder_1/sub/file.txt\"\
+        ."
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          maxItems: 100
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    HealthResponse:
+      properties:
+        status:
+          type: string
+          maxLength: 10
+          title: Status
+          default: healthy
+      type: object
+      title: HealthResponse
+      description: Health check response.
+    ResourceFilter:
+      description: 'Filters events based on their resource id as defined by the
+
+        publishing service.'
+      properties:
+        filter_type:
+          $ref: '#/components/schemas/FilterType'
+          description: 'Specifies the type of filter to apply. How much of the resource_id
+            needs to match the resource in the message for the filter to be successful.
+
+
+            - unspecified: The default, unspecified filter type. This will default
+            to eq behavior.
+
+            - eq: Performs an exact match on the resource_id.
+
+            - starts_with_lazy: Performs a "starts with" match (lazy). For example,
+            a filter for "folder_1" would match "folder_1/file.txt" but not "folder_10/file.txt".
+
+            - starts_with_greedy: Performs a "starts with" match (greedy). For example,
+            a filter for "folder_1" would match "folder_1/sub/file.txt".'
+        resource_id:
+          description: 'The path to filter the field by.</br></br>A resource is a
+            path like string with words separated by slashes. For example, if two
+            messages were published for the following resources:</br><b>folder_1/folder_2/folder_3/astronaut.usd</b>
+            and <b>folder_1/astronaut.usd</b>, then</br>1) A filter with a resource_id
+            of <b>folder_1</b> and <b>filter_type = starts_with_greedy</b> would match
+            both messages.</br>2) A filter with a resource_id of <b>folder_1</b> and
+            a <b>filter_type = starts_with_lazy</b> would only match the second message.</br></br>If
+            <b>resource_id = ""</b>, then there are three possibilities depending
+            on the value of filter_type:</br>1) starts_with_greedy: consume all messages
+            of the event_type with or without a resource_id, regardless of what the
+            value for resource_id in the message is; </br>2) starts_with_lazy: consume
+            any message that doesn''t have a resource_id or has a resource_id="",
+            AND any message with a resource_id like ''something'' or ''something/'',
+            but not ''something/something-else''; </br>3) eq: generates an error response.'
+          maxLength: 4096
+          title: Resource Id
+          type: string
+      required:
+      - filter_type
+      - resource_id
+      title: ResourceFilter
+      type: object
+    UpdateDurableQueueRequest:
+      properties:
+        queue_id:
+          type: string
+          maxLength: 256
+          title: Queue Id
+          description: The id of the durable queue to update
+        current_filter_groups:
+          items:
+            $ref: '#/components/schemas/FilterGroup'
+          type: array
+          maxItems: 100
+          title: Current Filter Groups
+          description: The current filters in use on the existing durable queue. These
+            will be replaced if new_filter_groups is provided.
+        new_filter_groups:
+          items:
+            $ref: '#/components/schemas/FilterGroup'
+          type: array
+          maxItems: 100
+          title: New Filter Groups
+          description: The new filters to use on the existing durable queue. They
+            will replace the existing filters.
+      type: object
+      required:
+      - queue_id
+      - current_filter_groups
+      - new_filter_groups
+      title: UpdateDurableQueueRequest
+      description: Request model for updating a durable queue's filters.
+    UpdateDurableQueueResponse:
+      properties:
+        success:
+          type: boolean
+          title: Success
+          description: Indicates whether the queue was successfully updated
+          default: true
+      type: object
+      title: UpdateDurableQueueResponse
+      description: Response model for updating a durable queue.
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+              maxLength: 256
+            - type: integer
+              format: int32
+              minimum: 0
+              maximum: 2147483647
+          type: array
+          maxItems: 100
+          title: Location
+        msg:
+          type: string
+          maxLength: 1024
+          title: Message
+        type:
+          type: string
+          maxLength: 256
+          title: Error Type
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+  securitySchemes:
+    HTTPBearer:
+      type: http
+      scheme: bearer
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Bearer token authentication using JWT. Implements security best
+        practices from RFC8725.

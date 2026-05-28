@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-http"
+version = "0.1.0"
+edition = "2024"
+description = "HTTP backend for ovstorage."
+license = "Apache-2.0"
+
+[dependencies]
+ovstorage-plugin = { version = "0.1.0", path = "../ovstorage-plugin" }
+async-trait.workspace = true
+bytes.workspace = true
+futures = { workspace = true }
+httpdate.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+ovstorage = { version = "0.1.0", path = "../ovstorage" }
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ovstorage"
+version = "0.2.0"
+requires-python = ">=3.10"
+description = "Python bindings for ovstorage"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
+[tool.maturin]
+bindings = "pyo3"
+manifest-path = "Cargo.toml"
+module-name = "ovstorage"
+# LICENSE and THIRD_PARTY_NOTICES.md are staged into this directory by
+# `xtask dist --wheel` from the repo root. Both are gitignored locally.
+include = ["ovstorage.pyi", "py.typed", "THIRD_PARTY_NOTICES.md"]

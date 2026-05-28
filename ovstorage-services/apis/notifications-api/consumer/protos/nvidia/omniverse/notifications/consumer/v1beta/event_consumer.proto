@@ -1,0 +1,300 @@
+//SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+//
+//NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+//property and proprietary rights in and to this material, related
+//documentation and any modifications thereto. Any use, reproduction,
+//disclosure or distribution of this material and related documentation
+//without an express license agreement from NVIDIA CORPORATION or
+//its affiliates is strictly prohibited.
+
+syntax = "proto3";
+
+package nvidia.omniverse.notifications.consumer.v1beta;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/nvidia/omniverse/notifications/consumer/v1beta";
+option java_multiple_files = true;
+option java_outer_classname = "EventConsumerProto";
+option java_package = "com.nvidia.omniverse.notifications.consumer.v1beta";
+
+// EventConsumerService provides APIs for consuming events from the notification system.
+// This service provides APIs for consuming events
+service EventConsumerService {
+  // ConsumeDurableEvents starts a streaming session to receive events
+  // using a durable queue.
+  //
+  // This means any events that occurred since the queue was created
+  // with a call to the CreateDurableQueue RPC will be received,
+  // even if the events occur while the client is disconnected.
+  //
+  // A RESOURCE_EXHAUSTED status code may be returned if a given k8s pod has an exhausted channel
+  // pool, and the client should automatically try to reconnect until they
+  // get a pod with available channels.
+  //
+  // At any time while streaming events, a PERMISSION_DENIED or UNAUTHENTICATED
+  // status code could be returned,
+  // for example, if a token becomes expired while streaming.
+  // The client must handle these errors and reconnect with a valid token.
+  //
+  // Clients should implement automatic reconnection on UNAVAILABLE errors because
+  // cloud load balancers (AWS NLB/ALB, Azure Load Balancer) may terminate idle
+  // connections based on their idle timeout settings (typically 60 seconds to 4 minutes).
+  // These load balancers operate at Layer 4 (TCP) and do not recognize HTTP/2 PING
+  // frames (gRPC keep-alive) as activity, so they may close idle streams even when
+  // gRPC keep-alive is configured. The exact timeout depends on the deployment
+  // environment and infrastructure configuration.
+  rpc ConsumeDurableEvents(ConsumeDurableEventsRequest) returns (stream ConsumeDurableEventsResponse) {}
+
+  // ConsumeNonDurableEvents starts a streaming session to receive events
+  // using a non-durable queue. This means that only events that occur while
+  // connected will be consumed.
+  //
+  // This is stream-stream, so that additional
+  // ConsumeNonDurableEventsRequest objects may be sent to change
+  // filtering while consuming events of a given set of types.
+  //
+  // A RESOURCE_EXHAUSTED status code may be returned if a given k8s pod has an exhausted channel
+  // pool, and the client should automatically try to reconnect until they
+  // get a pod with available channels.
+  //
+  // At any time while streaming events, a PERMISSION_DENIED or UNAUTHENTICATED
+  // status code could be returned,
+  // for example, if a token becomes expired while streaming.
+  // The client must handle these errors and reconnect using the reconnect_token
+  // returned by the initial ConsumeNonDurableEventsResponse to ensure messages
+  // are not lost.
+  //
+  // Clients should implement automatic reconnection on UNAVAILABLE errors because
+  // cloud load balancers (AWS NLB/ALB, Azure Load Balancer) may terminate idle
+  // connections based on their idle timeout settings (typically 60 seconds to 4 minutes).
+  // These load balancers operate at Layer 4 (TCP) and do not recognize HTTP/2 PING
+  // frames (gRPC keep-alive) as activity, so they may close idle streams even when
+  // gRPC keep-alive is configured. The exact timeout depends on the deployment
+  // environment and infrastructure configuration.
+  rpc ConsumeNonDurableEvents(stream ConsumeNonDurableEventsRequest) returns (stream ConsumeNonDurableEventsResponse) {}
+
+  // CreateDurableQueue is used to create a durable queue which will immediately begin
+  // receiving and queuing up messages for later consumption.
+  // The durable queue will exist until it is explicitly deleted
+  // with a call to DeleteDurableQueue.
+  //
+  // When building a service that uses the Notification APIs,
+  // this will typically be called outside of the code base
+  // of that service, and then the "queue_id" value
+  // retrieved will be used as configuration for that service.
+  //
+  // This is not required for non-durable events.
+  // E.g., when ConsumeNonDurableEvents is called, the client will only
+  // receive events that occur while the client is connected.
+  //
+  // A config object will be returned that includes an ID that
+  // must be reused as an argument in all future ConsumeDurableEvents calls.
+  //
+  // A RESOURCE_EXHAUSTED status code may be returned if a given k8s pod has an exhausted channel
+  // pool, and the client should automatically try to reconnect until they
+  // get a pod with available channels.
+  rpc CreateDurableQueue(CreateDurableQueueRequest) returns (CreateDurableQueueResponse) {}
+
+  // DeleteDurableQueue is called if a durable consumer queue was created and used, and it is no
+  // longer required, a delete queue call must be made to free up resources.
+  // This typically only happens if the consumer client is being taken
+  // down permanently.
+  //
+  // A RESOURCE_EXHAUSTED status code may be returned if a given k8s pod has an exhausted channel
+  // pool, and the client should automatically try to reconnect until they
+  // get a pod with available channels.
+  rpc DeleteDurableQueue(DeleteDurableQueueRequest) returns (DeleteDurableQueueResponse) {}
+
+  // UpdateDurableQueue is used to update the filtering on an existing durable queue that was
+  // created using CreateDurableQueue.
+  //
+  // The filters will be updated without losing messages.
+  // This may be preferable to deleting and re-creating the
+  // durable queue, which may result in lost messages.
+  //
+  // A RESOURCE_EXHAUSTED status code may be returned if a given k8s pod has an exhausted channel
+  // pool, and the client should automatically try to reconnect until they
+  // get a pod with available channels.
+  rpc UpdateDurableQueue(UpdateDurableQueueRequest) returns (UpdateDurableQueueResponse) {}
+}
+
+// ConsumeDurableEventsResponse contains a batch of events consumed from a durable queue.
+message ConsumeDurableEventsResponse {
+  // events is a list of consumed events.
+  repeated Event events = 1;
+}
+
+// ConsumeNonDurableEventsResponse contains a batch of events consumed from a non-durable stream.
+message ConsumeNonDurableEventsResponse {
+  // events is a list of consumed events.
+  repeated Event events = 1;
+
+  // Token for reconnecting to the same queue after a disconnection OR
+  // for using the same queue between multiple simultaneous clients to
+  // consume in parallel from a single queue.
+  string reconnect_token = 2;
+}
+
+// ConsumeDurableEventsRequest specifies the durable queue from which to consume events.
+message ConsumeDurableEventsRequest {
+  // The queue_id which was created with a call to CreateDurableQueue,
+  // and identifies the queue used for consuming durable events.
+  string queue_id = 1;
+}
+
+// ConsumeNonDurableEventsRequest specifies filter groups for consuming non-durable events.
+// This can be sent multiple times on the stream to update filters.
+message ConsumeNonDurableEventsRequest {
+  // filter_groups defines sets of filters to apply to the events based
+  // on the event type of the messages, and optionally the resource id of the messages.
+  //
+  // If using a reconnect_token to reconnect, then this field should be omitted unless
+  // trying to change the filters from previous values.
+  //
+  // NOTE: If you are using this ConsumeNonDurableEventsRequest to change which
+  //       filters are being used, you must also include the previous filter groups in
+  //       the "previous_filter_groups" field.
+  repeated FilterGroup filter_groups = 1;
+
+  // Optional token for reconnecting to the same queue after a disconnection OR
+  // for using the same queue between multiple simultaneous clients to
+  // consume in parallel from a single queue.
+  //
+  // NOTE: the queues have a TTL that is configurable and has a 20 second default.
+  optional string reconnect_token = 2;
+
+  // Optional. If this ConsumeNonDurableEventsRequest is being used to update which
+  // filters are being used, in addition to specifying the new filter groups with the
+  // "filter_groups" field, this field must be included and should contain
+  // the previous filter groups.
+  repeated FilterGroup previous_filter_groups = 3;
+}
+
+// CreateDurableQueueRequest defines the initial filters for a new durable queue.
+message CreateDurableQueueRequest {
+  // filter_groups defines sets of filters to apply to the events based
+  // on the resource id of the messages.
+  //
+  // If omitted or empty, all events for an event type are
+  // added to the queue for later consumption.
+  repeated FilterGroup filter_groups = 1;
+}
+
+// CreateDurableQueueResponse returns the ID of the newly created durable queue.
+// A queue_id is required for all durable type
+// ConsumeEvent calls, and is obtained by making a
+// call to CreateDurableQueue.
+message CreateDurableQueueResponse {
+  // The queue_id identifies the durable queue. This ID must be persisted
+  // somewhere and sent on all ConsumeDurableEvents calls.
+  string queue_id = 1;
+}
+
+// DeleteDurableQueueRequest specifies the durable queue to be deleted.
+message DeleteDurableQueueRequest {
+  // The queue_id identifies the durable queue to delete. It was created
+  // with a call to the CreateDurableQueue RPC.
+  string queue_id = 1;
+}
+
+// UpdateDurableQueueRequest specifies how to update filters for an existing durable queue.
+message UpdateDurableQueueRequest {
+  // The id of the durable queue to update.
+  string queue_id = 1;
+
+  // The current filters in use on the existing durable queue.
+  // These will be replaced if new_filter_groups is provided.
+  repeated FilterGroup current_filter_groups = 2;
+
+  // The new filters to use on the existing durable queue.
+  // They will replace the existing filters.
+  repeated FilterGroup new_filter_groups = 3;
+}
+
+// DeleteDurableQueueResponse is an empty response indicating successful deletion of a durable queue.
+message DeleteDurableQueueResponse {}
+
+// UpdateDurableQueueResponse is an empty response indicating successful update of a durable queue.
+message UpdateDurableQueueResponse {}
+
+// The event object that encapsulates all event data
+message Event {
+  // type of event - defined by the publisher
+  string event_type = 1;
+  // principal who published event
+  string principal_identity = 2;
+  // time at which event was generated
+  google.protobuf.Timestamp occurred_at = 3;
+  // time at which event was published
+  google.protobuf.Timestamp published_at = 4;
+  // body of event
+  google.protobuf.Struct message = 5;
+}
+
+// Allow groups of filters for filtering the events that will be consumed.
+message FilterGroup {
+  // Event type for this filter.
+  // Other services that publish events will define unique event types.
+  string event_type = 1;
+
+  // Optional: the filters for filtering on resource id (filters use OR logic).
+  // If no resource filters are supplied then messages
+  // will only be filtered by event_type.
+  repeated ResourceFilter filters = 2;
+}
+
+// Filters events based on their resource id as defined by the
+// publishing service.
+message ResourceFilter {
+  // FilterType specifies the matching strategy for the resource filter.
+  // How much of the resource_id needs to match
+  // the resource in the message for the filter
+  // to be successful.
+  enum FilterType {
+    // FILTER_TYPE_UNSPECIFIED is the default, unspecified filter type.
+    // This will default to FILTER_TYPE_EQ behavior
+    FILTER_TYPE_UNSPECIFIED = 0;
+    // FILTER_TYPE_EQ performs an exact match on the resource_id.
+    FILTER_TYPE_EQ = 1;
+    // FILTER_TYPE_STARTS_WITH_LAZY performs a "starts with" match (lazy).
+    // For example, a filter for "folder_1" would match "folder_1/file.txt" but not "folder_10/file.txt".
+    FILTER_TYPE_STARTS_WITH_LAZY = 2;
+    // FILTER_TYPE_STARTS_WITH_GREEDY performs a "starts with" match (greedy).
+    // For example, a filter for "folder_1" would match "folder_1/sub/file.txt".
+    FILTER_TYPE_STARTS_WITH_GREEDY = 3;
+  }
+
+  // filter_type specifies the type of filter to apply.
+  FilterType filter_type = 1;
+
+  // The path to filter the field by.
+  // A resource is a path like string with words separated by slashes.
+  //
+  // For example, if two messages were published
+  // for the following resources:
+  //
+  // "folder_1/folder_2/folder_3/astronaut.usd"
+  // "folder_1/astronaut.usd"
+  //
+  // then a filter with a resource_id of "folder_1" and
+  // filter_type = FILTER_TYPE_STARTS_WITH_GREEDY would match both messages.
+  //
+  // A filter with a resource_id of "folder_1"
+  // and a filter_type = FILTER_TYPE_STARTS_WITH_LAZY would only match the
+  // second message.
+  //
+  // If resource_id = "", then there are three possibilities
+  // depending on the value of filter_type:
+  //     1) FILTER_TYPE_STARTS_WITH_GREEDY: consume all messages
+  //        of the event_type with or without a resource_id,
+  //        regardless of what the value for resource_id in the message is
+  //     2) FILTER_TYPE_STARTS_WITH_LAZY: consume any message that doesn't have
+  //        a resource_id or has a resource_id="", AND any message with a
+  //        resource_id like “something” or “something/“, but not
+  //        “something/something-else”
+  //     3) FILTER_TYPE_EQ: generates an error response
+  string resource_id = 2;
+}

@@ -1,0 +1,905 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="./" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Omniverse Storage API conformance tests &#8212; Omniverse Storage API</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="_static/custom.css?v=767de534" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-design.min.css?v=95c83b7e" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+
+
+    <script rel="preload" src="_static/modal-table.js"></script>
+    <script src="_static/documentation_options.js?v=a52ce144"></script>
+    <script src="_static/doctools.js?v=9bcbadda"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/scrollspy-patch.js?v=edc4054a"></script>
+    <script src="_static/design-tabs.js?v=f930bc37"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'conformance_tests_include';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = '../versions1.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0-beta.4';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            true;
+        </script>
+    <script src="_static/version-patch.js?v=3e13fdd2"></script>
+
+    <link rel="icon" href="_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Omniverse Storage API change log" href="changes.html" />
+    <link rel="prev" title="Omniverse Filesystem Storage Service" href="local_filesystem_example_include.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+    <meta name="docbuild:last-update" content="Apr 17, 2026"/>
+
+
+  </head>
+
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="Omniverse Storage API - Home"/>
+    <img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="Omniverse Storage API - Home"/>
+  
+  
+    <p class="title logo__title">Omniverse Storage API</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+        <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://twitter.com/nvidiaomniverse" title="twitter" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-twitter fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">twitter</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.youtube.com/channel/UCSKUoczbGAcMld7HjpCR8OA" title="youtube" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-youtube fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">youtube</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.instagram.com/nvidiaomniverse" title="instagram" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-instagram fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">instagram</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.nvidia.com/en-us/omniverse/" title="www" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-solid fa-globe fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">www</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.linkedin.com/showcase/nvidia-omniverse" title="linkedin" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-linkedin fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">linkedin</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.twitch.tv/nvidiaomniverse" title="twitch" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-twitch fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">twitch</span></a>
+        </li>
+</ul></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="Omniverse Storage API - Home"/>
+    <img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="Omniverse Storage API - Home"/>
+  
+  
+    <p class="title logo__title">Omniverse Storage API</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+          <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://twitter.com/nvidiaomniverse" title="twitter" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-twitter fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">twitter</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.youtube.com/channel/UCSKUoczbGAcMld7HjpCR8OA" title="youtube" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-youtube fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">youtube</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.instagram.com/nvidiaomniverse" title="instagram" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-instagram fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">instagram</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.nvidia.com/en-us/omniverse/" title="www" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-solid fa-globe fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">www</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.linkedin.com/showcase/nvidia-omniverse" title="linkedin" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-linkedin fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">linkedin</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.twitch.tv/nvidiaomniverse" title="twitch" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-twitch fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">twitch</span></a>
+        </li>
+</ul></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="user_manual.html">Storage API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="client_example_include.html">Client examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="service_example_include.html">Service examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="local_filesystem_example_include.html">Omniverse Filesystem Storage Service</a></li>
+
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Conformance test suite</a></li>
+<li class="toctree-l1"><a class="reference internal" href="changes.html">Changes</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Omniverse Storage API conformance tests</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="omniverse-storage-api-conformance-tests">
+<h1>Omniverse Storage API conformance tests<a class="headerlink" href="#omniverse-storage-api-conformance-tests" title="Link to this heading">#</a></h1>
+<p>The conformance test suite verifies that a Storage API implementation behaves in a way that generic client software
+can reliably depend on.</p>
+<p>The tests are written in the Gherkin specification language and executed via <code class="docutils literal notranslate"><span class="pre">pytest-bdd</span></code>. They focus on
+observable behavior and return values rather than internal implementation details.</p>
+<p>This is <strong>not</strong> a comprehensive quality or performance benchmark for a storage service. Instead, it is
+intended to ensure that different Storage API implementations expose a consistent contract so that clients
+can interact with them in a uniform way.</p>
+<p>A complete runtime implementation – fixtures, step definitions and test data generators – is provided so the
+suite can be run as a blackbox against any Storage API service that exposes the expected endpoints.</p>
+<section id="installation">
+<h2>Installation<a class="headerlink" href="#installation" title="Link to this heading">#</a></h2>
+<section id="prerequisites">
+<h3>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>Python</strong> 3.10, 3.11, or 3.12</p></li>
+<li><p><strong>Poetry</strong> package manager</p></li>
+</ul>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Run  these commands within the conformance tests subdirectory</span>
+<span class="nb">cd</span><span class="w"> </span>conformance_tests
+
+<span class="c1"># Create virtual environment for poetry</span>
+python<span class="w"> </span>-m<span class="w"> </span>venv<span class="w"> </span>.poetry_venv
+
+<span class="c1"># Install poetry</span>
+.poetry_venv/bin/pip<span class="w"> </span>install<span class="w"> </span>poetry
+</pre></div>
+</div>
+</section>
+<section id="build-from-source">
+<h3>Build from source<a class="headerlink" href="#build-from-source" title="Link to this heading">#</a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Install dependencies</span>
+.poetry_venv/bin/poetry<span class="w"> </span>install
+
+<span class="c1"># Activate the poetry-created virtual environment</span>
+<span class="nb">source</span><span class="w"> </span>.venv/bin/activate
+</pre></div>
+</div>
+</section>
+</section>
+<section id="usage">
+<h2>Usage<a class="headerlink" href="#usage" title="Link to this heading">#</a></h2>
+<p>The test suite is exposed as a Python package with a small command line entrypoint. Once installed in an
+environment, the tests can be invoked against any Storage API implementation that is reachable from the
+test runner.</p>
+<section id="start-a-storage-api-implementation">
+<h3>1. Start a Storage API implementation<a class="headerlink" href="#start-a-storage-api-implementation" title="Link to this heading">#</a></h3>
+<p>Start the Storage API service you want to validate and ensure it is reachable from the machine running the
+test suite. For the reference filesystem service refer to its documentation.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Start the service with default ports</span>
+local-filesystem-service<span class="w"> </span>filesystem<span class="w"> </span>--static-dir<span class="w"> </span>/tmp/storage
+</pre></div>
+</div>
+<p>This starts a Storage API implementation with the following default endpoints:</p>
+<ul class="simple">
+<li><p>REST endpoint: <code class="docutils literal notranslate"><span class="pre">http://localhost:8011</span></code></p></li>
+<li><p>gRPC endpoint: <code class="docutils literal notranslate"><span class="pre">localhost:50051</span></code></p></li>
+<li><p>Resource address base: <code class="docutils literal notranslate"><span class="pre">file-storage://fileservice</span></code></p></li>
+</ul>
+<p>These defaults match the conformance test suite defaults, so no additional configuration is required for a
+basic local run.</p>
+</section>
+<section id="running-the-tests-via-the-entrypoint">
+<h3>2. Running the tests via the entrypoint<a class="headerlink" href="#running-the-tests-via-the-entrypoint" title="Link to this heading">#</a></h3>
+<p>After installing the <code class="docutils literal notranslate"><span class="pre">omniverse-storageapi-conformance-tests</span></code> package into an environment (for example via
+<code class="docutils literal notranslate"><span class="pre">poetry</span> <span class="pre">install</span></code> in the <code class="docutils literal notranslate"><span class="pre">conformance_tests</span></code> directory), the tests can be run with:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># After successfully running `poetry install` above, activate the environment poetry created:</span>
+<span class="nb">source</span><span class="w"> </span>.venv/bin/activate
+
+<span class="c1"># In this environment, the run hook has been installed for the test suite:</span>
+run-conformance-tests
+</pre></div>
+</div>
+<p>This command:</p>
+<ul class="simple">
+<li><p>Uses <code class="docutils literal notranslate"><span class="pre">pytest</span></code> under the hood</p></li>
+<li><p>Loads the default test data generator plugin
+(<code class="docutils literal notranslate"><span class="pre">conformance_tests.example_fixtures.storageapi_testdata_generator</span></code>)</p></li>
+<li><p>Executes the full Gherkin-based conformance suite against the configured Storage API endpoints</p></li>
+</ul>
+<p>Any extra command line arguments are forwarded directly to <code class="docutils literal notranslate"><span class="pre">pytest</span></code>. For example, to select a subset of tests
+or increase verbosity:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>run-conformance-tests<span class="w"> </span>-k<span class="w"> </span><span class="s2">&quot;stat&quot;</span><span class="w"> </span>-vv
+</pre></div>
+</div>
+</section>
+</section>
+<section id="configuration">
+<h2>Configuration<a class="headerlink" href="#configuration" title="Link to this heading">#</a></h2>
+<p>The conformance tests are intentionally minimal in terms of configuration: they assume a running Storage API
+implementation and use a small set of environment variables to control the endpoints, the resource address
+base and some test behavior.</p>
+<section id="core-storage-api-configuration">
+<h3>Core Storage API configuration<a class="headerlink" href="#core-storage-api-configuration" title="Link to this heading">#</a></h3>
+<p>These environment variables are used by the default <code class="docutils literal notranslate"><span class="pre">storageapi_testdata_generator</span></code> fixture
+(<code class="docutils literal notranslate"><span class="pre">conformance_tests.example_fixtures.storageapi_testdata_generator</span></code>). This test data generator, a subclass
+of the conformance_tests.storage_testdata_generator.AbstractTestDataGenerator base class, uses only the
+Storage API itself to create test modify test data. This is limited for a few test cases like permission modification,
+so to extend test coverage a bespoke TestDataGenerator implementation can be useful for certain storage backends.</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">TEST_STORAGE_API_REST_ENDPOINT</span></code></strong> (default: <code class="docutils literal notranslate"><span class="pre">http://localhost:8011</span></code>)</p>
+<ul>
+<li><p>Base URL of the Storage API REST endpoint used by the tests.</p></li>
+<li><p>Must point to the root where the versioned APIs are exposed, e.g. <code class="docutils literal notranslate"><span class="pre">http://host:8011</span></code>.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">TEST_STORAGE_API_GRPC_ENDPOINT</span></code></strong> (default: <code class="docutils literal notranslate"><span class="pre">localhost:50051</span></code>)</p>
+<ul>
+<li><p>Host and port of the gRPC endpoint implementing the Storage API.</p></li>
+<li><p>Used to create an insecure gRPC channel for the <code class="docutils literal notranslate"><span class="pre">FileObjectService</span></code>, <code class="docutils literal notranslate"><span class="pre">FileFolderService</span></code> and
+<code class="docutils literal notranslate"><span class="pre">CapabilitiesService</span></code> stubs.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">TEST_STORAGE_API_RESOURCE_BASE</span></code></strong> (default: <code class="docutils literal notranslate"><span class="pre">file-storage://fileservice</span></code>)</p>
+<ul>
+<li><p>Base resource address prefix used when generating test namespaces and resource addresses.</p></li>
+<li><p>Must be a valid Storage API resource address prefix that is recognized by the service under test.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">STORAGEAPI_TEST_HTTP_TIMEOUT</span></code></strong> (default: <code class="docutils literal notranslate"><span class="pre">60</span></code> seconds)</p>
+<ul>
+<li><p>Global timeout used by the REST client helper for all HTTP calls made by the tests.</p></li>
+<li><p>Increase this value if your Storage API implementation has higher latency or performs expensive
+backend operations during the tests.</p></li>
+</ul>
+</li>
+</ul>
+<p>Some environment variables control corner cases and error conditions used by the test data generators:</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">TEST_INVALID_RESOURCE_ADDRESS</span></code></strong> (default: <code class="docutils literal notranslate"><span class="pre">c:d:e:\0</span></code>)</p>
+<ul>
+<li><p>Value returned by the test data generator when an intentionally invalid resource address is required.</p></li>
+<li><p>You can override this if your implementation uses different validation rules for invalid addresses.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">TEST_INVALID_RESOURCE_IDENTITY</span></code></strong> (default: <code class="docutils literal notranslate"><span class="pre">c:d:e:\0</span></code>)</p>
+<ul>
+<li><p>Value returned when an intentionally invalid resource identity is required.</p></li>
+</ul>
+</li>
+</ul>
+<p>These values are only used in negative test cases and should not correspond to valid addresses or identities
+in your Storage API implementation.</p>
+</section>
+<section id="openapi-verification">
+<h3>OpenAPI verification<a class="headerlink" href="#openapi-verification" title="Link to this heading">#</a></h3>
+<p>The test suite includes optional checks that validate the OpenAPI schemas exposed by the Storage API service
+against the reference schemas shipped with this repository.</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">OASDIFF_EXECUTABLE</span></code></strong> (required for OpenAPI tests)</p>
+<ul>
+<li><p>Path to the <code class="docutils literal notranslate"><span class="pre">oasdiff</span></code> binary used to compare schemas.</p></li>
+<li><p>Must point to an executable on the system running the tests.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">TEST_EXACT_OPENAPI_MATCH</span></code></strong> (default: <code class="docutils literal notranslate"><span class="pre">false</span></code>)</p>
+<ul>
+<li><p>When set to <code class="docutils literal notranslate"><span class="pre">true</span></code>, enables strict OpenAPI schema comparison tests.</p></li>
+<li><p>If this variable is not set to <code class="docutils literal notranslate"><span class="pre">&quot;true&quot;</span></code> (case-insensitive), the exact match tests are skipped.</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="s3-boto3-based-test-data-generator">
+<h3>S3/Boto3-based test data generator<a class="headerlink" href="#s3-boto3-based-test-data-generator" title="Link to this heading">#</a></h3>
+<p>The conformance test suite by default uses the Storage API itself to create and delete test data. This somewhat
+restricts the usefulness of the tests as you might have “symmetry” errors not caught when both test data creation
+and the test function use the same code path. Also, some tests are not enabled as the Storage API for example cannot
+modify permissions, therefore no tests for missing permissions can be created.</p>
+<p>As an alternative it is possible to subclass AbstractTestDataGenerator and build a test data generator that natively
+handles test data on the storage backend, giving better test coverage.</p>
+<p>As an example, an alternative test data generator is provided in
+<code class="docutils literal notranslate"><span class="pre">conformance_tests.example_fixtures.boto3_testdata_generator</span></code>. It uses <code class="docutils literal notranslate"><span class="pre">boto3</span></code> to store the test data in an
+S3-compatible object store. To use it, set the pytest plugin accordingly (via `PYTEST_PLUGINS).</p>
+<p>This generator uses the usual AWS configuration environment variables plus a few additional ones:</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">AWS_ACCESS_KEY_ID</span></code></strong>, <strong><code class="docutils literal notranslate"><span class="pre">AWS_SECRET_ACCESS_KEY</span></code></strong>, <strong><code class="docutils literal notranslate"><span class="pre">AWS_REGION</span></code></strong> (default: <code class="docutils literal notranslate"><span class="pre">us-east-1</span></code>)</p>
+<ul>
+<li><p>Standard AWS credentials and region configuration used by <code class="docutils literal notranslate"><span class="pre">boto3.Session()</span></code>.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">TEST_STORAGE_API_BOTO3_CONNECT_TIMEOUT</span></code></strong> (default: <code class="docutils literal notranslate"><span class="pre">5.0</span></code> seconds)</p>
+<ul>
+<li><p>Connection timeout used when constructing the S3 client.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">TEST_STORAGE_API_BOTO3_MAX_POOL_CONNECTIONS</span></code></strong> (default: <code class="docutils literal notranslate"><span class="pre">20</span></code>)</p>
+<ul>
+<li><p>Maximum number of pooled HTTP connections for the S3 client.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">TEST_STORAGE_API_BOTO3_BUCKET_NAME</span></code></strong> (default: <code class="docutils literal notranslate"><span class="pre">sapiv</span></code>)</p>
+<ul>
+<li><p>Name of the bucket where the test objects will be created.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">CREATE_FOLDER</span></code></strong> (default: <code class="docutils literal notranslate"><span class="pre">false</span></code>)</p>
+<ul>
+<li><p>When set to <code class="docutils literal notranslate"><span class="pre">true</span></code>, the S3 generator will create zero-byte objects to explicitly represent folders.</p></li>
+<li><p>When <code class="docutils literal notranslate"><span class="pre">false</span></code>, folders are inferred from object keys only.</p></li>
+</ul>
+</li>
+</ul>
+<p>In addition, when the configured S3 endpoint looks like a local or MinIO-style deployment, the generator
+automatically sets:</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">BOTO_EXPERIMENTAL__NO_EMPTY_CONTINUE</span></code></strong> to <code class="docutils literal notranslate"><span class="pre">true</span></code></p>
+<ul>
+<li><p>This is an internal boto3 flag used to work around known issues with certain S3-compatible implementations.</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="test-execution-control">
+<h3>Test execution control<a class="headerlink" href="#test-execution-control" title="Link to this heading">#</a></h3>
+<p>The following environment variables affect how the tests themselves are executed, rather than what they test:</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">PYTEST_PLUGINS</span></code></strong></p>
+<ul>
+<li><p>When unset, the <code class="docutils literal notranslate"><span class="pre">run-conformance-tests</span></code> entrypoint defaults to
+<code class="docutils literal notranslate"><span class="pre">conformance_tests.example_fixtures.storageapi_testdata_generator</span></code>.</p></li>
+<li><p>You can set it to another plugin (for example the boto3 generator, or your own implementation of the AbstractTestDataGenerator class) to change how test data is created.</p></li>
+</ul>
+</li>
+</ul>
+</section>
+</section>
+<section id="reporting-and-logs">
+<h2>Reporting and logs<a class="headerlink" href="#reporting-and-logs" title="Link to this heading">#</a></h2>
+<p>The conformance tests write their standard output, logging and <code class="docutils literal notranslate"><span class="pre">pytest</span></code> reports to the current working
+directory.</p>
+</section>
+<section id="summary">
+<h2>Summary<a class="headerlink" href="#summary" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>Start a Storage API implementation that exposes the REST and/or gRPC endpoints described in the Storage API
+specification.</p></li>
+<li><p>Build, install and configure the <code class="docutils literal notranslate"><span class="pre">omniverse-storageapi-conformance-tests</span></code> package.</p></li>
+<li><p>Point the tests at your implementation via the environment variables described above.</p></li>
+<li><p>Run <code class="docutils literal notranslate"><span class="pre">run-conformance-tests</span></code> and inspect the results to verify conformance of your implementation.</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="local_filesystem_example_include.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Omniverse Filesystem Storage Service</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="changes.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Omniverse Storage API change log</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#installation">Installation</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#build-from-source">Build from source</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#usage">Usage</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#start-a-storage-api-implementation">1. Start a Storage API implementation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#running-the-tests-via-the-entrypoint">2. Running the tests via the entrypoint</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#configuration">Configuration</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#core-storage-api-configuration">Core Storage API configuration</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#openapi-verification">OpenAPI verification</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#s3-boto3-based-test-data-generator">S3/Boto3-based test data generator</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#test-execution-control">Test execution control</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reporting-and-logs">Reporting and logs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#summary">Summary</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025-2026, NVIDIA Corporation.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item"><p class="last-updated">
+  Last updated on Apr 17, 2026.
+  <br/>
+</p></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

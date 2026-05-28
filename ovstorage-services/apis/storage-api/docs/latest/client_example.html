@@ -1,0 +1,1353 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="./" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Client examples &#8212; Omniverse Storage API</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="_static/custom.css?v=767de534" />
+    <link rel="stylesheet" type="text/css" href="_static/sphinx-design.min.css?v=95c83b7e" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+
+
+    <script rel="preload" src="_static/modal-table.js"></script>
+    <script src="_static/documentation_options.js?v=a52ce144"></script>
+    <script src="_static/doctools.js?v=9bcbadda"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/scrollspy-patch.js?v=edc4054a"></script>
+    <script src="_static/design-tabs.js?v=f930bc37"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'client_example';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = '../versions1.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0-beta.4';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            true;
+        </script>
+    <script src="_static/version-patch.js?v=3e13fdd2"></script>
+
+    <link rel="icon" href="_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+    <meta name="docbuild:last-update" content="Apr 17, 2026"/>
+
+
+  </head>
+
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="Omniverse Storage API - Home"/>
+    <img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="Omniverse Storage API - Home"/>
+  
+  
+    <p class="title logo__title">Omniverse Storage API</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+        <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://twitter.com/nvidiaomniverse" title="twitter" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-twitter fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">twitter</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.youtube.com/channel/UCSKUoczbGAcMld7HjpCR8OA" title="youtube" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-youtube fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">youtube</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.instagram.com/nvidiaomniverse" title="instagram" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-instagram fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">instagram</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.nvidia.com/en-us/omniverse/" title="www" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-solid fa-globe fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">www</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.linkedin.com/showcase/nvidia-omniverse" title="linkedin" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-linkedin fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">linkedin</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.twitch.tv/nvidiaomniverse" title="twitch" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-twitch fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">twitch</span></a>
+        </li>
+</ul></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="Omniverse Storage API - Home"/>
+    <img src="_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="Omniverse Storage API - Home"/>
+  
+  
+    <p class="title logo__title">Omniverse Storage API</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+          <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://twitter.com/nvidiaomniverse" title="twitter" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-twitter fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">twitter</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.youtube.com/channel/UCSKUoczbGAcMld7HjpCR8OA" title="youtube" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-youtube fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">youtube</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.instagram.com/nvidiaomniverse" title="instagram" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-instagram fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">instagram</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.nvidia.com/en-us/omniverse/" title="www" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-solid fa-globe fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">www</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.linkedin.com/showcase/nvidia-omniverse" title="linkedin" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-linkedin fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">linkedin</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://www.twitch.tv/nvidiaomniverse" title="twitch" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-twitch fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">twitch</span></a>
+        </li>
+</ul></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="user_manual.html">Storage API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="client_example_include.html">Client examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="service_example_include.html">Service examples</a></li>
+<li class="toctree-l1"><a class="reference internal" href="local_filesystem_example_include.html">Omniverse Filesystem Storage Service</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="conformance_tests_include.html">Conformance test suite</a></li>
+<li class="toctree-l1"><a class="reference internal" href="changes.html">Changes</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Client examples</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="client-examples">
+<h1>Client examples<a class="headerlink" href="#client-examples" title="Link to this heading">#</a></h1>
+<p>Python is an excellent choice for writing a client that consumes the Storage API. This document provides examples for
+both REST and gRPC APIs.</p>
+<section id="discovery">
+<h2>Discovery<a class="headerlink" href="#discovery" title="Link to this heading">#</a></h2>
+<p>The Storage API endpoint is not auto-discovered. To connect, you need the Storage API endpoint address.
+An example REST endpoint on localhost could be http://127.0.0.1:8011/fileobject, and a valid gRPC connection string could be
+<code class="docutils literal notranslate"><span class="pre">127.0.0.1:50051</span></code>.</p>
+</section>
+<section id="rest">
+<h2>REST<a class="headerlink" href="#rest" title="Link to this heading">#</a></h2>
+<section id="client-library-selection">
+<h3>Client library selection<a class="headerlink" href="#client-library-selection" title="Link to this heading">#</a></h3>
+<p>The REST interface is a pure HTTP interface. Any library supporting basic web operations will work. We’ll use the
+Python <code class="docutils literal notranslate"><span class="pre">requests</span></code> module for this text, a popular library with <a class="reference external" href="https://requests.readthedocs.io/en/latest/">comprehensive documentation</a>.</p>
+<p>It can be installed for example with pip:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>pip install requests
+</pre></div>
+</div>
+</section>
+<section id="initial-call">
+<h3>Initial call<a class="headerlink" href="#initial-call" title="Link to this heading">#</a></h3>
+<p>Here’s the minimal code required for a successful roundtrip to the Storage API:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">stat</span><span class="p">(</span><span class="n">example_server_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">resource_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="n">api_url</span> <span class="o">=</span> <span class="n">example_server_address</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">&quot;/by-address/</span><span class="si">{</span><span class="n">urllib</span><span class="o">.</span><span class="n">parse</span><span class="o">.</span><span class="n">quote_plus</span><span class="p">(</span><span class="n">resource_address</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">head</span><span class="p">(</span><span class="n">api_url</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">==</span> <span class="mi">204</span><span class="p">:</span>
+        <span class="n">result</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">headers</span><span class="p">[</span><span class="s2">&quot;x-nvidia-omniverse-storage-metadata&quot;</span><span class="p">])</span>
+        <span class="nb">print</span><span class="p">(</span><span class="n">result</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Error calling stat, result code is </span><span class="si">{</span><span class="n">response</span><span class="o">.</span><span class="n">status_code</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+
+</pre></div>
+</div>
+<p>This code issues a single HTTP HEAD command on the calculated address. A successful stat returns the HTTP code 204,
+indicating success without body. The metadata is provided as a JSON struct within the
+<code class="docutils literal notranslate"><span class="pre">x-nvidia-omniverse-storage-metadata</span></code> response header, which is parsed and printed to stdout.</p>
+</section>
+<section id="data-download">
+<h3>Data download<a class="headerlink" href="#data-download" title="Link to this heading">#</a></h3>
+<p>The Storage API service determines how data is downloaded. The simplest method is to stream the data using the HTTP
+response’s content body. A simple client can request the download method via a query parameter, and a well-behaved storage
+service will respect the preference given if the performance envelop permits it.</p>
+<p>Here’s a working download loop:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">download_via_body</span><span class="p">(</span><span class="n">example_server_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">resource_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">destination_file_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="n">api_url</span> <span class="o">=</span> <span class="n">example_server_address</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">&quot;/by-address/</span><span class="si">{</span><span class="n">urllib</span><span class="o">.</span><span class="n">parse</span><span class="o">.</span><span class="n">quote_plus</span><span class="p">(</span><span class="n">resource_address</span><span class="p">)</span><span class="si">}</span><span class="s2">?download_preference=body&quot;</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">api_url</span><span class="p">,</span> <span class="n">stream</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">==</span> <span class="mi">200</span><span class="p">:</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">destination_file_name</span><span class="p">,</span> <span class="s2">&quot;wb&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">downloaded_file</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">response</span><span class="o">.</span><span class="n">iter_content</span><span class="p">(</span><span class="n">chunk_size</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                <span class="n">downloaded_file</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;finished writing to file </span><span class="si">{</span><span class="n">destination_file_name</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Error downloading </span><span class="si">{</span><span class="n">resource_address</span><span class="si">}</span><span class="s2">, result code is </span><span class="si">{</span><span class="n">response</span><span class="o">.</span><span class="n">status_code</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+
+</pre></div>
+</div>
+<p>This method is suitable for small files and simple clients. However, in a highly scalable environment, the Storage API
+service should not bear the load of all data downloads. In such cases, the service will likely return a redirect
+message with instructions for downloading data from the origin server.</p>
+<p>Here’s how to implement this:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">download_via_redirect</span><span class="p">(</span><span class="n">example_server_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">resource_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">destination_file_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="n">api_url</span> <span class="o">=</span> <span class="n">example_server_address</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">&quot;/by-address/</span><span class="si">{</span><span class="n">urllib</span><span class="o">.</span><span class="n">parse</span><span class="o">.</span><span class="n">quote_plus</span><span class="p">(</span><span class="n">resource_address</span><span class="p">)</span><span class="si">}</span><span class="s2">?download_preference=redirect&quot;</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">api_url</span><span class="p">,</span> <span class="n">stream</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">==</span> <span class="mi">300</span><span class="p">:</span>
+        <span class="n">redirection_properties</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">content</span><span class="p">)</span>
+        <span class="n">redirected_response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+            <span class="n">redirection_properties</span><span class="p">[</span><span class="s2">&quot;redirect_target_url&quot;</span><span class="p">],</span> <span class="n">headers</span><span class="o">=</span><span class="n">redirection_properties</span><span class="p">[</span><span class="s2">&quot;additional_headers&quot;</span><span class="p">],</span> <span class="n">stream</span><span class="o">=</span><span class="kc">True</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">redirected_response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">==</span> <span class="mi">200</span><span class="p">:</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">destination_file_name</span><span class="p">,</span> <span class="s2">&quot;wb&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">downloaded_file</span><span class="p">:</span>
+                <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">redirected_response</span><span class="o">.</span><span class="n">iter_content</span><span class="p">(</span><span class="n">chunk_size</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                    <span class="n">downloaded_file</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;finished writing to file </span><span class="si">{</span><span class="n">destination_file_name</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Error downloading </span><span class="si">{</span><span class="n">resource_address</span><span class="si">}</span><span class="s2"> after redirection, result code is </span><span class="si">{</span><span class="n">redirected_response</span><span class="o">.</span><span class="n">status_code</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Error downloading </span><span class="si">{</span><span class="n">resource_address</span><span class="si">}</span><span class="s2">, result code is </span><span class="si">{</span><span class="n">response</span><span class="o">.</span><span class="n">status_code</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+
+</pre></div>
+</div>
+<p>Combining these elements, we get a complete flexible download client:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">download</span><span class="p">(</span><span class="n">example_server_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">resource_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">destination_file_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="n">api_url</span> <span class="o">=</span> <span class="n">example_server_address</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">&quot;/by-address/</span><span class="si">{</span><span class="n">urllib</span><span class="o">.</span><span class="n">parse</span><span class="o">.</span><span class="n">quote_plus</span><span class="p">(</span><span class="n">resource_address</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">api_url</span><span class="p">,</span> <span class="n">stream</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">==</span> <span class="mi">200</span><span class="p">:</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">destination_file_name</span><span class="p">,</span> <span class="s2">&quot;wb&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">downloaded_file</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">response</span><span class="o">.</span><span class="n">iter_content</span><span class="p">(</span><span class="n">chunk_size</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                <span class="n">downloaded_file</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;finished writing to file </span><span class="si">{</span><span class="n">destination_file_name</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="k">elif</span> <span class="n">response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">==</span> <span class="mi">300</span><span class="p">:</span>
+        <span class="n">redirection_properties</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">content</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">redirection_properties</span><span class="p">[</span><span class="s2">&quot;method&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="s2">&quot;get&quot;</span><span class="p">:</span>
+            <span class="n">redirected_response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">redirection_properties</span><span class="p">[</span><span class="s2">&quot;redirect_target_url&quot;</span><span class="p">],</span> <span class="n">stream</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">redirection_properties</span><span class="p">[</span><span class="s2">&quot;method&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="s2">&quot;post&quot;</span><span class="p">:</span>
+            <span class="n">redirected_response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="n">redirection_properties</span><span class="p">[</span><span class="s2">&quot;redirect_target_url&quot;</span><span class="p">],</span> <span class="n">stream</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Download verb </span><span class="si">{</span><span class="n">redirection_properties</span><span class="p">[</span><span class="s1">&#39;method&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2"> not implemented&quot;</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">redirected_response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">==</span> <span class="mi">200</span><span class="p">:</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">destination_file_name</span><span class="p">,</span> <span class="s2">&quot;wb&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">downloaded_file</span><span class="p">:</span>
+                <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">redirected_response</span><span class="o">.</span><span class="n">iter_content</span><span class="p">(</span><span class="n">chunk_size</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                    <span class="n">downloaded_file</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;finished writing to file </span><span class="si">{</span><span class="n">destination_file_name</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Error downloading </span><span class="si">{</span><span class="n">resource_address</span><span class="si">}</span><span class="s2"> after redirection, result code is </span><span class="si">{</span><span class="n">redirected_response</span><span class="o">.</span><span class="n">status_code</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Error downloading </span><span class="si">{</span><span class="n">resource_address</span><span class="si">}</span><span class="s2">, result code is </span><span class="si">{</span><span class="n">response</span><span class="o">.</span><span class="n">status_code</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+
+</pre></div>
+</div>
+<p>Note it is the client’s responsibility to optimize the redirected HTTP download, e.g. using proper multipart operations.</p>
+</section>
+<section id="data-upload">
+<h3>Data upload<a class="headerlink" href="#data-upload" title="Link to this heading">#</a></h3>
+<p>HTTP provides some built-in large file transmission control mechanisms, so the mainstream HTTP client libraries won’t
+require additional actions to perform an upload.</p>
+<p>To write a file object, call the <code class="docutils literal notranslate"><span class="pre">PUT</span> <span class="pre">/fileobject/by-address/&lt;address&gt;</span></code> endpoint providing the contents of the file
+object as the payload and specifying the length of the file object in the <code class="docutils literal notranslate"><span class="pre">data_object_size</span></code> query parameter. You can
+optionally provide an <code class="docutils literal notranslate"><span class="pre">upload_preference</span></code> query parameter, specifying the preferred content upload method, just like
+on download. Upon processing the request, the service will respond with either HTTP 201 or HTTP 300
+status code, identifying either a successful write or the following write instruction respectively:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">upload</span><span class="p">(</span><span class="n">address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_preference</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">content</span><span class="p">:</span> <span class="n">IO</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Upload a file object at the specified address using REST interface.&quot;&quot;&quot;</span>
+
+    <span class="n">content_length</span> <span class="o">=</span> <span class="n">get_content_length</span><span class="p">(</span><span class="n">content</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">upload_preference</span><span class="p">:</span>
+        <span class="n">upload_preference</span> <span class="o">=</span> <span class="n">_get_upload_preference</span><span class="p">(</span><span class="n">address</span><span class="p">,</span> <span class="n">content_length</span><span class="p">)</span>
+
+    <span class="n">write_response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">put</span><span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">BASE_URL</span><span class="si">}</span><span class="s2">/fileobject/by-address/</span><span class="si">{</span><span class="n">quote_plus</span><span class="p">(</span><span class="n">address</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span>
+        <span class="n">data</span><span class="o">=</span><span class="n">content</span><span class="p">,</span>
+        <span class="n">headers</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;Expect&quot;</span><span class="p">:</span> <span class="s2">&quot;100-continue&quot;</span><span class="p">,</span>
+        <span class="p">},</span>
+        <span class="n">params</span><span class="o">=</span><span class="p">{</span>
+            <span class="n">key</span><span class="p">:</span> <span class="n">value</span>
+            <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="p">(</span>
+                <span class="p">(</span><span class="s2">&quot;data_object_size&quot;</span><span class="p">,</span> <span class="n">content_length</span><span class="p">),</span>
+                <span class="p">(</span><span class="s2">&quot;upload_preference&quot;</span><span class="p">,</span> <span class="n">upload_preference</span><span class="p">),</span>
+            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="p">},</span>
+    <span class="p">)</span>
+    <span class="n">write_response</span><span class="o">.</span><span class="n">raise_for_status</span><span class="p">()</span>
+
+    <span class="k">if</span> <span class="n">write_response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">==</span> <span class="mi">201</span><span class="p">:</span>
+        <span class="k">return</span>
+
+    <span class="k">if</span> <span class="n">write_response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">==</span> <span class="mi">300</span><span class="p">:</span>
+        <span class="n">content</span><span class="o">.</span><span class="n">seek</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+
+        <span class="n">write_response_json</span><span class="p">:</span> <span class="n">WriteResponse</span> <span class="o">=</span> <span class="n">write_response</span><span class="o">.</span><span class="n">json</span><span class="p">()</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">redirect</span> <span class="o">:=</span> <span class="n">write_response_json</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;redirect&quot;</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">_write_via_redirect</span><span class="p">(</span><span class="n">address</span><span class="p">,</span> <span class="n">redirect</span><span class="p">,</span> <span class="n">content</span><span class="p">)</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">multipart</span> <span class="o">:=</span> <span class="n">write_response_json</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;multipart&quot;</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">_write_via_multipart</span><span class="p">(</span><span class="n">address</span><span class="p">,</span> <span class="n">multipart</span><span class="p">,</span> <span class="n">content</span><span class="p">)</span>
+
+    <span class="k">raise</span> <span class="ne">Exception</span><span class="p">(</span><span class="s2">&quot;PUT write got unexpected response.&quot;</span><span class="p">)</span>
+
+
+</pre></div>
+</div>
+<p>HTTP 300 should be handled manually, namely by introspecting the contents of the response body. If the <code class="docutils literal notranslate"><span class="pre">redirect</span></code>
+response property is present and is not null, a redirect write must be performed:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">_write_via_redirect</span><span class="p">(</span><span class="n">address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">params</span><span class="p">:</span> <span class="n">WriteRedirectParams</span><span class="p">,</span> <span class="n">content</span><span class="p">:</span> <span class="n">IO</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]):</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">request</span><span class="p">(</span>
+        <span class="n">url</span><span class="o">=</span><span class="n">params</span><span class="p">[</span><span class="s2">&quot;redirect_target_url&quot;</span><span class="p">],</span>
+        <span class="n">method</span><span class="o">=</span><span class="n">params</span><span class="p">[</span><span class="s2">&quot;method&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">upper</span><span class="p">(),</span>
+        <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="n">h</span><span class="p">[</span><span class="s2">&quot;name&quot;</span><span class="p">]:</span> <span class="n">h</span><span class="p">[</span><span class="s2">&quot;value&quot;</span><span class="p">]</span> <span class="k">for</span> <span class="n">h</span> <span class="ow">in</span> <span class="n">params</span><span class="p">[</span><span class="s2">&quot;additional_headers&quot;</span><span class="p">]},</span>
+        <span class="n">data</span><span class="o">=</span><span class="n">content</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">response</span><span class="o">.</span><span class="n">raise_for_status</span><span class="p">()</span>
+
+    <span class="c1"># Optionally, obtain the resource information of the just uploaded file object</span>
+    <span class="c1"># This is not required to store the data, but helpful to keep the reference to the stored object.</span>
+    <span class="n">requested_headers</span> <span class="o">=</span> <span class="p">{</span><span class="n">name</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">params</span><span class="p">[</span><span class="s2">&quot;completion_header_names&quot;</span><span class="p">]}</span>
+    <span class="n">completion</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">BASE_URL</span><span class="si">}</span><span class="s2">/fileobject/by-address/</span><span class="si">{</span><span class="n">quote_plus</span><span class="p">(</span><span class="n">address</span><span class="p">)</span><span class="si">}</span><span class="s2">/redirect/complete&quot;</span><span class="p">,</span>
+        <span class="n">json</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;additional_headers&quot;</span><span class="p">:</span> <span class="p">[</span>
+                <span class="p">{</span><span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="n">response_key</span><span class="p">,</span> <span class="s2">&quot;value&quot;</span><span class="p">:</span> <span class="n">response</span><span class="o">.</span><span class="n">headers</span><span class="p">[</span><span class="n">response_key</span><span class="p">]}</span>
+                <span class="k">for</span> <span class="n">response_key</span> <span class="ow">in</span> <span class="n">response</span><span class="o">.</span><span class="n">headers</span>
+                <span class="k">if</span> <span class="n">response_key</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="ow">in</span> <span class="n">requested_headers</span>
+            <span class="p">]</span>
+        <span class="p">},</span>
+    <span class="p">)</span>
+    <span class="n">completion</span><span class="o">.</span><span class="n">raise_for_status</span><span class="p">()</span>
+
+
+</pre></div>
+</div>
+<p>Otherwise, if the response contains a non-null <code class="docutils literal notranslate"><span class="pre">multipart</span></code> response property, the contents of the file object must be
+cut into several chunks, not exceeding the multipart upload limits and uploaded as follows:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">_write_via_multipart</span><span class="p">(</span><span class="n">address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">params</span><span class="p">:</span> <span class="n">MultipartUploadParams</span><span class="p">,</span> <span class="n">content</span><span class="p">:</span> <span class="n">IO</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]):</span>
+    <span class="c1"># Build a list of redirect URLs to upload the parts to. The first we got from the CreateMultipartUploadResponse</span>
+    <span class="n">redirects</span> <span class="o">=</span> <span class="p">[</span><span class="n">params</span><span class="p">[</span><span class="s2">&quot;first_part_write_redirect&quot;</span><span class="p">]]</span>
+
+    <span class="c1"># Calculate the number of parts, and retrieve the pre-signed URLs from the service to use for individual part upload</span>
+    <span class="n">total_part_count</span><span class="p">,</span> <span class="n">part_size</span><span class="p">,</span> <span class="n">content_length</span> <span class="o">=</span> <span class="n">part_count_for_multipart_upload</span><span class="p">(</span>
+        <span class="n">content</span><span class="p">,</span> <span class="n">params</span><span class="p">[</span><span class="s2">&quot;minimum_size_per_part&quot;</span><span class="p">],</span> <span class="n">params</span><span class="p">[</span><span class="s2">&quot;maximum_size_per_part&quot;</span><span class="p">]</span>
+    <span class="p">)</span>
+    <span class="k">if</span> <span class="n">total_part_count</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">BASE_URL</span><span class="si">}</span><span class="s2">/fileobject/by-address/</span><span class="si">{</span><span class="n">quote_plus</span><span class="p">(</span><span class="n">address</span><span class="p">)</span><span class="si">}</span><span class="s2">/multipart/prepare&quot;</span><span class="p">,</span>
+            <span class="n">json</span><span class="o">=</span><span class="p">{</span>
+                <span class="s2">&quot;upload_id&quot;</span><span class="p">:</span> <span class="n">params</span><span class="p">[</span><span class="s2">&quot;upload_id&quot;</span><span class="p">],</span>
+                <span class="s2">&quot;part_number&quot;</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span>
+                <span class="s2">&quot;part_count&quot;</span><span class="p">:</span> <span class="n">total_part_count</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span>
+            <span class="p">},</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">!=</span> <span class="mi">200</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+            <span class="k">raise</span> <span class="ne">Exception</span><span class="p">(</span><span class="s2">&quot;POST multipart prepare got unexpected response.&quot;</span><span class="p">)</span>
+
+        <span class="n">redirects</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">json</span><span class="p">()[</span><span class="s2">&quot;part_write_redirects&quot;</span><span class="p">])</span>
+
+    <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">BASE_URL</span><span class="si">}</span><span class="s2">/fileobject/by-address/</span><span class="si">{</span><span class="n">quote_plus</span><span class="p">(</span><span class="n">address</span><span class="p">)</span><span class="si">}</span><span class="s2">/multipart/complete&quot;</span><span class="p">,</span>
+        <span class="n">json</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;upload_id&quot;</span><span class="p">:</span> <span class="n">params</span><span class="p">[</span><span class="s2">&quot;upload_id&quot;</span><span class="p">],</span>
+            <span class="s2">&quot;parts&quot;</span><span class="p">:</span> <span class="p">[</span>
+                <span class="n">_write_part</span><span class="p">(</span><span class="n">part_number</span><span class="p">,</span> <span class="n">redirects</span><span class="p">[</span><span class="n">part_number</span><span class="p">],</span> <span class="n">part</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">part_number</span><span class="p">,</span> <span class="n">part</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span>
+                    <span class="n">split_contents_for_multipart_upload</span><span class="p">(</span>
+                        <span class="n">content</span><span class="p">,</span>
+                        <span class="n">max_part_size</span><span class="o">=</span><span class="n">params</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;maximum_size_per_part&quot;</span><span class="p">),</span>
+                        <span class="n">min_part_size</span><span class="o">=</span><span class="n">params</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;minimum_size_per_part&quot;</span><span class="p">),</span>
+                        <span class="n">max_parts</span><span class="o">=</span><span class="n">params</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;maximum_parts_number&quot;</span><span class="p">),</span>
+                    <span class="p">),</span>
+                <span class="p">)</span>
+            <span class="p">],</span>
+        <span class="p">},</span>
+    <span class="p">)</span>
+    <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">!=</span> <span class="mi">200</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">Exception</span><span class="p">(</span><span class="s2">&quot;Post multipart complete got unexpected response.&quot;</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_write_part</span><span class="p">(</span><span class="n">part_number</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">redirect</span><span class="p">,</span> <span class="n">content</span><span class="p">:</span> <span class="n">SupportsRead</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CompletedUploadPart</span><span class="p">:</span>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="s2">&quot;part_number&quot;</span><span class="p">:</span> <span class="n">part_number</span><span class="p">,</span>
+        <span class="s2">&quot;additional_headers&quot;</span><span class="p">:</span> <span class="p">[</span>
+            <span class="p">{</span>
+                <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="n">name</span><span class="p">,</span>
+                <span class="s2">&quot;value&quot;</span><span class="p">:</span> <span class="n">value</span><span class="p">,</span>
+            <span class="p">}</span>
+            <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">upload_part</span><span class="p">(</span>
+                <span class="n">redirect</span><span class="p">[</span><span class="s2">&quot;redirect_target_url&quot;</span><span class="p">],</span>
+                <span class="n">redirect</span><span class="p">[</span><span class="s2">&quot;method&quot;</span><span class="p">],</span>
+                <span class="n">content</span><span class="p">,</span>
+                <span class="n">upload_headers</span><span class="o">=</span><span class="nb">dict</span><span class="p">([(</span><span class="n">h</span><span class="p">[</span><span class="s2">&quot;name&quot;</span><span class="p">],</span> <span class="n">h</span><span class="p">[</span><span class="s2">&quot;value&quot;</span><span class="p">])</span> <span class="k">for</span> <span class="n">h</span> <span class="ow">in</span> <span class="n">redirect</span><span class="p">[</span><span class="s2">&quot;additional_headers&quot;</span><span class="p">]]),</span>
+                <span class="n">return_headers</span><span class="o">=</span><span class="n">redirect</span><span class="p">[</span><span class="s2">&quot;completion_header_names&quot;</span><span class="p">],</span>
+            <span class="p">)</span>
+        <span class="p">],</span>
+    <span class="p">}</span>
+
+
+</pre></div>
+</div>
+<section id="upload-preference-selection">
+<h4>Upload preference selection<a class="headerlink" href="#upload-preference-selection" title="Link to this heading">#</a></h4>
+<p>A client may prepare itself in advance to a certain write workflow, deducing the upload preference from the response
+of the <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/fileobject/by-address/&lt;address&gt;/upload-options</span></code> endpoint, based on the size of the written file object:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">_get_upload_preference</span><span class="p">(</span><span class="n">address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">BASE_URL</span><span class="si">}</span><span class="s2">/fileobject/upload-options/by-address/</span><span class="si">{</span><span class="n">quote_plus</span><span class="p">(</span><span class="n">address</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="n">response</span><span class="o">.</span><span class="n">raise_for_status</span><span class="p">()</span>
+
+    <span class="k">for</span> <span class="n">interval</span> <span class="ow">in</span> <span class="n">response</span><span class="o">.</span><span class="n">json</span><span class="p">()[</span><span class="s2">&quot;write_type_intervals&quot;</span><span class="p">]:</span>
+        <span class="n">min_size</span> <span class="o">=</span> <span class="n">interval</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;minimum_data_object_size&quot;</span><span class="p">)</span>
+        <span class="n">max_size</span> <span class="o">=</span> <span class="n">interval</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;maximum_data_object_size&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">min_size</span> <span class="ow">and</span> <span class="n">min_size</span> <span class="o">&gt;</span> <span class="n">size</span><span class="p">:</span>
+            <span class="k">continue</span>
+
+        <span class="k">if</span> <span class="n">max_size</span> <span class="ow">and</span> <span class="n">max_size</span> <span class="o">&lt;</span> <span class="n">size</span><span class="p">:</span>
+            <span class="k">continue</span>
+
+        <span class="k">return</span> <span class="n">interval</span><span class="p">[</span><span class="s2">&quot;preferred_upload_method&quot;</span><span class="p">]</span>
+
+    <span class="k">return</span> <span class="kc">None</span>
+
+
+</pre></div>
+</div>
+<p>In such a case, when a matching <code class="docutils literal notranslate"><span class="pre">upload_preference</span></code> is passed in the query parameters of the following
+<code class="docutils literal notranslate"><span class="pre">PUT</span> <span class="pre">/fileobject/by-address/&lt;address&gt;</span></code> request, it’s guaranteed that the service will select this exact upload method.</p>
+</section>
+</section>
+<section id="listing-folders">
+<h3>Listing folders<a class="headerlink" href="#listing-folders" title="Link to this heading">#</a></h3>
+<p>REST interface exposes a token-based pagination “list” and “list with stat” endpoints allowing to list the contents of
+folders in one or more chunks:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">list_file_folders</span><span class="p">(</span><span class="n">resource_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">stat</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span> <span class="n">max_page_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+    <span class="k">with</span> <span class="n">Session</span><span class="p">()</span> <span class="k">as</span> <span class="n">session</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">stat</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">list_stat_response</span> <span class="ow">in</span> <span class="n">list_stat_file_folders_paginated</span><span class="p">(</span><span class="n">session</span><span class="p">,</span> <span class="n">resource_address</span><span class="p">,</span> <span class="n">max_page_size</span><span class="p">):</span>
+                <span class="n">handle_list_stat_file_folders_response</span><span class="p">(</span><span class="n">list_stat_response</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">list_response</span> <span class="ow">in</span> <span class="n">list_file_folders_paginated</span><span class="p">(</span><span class="n">session</span><span class="p">,</span> <span class="n">resource_address</span><span class="p">,</span> <span class="n">max_page_size</span><span class="p">):</span>
+                <span class="n">handle_list_file_folders_response</span><span class="p">(</span><span class="n">list_response</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">fetch_paginated</span><span class="p">(</span><span class="n">session</span><span class="p">:</span> <span class="n">Session</span><span class="p">,</span> <span class="n">url</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">max_page_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Iterable</span><span class="p">[</span><span class="nb">dict</span><span class="p">]:</span>
+    <span class="n">query_params</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">if</span> <span class="n">max_page_size</span><span class="p">:</span>
+        <span class="n">query_params</span><span class="p">[</span><span class="s2">&quot;max_page_size&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">max_page_size</span>
+
+    <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+        <span class="n">response</span> <span class="o">=</span> <span class="n">session</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">url</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="n">query_params</span><span class="p">)</span>
+        <span class="n">response</span><span class="o">.</span><span class="n">raise_for_status</span><span class="p">()</span>
+
+        <span class="n">response_json</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">json</span><span class="p">()</span>
+        <span class="k">yield</span> <span class="n">response_json</span>
+
+        <span class="k">if</span> <span class="n">continuation_handle</span> <span class="o">:=</span> <span class="n">response_json</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;next_continuation_handle&quot;</span><span class="p">):</span>
+            <span class="n">query_params</span><span class="p">[</span><span class="s2">&quot;continuation_handle&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">continuation_handle</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">break</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">list_file_folders_paginated</span><span class="p">(</span>
+    <span class="n">session</span><span class="p">:</span> <span class="n">Session</span><span class="p">,</span>
+    <span class="n">address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="n">max_page_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Iterable</span><span class="p">[</span><span class="n">ListFileFoldersResponse</span><span class="p">]:</span>
+    <span class="k">return</span> <span class="n">fetch_paginated</span><span class="p">(</span>
+        <span class="n">session</span><span class="p">,</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">REST_SERVICE_ADDRESS</span><span class="si">}</span><span class="s2">/filefolder/list/</span><span class="si">{</span><span class="n">quote_plus</span><span class="p">(</span><span class="n">address</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span>
+        <span class="n">max_page_size</span><span class="p">,</span>
+    <span class="p">)</span>  <span class="c1"># type: ignore[return-value]</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">list_stat_file_folders_paginated</span><span class="p">(</span>
+    <span class="n">session</span><span class="p">:</span> <span class="n">Session</span><span class="p">,</span>
+    <span class="n">address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="n">max_page_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Iterable</span><span class="p">[</span><span class="n">ListStatFileFoldersResponse</span><span class="p">]:</span>
+    <span class="k">return</span> <span class="n">fetch_paginated</span><span class="p">(</span>
+        <span class="n">session</span><span class="p">,</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">REST_SERVICE_ADDRESS</span><span class="si">}</span><span class="s2">/filefolder/liststat/</span><span class="si">{</span><span class="n">quote_plus</span><span class="p">(</span><span class="n">address</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span>
+        <span class="n">max_page_size</span><span class="p">,</span>
+    <span class="p">)</span>  <span class="c1"># type: ignore[return-value]</span>
+
+
+</pre></div>
+</div>
+</section>
+<section id="deleting-file">
+<h3>Deleting file<a class="headerlink" href="#deleting-file" title="Link to this heading">#</a></h3>
+<p>To delete a file object, call the <code class="docutils literal notranslate"><span class="pre">DELETE</span> <span class="pre">/fileobject/by-address/&lt;address&gt;</span></code> endpoint. The endpoint always returns a 204 status code, regardless of whether the object exists.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">delete</span><span class="p">(</span>
+    <span class="n">example_server_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="n">resource_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<span class="p">):</span>
+    <span class="n">api_url</span> <span class="o">=</span> <span class="n">example_server_address</span> <span class="o">+</span> <span class="sa">f</span><span class="s2">&quot;/by-address/</span><span class="si">{</span><span class="n">urllib</span><span class="o">.</span><span class="n">parse</span><span class="o">.</span><span class="n">quote_plus</span><span class="p">(</span><span class="n">resource_address</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">delete</span><span class="p">(</span><span class="n">api_url</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">==</span> <span class="mi">204</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Done deleting via rest, file </span><span class="si">{</span><span class="n">resource_address</span><span class="si">}</span><span class="s2">!&quot;</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Error deleting </span><span class="si">{</span><span class="n">resource_address</span><span class="si">}</span><span class="s2">, result code is </span><span class="si">{</span><span class="n">response</span><span class="o">.</span><span class="n">status_code</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">json</span><span class="p">())</span>
+        <span class="k">raise</span> <span class="ne">Exception</span><span class="p">(</span><span class="s2">&quot;Could not delete&quot;</span><span class="p">)</span>
+
+
+</pre></div>
+</div>
+</section>
+</section>
+<section id="grpc">
+<h2>GRPC<a class="headerlink" href="#grpc" title="Link to this heading">#</a></h2>
+<section id="id1">
+<h3>Client library selection<a class="headerlink" href="#id1" title="Link to this heading">#</a></h3>
+<p>Like REST, multiple different client libraries for Python are available to implement the gRPC client code.
+We’ll use the official <code class="docutils literal notranslate"><span class="pre">grpcio</span></code> library for our examples. Install it with</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>pip install grpcio grpcio-tools
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">grpcio-tools</span></code> package includes the protobuf compiler needed to generate the service stub files.</p>
+</section>
+<section id="python-language-bindings-generation">
+<h3>Python language bindings generation<a class="headerlink" href="#python-language-bindings-generation" title="Link to this heading">#</a></h3>
+<p>Assuming the storage proto files are in a <code class="docutils literal notranslate"><span class="pre">proto</span></code> subdirectory, create the language bindings in the current directory
+with the following command:</p>
+<div class="highlight-none notranslate"><div class="highlight"><pre><span></span>python -m grpc_tools.protoc --python_out=. --pyi_out=. --grpc_python_out=. --proto_path=proto proto\nvidia\omniverse\storage\fileobject\v1beta\fileobject.proto proto\nvidia\omniverse\storage\fileobject\v1beta\fileobject_service.proto proto\nvidia\omniverse\storage\capabilities\v1beta\capabilities.proto proto\nvidia\omniverse\storage\filefolder\v1beta\filefolder_service.proto
+</pre></div>
+</div>
+<p>This command creates the required Python files in the <code class="docutils literal notranslate"><span class="pre">nvidia</span></code> subdirectory, from which they can be imported. Make sure to adjust
+the paths and number of files matching the version of the storage API definitions, new files might be added and paths might change.</p>
+</section>
+<section id="simple-stat">
+<h3>Simple stat<a class="headerlink" href="#simple-stat" title="Link to this heading">#</a></h3>
+<p>With the generated files, calling stat is even simpler than the REST version:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">nvidia.omniverse.storage.fileobject.v1alpha.fileobject_service_pb2_grpc</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">FileObjectServiceStub</span><span class="p">,</span>
+<span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">stat</span><span class="p">(</span><span class="n">grpc_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">resource_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">with</span> <span class="n">grpc</span><span class="o">.</span><span class="n">insecure_channel</span><span class="p">(</span><span class="n">grpc_address</span><span class="p">)</span> <span class="k">as</span> <span class="n">channel</span><span class="p">:</span>
+        <span class="n">storage_api_server</span> <span class="o">=</span> <span class="n">FileObjectServiceStub</span><span class="p">(</span><span class="n">channel</span><span class="p">)</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">response</span> <span class="o">=</span> <span class="n">storage_api_server</span><span class="o">.</span><span class="n">Stat</span><span class="p">(</span><span class="n">StatRequest</span><span class="p">(</span><span class="n">resource_address</span><span class="o">=</span><span class="n">resource_address</span><span class="p">))</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">resource_address</span><span class="si">}</span><span class="s2">: size </span><span class="si">{</span><span class="n">response</span><span class="o">.</span><span class="n">resource_info</span><span class="o">.</span><span class="n">metadata</span><span class="o">.</span><span class="n">data_object_size</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">except</span> <span class="n">grpc</span><span class="o">.</span><span class="n">RpcError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Failure to stat </span><span class="si">{</span><span class="n">resource_address</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">e</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+
+</pre></div>
+</div>
+<p>A connection to the gRPC server is established once via a channel context manager. The created service stub connecting
+via that channel can be reused for multiple calls.</p>
+</section>
+<section id="id2">
+<h3>Data download<a class="headerlink" href="#id2" title="Link to this heading">#</a></h3>
+<p>Downloading data from the Storage API is straightforward. We just need to loop over the replies:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">nvidia.omniverse.storage.fileobject.v1alpha.fileobject_service_pb2_grpc</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">FileObjectServiceStub</span><span class="p">,</span>
+<span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">download</span><span class="p">(</span>
+    <span class="n">grpc_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="n">resource_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="n">destination_file_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="n">download_preference</span><span class="p">:</span> <span class="n">DownloadPreference</span><span class="p">,</span>
+<span class="p">):</span>
+    <span class="k">with</span> <span class="n">grpc</span><span class="o">.</span><span class="n">insecure_channel</span><span class="p">(</span><span class="n">grpc_address</span><span class="p">)</span> <span class="k">as</span> <span class="n">channel</span><span class="p">:</span>
+        <span class="n">storage_api_server</span> <span class="o">=</span> <span class="n">FileObjectServiceStub</span><span class="p">(</span><span class="n">channel</span><span class="p">)</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">destination_file_name</span><span class="p">,</span> <span class="s2">&quot;wb&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">destination_file</span><span class="p">:</span>
+                <span class="k">for</span> <span class="n">reply</span> <span class="ow">in</span> <span class="n">storage_api_server</span><span class="o">.</span><span class="n">ReadFromAddress</span><span class="p">(</span>
+                    <span class="n">ReadFromAddressRequest</span><span class="p">(</span><span class="n">resource_address</span><span class="o">=</span><span class="n">resource_address</span><span class="p">,</span> <span class="n">download_preference</span><span class="o">=</span><span class="n">download_preference</span><span class="p">)</span>
+                <span class="p">):</span>
+                    <span class="k">if</span> <span class="n">reply</span><span class="o">.</span><span class="n">HasField</span><span class="p">(</span><span class="s2">&quot;resource_info&quot;</span><span class="p">):</span>
+                        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Found </span><span class="si">{</span><span class="n">resource_address</span><span class="si">}</span><span class="s2">, downloading </span><span class="si">{</span><span class="n">reply</span><span class="o">.</span><span class="n">resource_info</span><span class="o">.</span><span class="n">metadata</span><span class="o">.</span><span class="n">data_object_size</span><span class="si">}</span><span class="s2"> bytes&quot;</span><span class="p">)</span>
+                    <span class="k">elif</span> <span class="n">reply</span><span class="o">.</span><span class="n">HasField</span><span class="p">(</span><span class="s2">&quot;chunk&quot;</span><span class="p">):</span>
+                        <span class="n">destination_file</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">reply</span><span class="o">.</span><span class="n">chunk</span><span class="o">.</span><span class="n">chunk</span><span class="p">)</span>
+                    <span class="k">elif</span> <span class="n">reply</span><span class="o">.</span><span class="n">HasField</span><span class="p">(</span><span class="s2">&quot;redirect&quot;</span><span class="p">):</span>
+                        <span class="n">redirected_response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">reply</span><span class="o">.</span><span class="n">redirect</span><span class="o">.</span><span class="n">redirect_target_url</span><span class="p">,</span> <span class="n">stream</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+                        <span class="k">if</span> <span class="n">redirected_response</span><span class="o">.</span><span class="n">ok</span><span class="p">:</span>
+                            <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">redirected_response</span><span class="o">.</span><span class="n">iter_content</span><span class="p">(</span><span class="n">chunk_size</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                                <span class="n">destination_file</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span>
+                            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Done downloading from webserver file </span><span class="si">{</span><span class="n">destination_file_name</span><span class="si">}</span><span class="s2"> written!&quot;</span><span class="p">)</span>
+                            <span class="k">return</span>
+                        <span class="k">else</span><span class="p">:</span>
+                            <span class="k">raise</span> <span class="ne">Exception</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">reply</span><span class="o">.</span><span class="n">redirect</span><span class="o">.</span><span class="n">redirect_target_url</span><span class="si">}</span><span class="s2"> failed to download&quot;</span><span class="p">)</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="k">raise</span> <span class="ne">Exception</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unexpected reply </span><span class="si">{</span><span class="n">reply</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Done downloading via grpc, file </span><span class="si">{</span><span class="n">destination_file_name</span><span class="si">}</span><span class="s2"> written!&quot;</span><span class="p">)</span>
+        <span class="k">except</span> <span class="n">grpc</span><span class="o">.</span><span class="n">RpcError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Failure to download </span><span class="si">{</span><span class="n">resource_address</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">e</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+
+</pre></div>
+</div>
+<p>In this case, we handle the download by iterating over the response stream from the <code class="docutils literal notranslate"><span class="pre">ReadFromAddress</span></code> method. This method
+returns first the metadata and then either a stream of chunks, which we write into the destination file as they come in,
+or responds with redirection data similar to the REST redirect described above.</p>
+</section>
+<section id="id3">
+<h3>Data upload<a class="headerlink" href="#id3" title="Link to this heading">#</a></h3>
+<p>In contrast to HTTP, gRPC requires a more explicit transmission management, to avoid traffic congestion and ensure
+optional performance of a client.</p>
+<p>Write must be initiated by sending a <code class="docutils literal notranslate"><span class="pre">WriteRequest</span></code>, including at least the <code class="docutils literal notranslate"><span class="pre">resource_address</span></code> of the written file object and
+its size specified in the <code class="docutils literal notranslate"><span class="pre">data_object_size</span></code> field. A client may optionally provide an <code class="docutils literal notranslate"><span class="pre">upload_preference</span></code> parameter
+identifying a preferred file object upload method as before.</p>
+<p>Upon receiving a <code class="docutils literal notranslate"><span class="pre">WriteRequest</span></code>, the service will respond with a control message, which can be either a <code class="docutils literal notranslate"><span class="pre">WriteChunksAccepted</span></code>
+message, identifying the willingness of the service to accept the file object contents in one or more following <code class="docutils literal notranslate"><span class="pre">Chunk</span></code>
+messages, or a <code class="docutils literal notranslate"><span class="pre">WriteRedirect</span></code> message, which contains an instruction to follow either an indirect or a multipart write flow.</p>
+<p>On a successful write, the service will respond with a <code class="docutils literal notranslate"><span class="pre">ResourceInfo</span></code> message containing the metadata of the newly created
+data object:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">upload</span><span class="p">(</span><span class="n">channel</span><span class="p">:</span> <span class="n">Channel</span><span class="p">,</span> <span class="n">address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_preference</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">content</span><span class="p">:</span> <span class="n">IO</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Upload the contents of a file object at the specified address.&quot;&quot;&quot;</span>
+
+    <span class="n">content_length</span> <span class="o">=</span> <span class="n">get_content_length</span><span class="p">(</span><span class="n">content</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">upload_preference</span><span class="p">:</span>
+        <span class="n">chosen_upload_preference</span> <span class="o">=</span> <span class="n">_string_to_upload_preference</span><span class="p">(</span><span class="n">upload_preference</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">chosen_upload_preference</span> <span class="o">=</span> <span class="n">_get_upload_preference</span><span class="p">(</span><span class="n">channel</span><span class="p">,</span> <span class="n">address</span><span class="p">,</span> <span class="n">content_length</span><span class="p">)</span>
+
+    <span class="n">service</span> <span class="o">=</span> <span class="n">FileObjectServiceStub</span><span class="p">(</span><span class="n">channel</span><span class="p">)</span>
+    <span class="k">with</span> <span class="n">_write_message_queue</span><span class="p">()</span> <span class="k">as</span> <span class="p">(</span><span class="n">requests</span><span class="p">,</span> <span class="n">request_iterator</span><span class="p">):</span>
+        <span class="n">requests</span><span class="o">.</span><span class="n">put</span><span class="p">(</span>
+            <span class="n">WriteRequest</span><span class="p">(</span>
+                <span class="n">params</span><span class="o">=</span><span class="n">WriteParameters</span><span class="p">(</span>
+                    <span class="n">destination_resource_address</span><span class="o">=</span><span class="n">address</span><span class="p">,</span>
+                    <span class="n">data_object_size</span><span class="o">=</span><span class="n">content_length</span><span class="p">,</span>
+                    <span class="n">upload_preference</span><span class="o">=</span><span class="n">chosen_upload_preference</span><span class="p">,</span>
+                <span class="p">),</span>
+            <span class="p">),</span>
+        <span class="p">)</span>
+
+        <span class="n">write_responses</span><span class="p">:</span> <span class="n">Iterator</span><span class="p">[</span><span class="n">WriteResponse</span><span class="p">]</span> <span class="o">=</span> <span class="n">service</span><span class="o">.</span><span class="n">Write</span><span class="p">(</span><span class="n">request_iterator</span><span class="p">)</span>
+
+        <span class="n">flow_control_message</span> <span class="o">=</span> <span class="nb">next</span><span class="p">(</span><span class="n">write_responses</span><span class="p">)</span>
+
+        <span class="c1"># A service may immediately respond with a &quot;resource info&quot; message, meaning that a 0-byte object write has</span>
+        <span class="c1"># been performed immediately without the need for any further actions on the client end.</span>
+        <span class="k">if</span> <span class="n">flow_control_message</span><span class="o">.</span><span class="n">HasField</span><span class="p">(</span><span class="s2">&quot;resource_info&quot;</span><span class="p">):</span>
+            <span class="k">return</span>
+
+        <span class="c1"># If we receive a &quot;write chunks accepted&quot; message, stream the chunks and finally await for a &quot;resource info&quot;</span>
+        <span class="c1"># response message.</span>
+        <span class="k">if</span> <span class="n">flow_control_message</span><span class="o">.</span><span class="n">HasField</span><span class="p">(</span><span class="s2">&quot;write_chunks_accepted&quot;</span><span class="p">):</span>
+            <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">_slice_content</span><span class="p">(</span><span class="n">content</span><span class="p">):</span>
+                <span class="n">requests</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">WriteRequest</span><span class="p">(</span><span class="n">chunk</span><span class="o">=</span><span class="n">chunk</span><span class="p">))</span>
+
+            <span class="c1"># End chunk transmission.</span>
+            <span class="n">requests</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
+
+            <span class="n">resource_info_response</span> <span class="o">=</span> <span class="nb">next</span><span class="p">(</span><span class="n">write_responses</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">resource_info_response</span><span class="o">.</span><span class="n">HasField</span><span class="p">(</span><span class="s2">&quot;resource_info&quot;</span><span class="p">):</span>
+                <span class="k">return</span>
+
+            <span class="k">raise</span> <span class="ne">Exception</span><span class="p">(</span><span class="s2">&quot;Resource info message is expected.&quot;</span><span class="p">)</span>
+
+    <span class="c1"># Write redirect and multipart upload methods don&#39;t operate over the same stream of Write requests, so we should</span>
+    <span class="c1"># close the write stream.</span>
+    <span class="k">if</span> <span class="n">flow_control_message</span><span class="o">.</span><span class="n">HasField</span><span class="p">(</span><span class="s2">&quot;write_redirect&quot;</span><span class="p">):</span>
+        <span class="n">_write_via_redirect</span><span class="p">(</span><span class="n">service</span><span class="p">,</span> <span class="n">address</span><span class="p">,</span> <span class="n">flow_control_message</span><span class="o">.</span><span class="n">write_redirect</span><span class="p">,</span> <span class="n">content</span><span class="p">)</span>
+        <span class="k">return</span>
+
+    <span class="k">if</span> <span class="n">flow_control_message</span><span class="o">.</span><span class="n">HasField</span><span class="p">(</span><span class="s2">&quot;multipart_upload&quot;</span><span class="p">):</span>
+        <span class="n">_write_via_multipart</span><span class="p">(</span><span class="n">service</span><span class="p">,</span> <span class="n">address</span><span class="p">,</span> <span class="n">flow_control_message</span><span class="o">.</span><span class="n">multipart_upload</span><span class="p">,</span> <span class="n">content</span><span class="p">)</span>
+        <span class="k">return</span>
+
+    <span class="k">raise</span> <span class="ne">Exception</span><span class="p">(</span><span class="s2">&quot;Unexpected flow control message.&quot;</span><span class="p">)</span>
+
+
+</pre></div>
+</div>
+<p>Redirect and multipart write routines are similar to those of the HTTP protocol.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">_write_via_redirect</span><span class="p">(</span><span class="n">service</span><span class="p">:</span> <span class="n">FileObjectServiceStub</span><span class="p">,</span> <span class="n">address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">parameters</span><span class="p">:</span> <span class="n">WriteRedirectProperties</span><span class="p">,</span> <span class="n">content</span><span class="p">:</span> <span class="n">IO</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]):</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">request</span><span class="p">(</span>
+        <span class="n">url</span><span class="o">=</span><span class="n">parameters</span><span class="o">.</span><span class="n">redirect_target_url</span><span class="p">,</span>
+        <span class="n">method</span><span class="o">=</span><span class="n">_upload_method_to_string</span><span class="p">(</span><span class="n">parameters</span><span class="o">.</span><span class="n">method</span><span class="p">),</span>
+        <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="n">header</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">header</span><span class="o">.</span><span class="n">value</span> <span class="k">for</span> <span class="n">header</span> <span class="ow">in</span> <span class="n">parameters</span><span class="o">.</span><span class="n">additional_headers</span><span class="p">},</span>
+        <span class="n">data</span><span class="o">=</span><span class="n">content</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">response</span><span class="o">.</span><span class="n">raise_for_status</span><span class="p">()</span>
+
+    <span class="c1"># Optionally, obtain the resource information of the just uploaded file object</span>
+    <span class="c1"># This is not required to store the data, but helpful to keep the reference to the stored object.</span>
+    <span class="n">requested_headers</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">parameters</span><span class="o">.</span><span class="n">completion_header_names</span><span class="p">)</span>
+
+    <span class="c1"># Create lowercase mapping for case-insensitive header matching</span>
+    <span class="n">response_headers_lower</span> <span class="o">=</span> <span class="p">{</span><span class="n">key</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span> <span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">response</span><span class="o">.</span><span class="n">headers</span><span class="p">}</span>
+
+    <span class="n">service</span><span class="o">.</span><span class="n">CompleteRedirectUpload</span><span class="p">(</span>
+        <span class="n">CompleteRedirectUploadRequest</span><span class="p">(</span>
+            <span class="n">destination_resource_address</span><span class="o">=</span><span class="n">address</span><span class="p">,</span>
+            <span class="n">additional_headers</span><span class="o">=</span><span class="p">[</span>
+                <span class="n">Header</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="n">x</span><span class="p">,</span> <span class="n">value</span><span class="o">=</span><span class="n">response</span><span class="o">.</span><span class="n">headers</span><span class="p">[</span><span class="n">response_headers_lower</span><span class="p">[</span><span class="n">x</span><span class="o">.</span><span class="n">lower</span><span class="p">()]])</span>
+                <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">requested_headers</span>
+                <span class="k">if</span> <span class="n">x</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="ow">in</span> <span class="n">response_headers_lower</span>
+            <span class="p">],</span>
+        <span class="p">)</span>
+    <span class="p">)</span>
+
+
+</pre></div>
+</div>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">_write_via_multipart</span><span class="p">(</span><span class="n">service</span><span class="p">:</span> <span class="n">FileObjectServiceStub</span><span class="p">,</span> <span class="n">address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">parameters</span><span class="p">:</span> <span class="n">CreateMultipartUploadResponse</span><span class="p">,</span> <span class="n">content</span><span class="p">:</span> <span class="n">IO</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]):</span>
+    <span class="c1"># Build a list of redirect URLs to upload the parts to. The first we got from the CreateMultipartUploadResponse</span>
+    <span class="n">redirects</span> <span class="o">=</span> <span class="p">[</span><span class="n">parameters</span><span class="o">.</span><span class="n">first_part_write_redirect</span><span class="p">]</span>
+
+    <span class="c1"># Calculate the number of parts, and retrieve the pre-signed URLs from the service to use for individual part upload</span>
+    <span class="n">total_part_count</span><span class="p">,</span> <span class="n">part_size</span><span class="p">,</span> <span class="n">content_length</span> <span class="o">=</span> <span class="n">part_count_for_multipart_upload</span><span class="p">(</span>
+        <span class="n">content</span><span class="p">,</span> <span class="n">parameters</span><span class="o">.</span><span class="n">minimum_size_per_part</span><span class="p">,</span> <span class="n">parameters</span><span class="o">.</span><span class="n">maximum_size_per_part</span>
+    <span class="p">)</span>
+    <span class="k">if</span> <span class="n">total_part_count</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="n">response</span><span class="p">:</span> <span class="n">UploadPartResponse</span> <span class="o">=</span> <span class="n">service</span><span class="o">.</span><span class="n">UploadPart</span><span class="p">(</span>
+            <span class="n">UploadPartRequest</span><span class="p">(</span>
+                <span class="n">upload_id</span><span class="o">=</span><span class="n">parameters</span><span class="o">.</span><span class="n">upload_id</span><span class="p">,</span>
+                <span class="n">destination_resource_address</span><span class="o">=</span><span class="n">address</span><span class="p">,</span>
+                <span class="n">part_number</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>  <span class="c1"># Part number 0 has already been delivered by the first CreateMultipartUploadReponse</span>
+                <span class="n">part_count</span><span class="o">=</span><span class="n">total_part_count</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span>
+            <span class="p">),</span>
+        <span class="p">)</span>
+        <span class="n">redirects</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">part_write_redirects</span><span class="p">)</span>
+
+    <span class="n">completed_parts</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">part_number</span><span class="p">,</span> <span class="n">part</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span>
+        <span class="n">split_contents_for_multipart_upload</span><span class="p">(</span>
+            <span class="n">content</span><span class="p">,</span>
+            <span class="n">min_part_size</span><span class="o">=</span><span class="n">parameters</span><span class="o">.</span><span class="n">minimum_size_per_part</span><span class="p">,</span>
+            <span class="n">max_part_size</span><span class="o">=</span><span class="n">parameters</span><span class="o">.</span><span class="n">maximum_size_per_part</span><span class="p">,</span>
+            <span class="n">max_parts</span><span class="o">=</span><span class="n">parameters</span><span class="o">.</span><span class="n">maximum_parts_number</span><span class="p">,</span>
+        <span class="p">)</span>
+    <span class="p">):</span>
+        <span class="n">completed_parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">_write_part</span><span class="p">(</span><span class="n">redirects</span><span class="p">[</span><span class="n">part_number</span><span class="p">],</span> <span class="n">part_number</span><span class="p">,</span> <span class="n">part</span><span class="p">))</span>
+
+    <span class="n">service</span><span class="o">.</span><span class="n">CompleteMultipartUpload</span><span class="p">(</span>
+        <span class="n">CompleteMultipartUploadRequest</span><span class="p">(</span>
+            <span class="n">upload_id</span><span class="o">=</span><span class="n">parameters</span><span class="o">.</span><span class="n">upload_id</span><span class="p">,</span>
+            <span class="n">destination_resource_address</span><span class="o">=</span><span class="n">address</span><span class="p">,</span>
+            <span class="n">parts</span><span class="o">=</span><span class="n">completed_parts</span><span class="p">,</span>
+        <span class="p">),</span>
+    <span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_write_part</span><span class="p">(</span><span class="n">redirect</span><span class="p">:</span> <span class="n">WriteRedirectProperties</span><span class="p">,</span> <span class="n">part</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">content</span><span class="p">:</span> <span class="n">SupportsRead</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CompletedUploadPart</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">CompletedUploadPart</span><span class="p">(</span>
+        <span class="n">part_number</span><span class="o">=</span><span class="n">part</span><span class="p">,</span>
+        <span class="n">headers</span><span class="o">=</span><span class="p">[</span>
+            <span class="n">Header</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="o">=</span><span class="n">value</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">upload_part</span><span class="p">(</span>
+                <span class="n">url</span><span class="o">=</span><span class="n">redirect</span><span class="o">.</span><span class="n">redirect_target_url</span><span class="p">,</span>
+                <span class="n">method</span><span class="o">=</span><span class="n">_upload_method_to_string</span><span class="p">(</span><span class="n">redirect</span><span class="o">.</span><span class="n">method</span><span class="p">),</span>
+                <span class="n">upload_headers</span><span class="o">=</span><span class="nb">dict</span><span class="p">([(</span><span class="n">header</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">header</span><span class="o">.</span><span class="n">value</span><span class="p">)</span> <span class="k">for</span> <span class="n">header</span> <span class="ow">in</span> <span class="n">redirect</span><span class="o">.</span><span class="n">additional_headers</span><span class="p">]),</span>
+                <span class="n">return_headers</span><span class="o">=</span><span class="p">[</span><span class="n">name</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">redirect</span><span class="o">.</span><span class="n">completion_header_names</span><span class="p">],</span>
+                <span class="n">content</span><span class="o">=</span><span class="n">content</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="p">],</span>
+    <span class="p">)</span>
+
+
+</pre></div>
+</div>
+<section id="opportunistic-writes">
+<h4>Opportunistic writes<a class="headerlink" href="#opportunistic-writes" title="Link to this heading">#</a></h4>
+<p>In some cases, clients can use “opportunistic writes”, that is such write operations, where <code class="docutils literal notranslate"><span class="pre">Chunk</span></code> messages
+are streamed without awaiting for the <code class="docutils literal notranslate"><span class="pre">WriteChunksAccepted</span></code> response from the service. While this can be beneficial
+performance-wise for small uploads, for any “substantially large” file objects, clients are advised to call the
+<code class="docutils literal notranslate"><span class="pre">FetchWriteTypeInfo</span></code> in advance to familiarize themselves with the method upload limits, as otherwise a rejected
+sequence of <code class="docutils literal notranslate"><span class="pre">Chunk</span></code> messages may cause traffic congestion.</p>
+</section>
+<section id="id4">
+<h4>Upload preference selection<a class="headerlink" href="#id4" title="Link to this heading">#</a></h4>
+<p>In a similar way to the REST API, gRPC API provides means of deducing the upload method selected by the storage
+service, namely by introspecting the response of the <code class="docutils literal notranslate"><span class="pre">FetchWriteTypeInfo</span></code> method call:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">_get_upload_preference</span><span class="p">(</span><span class="n">channel</span><span class="p">:</span> <span class="n">Channel</span><span class="p">,</span> <span class="n">resource_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">UploadPreference</span><span class="p">:</span>
+    <span class="n">client</span> <span class="o">=</span> <span class="n">FileObjectServiceStub</span><span class="p">(</span><span class="n">channel</span><span class="p">)</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">FetchWriteTypeInfo</span><span class="p">(</span><span class="n">FetchWriteTypeInfoRequest</span><span class="p">(</span><span class="n">destination_resource_address</span><span class="o">=</span><span class="n">resource_address</span><span class="p">))</span>
+
+    <span class="k">for</span> <span class="n">interval</span> <span class="ow">in</span> <span class="n">response</span><span class="o">.</span><span class="n">write_type_intervals</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">interval</span><span class="o">.</span><span class="n">minimum_data_object_size</span> <span class="ow">and</span> <span class="n">interval</span><span class="o">.</span><span class="n">minimum_data_object_size</span> <span class="o">&gt;</span> <span class="n">size</span><span class="p">:</span>
+            <span class="k">continue</span>
+
+        <span class="k">if</span> <span class="n">interval</span><span class="o">.</span><span class="n">maximum_data_object_size</span> <span class="ow">and</span> <span class="n">interval</span><span class="o">.</span><span class="n">maximum_data_object_size</span> <span class="o">&lt;</span> <span class="n">size</span><span class="p">:</span>
+            <span class="k">continue</span>
+
+        <span class="k">return</span> <span class="n">interval</span><span class="o">.</span><span class="n">preferred_upload_method</span>
+
+    <span class="k">return</span> <span class="n">UploadPreference</span><span class="o">.</span><span class="n">UPLOAD_PREFERENCE_UNSPECIFIED</span>
+
+
+</pre></div>
+</div>
+</section>
+</section>
+<section id="id5">
+<h3>Listing folders<a class="headerlink" href="#id5" title="Link to this heading">#</a></h3>
+<p>To perform file and folder listings, use the <code class="docutils literal notranslate"><span class="pre">List</span></code> operation provided by the <code class="docutils literal notranslate"><span class="pre">FileFolderService</span></code> API, which
+returns a stream of file and folder entries. For clients requiring additional metadata for file entries, the
+<code class="docutils literal notranslate"><span class="pre">ListStat</span></code> operation should be employed as follows:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">list_file_folders</span><span class="p">(</span><span class="n">channel</span><span class="p">:</span> <span class="n">Channel</span><span class="p">,</span> <span class="n">resource_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">stat</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
+    <span class="n">client</span> <span class="o">=</span> <span class="n">FileFolderServiceStub</span><span class="p">(</span><span class="n">channel</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">stat</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">list_stat_message</span> <span class="ow">in</span> <span class="n">client</span><span class="o">.</span><span class="n">ListStat</span><span class="p">(</span><span class="n">ListStatRequest</span><span class="p">(</span><span class="n">folder</span><span class="o">=</span><span class="n">FolderAddress</span><span class="p">(</span><span class="n">uri</span><span class="o">=</span><span class="n">resource_address</span><span class="p">))):</span>
+            <span class="n">handle_list_stat_message</span><span class="p">(</span><span class="n">list_stat_message</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">list_message</span> <span class="ow">in</span> <span class="n">client</span><span class="o">.</span><span class="n">List</span><span class="p">(</span><span class="n">ListRequest</span><span class="p">(</span><span class="n">folder</span><span class="o">=</span><span class="n">FolderAddress</span><span class="p">(</span><span class="n">uri</span><span class="o">=</span><span class="n">resource_address</span><span class="p">))):</span>
+            <span class="n">handle_list_message</span><span class="p">(</span><span class="n">list_message</span><span class="p">)</span>
+
+
+</pre></div>
+</div>
+<p>Depending on the storage backend’s capabilities, ListStat might be significantly slower than List or there might be no
+performance difference at all.</p>
+</section>
+<section id="id6">
+<h3>Deleting file<a class="headerlink" href="#id6" title="Link to this heading">#</a></h3>
+<p>To delete a file object, call the <code class="docutils literal notranslate"><span class="pre">Delete</span></code> operation provided by the <code class="docutils literal notranslate"><span class="pre">FileFolderService</span></code> API. This operation is idempotent, meaning it returns an <code class="docutils literal notranslate"><span class="pre">OK</span></code> response even if the specified file object does not exist. Additionally, it does not return any content in the response.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">nvidia.omniverse.storage.fileobject.v1alpha.fileobject_service_pb2_grpc</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">FileObjectServiceStub</span><span class="p">,</span>
+<span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">delete</span><span class="p">(</span>
+    <span class="n">grpc_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="n">resource_address</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<span class="p">):</span>
+    <span class="k">with</span> <span class="n">grpc</span><span class="o">.</span><span class="n">insecure_channel</span><span class="p">(</span><span class="n">grpc_address</span><span class="p">)</span> <span class="k">as</span> <span class="n">channel</span><span class="p">:</span>
+        <span class="n">storage_api_server</span> <span class="o">=</span> <span class="n">FileObjectServiceStub</span><span class="p">(</span><span class="n">channel</span><span class="p">)</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">reply</span> <span class="o">=</span> <span class="n">storage_api_server</span><span class="o">.</span><span class="n">Delete</span><span class="p">(</span><span class="n">DeleteRequest</span><span class="p">(</span><span class="n">resource_address</span><span class="o">=</span><span class="n">resource_address</span><span class="p">))</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Done deleting via grpc, file </span><span class="si">{</span><span class="n">resource_address</span><span class="si">}</span><span class="s2">!&quot;</span><span class="p">)</span>
+        <span class="k">except</span> <span class="n">grpc</span><span class="o">.</span><span class="n">RpcError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Failure to delete </span><span class="si">{</span><span class="n">resource_address</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">e</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+
+</pre></div>
+</div>
+</section>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#discovery">Discovery</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#rest">REST</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#client-library-selection">Client library selection</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#initial-call">Initial call</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#data-download">Data download</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#data-upload">Data upload</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#upload-preference-selection">Upload preference selection</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#listing-folders">Listing folders</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#deleting-file">Deleting file</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#grpc">GRPC</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Client library selection</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#python-language-bindings-generation">Python language bindings generation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#simple-stat">Simple stat</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">Data download</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id3">Data upload</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#opportunistic-writes">Opportunistic writes</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id4">Upload preference selection</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id5">Listing folders</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id6">Deleting file</a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025-2026, NVIDIA Corporation.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item"><p class="last-updated">
+  Last updated on Apr 17, 2026.
+  <br/>
+</p></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

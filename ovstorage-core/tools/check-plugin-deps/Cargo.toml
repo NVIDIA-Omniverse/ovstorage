@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "check-plugin-deps"
+version = "0.1.0"
+edition = "2024"
+description = "Layering lint that forbids ovstorage plugin crates from depending on host-side ovstorage crates."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "check-plugin-deps"
+path = "src/main.rs"
+
+[lints]
+workspace = true

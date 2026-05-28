@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-authz-toml"
+version = "0.1.0"
+edition = "2024"
+description = "First-party TOML authorization plugin for ovstorage brokered mode."
+license = "Apache-2.0"
+build = "build.rs"
+
+[dependencies]
+async-trait.workspace = true
+ovstorage-authz = { version = "0.1.0", path = "../ovstorage-authz" }
+ovstorage-plugin.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync"] }
+toml.workspace = true
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true

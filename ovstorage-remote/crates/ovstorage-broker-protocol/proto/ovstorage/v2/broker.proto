@@ -1,0 +1,677 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package ovstorage.v2;
+
+service BrokerService {
+  rpc ListAddressRoots(ListAddressRootsRequest) returns (ListAddressRootsResponse);
+  // Server-streaming follow-up to `ListAddressRoots`: emits an initial
+  // `Snapshot` with the current root set, then `Added` / `Removed`
+  // deltas as the broker's route table mutates. The host uses this to
+  // update its routing table without reconnecting.
+  rpc WatchAddressRoots(WatchAddressRootsRequest) returns (stream AddressRootsChange);
+  rpc Stat(StatRequest) returns (StatResponse);
+  rpc Read(ReadRequest) returns (stream ReadResponse);
+  rpc Write(stream WriteRequest) returns (stream WriteResponse);
+  rpc WriteRedirect(WriteRedirectRequest) returns (WriteRedirectResponse);
+  rpc ContinueWrite(ContinueWriteRequest) returns (ContinueWriteResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc List(ListRequest) returns (ListResponse);
+  rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
+  rpc GetLatestVersion(GetLatestVersionRequest) returns (GetLatestVersionResponse);
+  rpc WatchDirectory(WatchDirectoryRequest) returns (stream WatchDirectoryResponse);
+  rpc CreateDirectory(CreateDirectoryRequest) returns (CreateDirectoryResponse);
+  rpc DeleteDirectory(DeleteDirectoryRequest) returns (DeleteDirectoryResponse);
+  rpc Copy(CopyRequest) returns (CopyResponse);
+  rpc Rename(RenameRequest) returns (RenameResponse);
+  rpc UpdateMetadata(UpdateMetadataRequest) returns (UpdateMetadataResponse);
+  rpc CheckAccess(CheckAccessRequest) returns (CheckAccessResponse);
+  // Per-user upstream OAuth. The broker streams `AuthEvent`s to the
+  // caller (typically the broker-client SDK on a host). The host runs
+  // the interactive flow end-to-end, then sends the resolved
+  // credential back via `RegisterCredential`. Workers without an
+  // interactive UI just drop the stream; the broker times out and
+  // surfaces `AuthRequired` to the originating SPI call.
+  rpc Auth(AuthRequest) returns (stream AuthEventEnvelope);
+  rpc RegisterCredential(RegisterCredentialRequest) returns (RegisterCredentialResponse);
+}
+
+// Tag order mirrors the SPI `ObjectInfo` field order: identity first
+// (address, kind), then identity-bearing scalars (etag, version, size,
+// mtime, modified_by), then descriptive collections.
+message ObjectInfo {
+  string address = 1;
+  // File / directory discriminator. Mirrors `ovstorage_plugin::ObjectKind`.
+  // Default `OBJECT_KIND_FILE = 0` matches `ObjectKind::default() == File`.
+  ObjectKind kind = 2;
+  optional string etag = 3;
+  // Backend-specific version identifier (S3 versionId, GCS generation).
+  // Descriptive only — not used as a precondition.
+  optional string version = 4;
+  optional uint64 size = 5;
+  // Signed millis since the Unix epoch. Pre-epoch mtimes are legal
+  // (clock skew on the file plugin) and surface as negative values.
+  optional int64 mtime_unix_millis = 6;
+  // Last-modifier; broker overrides via attribution when present, else
+  // reflects the plugin's native source.
+  optional string modified_by = 7;
+  repeated Checksum checksums = 8;
+  AccessOps effective_permissions = 9;
+  map<string, string> user_metadata = 10;
+  map<string, string> system_metadata = 11;
+}
+
+enum ObjectKind {
+  OBJECT_KIND_FILE = 0;
+  OBJECT_KIND_DIRECTORY = 1;
+  OBJECT_KIND_DIRECTORY_MARKER = 2;
+  OBJECT_KIND_DIRECTORY_INFERRED = 3;
+}
+
+// Destination-side precondition for `write` / `copy` / `rename`. Mirrors
+// `ovstorage_plugin::IfDestExists`. Shape: enum discriminator + optional
+// etag (only populated when `kind == IF_DEST_EXISTS_KIND_MATCH_ETAG`).
+// Chosen over `oneof` so the default-zero variant (`OVERWRITE`) is the
+// wire-default — no tag bytes on the common path.
+message IfDestExists {
+  IfDestExistsKind kind = 1;
+  optional string match_etag = 2;
+}
+
+enum IfDestExistsKind {
+  IF_DEST_EXISTS_KIND_OVERWRITE = 0;
+  IF_DEST_EXISTS_KIND_FAIL = 1;
+  IF_DEST_EXISTS_KIND_MATCH_ETAG = 2;
+}
+
+message Checksum {
+  string algorithm = 1;
+  bytes value = 2;
+}
+
+message AccessOps {
+  bool read = 1;
+  bool write = 2;
+  bool delete = 3;
+  bool update_metadata = 4;
+}
+
+message AccessDecision {
+  bool allowed = 1;
+  AccessOps denied_ops = 2;
+  string reason = 3;
+}
+
+message ByteRange {
+  uint64 start = 1;
+  optional uint64 end_inclusive = 2;
+}
+
+message StatOptions {
+  bool full_metadata = 1;
+}
+
+message ReadOptions {
+  optional string if_match = 1;
+  ByteRange range = 2;
+}
+
+message WriteOptions {
+  // Destination-side precondition (subsumes `if_match` + `no_overwrite`).
+  IfDestExists if_dest = 1;
+  optional uint64 size_hint = 2;
+  // Per-operation annotation. Backends that version objects (Nucleus
+  // checkpoints) treat this as the version commit message; others
+  // drop it silently.
+  optional string message = 3;
+  map<string, string> user_metadata = 4;
+}
+
+message DeleteOptions {
+  optional string if_match = 1;
+}
+
+message ListOptions {
+  bool recursive = 1;
+  optional uint32 max_results = 2;
+  string page_token = 3;
+  bool full_metadata = 4;
+}
+
+message ListVersionsOptions {
+  optional uint32 max_results = 1;
+  string page_token = 2;
+}
+
+message CreateDirectoryOptions {}
+
+message DeleteDirectoryOptions {}
+
+message CopyOptions {
+  // Source-side precondition.
+  optional string if_source = 1;
+  // Destination-side precondition.
+  IfDestExists if_dest = 2;
+  // See WriteOptions.message.
+  optional string message = 3;
+}
+
+message RenameOptions {
+  // Source-side precondition.
+  optional string if_source = 1;
+  // Destination-side precondition.
+  IfDestExists if_dest = 2;
+  // See WriteOptions.message.
+  optional string message = 3;
+}
+
+message ListPage {
+  repeated ObjectInfo items = 1;
+  string next_page_token = 2;
+}
+
+message AddressRoot {
+  string address = 1;
+  string display_name = 2;
+  string backend_kind = 3;
+  string connection_id = 4;
+  AddressVisibility visibility = 5;
+  map<string, string> user_metadata = 6;
+  // Full capability profile of the upstream backend serving this root.
+  Capabilities capabilities = 7;
+}
+
+// Mirror of `ovstorage_plugin::Capabilities`. Field-by-field copy so
+// the broker-client can advertise per-route capabilities that match
+// the upstream backend's profile (a flat S3 bucket reports
+// `supports_recursive_list = false`, a versioning-disabled bucket
+// reports `supports_version_listing = false`, etc.). Tag order
+// mirrors the SPI struct's field order.
+message Capabilities {
+  bool supports_if_match_write = 1;
+  bool supports_no_overwrite_write = 2;
+  bool supports_native_metadata_patch = 3;
+  bool supports_metadata_rewrite_emulation = 4;
+  bool writes_are_atomic = 5;
+  bool supports_server_side_copy = 6;
+  bool supports_server_side_rename = 7;
+  bool supports_atomic_rename = 8;
+  bool has_real_directories = 9;
+  bool supports_write = 10;
+  bool supports_write_stream = 11;
+  bool supports_write_redirect = 12;
+  bool supports_delete = 13;
+  bool supports_list = 14;
+  bool wants_list_backed_stat = 15;
+  bool supports_recursive_list = 16;
+  bool populates_subdirectory_metadata = 17;
+  bool supports_create_directory = 18;
+  bool supports_delete_directory = 19;
+  bool supports_version_listing = 20;
+  optional VersionListOrder version_list_order = 21;
+  bool populates_effective_permissions_on_stat = 22;
+  bool supports_access_check = 23;
+  bool supports_watch_directory = 24;
+  ChangeKindSet watch_directory_kinds = 25;
+  bool watch_directory_resumable = 26;
+  optional uint64 watch_directory_max_lag_millis = 27;
+  optional uint64 redirect_size_threshold = 28;
+}
+
+enum VersionListOrder {
+  VERSION_LIST_ORDER_NEWEST = 0;
+  VERSION_LIST_ORDER_OLDEST = 1;
+  VERSION_LIST_ORDER_UNORDERED = 2;
+}
+
+message ChangeKindSet {
+  bool created = 1;
+  bool modified = 2;
+  bool deleted = 3;
+  bool metadata_changed = 4;
+}
+
+enum AddressVisibility {
+  ADDRESS_VISIBILITY_VISIBLE = 0;
+  ADDRESS_VISIBILITY_HIDDEN = 1;
+  ADDRESS_VISIBILITY_SUPPRESSED = 2;
+}
+
+message HttpRequest {
+  string method = 1;
+  string url = 2;
+  repeated Header headers = 3;
+}
+
+message Header {
+  string name = 1;
+  string value = 2;
+}
+
+message RedirectScope {
+  string physical_url_prefix = 1;
+  AccessOps operations = 2;
+  uint64 expires_at_unix_millis = 3;
+}
+
+message ReadRedirect {
+  HttpRequest request = 1;
+  uint64 expires_at_unix_millis = 2;
+  RedirectScope scope = 3;
+  string audit_id = 4;
+  uint64 policy_epoch = 5;
+  ResponseParsing response_parsing = 6;
+}
+
+message WriteRedirect {
+  HttpRequest request = 1;
+  RedirectBodySource body_source = 2;
+  uint64 expires_at_unix_millis = 3;
+  RedirectScope scope = 4;
+  string audit_id = 5;
+  uint64 policy_epoch = 6;
+  ResultCapture result_capture = 7;
+}
+
+message ResponseParsing {
+  optional string etag_header = 1;
+  optional string version_header = 2;
+  optional string size_header = 3;
+  optional string mtime_header = 4;
+  MtimeFormat mtime_format = 5;
+  repeated string system_metadata_headers = 6;
+  optional string content_checksum_header = 7;
+  optional string content_checksum_algorithm = 8;
+  repeated ChecksumHeader checksum_headers = 9;
+}
+
+message ChecksumHeader {
+  string algorithm = 1;
+  string header = 2;
+}
+
+enum MtimeFormat {
+  MTIME_FORMAT_RFC1123 = 0;
+  MTIME_FORMAT_ISO8601 = 1;
+  MTIME_FORMAT_UNIX_SECONDS = 2;
+}
+
+message ResultCapture {
+  repeated string headers = 1;
+  uint32 body_max_bytes = 2;
+}
+
+message RedirectBodySource {
+  oneof source {
+    Empty empty = 1;
+    UserBytes user_bytes = 2;
+    bytes inline_bytes = 3;
+  }
+}
+
+message Empty {}
+
+message UserBytes {
+  uint64 offset = 1;
+  uint64 len = 2;
+}
+
+message WriteRedirectBatch {
+  repeated WriteRedirect redirects = 1;
+  // Opaque per-plugin payload that the host must round-trip back
+  // through `ContinueWrite` so the plugin can resume its multipart
+  // / resumable upload state machine. Plugins (S3 multipart, GCS
+  // resumable, Azure block-list, plugin-test) encode whatever they
+  // need here; the host treats it as opaque bytes.
+  bytes continuation = 2;
+}
+
+message RedirectResult {
+  uint32 status_code = 1;
+  repeated Header captured_headers = 2;
+  bytes captured_body = 3;
+}
+
+message RedirectResultBatch {
+  repeated RedirectResult results = 1;
+}
+
+message WriteResult {
+  ObjectInfo info = 1;
+}
+
+message ChangeEvent {
+  oneof event {
+    ObjectChange object = 1;
+    LapsedChange lapsed = 2;
+  }
+}
+
+// Tag order mirrors `ObjectInfo`: address, then descriptive scalars,
+// then the watch-stream-specific `at` / `cursor` trailing pair.
+message ObjectChange {
+  string address = 1;
+  ChangeKind kind = 2;
+  // Post-change etag, mirroring `ChangeEvent::Object::etag`.
+  optional string etag = 3;
+  optional string version = 4;
+  optional uint64 size = 5;
+  // Signed millis since the Unix epoch; see ObjectInfo.mtime_unix_millis.
+  optional int64 mtime_unix_millis = 6;
+  uint64 at_unix_millis = 7;
+  bytes cursor = 8;
+}
+
+message LapsedChange {
+  optional uint64 since_unix_millis = 1;
+  bytes cursor = 2;
+}
+
+enum ChangeKind {
+  CHANGE_KIND_CREATED = 0;
+  CHANGE_KIND_MODIFIED = 1;
+  CHANGE_KIND_DELETED = 2;
+  CHANGE_KIND_METADATA_CHANGED = 3;
+}
+
+message ErrorDetail {
+  string code = 1;
+  string message = 2;
+  string address = 3;
+  string audit_id = 4;
+  optional uint64 policy_epoch = 5;
+  oneof context {
+    ErrorIdentityContext identity = 6;
+    ErrorAuthContext auth = 7;
+  }
+}
+
+message ErrorIdentityContext {
+  // Post-mismatch etag (mirrors `ErrorContext::Identity::new_etag`).
+  optional string new_etag = 1;
+}
+
+message ErrorAuthContext {
+  string connection_id = 1;
+  optional string reason = 2;
+  optional uint64 expired_at_unix_millis = 3;
+}
+
+message ListAddressRootsRequest {}
+
+message ListAddressRootsResponse {
+  repeated AddressRoot roots = 1;
+}
+
+message WatchAddressRootsRequest {}
+
+// Stream entry for `WatchAddressRoots`. The first entry the server
+// emits MUST be a `Snapshot` carrying the current root set; subsequent
+// entries carry only the routes that mutated.
+message AddressRootsChange {
+  oneof kind {
+    AddressRootsSnapshot snapshot = 1;
+    AddressRootsAdded added = 2;
+    AddressRootsRemoved removed = 3;
+  }
+}
+
+message AddressRootsSnapshot {
+  repeated AddressRoot roots = 1;
+}
+
+message AddressRootsAdded {
+  repeated AddressRoot roots = 1;
+}
+
+message AddressRootsRemoved {
+  // For removals we only need the addresses, but emitting full
+  // `AddressRoot` messages keeps the wire format symmetric with
+  // Snapshot/Added and lets clients log the removed roots' display
+  // names without a separate lookup.
+  repeated AddressRoot roots = 1;
+}
+
+message StatRequest {
+  string address = 1;
+  StatOptions options = 2;
+}
+
+message StatResponse {
+  ObjectInfo info = 1;
+}
+
+message ReadRequest {
+  string address = 1;
+  ReadOptions options = 2;
+}
+
+// Server-streaming `Read` response shape. Allowed sequences:
+//   `info`                 — info-only (caller asked for info, no body)
+//   `info`, `body`...      — streamed read; end-of-stream is gRPC stream close
+//   `info`, `redirect`     — info first, then bounce body to a presigned URL
+//   `redirect`             — standalone redirect (no info)
+// Disallowed: any sequence mixing `body` with a subsequent `redirect`,
+// any `info` after `info`, any `body` before `info`, anything after a
+// `redirect`. The client surfaces violations as `ErrorCode::Internal`.
+//
+// Peak broker and client memory is bounded by one chunk at a time —
+// the server-streaming RPC delivers frames lazily.
+message ReadResponse {
+  oneof result {
+    ObjectInfo info = 1;
+    bytes body = 2;
+    ReadRedirect redirect = 3;
+  }
+}
+
+message WriteRequest {
+  oneof step {
+    WriteOpen open = 1;
+    bytes chunk = 2;
+    RedirectResultBatch redirect_results = 3;
+  }
+}
+
+message WriteOpen {
+  string address = 1;
+  WriteOptions options = 2;
+}
+
+message WriteResponse {
+  oneof step {
+    Empty accept_upload = 1;
+    WriteRedirectBatch redirects = 2;
+    WriteResult done = 3;
+  }
+}
+
+message WriteRedirectRequest {
+  string address = 1;
+  WriteOptions options = 2;
+}
+
+message WriteRedirectResponse {
+  WriteRedirectBatch redirects = 1;
+}
+
+message ContinueWriteRequest {
+  string address = 1;
+  WriteRedirectBatch redirects = 2;
+  RedirectResultBatch results = 3;
+}
+
+message ContinueWriteResponse {
+  oneof step {
+    WriteRedirectBatch redirects = 1;
+    WriteResult done = 2;
+  }
+}
+
+message DeleteRequest {
+  string address = 1;
+  DeleteOptions options = 2;
+}
+
+message DeleteResponse {}
+
+message ListRequest {
+  string prefix = 1;
+  ListOptions options = 2;
+}
+
+message ListResponse {
+  ListPage page = 1;
+}
+
+message ListVersionsRequest {
+  string address = 1;
+  ListVersionsOptions options = 2;
+}
+
+message ListVersionsResponse {
+  repeated ObjectInfo items = 1;
+}
+
+message GetLatestVersionRequest {
+  string address = 1;
+}
+
+message GetLatestVersionResponse {
+  ObjectInfo version = 1;
+}
+
+message WatchDirectoryRequest {
+  string prefix = 1;
+  bool recursive = 2;
+  bool include_metadata_changes = 3;
+  bytes since = 4;
+  uint64 poll_interval_millis = 5;
+}
+
+message WatchDirectoryResponse {
+  ChangeEvent event = 1;
+}
+
+message CreateDirectoryRequest {
+  string address = 1;
+  CreateDirectoryOptions options = 2;
+}
+
+message CreateDirectoryResponse {
+  ObjectInfo info = 1;
+}
+
+message DeleteDirectoryRequest {
+  string address = 1;
+  DeleteDirectoryOptions options = 2;
+}
+
+message DeleteDirectoryResponse {}
+
+message CopyRequest {
+  string source = 1;
+  string destination = 2;
+  CopyOptions options = 3;
+}
+
+message CopyResponse {
+  WriteResult result = 1;
+}
+
+message RenameRequest {
+  string source = 1;
+  string destination = 2;
+  RenameOptions options = 3;
+}
+
+message RenameResponse {}
+
+message UpdateMetadataRequest {
+  string address = 1;
+  optional string if_match = 2;
+  bool allow_rewrite_emulation = 3;
+  map<string, string> user_metadata_set = 4;
+  repeated string user_metadata_remove = 5;
+  optional string message = 6;
+}
+
+message UpdateMetadataResponse {
+  ObjectInfo info = 1;
+}
+
+message CheckAccessRequest {
+  string address = 1;
+  AccessOps operations = 2;
+}
+
+message CheckAccessResponse {
+  AccessDecision decision = 1;
+}
+
+// Per-user upstream OAuth.
+message AuthRequest {
+  // Address whose route's upstream the caller wants to authenticate.
+  // The broker uses this to identify the `(BackendId, PrincipalView)`
+  // cache slot.
+  string address = 1;
+}
+
+// Mirror of `ovstorage_plugin::AuthEvent`. The connection-related
+// `Succeeded` variant is intentionally lossy at the wire — only the
+// `connection_id` is propagated; the resolved credential bytes are
+// delivered by `RegisterCredential` on a separate unary RPC, never
+// embedded in the stream.
+message AuthEventEnvelope {
+  oneof event {
+    AuthOpenBrowser open_browser = 1;
+    AuthDeviceCode device_code = 2;
+    AuthProgress progress = 3;
+    AuthSucceeded succeeded = 4;
+    AuthFailed failed = 5;
+    AuthCancelled cancelled = 6;
+  }
+}
+
+message AuthOpenBrowser {
+  string url = 1;
+  uint64 expires_at_unix_millis = 2;
+}
+
+message AuthDeviceCode {
+  string user_code = 1;
+  string verification_url = 2;
+  uint64 expires_at_unix_millis = 3;
+  uint64 interval_millis = 4;
+}
+
+message AuthProgress {
+  string message = 1;
+}
+
+message AuthSucceeded {
+  string connection_id = 1;
+}
+
+message AuthFailed {
+  ErrorDetail error = 1;
+}
+
+message AuthCancelled {}
+
+message RegisterCredentialRequest {
+  // Same `address` the matching `Auth` RPC was opened against. The
+  // broker pairs the credential with the in-flight Auth gate.
+  string address = 1;
+  // Access token (raw bytes; opaque to the broker).
+  bytes access_token = 2;
+  // Optional refresh token; when present the broker stores it under
+  // the same `(backend_id, principal)` keyring slot as the access
+  // token so subsequent warm continuations skip the interactive flow.
+  bytes refresh_token = 3;
+  uint64 expires_at_unix_millis = 4;
+}
+
+message RegisterCredentialResponse {}

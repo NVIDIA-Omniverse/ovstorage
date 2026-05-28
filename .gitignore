@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+venv/
+.venv/
+.venv-test/
+env/
+.env
+.env.local
+
+# Local Junk
+.local/
+.remember/
+
+# Rust
+target/
+Cargo.lock.bak
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Mirror / tool output
+reports/
+*.log
+.mirror-cache/
+.worktrees/
+.swarmforge/
+swarmforge/
+swarmtools/

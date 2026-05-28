@@ -1,0 +1,54 @@
+# api-support.yaml — template
+#
+# This file is the per-service-repo manifest declaring which ovstorage API
+# spec versions a given service release implements and the URL prefix each
+# version is exposed on. Service implementation repos copy this template into
+# their own root and fill in concrete values per release. Consumers (clients,
+# agents, other services, the operator) read this file to discover the API
+# surface a deployed binary actually exposes.
+#
+# If a future revision adds fields (for example capability flags or deprecation
+# dates), update this template and bump the schema version below.
+
+# Schema version of THIS file's shape. Bump if the structure below changes.
+schema_version: 1
+
+# Name of the service this release implements.
+service: <service-name>
+
+# Service binary version (semver). Each service repo tags its releases
+# `MAJOR.MINOR.PATCH`; this field matches the tag.
+version: <MAJOR.MINOR.PATCH>
+
+# One entry per API surface this service implements. Each entry lists the
+# spec versions exposed and the URL path prefix for each.
+apis:
+  - name: <api-name>          # e.g. storage-api, notifications-consumer-api
+    versions:
+      - spec: <v1alpha|v1beta|v1>
+        path: /api/<api>/<version>/
+      # Multiple versions can coexist:
+      # - spec: v1alpha
+      #   path: /api/storage/v1alpha/
+      # - spec: v1beta
+      #   path: /api/storage/v1beta/
+
+# Example:
+#
+# service: storage-service
+# version: 1.5.0
+# apis:
+#   - name: storage-api
+#     versions:
+#       - spec: v1alpha
+#         path: /api/storage/v1alpha/
+#       - spec: v1beta
+#         path: /api/storage/v1beta/
+#   - name: notifications-aggregation-api
+#     versions:
+#       - spec: v1beta
+#         path: /api/v1beta/
+#   - name: permissions-api
+#     versions:
+#       - spec: v1beta
+#         path: /v1beta/
