@@ -1,4 +1,4 @@
-# ovstorage
+# NVIDIA ovstorage
 
 `ovstorage` is a portable storage abstraction for Rust, C, C++, and Python:
 one address-routed object API with a stable C ABI for backend plugins.
@@ -10,6 +10,9 @@ along with first-party plugins for `file://` and HTTP(S) addresses. First-
 party cloud, services-client, Nucleus, broker, REST, and authz components
 extend the surface across `ovstorage-services-client/`, `ovstorage-cloud/`,
 `ovstorage-nucleus/`, and `ovstorage-remote/`.
+
+> [!NOTE]
+> ovstorage is **pre-release** software and is not enterprise-supported.
 
 ## Layout
 
