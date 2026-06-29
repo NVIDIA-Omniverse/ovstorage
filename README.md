@@ -1,132 +1,96 @@
-# NVIDIA ovstorage
+# ovstorage - a generalized, extensible data access library for Omniverse storage clients
 
-`ovstorage` is a portable storage abstraction for Rust, C, C++, and Python:
-one address-routed object API with a stable C ABI for backend plugins.
-Switching backends is a route-registration change, not a recompile.
+> **`make dist-wheel && pip install dist/wheels/ovstorage-*.whl`** - build a
+> local Python wheel and first-party plugins so applications can read, write,
+> list, and materialize objects through one backend-neutral API. Built on the
+> Rust `ovstorage::Library` dispatcher, the async `Storage` trait, and a stable
+> C ABI plugin contract.
+>
+> *Pre-release / Early Access. Workspace crates advertise `0.1.0`; the Python
+> wheel metadata advertises `0.2.0`. APIs may change before 1.0, and the project
+> is not enterprise-supported.*
 
-The core library, CLI, MCP server, result-envelope contract, C ABI cdylib,
-C++ header, and Python wheel live in [`ovstorage-core/`](ovstorage-core/),
-along with first-party plugins for `file://` and HTTP(S) addresses. First-
-party cloud, services-client, Nucleus, broker, REST, and authz components
-extend the surface across `ovstorage-services-client/`, `ovstorage-cloud/`,
-`ovstorage-nucleus/`, and `ovstorage-remote/`.
+```sh
+make dist-wheel
+export OVSTORAGE_PLUGIN_DIR="$(git rev-parse --show-toplevel)/dist/plugins"
+pip install dist/wheels/ovstorage-*.whl
+python ovstorage-core/examples/python/hello_storage.py
+```
 
-> [!NOTE]
-> ovstorage is **pre-release** software and is not enterprise-supported.
+---
 
-## Layout
+## 1. What is ovstorage?
 
-| Path | Purpose |
-|---|---|
-| [`ovstorage-core/`](ovstorage-core/) | Core Rust library, CLI, MCP server, result envelope, cache, plugin SPI, C/C++/Python bindings, and `file`/`http`/test plugins |
-| [`ovstorage-services-client/`](ovstorage-services-client/) | Omniverse Storage Service client: cdylib backend plugin + tonic-generated proto stubs compiled against `ovstorage-services/` |
-| [`ovstorage-cloud/`](ovstorage-cloud/) | First-party cloud-storage plugins: `s3`, `gcs`, `azure`, `opendal` cdylibs |
-| [`ovstorage-nucleus/`](ovstorage-nucleus/) | Transitional Nucleus compatibility: `nucleus` cdylib plugin plus five `nucleus-*` protocol-binding crates (omni1 client/transport/discovery/auth/codegen) |
-| [`ovstorage-remote/`](ovstorage-remote/) | Broker daemon (`ovstorage-broker`), REST gateway (`ovstorage-rest`), broker-client cdylib, authz SPI + first-party TOML authz plugin, and the broker wire-protocol crate |
-| [`ovstorage-services/`](ovstorage-services/) | Service/API contracts, conformance material, deployment guidance, and service skills (vendored source of truth — do not modify in place) |
-| [`docs/`](docs/) | PRD/SRD/SDD, glossary, agent MCP/envelope reference, and persona docs |
-| [`skills/`](skills/) | Agent skills for user, operator, and contributor workflows |
-| [`xtask/`](xtask/) | Repo automation for verify, distribution, release versioning, generated headers, and skill validation |
+**ovstorage** is a generalized, extensible data access library that gives Omniverse simulations a single client interface to local and remote storage. Rather than binding application code to one storage SDK, callers work against one address-routed object API: they pass an object address, and the library routes each operation to the configured backend plugin. The same client code reads, writes, lists, and materializes objects across:
 
-## Start Here
+- **Local storage devices** - local filesystems through the `file://` backend.
+- **Remote and cloud storage** - HTTP(S), S3, GCS, Azure, OpenDAL, and Nucleus backends.
+- **Omniverse Storage API deployments** - the Omniverse Storage Service client and the brokered `ovstorage-broker` path.
 
-| Goal | Entry |
-|---|---|
-| Use the Rust library | [`docs/public/library-rust/README.md`](docs/public/library-rust/README.md) |
-| Use the Python binding | [`docs/public/library-python/README.md`](docs/public/library-python/README.md) |
-| Use the C++ binding | [`docs/public/library-cpp/README.md`](docs/public/library-cpp/README.md) |
-| Call ovstorage over HTTP/REST | [`docs/public/library-web/README.md`](docs/public/library-web/README.md) |
-| Write a storage plugin | [`docs/public/plugin-storage/README.md`](docs/public/plugin-storage/README.md) |
-| Write an authz plugin | [`docs/public/plugin-authz/README.md`](docs/public/plugin-authz/README.md) |
-| Operate the broker daemon | [`docs/public/broker-operator/README.md`](docs/public/broker-operator/README.md) |
-| Work on the repo | Start at [`AGENTS.md`](AGENTS.md), then use the source-developer skills under [`skills/`](skills/) |
-| Use the MCP/envelope contract | [`docs/public/agent/README.md`](docs/public/agent/README.md) |
-| Work on service/API material | [`ovstorage-services/AGENTS.md`](ovstorage-services/AGENTS.md) |
+Because routing is configuration rather than code, applications add or switch backends by changing route and connection configuration instead of recompiling against a different storage SDK - and new storage devices can be supported by shipping a plugin behind the same stable contract or by extending a Storage API stack deployment.
 
-## Skills
+ovstorage runs standalone outside Omniverse Kit. In Direct mode, the application process loads trusted storage plugins from `OVSTORAGE_PLUGIN_DIR` or `<exe-dir>/plugins/` and dispatches calls in process. Brokered mode adds an out-of-process `ovstorage-broker` for deployments that need credential isolation, shared policy, REST access, or per-call authorization.
 
-`skills/` is the catalog of invocable agent skills for ovstorage workflows
-that can be reviewed for external publication. The dist layout assembled by
-`make dist` ships `skills/ovstorage-user-*` and
-`skills/ovstorage-operator-*` to end users and operators;
-`skills/ovstorage-contributor-*` stays in the repo for developers and is
-intentionally excluded from release archives.
+The library is consumable from Rust, C, C++, Python, the CLI, MCP, and REST, so the same backend-neutral behavior is available wherever an Omniverse simulation or tool needs it.
 
-- **User skills** — connecting over MCP, discovering backends,
-  choosing one, authenticating, reading / writing / listing safely,
-  materializing, handling errors.
-- **Operator skills** — deploying `ovstorage-broker`, authoring its authz
-  policy, monitoring the running daemon, debugging incidents.
-- **Source-developer skills** — authoring storage plugins or authz plugins,
-  running the broker locally, regenerating C headers, running conformance,
-  running the verification gate.
+---
 
-These root skills are for the ovstorage library/plugin/broker surface.
-They are deliberately separate from the heavier `ovstorage-services`
-Kubernetes stack and its service-deployment skills, which live under
-`ovstorage-services/skills/` in source checkouts.
+## 2. What functionalities are available, and who are the target users?
 
-See [`AGENTS.md`](AGENTS.md) for the per-skill routing table.
+**What you can do with it:**
 
-## Vendored Omniverse Storage Service contracts
+- **Use one object API across backends** - `stat`, `read_bytes`, `read_stream`, `materialize`, `write`, `delete`, `list`, `list_versions`, `copy`, `rename`, directory operations, access checks, and watch streams, where supported by the selected backend and host surface.
+- **Load storage backends at runtime** - register connections, aliases, address visibility, and config files without baking a backend choice into application code.
+- **Use first-party backend plugins** - source workspaces cover `file://`, HTTP(S), S3, GCS, Azure, OpenDAL, Nucleus, Omniverse Storage Service, and the broker-client path.
+- **Choose the host surface that fits** - Rust `ovstorage::Library`, the stable C ABI, the header-only C++20 `ovstorage.hpp` wrapper, the `abi3-py310` Python wheel, the `ovstorage` CLI, the MCP server, or the REST gateway.
+- **Preserve backend identity and safety** - `ObjectInfo` carries address, etag, version, size, mtime, and metadata; capability bits gate optional backend features; typed errors surface unsupported operations explicitly.
+- **Ship agent-aware workflows** - MCP tools use the `v=0.1` result envelope, and repo-root skills cover user, operator, and contributor workflows.
 
-[`ovstorage-services/`](ovstorage-services/) is a vendored snapshot of the
-Omniverse Storage Service API definitions, conformance suite, and
-deployment guidance. The `ovstorage-services-client` workspace compiles
-its tonic stubs directly from `ovstorage-services/apis/storage-api/proto/`,
-so the in-repo client always matches the canonical wire contract.
+**Who benefits:**
 
-`ovstorage-services/` is not licensed by the root Apache-2.0 grant. It
-contains separately licensed service/API material, including files marked
-`LicenseRef-NvidiaProprietary` and NVIDIA Software License Agreement /
-Omniverse product terms. The applicable license files are preserved in that
-subtree and summarized in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+- **Omniverse and USD simulation developers** - read and write asset payloads across local, service, cloud, Nucleus, and HTTP-backed storage without a Kit-bound dependency.
+- **Storage platform teams** - expose one application contract while migrating or bridging between Omniverse Storage Service, direct cloud backends, and a future broker-managed deployment.
+- **Rust, Python, C, and C++ application developers** - embed the same storage behavior in scripts, tools, services, notebooks, and native applications.
+- **Operators** - run `ovstorage-broker`, wire authorization policy, monitor the daemon, and keep credentials outside client processes.
+- **AI coding agents and their users** - connect through MCP, consume bounded result envelopes, and follow shipped skills for common storage tasks.
 
-**Do not modify `ovstorage-services/` in place** — consumer-side adapters live
-in `docs/public/` and the `*-client` workspaces; CI flags any edits to the
-vendored subtree.
+---
 
-## External Contributions
+## 3. Documentation and reference links
 
-This project is currently not accepting contributions.
+- **User guide and tutorials:** [docs/public/README.md](docs/public/README.md)
+- **API reference (Rust):** [docs/public/library-rust/README.md](docs/public/library-rust/README.md)
+- **API reference (C / C++):** [docs/public/library-cpp/README.md](docs/public/library-cpp/README.md)
+- **API reference (Python):** [docs/public/library-python/README.md](docs/public/library-python/README.md)
+- **HTTP / REST callers:** [docs/public/library-web/README.md](docs/public/library-web/README.md)
+- **Plugin development:** [docs/public/plugin-development/README.md](docs/public/plugin-development/README.md) and [docs/public/plugin-storage/README.md](docs/public/plugin-storage/README.md)
+- **Broker operations:** [docs/public/broker-operator/README.md](docs/public/broker-operator/README.md)
+- **MCP tools and result envelope:** [docs/public/agent/README.md](docs/public/agent/README.md)
+- **Start here (coding agents):** [AGENTS.md](AGENTS.md) - task routing for source-developer and agent workflows.
+- **Skills for AI coding agents:** [skills/README.md](skills/README.md) - the skill catalog.
+- **Source:** <https://github.com/NVIDIA-Omniverse/ovstorage>
+- **Related API and services documentation:** [Omniverse Storage APIs](https://docs.omniverse.nvidia.com/ovstorage/ovstorage-guide)
 
-## Verification
+---
 
-`make verify` is the non-test repo gate. It validates generated headers,
-Rust and TOML formatting, license / advisory / unused-dependency checks,
-clippy, rustdoc broken-link checks, public-doc links, and publication-ready
-skill frontmatter.
-Run `make test` for the Rust test suite across all five active workspaces.
+## 4. System requirements
 
-`make dist` assembles the release layout, including
-`skills/ovstorage-user-*`, `skills/ovstorage-operator-*`, and a filtered
-`services/` copy of the `ovstorage-services` service/API release surface
-while excluding `skills/ovstorage-contributor-*`. The `services/` copy keeps
-contracts, conformance material, service examples, deployment guidance,
-templates, service skills, generated API HTML docs, and the license/product-term
-files that govern them; build/dependency caches are not packaged.
-The Python wheel currently does not package agent skills.
+- **Rust builds:** Rust `1.96.0` or newer; workspace edition `2024`.
+- **Python binding:** Python `3.10+`; the wheel uses PyO3 `abi3-py310` and builds with `maturin`.
+- **C++ binding:** C++20 with `<coroutine>`, `<span>`, and `<concepts>`; docs name GCC 13+, Clang 17+, and MSVC 19.40+ as the compiler floor.
+- **Runtime plugins:** storage plugins must be built as `.so`, `.dylib`, or `.dll` artifacts and discoverable through `OVSTORAGE_PLUGIN_DIR` or `<exe-dir>/plugins/`.
+- **Repo verification tools:** `make`, `cargo`, `maturin`, `cbindgen`, `taplo`, `cargo-deny`, and `cargo-machete` are used by the local build and verify gates.
+- **Current metadata:** Rust workspace packages are `0.1.0`; Python project metadata is `0.2.0`. Align the release version before external publication.
+- **Platform matrix:** active source docs do not yet declare a final supported OS / architecture matrix for the library and wheel release.
 
-## License
+---
 
-ovstorage uses a split license:
+## 5. Licensing
 
-- **Source code** — Rust crates, C/C++ headers, the Python binding, the CLI,
-  the MCP server, and all first-party plugins — is licensed under the Apache
-  License, Version 2.0. See [`LICENSE`](LICENSE).
-- **Agent skills under [`skills/`](skills/)** — the user, operator, and
-  contributor skill prose — is licensed under the Creative Commons
-  Attribution 4.0 International License (CC BY 4.0). See
-  [`skills/LICENSE.txt`](skills/LICENSE.txt) for the verbatim license text
-  and [`skills/NOTICE.txt`](skills/NOTICE.txt) for the NVIDIA grant. Each
-  `skills/<slug>/SKILL.md` also carries `license: CC-BY-4.0` in its YAML
-  frontmatter.
-- **Vendored service/API material under [`ovstorage-services/`](ovstorage-services/)**
-  is not covered by the root Apache-2.0 grant. It includes NVIDIA proprietary
-  material and NVIDIA Software License Agreement / Omniverse product terms;
-  see the in-subtree license files and the
-  [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) vendored service/API
-  section.
+- **Source code** - Rust crates, C/C++ headers, the Python binding, the CLI, the MCP server, and all first-party plugins are licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+- **Agent skills under `skills/`** - user, operator, and contributor skill prose is licensed under Creative Commons Attribution 4.0 International (CC BY 4.0). See [skills/LICENSE.txt](skills/LICENSE.txt) and [skills/NOTICE.txt](skills/NOTICE.txt).
+- **Vendored service/API material under `ovstorage-services/`** - not covered by the root Apache-2.0 grant. It includes NVIDIA proprietary material and NVIDIA Software License Agreement / Omniverse product terms. See the in-subtree license files and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-Third-party attribution is recorded in
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+> **Note:** ovstorage is pre-release software, not enterprise-supported, and is currently not accepting external contributions.
+
+*ovstorage - Omniverse storage abstraction - Copyright (c) 2026 NVIDIA Corporation.*
