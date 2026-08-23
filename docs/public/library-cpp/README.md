@@ -1,381 +1,389 @@
-# Persona: C++ application using `ovstorage.hpp`
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
 
-> "I'm writing a C++20 application that needs object I/O across multiple
-> backends and want native coroutines, RAII handle management, and
-> `Result<T>` error handling without exceptions across the library
-> boundary."
+# Persona: C++20 application using `ovstorage.hpp`
 
-You're reaching for ovstorage from a C++ host (a desktop tool, a
-service, a render-farm worker) and you want the binding to feel native:
-`co_await` on every long-running call, RAII for every handle, and
-errors that come back as values rather than exceptions thrown across
-the FFI seam.
+The header-only C++ wrapper composes ABI-v2 Layers with
+`ovstorage::Registry` and `ovstorage::Stack`. A successful build returns an
+immutable `ovstorage::LayerHandle`; object, introspection, and connection calls
+run through that handle.
 
-## What you link against
+> **"ABI-v2" is the plugin ABI family, not an ovstorage release.** The plugin
+> ABI carries its own version number (13 in ovstorage 0.2.1, within the v2
+> family whose floor is 5). Nothing on this page named `v2` refers to the
+> package version.
 
-`ovstorage.hpp` is the **header-only** C++20 wrapper that ships from
-`ovstorage-capi`'s include directory alongside the cbindgen-generated
-`ovstorage.h`. No separate Cargo crate, no `.cpp` translation unit —
-add the include directory to your project, link `ovstorage-capi`'s
-cdylib, and `#include "ovstorage.hpp"`. Compiler floor: C++20 with
-`<coroutine>`, `<span>`, and `<concepts>` — GCC 13+, Clang 17+, MSVC
-19.40+.
+## Build and link
 
-**Build recipe.** From a checkout of this repo:
+ovstorage ships its C/C++ surface as source. There is no library to link:
+add `ovstorage-c-source/src/*.c` to your build, put
+`ovstorage-c-source/include` on the header search path, and
+`#include "ovstorage.hpp"` from your C++ translation units. The `.c` files
+stay compiled as C99; only your own code is compiled as C++.
+
+The wrapper is header-only and needs C++20 coroutines, `<span>` and
+`<concepts>`. The C sources need only C99, so a toolchain below the C++ floor
+can still build and use the C API.
+
+`ovstorage-c-source/` carries two worked build files and a round-trip example
+that exercises the wrapper end to end:
 
 ```sh
-# 1. Build the cdylib + cbindgen-regenerated ovstorage.h.
-cd ovstorage-core
-cargo build --release -p ovstorage-capi
-
-# 2. Build at least one plugin so the runtime has a backend to dispatch to.
-#    (If you already ran `make dist` from the repo root, dist/plugins/ has
-#    every plugin built — skip this step and use that path in step 4.)
-cargo build --release -p ovstorage-plugin-file
-
-# 3. Point your build at the headers + cdylib.
-#    Headers:  ovstorage-core/crates/ovstorage-capi/include/
-#              (carries both ovstorage.h and ovstorage.hpp)
-#    Library:  ovstorage-core/target/release/libovstorage.{so,dylib,dll}
-#    RPATH or LD_LIBRARY_PATH must reach that target/release directory.
-#
-# 4. At runtime, set OVSTORAGE_PLUGIN_DIR to the directory holding
-#    libovstorage_plugin_*.so, then call load_plugins_from_dir().
-export OVSTORAGE_PLUGIN_DIR="$(pwd)/target/release"
+cd ovstorage-c-source
+make -f Makefile.example check          # builds and runs all examples
 ```
 
-`ovstorage-core/examples/cpp-async/` is a working reference; its
-`CMakeLists.txt` parameterizes the cdylib path on
-`OVSTORAGE_LIB_DIR` (default `target/debug`) and wires
-`OVSTORAGE_PLUGIN_DIR` into `ctest`.
+or, with CMake:
+
+```sh
+cp CMakeLists.txt.example CMakeLists.txt
+cmake -S . -B /tmp/ovstorage-build
+cmake --build /tmp/ovstorage-build
+ctest --test-dir /tmp/ovstorage-build --output-on-failure
+```
+
+Both are examples of the integration model rather than a supported ovstorage
+build system. Copy the pattern into your own build.
+
+## Build a Stack
+
+`Registry` starts with exactly one built-in Layer factory: the `file` backend.
+Load trusted ABI-v2 plugins with `Plugin::load`, keep each `Plugin` alive, and
+add it to the registry. `Stack` records named layers and graph edges; `build()`
+is a coroutine that resolves to the root `LayerHandle` and consumes the Stack
+on success.
+
+```cpp
+#include "ovstorage.hpp"
+
+ovstorage::Registry registry;
+ovstorage::Stack stack;
+
+auto added = stack.add_layer(registry, "files", "file");
+auto rooted = stack.set_root("files");
+
+ovstorage::ConnectionRequest request("file");
+request.set_persist(false);
+request.add_config(
+    "root", ovstorage::ConfigValue::string_("file:///srv/assets/"));
+auto connected = stack.add_connection("files", std::move(request));
+
+auto built = ovstorage::sync_wait(stack.build());
+if (!built.has_value()) {
+    // built.error() is an ovstorage::Error
+}
+ovstorage::LayerHandle handle = std::move(built).value();
+```
+
+`build()` returns `task<LayerHandle>` and drives the non-blocking async build.
+Coroutine-native code writes `auto built = co_await stack.build();`; the
+`sync_wait` above drives it to completion for synchronous callers. The Stack
+must outlive the await — keep it (and every recorded request) alive until the
+task resolves. Pass `build(options, &cancel)` to build under a `CancelToken`.
+
+Wrappers use `set_inner`; routers use `set_children`.
+`add_layer_config(instance, key, ConfigValue)` supplies factory-time Layer
+configuration. Backend connection configuration and credentials remain
+separate in `ConnectionRequest`.
+
+There is no directory-scan plugin loader on this surface: enumerate the
+cdylibs yourself and call `ovstorage_load_plugin` (or `Plugin::load`) on each.
+
+Plugin loading executes platform loader hooks. Only load trusted paths.
+`Plugin::inspect` is for discovery UI and permanently pins the inspected cdylib
+for process lifetime, so inspect a path once rather than polling it.
+
+For a complete progression from the one-file Stack through routing, HTTP,
+caching, and a native C++ wrapper, follow the
+[numbered C++20 examples](https://github.com/NVIDIA-Omniverse/ovstorage/tree/main/ovstorage-c-source/examples/tutorial).
+
+## Native C++ Layers
+
+`LayerHandle::export_handle()` mints an owned
+`OvStoragePlugin_LayerHandle`. A native C++ Layer can wrap that handle using
+the same operational vtable a plugin implements, then pass its own handle to
+`LayerHandle::import_handle()`. The imported result is the new driveable root;
+Layers above it do not need to know that the implementation is C++ rather than
+plugin-provided.
+
+Start wrapper implementations from `OVSTORAGE_PASSTHROUGH_VTABLE` in
+`ovstorage_defaults.h`, replace the slots they decorate, and preserve its state
+layout rule: the owned inner handle is the first state member. A wrapper with
+additional state must replace `drop`. The default `drop` also calls `free()`
+on the state block, so a wrapper allocated with `new` must replace it even
+when the inner handle is its only state. The native logging example
+`examples/tutorial/06_native_layer.cpp` decorates every asynchronous request
+slot and demonstrates the complete ownership transfer.
 
 ## Surface inventory
 
-Owning handle types — `ovstorage::Library`, `ovstorage::Info`,
-`ovstorage::Bytes`, `ovstorage::LocalDelegate`, `ovstorage::List`,
-`ovstorage::VersionList`, `ovstorage::UpdateMetadataOptions`,
-`ovstorage::AccessDecision`, `ovstorage::CancelToken`, plus
-`Capabilities`, `ConfigValue`, `SecretValue`, `SecretBundle`,
-`ConnectionRequest`, `Connection`, `ConnectionList`, `AuthEvent`,
-`AliasRequest`, `Alias`, `AliasList`, `AddressVisibilityOverride` (+
-list), `AddressRootList`, `BackendKindDescriptorList` — wrap the
-corresponding C handles and call the appropriate `_destroy` / `_clear`
-functions in their destructors. All move-only, no copy.
+Owning wrapper types are move-only and destroy their C handle:
 
-Methods mirror the C surface: `stat`, `read_bytes`, `read_stream`,
-`read_local_file`, `write`, `delete_object`, `list`, `list_versions`,
-`copy`, `rename`, `create_directory`, `delete_directory`,
-`update_metadata`, `check_access`, plus the connection / alias /
-discovery group (`add_connection`, `list_connections`,
-`remove_connection`, `update_connection_credentials`,
-`authenticate_connection`, `add_alias`, `remove_alias`, `list_aliases`,
-`set_address_visibility`, `list_address_visibility_overrides`,
-`list_address_roots`, `watch_address_roots`, `list_backend_kinds`,
-`capabilities_for`).
+- `Registry`: kind-to-factory registry seeded with the built-in `file`
+  backend;
+- `Plugin`: one loaded ABI-v2 plugin and its advertised factories;
+- `Stack`: mutable composition accumulator, consumed by successful build;
+- `LayerHandle`: immutable built root and operational handle;
+- `ConnectionRequest`, `ConfigValue`, and credential builders;
+- result payload wrappers such as `Info`, `Bytes`, `LocalDelegate`,
+  `WriteRedirectBatch`, and lists;
+- value types for streamed writes, redirect results, watch events, read
+  ranges, and connection-attribute patches;
+- `CancelToken`: shareable cooperative cancellation.
 
-`ovstorage::Bytes` exposes `std::span<const std::byte>` over the
-underlying buffer and frees it on destruction; conversion to
-`std::string`, `std::vector<std::byte>`, or any contiguous range is one
-move-or-copy. Writes accept `std::span<const std::byte>` directly;
-there is no intermediate `ByteSink` type.
+`LayerHandle` exposes coroutine operations for object I/O, listing,
+materialization, metadata and directory operations, connection lifecycle,
+authentication events, and Layer introspection. Consult `ovstorage.hpp` for
+the exact overload and option shape; it is hand-written and tested against the
+C sources it ships beside.
 
-`ovstorage::Error` is a value type that copies the error fields out of
-the C `OvStorage_Error` before the library releases the message.
-`.code()` returns `OvStorage_Status`; `.message()` returns `const
-std::string&`.
+The object-I/O surface includes producer-driven `write_stream`, the
+`write_redirect` / `continue_write` handshake, `get_latest_version`, and
+multi-fire `watch_directory`. Connection management includes borrowed-builder
+`probe` and `update_connection_attributes`.
+
+`read_bytes`, `read_stream`, `read_local_file`, and `get_latest_version` each
+accept an optional `ReadOptions` carrying a byte range. A start on its own
+reads to the end of the object; a start with an inclusive end reads that
+window. An end with no start is refused with `InvalidArgument`, since the C
+struct beneath gates both endpoints behind one flag and cannot express it.
+An end that precedes its start is refused for the same status but a
+different reason: the C struct can carry it, and the C layer would answer with
+one catch-all string naming neither endpoint. Whether a range is honored at
+all is a backend property: `read_local_file` materializes, and the `file://`
+backend refuses a window rather than staging one. `RootInfo::range_read_strategy`
+reports what a range costs on a given root — `MaterializeOnly` means a small
+window pulls the whole object.
+
+`write`, `write_stream` and `write_redirect` each accept an optional
+`WriteOptions` carrying `no_overwrite`, `if_match_etag` and `size_hint`. The
+two preconditions are mutually exclusive — `no_overwrite` fails if anything is
+at the destination, `if_match_etag` fails unless what is there carries exactly
+that etag — and setting both is refused with `InvalidArgument` rather than
+given a precedence. An empty etag is refused too, so propagating an absent
+`Info::etag()` as `""` is an error rather than a silent unconditional
+overwrite. `Capabilities::supports_if_match_write` reports whether a backend evaluates
+the precondition; the host forwards it either way rather than pre-screening on
+that bit, since capabilities are reported per root.
+
+`Capabilities` exposes every field of the C struct through a typed accessor,
+with the two optional fields — `version_list_order` and
+`watch_directory_max_lag_nanos` — returning `std::optional`. Verb availability
+(`supports_write`, `supports_delete`, `supports_create_directory`, …) is
+distinct from mechanism (`supports_server_side_copy`, `supports_atomic_rename`):
+the first says a verb can be attempted, the second says how it runs.
+
+`Info` carries `modified_by`, `checksums` and `effective_permissions`
+alongside the metadata maps. `Connection` exposes the auth-state payloads —
+credential expiry under `Authenticated`, the `AuthReason` under
+`AwaitingAuth`, and an error code under `AuthFailed` — each returning
+`std::nullopt` for a variant other than the one `auth_state_kind()` names.
+Every connection operation takes a `target` parameter naming the owning Layer
+instance; `RootInfo::owning_target` is that instance name, which is not
+derivable from the root URL.
+
+`OvStorage_AuthEvent` is a union. Check the discriminant before reading a
+variant; reading the wrong one is undefined behaviour.
+`OvStorage_InteractiveAuthCapability` encodes `0 = None`, `1 = Headless`,
+`2 = Browser`, so a stored or serialized numeric value must be read against
+that order. `ovstorage_init_auth_substrate` takes an options struct that, when
+non-NULL, *must* name a directory; pass `options = NULL` to request the
+default directory.
+
+The options structs are plain C structs with no `struct_size` member, so `{0}`
+selects defaults for every one of them. Do not initialize one with
+`= { sizeof o }`: that sets the leading member — `no_overwrite` on a write —
+rather than any size field.
+
+The runtime thread count defaults to available parallelism clamped to
+[2, 32]. It is process-global: the first `stack_build` wins, and a later build
+requesting a different count warns rather than taking effect.
+
+`WatchDirectoryOptions` carries `has_since` alongside `since`. A backend may
+mint a zero-length cursor, and emptiness alone cannot distinguish that from
+having no cursor at all, so resuming from one without the flag replays the
+whole change history. A non-empty `since` resumes either way.
+
+`sync_wait` blocks the calling thread and must not be called from a runtime
+worker thread, the same constraint `ovstorage_stack_build` carries: the
+process-global runtime's workers run tasks to completion, so nested blocking
+calls exhaust the pool. Use `co_await` inside a callback the library invoked.
+
+Every async operation returns `task<T>`. Awaiting the task yields
+`Result<T>`; the wrapper does not throw for ovstorage failures.
+
+```cpp
+auto outcome = ovstorage::sync_wait(handle.read_bytes("file:///srv/a.usd"));
+if (!outcome.has_value()) {
+    std::fprintf(stderr, "%s\n", outcome.error().message().c_str());
+}
+```
+
+Streaming reads are aggregated into `Bytes` by the C++ wrapper. Use
+the C ABI's multi-fire callback surface when per-chunk delivery is required.
 
 ## Coroutine internals
 
-`task<T>::initial_suspend()` is `std::suspend_never` — the coroutine
-body starts immediately on the call expression so any caller-borrowed
-inputs (`std::span` write buffers, `ConnectionRequest&&` builders,
-`const UpdateMetadataOptions&`) are snapshotted into the awaiter frame
-before the call expression's temporaries die. Defer the await safely:
-`auto t = lib.write(addr, std::span(temp_buffer)); co_await std::move(t);`
-is sound.
+Each method creates an awaiter state shared with its C callback. The tasks are
+**eager**: calling a method submits its operation immediately, and awaiting
+only collects the result — a task you construct and never await has still
+performed its operation. Completion stores a `Result<T>` and the callback
+resumes the continuation. Completion may race suspension; the bridge uses a
+commit protocol so either ordering resumes exactly once.
 
-Eager start admits two cross-thread orderings — body completion via the
-tokio worker may fire before, during, or after the consumer's
-`co_await`. The `task<T>::promise_type` carries an atomic `state` that
-the `final_awaiter` and `task::await_suspend` exchange against (the
-same canonical 0/1/2 pattern used by the per-callback awaiter bases):
-whichever party arrives second observes the other's value and either
-resumes the consumer's continuation directly or short-circuits the
-suspend.
+`sync_wait` is a convenience for synchronous callers. Coroutine-native code
+should `co_await` tasks directly. Callbacks run on runtime worker threads, so
+do not assume thread affinity.
 
-**Drop-while-suspended.** A consumer is also allowed to drop the task
-without ever co_awaiting it (e.g., the surrounding scope unwinds via
-exception). The promise's atomic state has a fourth value `3`
-("consumer abandoned") that `~task()` writes if the body is still
-suspended at an in-flight C callback; in that case `~task()` does
-**not** call `handle.destroy()`. The body's eventual
-`final_awaiter::await_suspend` observes `state == 3` and destroys the
-frame itself, so the in-flight callback can safely write into the
-per-awaiter heap-allocated state (held alive by a leaked
-`std::shared_ptr` ref count that the static `on_complete` thunk
-reclaims) and resume the body's continuation. This shared-ownership of
-awaiter state closes a drop-before-await use-after-free: stack-allocated
-awaiter sub-objects in the coroutine frame would be destroyed by
-`handle.destroy()` while the C callback still held a `this` pointer;
-the heap-allocated state outlives both the awaiter and (when abandoned)
-the entire frame. The await-race coordination is exercised by
-`cpp20_task_deferred_await_race`; the abandon path by
-`cpp20_task_drop_before_await_no_uaf` (compiled with `-fsanitize=address`
-when ASan is available).
+Completion is not guaranteed to be asynchronous. Argument rejections in the C
+ABI's prologue, and Layers that answer synchronously, complete inline on the
+calling thread. The awaiters handle both orderings, so this is not something
+callers have to reason about — but do not build on an assumption that the
+callback lands on another thread.
 
-## Picking up connections saved by the CLI
+`CancelToken` can be shared across operations. Destroying the C++ token does
+not invalidate copies already held by in-flight work. Cancellation is
+cooperative and returns through the normal `Result` path.
 
-If you've already used `ovstorage connect` and `ovstorage write-config`
-to set up a backend interactively, your C++ app can pick those
-connections up automatically:
+## Ownership and errors
 
-```cpp
-auto opened = ovstorage::Library::init();
-if (!opened.has_value()) co_return /* propagate opened.error() */;
-ovstorage::Library library = std::move(opened.value());
-co_await library.load_plugins_from_dir(std::nullopt);  // OVSTORAGE_PLUGIN_DIR
-co_await library.load_config(std::nullopt);            // default search path
-```
+All owning types are move-only. Moved-from/default handles are null; operations
+on a null `LayerHandle` return `InvalidArgument`. `Stack::build` consumes the
+Stack when the build succeeds; a build that fails or is cancelled does not
+consume it, so it can always be inspected or destroyed safely.
 
-`load_config(std::nullopt)` searches `./ovstorage.toml` then
-`$XDG_CONFIG_HOME/ovstorage/ovstorage.toml` (matching the CLI) and
-registers every `[[connections]]` entry on the live library —
-credential refs (env / keyring) resolve through the same keyring
-namespace the CLI used, so a CLI `write-config --secrets keyring` flow
-Just Works. Returns an empty `ConnectionList` when no config file
-exists. Pass an explicit path string instead of `std::nullopt` to
-load a non-default config. Per-route overrides and `[state]` are
-init-time concerns; pass them through `LibraryInitOptions` if needed.
+The C snapshot types behind `Info`, `Connection`, `AuthEvent`, `RootInfo`, and
+their lists have visible read-only fields. The C++ wrappers preserve null and
+variant guards around those fields. `List::info(i)` and
+`VersionList::info(i)` return a borrowed `InfoView`; call `.clone()` only when
+the item must outlive its list. The clone is an owning `Info` and performs a
+deep copy of strings and metadata.
 
-## How calls return
+A failed build is generally **not** retryable in place. Any path that reaches
+the build epilogue zeroes recorded credentials for secret hygiene, after which
+a retry is rejected with `InvalidArgument` for every connection that carried
+secrets. Connections without credentials retry unchanged, and a prologue
+rejection leaves the builder untouched. Recover by destroying the Stack and
+rebuilding it with fresh credentials rather than re-awaiting `build()`. This
+applies equally to `ovstorage_stack_build` and `ovstorage_stack_build_async`.
 
-Every long-running method on `ovstorage::Library` returns
-`ovstorage::task<T>` — a C++20 coroutine type whose final result is
-`ovstorage::Result<T>` (a small `std::expected`-shaped value with
-`ovstorage::Error` on the failure side).
+No exception crosses the C boundary. `ovstorage::Result<T>` carries either a
+value or an `ovstorage::Error` with the stable status code and message. Plugin
+authors using C++ internally must catch exceptions before returning through a
+C vtable. `OvStorage_Error` carries `code`, `message` and `code_name`.
 
-- **Inside another coroutine,** `co_await` the call directly:
-  `auto info = co_await lib.stat(addr);`.
-- **From a top-level caller** (your `main`, a non-coroutine method,
-  a thread that doesn't have its own coroutine context),
-  `ovstorage::sync_wait(task<T>)` drives the task to completion on
-  the calling thread.
+`OvStorage_Status` runs 0–16 plus `Internal = 255`, where
+`IncompatibleType = 13`, `ResourceExhausted = 14`, `PartialCompletion = 15`
+and `PluginRejected = 16`. Route retry decisions through
+`ovstorage_status_is_retryable` rather than a hand-rolled list: neither
+blanket policy is safe, since treating an unrecognized status as fatal
+abandons `ResourceExhausted`, which is retryable, while treating it as
+retryable retries `PartialCompletion`, which the header warns is destructive.
 
-The per-method awaiter parks the coroutine; the C ABI's `on_complete`
-callback resumes the continuation from a tokio worker thread. You
-never see threads in your code — the bridge is in the header.
+Every string argument crosses the C ABI as a `const char*`, which ends at its
+first NUL. A `std::string` carrying an embedded NUL would therefore arrive
+truncated — a different address, a different config key — so the wrapper
+rejects it with `InvalidArgument` instead of letting it through. This applies
+to every entry point that takes a string, not just addresses.
 
-## ConfigValue factory naming (`string_`, `int_`, `bool_`)
+### Mixing header and implementation versions
 
-The `ovstorage::ConfigValue` factory methods carry a trailing
-underscore (`string_`, `int_`, `bool_`) to avoid collision with C++'s
-own `string` (the `<string>` header types) and with the `int` / `bool`
-keywords. The `_` is part of the name; not a typo. The fourth
-factory, `toml(...)`, is unambiguous and unsuffixed.
+Building from source, as ovstorage distributes it, removes most of this
+hazard: the header and the implementation come from one tree and are compiled
+together, so they cannot disagree.
 
-## RAII for every handle
+The hazard appears if you package these sources into a shared library of your
+own and then link older application objects against a newer build of it. That
+puts back a binary boundary the source distribution does not have, and every
+caller-allocated struct in `ovstorage.h` is where it bites. `OvStorage_Error`,
+the options structs, and `OvStorage_Capabilities` are all plain structs
+callers may stack-allocate, with no `struct_size` field, no reserved padding
+and no version macro, so a layout change is a **silent** break rather than a
+detected one — a caller compiled against a stale layout has the newer library
+write past the end of its object.
 
-Every owning C handle has a C++ wrapper whose destructor calls the
-matching `_destroy`: `Library`, `Info`, `Bytes`, `LocalDelegate`,
-`List`, `VersionList`, `Connection`, `ConnectionList`,
-`ConnectionRequest`, `AliasRequest`, `SecretBundle`, `ConfigValue`,
-`SecretValue`, `CancelToken`, plus the rest of the surface listed in
-§ *Surface inventory* above. All wrappers are **move-only**, no copy.
-A moved-from
-handle is null; calling a method on a null `Library` returns a failed
-`Result` with `InvalidArgument` rather than hanging the coroutine.
+This is deliberate rather than an oversight. In the source-distribution model
+there is no boundary for that machinery to guard, and paying for it everywhere
+so that a repackager need not think about versioning would be the wrong trade.
+The `ovstorage-c-source/README.md` section "C ABI stability at 1.0" carries the
+full rationale.
 
-## Multi-fire callbacks aggregate
-
-`read_stream`, `authenticate_connection`, and `watch_address_roots` are
-the multi-fire callback shapes in the C ABI (one fire per chunk / event
-/ snapshot, plus a final `done = true`). The C++ wrapper aggregates
-read chunks and auth events into `std::vector<…>`; address-root watch
-uses a snapshot callback:
-
-- `read_stream(addr) -> task<std::vector<std::byte>>`
-- `authenticate_connection(conn_id) -> task<std::vector<AuthEvent>>`
-- `watch_address_roots(on_snapshot) -> task<void>`
-
-A per-chunk awaiter / `AsyncStream<Bytes>` shape is **not provided**.
-For multi-gigabyte reads where in-process aggregation is unacceptable,
-use the C ABI directly with your own callback that streams chunks to
-disk or downstream — the C++ wrapper does not yet have a streaming
-seam for that path.
-
-## Cancellation
-
-`ovstorage::CancelToken` wraps an `Arc<CancellationToken>`. Construct
-one, pass it into multiple in-flight ops, and call `.cancel()` to
-signal group-cancel:
-
-```cpp
-ovstorage::CancelToken token;
-auto a = lib.stat(addr_a, false, &token);
-auto b = lib.read_bytes(addr_b, ovstorage::ReadOptions{}, &token);
-// later, from another thread or signal handler:
-token.cancel();
-auto outcome_a = co_await std::move(a);
-auto outcome_b = co_await std::move(b);
-```
-
-A pre-canceled token does not hang the bridge — the call resolves with
-a `Cancelled`-class status.
-
-## ETags, preconditions, and races
-
-Reads, writes, lists, and `stat` return an `ObjectInfo` that carries
-the backend-native `etag` (plus descriptive `version` / `size` /
-`mtime` when the backend reports them). The etag asserts *which
-version of the bytes* you observed; pass it back on the next mutation
-so you don't accidentally clobber a concurrent writer.
-
-The 0.1 C++ wrapper (`ovstorage.hpp`) exposes `write(address, body,
-no_overwrite)` — a single boolean toggling unconditional clobber vs.
-refuse-if-exists. The full SPI shape (`if_match` etag on
-read / delete / update-metadata, `IfDestExists` on write / copy /
-rename, separate `if_source` on copy / rename) is not yet surfaced
-through the C++ headers; reach for the REST gateway
-(`If-Match` / `If-None-Match: *` / `X-OV-If-Source-Match`) when
-etag-bound mutation is required from C++. Header expansion is a
-tracked follow-up.
-
-Version selection, when a backend supports it, lives in
-version-pinned addresses returned by `list_versions` or
-`get_latest_version`. Preconditions carry only opaque etag strings,
-and a backend that lacks etag-bound writes advertises that through its
-capability matrix. Issuing an etag-bound write against such a backend
-yields a typed error rather than silent data loss. Multi-writer
-correctness is the caller's contract; the plugin can't paper over it.
+There is no runtime guard. If you own that packaging, rebuild everything from
+one source tree rather than mixing a stale translation unit with a newer
+build. This differs from the plugin ABI, where a version mismatch is refused
+at load with `IncompatibleType` — the application C API has no equivalent
+gate, because in the source-distribution model it does not need one.
 
 ## STL mismatch posture
 
-`ovstorage-capi` itself is C ABI — no STL types cross the binding
-seam. Your application's STL choice (libstdc++, libc++, MSVC's STL)
-is invisible to the library and to plugins.
+The public plugin and host ABI is POD C. Do not put `std::string`, containers,
+exceptions, RTTI objects, or C++ allocators in plugin manifests or vtables.
+This keeps a plugin built with a different standard library from exchanging
+STL ownership with the host.
 
-The risk this posture closes: a C++ application linked against
-`libstdc++` loads an ovstorage plugin compiled against `libc++` (or
-vice versa). The two STLs have incompatible `std::string` and
-`std::vector` layouts; passing one through a function boundary
-corrupts memory and crashes — typically at the most confusing possible
-moment, far from the actual mismatch.
+The header-only application wrapper does use the application's STL. That is
+safe because its STL objects are consumed within the application translation
+unit and converted to C ABI buffers/handles at the boundary. A plugin that
+uses C++ internally remains responsible for keeping its C++ runtime and object
+ownership on its side of the ABI.
 
-The C ABI is the *only* cross-toolchain stable interface ovstorage
-exposes. The C++ binding is header-only and always inherits the host
-application's STL, so there is no way for an STL mismatch to cross a
-binary boundary that the project owns. Plugin authors who need C++
-inside their plugin link the C++ STL statically (a one-line CMake
-flag), the same posture LLVM, Boost, and every cross-vendor C++
-ecosystem ships in production. The project never claims to provide a
-stable C++ ABI; that claim has bitten Qt and Apple's C++ libraries
-repeatedly and is widely understood as a non-goal.
+## Current toolchain posture
 
-**Alternatives considered and rejected.**
+Documented compiler floors are GCC 13+, Clang 17+, and MSVC 19.40+. Both
+shipped example build files enforce that with a capability probe: they compile
+`ovstorage.hpp` itself and report the floor if the compiler cannot, rather
+than emitting template diagnostics from inside the wrapper. Probing the header
+is deliberate — a narrower coroutine probe passes on compilers that then
+reject it. Below the floor, the CMake example omits the C++ target and keeps
+generating the C99 ones.
 
-- **Stable C++ ABI surface.** No serious project ships one across
-  compilers and STLs; the maintenance cost is the single biggest
-  reason cross-platform C++ libraries default to header-only.
-- **Force libc++ everywhere.** Excludes Linux distros where
-  `libstdc++` is the system default; not portable.
-- **Static-link `libstdc++` into the library.** Doubles binary size,
-  increases load time, and creates the diamond-dependency problem
-  when the host application also static-links.
+A full compiler/STL/sanitizer matrix is not currently provided. Symbol
+versioning, pkg-config files, and generated CMake package files are also not
+yet shipped.
 
-**What this posture does NOT cover.**
+### Known toolchain defects
 
-- Two plugins compiled against different STLs in the same process:
-  each plugin is a separate `.so` and a separate dynamic-link unit;
-  if both happen to use STL types in their public manifests, mismatch
-  is theoretically possible. Mitigation: plugin manifests are POD C
-  structs only; no STL types cross plugin boundaries.
-- C++ exception propagation across the FFI: not supported; plugins
-  must catch all C++ exceptions internally and translate to the C
-  error code shape.
+**GCC 15.x — non-atomic coroutine frame refcount (affects coroutines resumed on another thread before the ramp returns)**
 
-**Plugin-author checklist.**
+GCC 15 adds a 16-bit `_Coro_frame_refcount` field to every coroutine frame
+and manipulates it with plain (non-atomic) read-modify-write instructions.
+The ramp function increments the refcount before entering the coroutine actor
+and decrements it after the actor returns; the actor does the same pair around
+its body. When a coroutine handle is published to another thread from inside
+`await_suspend` — the only conforming place for a callback-driven awaiter —
+that thread's decrement races the ramp's decrement. The result is UB and can
+leak the coroutine frame (both sides read 2, both write 1, neither frees).
 
-- The C++ binding ships as a single header (`ovstorage.hpp` from
-  `ovstorage-capi/include/`) with no `.cpp` translation unit and no
-  separate Cargo crate; CMake `INTERFACE` library only.
-- If you ship a plugin that uses C++ internally, **link the C++
-  runtime statically**: `-static-libstdc++ -static-libgcc` (GCC), or
-  `-stdlib=libc++ -lc++abi` plus `--whole-archive` (Clang). This
-  keeps the plugin's STL from escaping into the host process.
-- Plugin manifest types are POD C structs — never `std::vector`,
-  `std::string`, or any other STL type. The
-  `plugin_manifest_pod_check` header-side conformance check is a pair
-  of `static_assert`s (`is_standard_layout_v` and
-  `is_trivially_copyable_v`) emitted per manifest type by the C ABI
-  build, so a manifest with an STL field fails to compile.
-- A multi-STL CI matrix (libstdc++ and libc++ on Linux, MSVC's STL on
-  Windows) is not configured.
+Single-threaded coroutines and coroutines whose handles are published only
+after the ramp has returned are not affected — there is no concurrent refcount
+operation in those cases.
 
-## Working example
+This is a compiler defect, not an ovstorage defect. `ovstorage.hpp`'s
+synchronization is correct; the race is in the code GCC 15 generates for any
+coroutine whose handle is published to another thread inside `await_suspend`,
+independent of the library. ThreadSanitizer reports a 2-byte data
+race on the coroutine frame heap block and exits non-zero. That output can look
+like a `sync_wait` failure even when the condvar-destruction check itself passes.
 
-`ovstorage-core/examples/cpp-async/` is a CMake project that builds
-against the workspace `target/{debug,release}/` tree, resolves the
-headers from `ovstorage-core/crates/ovstorage-capi/include/`, links
-`libovstorage.so`, and wires `OVSTORAGE_PLUGIN_DIR` into the
-`add_test` environment so plugins are discoverable at runtime. The
-driver in `ovstorage-core/examples/cpp-async/test_driver.cpp` shows the
-full shape —
-`Library::init`, building a `ConnectionRequest`, `add_connection`,
-then write/read/stat:
+This repository's test suite detects the defect and attributes it. On an
+affected compiler `cpp20_toolchain_coroutine_frames_are_race_free` fails and
+names it; that test's driver includes no ovstorage header, so its verdict is
+about the compiler alone. `cpp20_sync_wait_does_not_destroy_a_condvar_in_use`
+then builds without ThreadSanitizer and says so loudly, because a TSan build
+would halt on the frame race and never reach the condvar race it exists to
+pin — so on GCC 15 that leg catches a wrong outcome or a hang, but contributes
+no condvar-race coverage. This is a property of the compiler in use, not of
+the ovstorage version: the same test gives full coverage on GCC 13, GCC 14 and
+Clang 17+.
 
-```cpp
-// ConfigValue is move-only. `string_(root)` returns a temporary that
-// lives long enough for `add_config` to consume it; the temporary
-// dies at the semicolon.
-ovstorage::ConnectionRequest request("file");
-request.add_config("root", ovstorage::ConfigValue::string_(root));
-// Equivalent two-step form — make the move explicit:
-//     auto value = ovstorage::ConfigValue::string_(root);
-//     request.add_config("root", std::move(value));
-//     // value is now in the moved-from null state; do not reuse.
-auto registered = co_await lib.add_connection(std::move(request));
-if (!registered.has_value()) co_return /* propagate registered.error() */;
+**Workaround:** build the C++ wrapper with GCC 13, GCC 14, or Clang 17+ until
+this is fixed upstream. No upstream GCC bug number is cited here because none
+could be verified at the time of writing; consult the GCC bug tracker before
+upgrading to GCC 15 for C++20 coroutine workloads.
 
-std::span<const std::byte> payload_span(
-    reinterpret_cast<const std::byte*>(payload.data()), payload.size());
-auto write_outcome = co_await lib.write(addr, payload_span);
-if (!write_outcome.has_value()) co_return /* propagate */;
-
-auto read_outcome = co_await lib.read_bytes(addr);
-if (!read_outcome.has_value()) co_return /* propagate */;
-auto& [bytes, info] = read_outcome.value();
-auto bytes_span = bytes.span(); // std::span<const std::byte>
-```
-
-`Library::init(LibraryInitOptions opts = {})` is the static
-constructor (returns `Result<Library>`); it calls the C ABI's
-`ovstorage_library_init`, which spins up the per-`Library` tokio runtime
-without loading plugins or routes. Call `load_plugins_from_dir` or
-`load_plugin` explicitly before adding connections that depend on
-backend kinds those plugins provide. The full signature lives in
-`ovstorage.hpp` under `class Library`.
-
-The example also exercises `list_connections`,
-`authenticate_connection` (multi-event drain),
-`capabilities_for`, `list_backend_kinds`, `watch_address_roots`, and
-`remove_connection` against the in-tree plugin-test backend — read it
-as the canonical reference for the surface.
-
-## What's not supported
-
-- **Exceptions across the library boundary.** The C ABI is the only
-  cross-toolchain stable interface, and exception ABIs aren't
-  interoperable across compilers / STLs. Errors come back as
-  `ovstorage::Result<T>`; the wrapper itself never throws. Plugins
-  that use C++ internally must catch all C++ exceptions and translate
-  to the C error shape before the call returns.
-- **Per-chunk `read_stream`.** The C++ wrapper aggregates chunks into
-  `std::vector<std::byte>`. A chunk-by-chunk awaiter is a follow-up;
-  for now, callers that can't tolerate aggregation use the C ABI's
-  multi-fire callback directly.
-- **STL types in plugin manifests.** Manifest types are POD C only —
-  no `std::vector`, `std::string`, or any STL type. The
-  `plugin_manifest_pod_check` header-side conformance check is a pair
-  of `static_assert`s (`is_standard_layout_v` and
-  `is_trivially_copyable_v`) emitted per manifest type by the C ABI
-  build, so a manifest with an STL field fails to compile.
+See [configuration](../configuration.md) and the
+[glossary](../GLOSSARY.md). `ovstorage.h` remains the exact C API reference; it
+is hand-maintained alongside the implementation it declares, and the two are
+edited together.

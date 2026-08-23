@@ -3,15 +3,15 @@
 
 [package]
 name = "ovstorage-example-plugin-rust"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "Example Rust plugin for ovstorage."
 license = "Apache-2.0"
 publish = false
 
 [dependencies]
-ovstorage-plugin = { version = "0.1.0", path = "../../crates/ovstorage-plugin" }
-async-trait.workspace = true
+ovstorage-plugin = { workspace = true }
+async-trait = "0.1.89"
 
 [lib]
 name = "ovstorage_plugin_example_rust"

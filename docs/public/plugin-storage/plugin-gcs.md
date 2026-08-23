@@ -2,7 +2,7 @@
 
 The `gcs` plugin: a first-party `Backend` implementation against
 Google Cloud Storage. Lives in
-`ovstorage-cloud/crates/ovstorage-plugin-gcs/` and compiles as a
+`ovstorage-cloud/ovstorage-plugin-gcs/` and compiles as a
 cdylib loaded through the C ABI declared by `ovstorage-plugin`. The
 plugin hand-rolls the GCS REST client, V4 RSA signed-URL minting,
 ADC discovery, and OAuth2 token exchange against the async
@@ -28,8 +28,7 @@ so the host stays generic.
   - `project_id` (optional; surfaced for operator clarity, not used in
     the data path).
   - `service_account` (optional; named in the GCS credential chain).
-  - `endpoint` (optional; for GCS-compatible deployments such as
-    `fake-gcs-server`).
+  - `endpoint` (optional; for GCS-compatible deployments).
   - `pubsub_subscription` (optional;
     `projects/{project}/subscriptions/{subscription}` — enables
     `watch_directory`).
@@ -79,6 +78,12 @@ bundle-resolution layer is free to expand env vars into `file_path`
 or `service_account_key` before handing the bundle to the plugin;
 that resolution happens above the plugin boundary.
 
+The cross-plugin
+[credential-provider matrix](credential-providers.md)
+includes the supported file-path bridge and identifies metadata,
+workload-identity, and impersonation credentials that have no
+representable bundle shape.
+
 For service-account credentials the plugin builds a self-issued JWT
 (`alg = RS256`, `iss = client_email`, `aud = token_uri`,
 `scope = devstorage.full_control pubsub`, lifetime 3600 s), signs it
@@ -106,11 +111,14 @@ bucket disagrees with `ErrorCode::NoRoute`. `stat` against an empty
 object name (`gs://bucket/`) returns `InvalidArgument`; bucket-root
 metadata is not exposed.
 
-GCS object names are opaque byte strings except for provider-side
-restrictions such as rejecting an object name that is exactly `.` or
-`..`. The plugin preserves literal `..`, double slashes, trailing
-dots, percent-encoded bytes, and existing query parameters; it does
-not normalise path segments before signing.
+**The object name is the decoded path.** `gs://bucket/pub%20x` names
+the object `pub x`, and a name containing a literal `%` is spelled
+`%25`. Trailing dots and other escaped bytes round-trip. A name
+containing a dot segment or a doubled separator cannot be named by an
+address: it is omitted from listings with a `warn!` rather than handed
+out as an address that resolves to a different object. A name whose
+bytes are not valid UTF-8 has no GCS wire spelling and is rejected with
+`InvalidArgument`, as is an address carrying a port.
 
 Versioned URLs use `?generation=<N>`. `list_versions` returns
 `ObjectInfo` values whose addresses carry the corresponding
@@ -157,17 +165,41 @@ set, both the URL host and the V4 `host:` canonical header resolve to
 that endpoint (port preserved). The signing scope
 (`storage` / `goog4_request`) stays host-independent.
 
-## SPI-to-API mapping
+## Redirect credential scope
 
-| SPI method | GCS API |
+Every redirect this plugin mints declares what its credential authorizes,
+on `RedirectScope.credential`. A host reads that declaration to decide
+whether the redirect may be handed to a caller outside its own process;
+inspection cannot answer the question, since a signature over one object
+and one over a whole bucket are the same shape on the wire.
+
+| Mode | Declares | What the party executing the redirect holds |
+|---|---|---|
+| Anonymous read (public bucket) | `none` | The unsigned public download URL, plus the `generation` / `ifGenerationMatch` pins the caller asked for. No credential rides on it. |
+| Service-account read | `request` | A `GOOG4-RSA-SHA256` signature over this bucket, this object, `GET` and the pinned query, valid for the 5-minute default expiry. `Range` is supplied by the follower and is not signed (GCS V4 here signs only `host`), so the signature binds the object and the window, not the slice. |
+| Authorized-user read | — | Nothing. An authorized-user credential cannot V4-sign, and the plugin does not fall back to a broader credential: it pulls the bytes itself and answers `ReadResult::Stream` (whole object) or `ReadResult::Bytes` (range). |
+| `write_redirect` (every credential mode) | `request` | The resumable session URL GCS returned in `Location`. The session names one object and accepts uploads to that session alone; the redirect's own request carries only `content-type`, never the connection's bearer, which is spent on the plugin's `uploadType=resumable` POST and not passed on. The declared expiry on that scope is seven days. |
+
+So nothing this plugin hands out reaches an object the redirect does not
+name, and the write session is the longest-lived of them. Under a host
+running the default `redirect_credential_disclosure = "refuse"`, every
+GCS redirect is delegated on both paths — the credential is never
+broader than the redirected request, so the policy has nothing to
+withhold. The session URL is a bearer credential for its lifetime all
+the same: whoever holds it can upload to that object until the session
+is finished or expires.
+
+## Layer-to-API mapping
+
+| Layer method | GCS API |
 |---|---|
-| `instantiate` | (no remote call; validates the connection config, builds the `reqwest` client, constructs the `Authenticator` from the `SecretBundle`, and returns the `BackendInstance` with the per-connection `Capabilities`. Bearer-token acquisition is deferred to the first data-path call.) |
+| `add_connection` | Validates the connection config, builds the `reqwest` client, and constructs the `Authenticator` from the `SecretBundle`. Bearer-token acquisition is deferred to the first data-path call. Capabilities are returned through `RootInfo`. |
 | `stat` | `GET /b/{bucket}/o/{name}` (or `?generation=N` for a version-pinned target). Parses `etag`, `generation`, `metageneration`, `size`, `updated`, `crc32c`, `md5Hash`, `storageClass`, `contentType`, `contentEncoding`, `metadata`. |
 | `read` | V4-signed presigned GET (service-account creds) or `alt=media` JSON-API streaming GET (authorized-user creds). |
 | `write` (Body::Bytes) | Single-shot upload through the JSON API (preconditions inline). |
 | `write_redirect` (known size) | Initiates a resumable session (`uploadType=resumable` with `X-Upload-Content-Length`), returns a single `WriteRedirect` (PUT against the session URL with `RedirectBodySource::UserBytes { offset: 0, len }`). |
 | `write_redirect` (unknown size) | Returns `Unsupported`; the dispatcher falls through to `write_stream`. |
-| `continue_write` | Parses the captured `Object` JSON; rejects 308 Resume Incomplete on the single-PUT path (partial commit must not be reported as success). Validates session URL + target address from the continuation blob. |
+| `continue_write` | Parses the captured `Object` JSON; rejects 308 Resume Incomplete on the single-PUT path (partial commit must not be reported as success). Compares the session URL and the recorded target address from the continuation blob, and re-checks the committed object's `name` against the target — all three are defence in depth, not the control. A resumable session names the object by itself, so it cannot be re-derived from the request address; on the broker's client-driven route both sides of either continuation comparison come from the same caller, and the `name` re-check reads a response body that caller also supplied. The `name` re-check is in any case detection after the commit rather than prevention. |
 | `write_stream` | Initiates a resumable session itself, PUTs exactly-8 MiB chunks (`Content-Range: bytes <s>-<e>/*`, 308 = continue), finalises with `Content-Range: bytes <s>-<e>/<total>`. Memory stays bounded by one ~8 MiB chunk regardless of object size. |
 | `delete` | `DELETE /b/{bucket}/o/{name}` with `ifGenerationMatch` parsed from `DeleteOptions.if_match` (etag string; GCS uses the generation number as the etag) or address `?generation`. |
 | `list` | `GET /b/{bucket}/o?prefix=&delimiter=&pageToken=&maxResults=`. Real objects return `ObjectInfo` with `ObjectKind::File`; zero-byte marker objects ending in `/` return `ObjectInfo` with `ObjectKind::DirectoryMarker`; common prefixes return `ObjectInfo` with `ObjectKind::DirectoryInferred`. If GCS reports the same address as both a marker object and a prefix, the marker wins and only one item is emitted. |
@@ -177,7 +209,7 @@ that endpoint (port preserved). The signing scope
 | `rename` | Copy-then-delete with best-effort delete-on-failure rollback. |
 | `update_metadata` | `PATCH /b/{bucket}/o/{name}` with `metadata` map (set → string values, remove → JSON `null`). `if_match` (etag) → `ifGenerationMatch`. **Native** patch — does not rewrite the object's bytes. |
 | `check_access` | `GET /b/{bucket}/iam/testIamPermissions?permissions=…` for the requested ops. |
-| `watch_directory` | Pub/Sub `:pull` against `pubsub_subscription`; ack on the following pull. |
+| `watch_directory` | Pub/Sub `:pull` against `pubsub_subscription`; one coalesced consumer per connection, ack after fan-out. |
 
 ## Streaming guarantees
 
@@ -194,9 +226,10 @@ requested byte slice.
 The plugin advertises (true):
 `writes_are_atomic`, `supports_no_overwrite_write` (via
 `ifGenerationMatch=0`), `supports_if_match_write` (via
-`ifGenerationMatch=<N>`), `supports_server_side_copy`,
-`supports_server_side_rename` (copy-plus-delete with rollback;
-`supports_atomic_rename = false`), `supports_recursive_list`,
+`ifGenerationMatch=<N>`), `supports_server_side_copy`, `supports_copy`,
+`supports_rename` (availability: `rename` is offered, implemented as
+copy-plus-delete with rollback, so `supports_server_side_rename` and
+`supports_atomic_rename` are both false), `supports_recursive_list`,
 `supports_list`, `wants_list_backed_stat`, `supports_version_listing`
 (with `version_list_order = Some(Newest)`),
 `supports_native_metadata_patch`, `supports_access_check`,
@@ -224,7 +257,7 @@ would require an extra IAM `testIamPermissions` call beyond
 - Background OAuth refresh runs at ~90% of the access token's TTL with a
   30s retry floor on failure. The refresh task holds a weak reference to
   the auth state, so it stops naturally when the connection is dropped.
-- Inverted byte ranges return `InvalidArgument` at the SPI boundary.
+- Inverted byte ranges return `InvalidArgument` at the Layer boundary.
 
 ## Subscriptions and watch
 
@@ -234,12 +267,52 @@ bucket. The plugin does not create subscriptions or notification
 configurations; configure those out-of-band and set
 `pubsub_subscription` on the connection.
 
-At setup the plugin reads the subscription resource and caches
-`ackDeadlineSeconds` (`0` normalised to Pub/Sub's 10 second default)
-and `enableExactlyOnceDelivery`. Pull uses
+When the shared consumer opens it reads the subscription resource once
+and caches `ackDeadlineSeconds` (`0` normalised to Pub/Sub's 10 second
+default) and `enableExactlyOnceDelivery`. Pull uses
 `POST /v1/{subscription}:pull`; acknowledgements use
 `POST /v1/{subscription}:acknowledge` through the same
 bearer-authenticated `reqwest` client.
+
+Acknowledgement is at-least-once and happens **after fan-out**: once a
+derived ovstorage event has been dispatched to every matching watcher,
+its ack is queued to the Pub/Sub ack pump (off the fan-out path, so a
+slow network ack never stalls delivery). Each Pub/Sub message carries
+one refcount and is acked **exactly once**, after every one of its
+events has been dispatched and acked. Malformed notification bodies
+yield `Lapsed` and are acked the same way; a notification outside the
+watched prefix or bucket carries no event for that watcher but is still
+acked. A synchronous ack-dispatch failure (the bounded pump is full or
+closed) and a fatal asynchronous provider failure (a Pub/Sub
+`:acknowledge` error the pump classifies as fatal) each surface as a
+terminal error on the watch stream — never a silently dropped ack —
+tearing the shared consumer down so the next watch reopens it. A
+transient `:acknowledge` failure is logged and retried on redelivery,
+not terminal.
+
+### One consumer per connection
+
+Concurrent `watch_directory` calls on a single connection — any prefix,
+any principal — **self-coalesce onto one physical Pub/Sub pull
+consumer** per connection. Events are fanned out in-process,
+prefix-filtered per watcher, so watches on different prefixes never
+cannibalize each other's notifications (Pub/Sub pull is a
+competing-consumer transport: each message is delivered to one puller).
+The coalescer is principal-blind: it keys solely on the Pub/Sub
+subscription resource, never on the caller.
+
+A `since` request coalesces like any other watch: the stream is prefixed
+with one `Lapsed` (GCS keeps no resume history) and then delivers live
+events off the shared consumer — no dedicated puller.
+
+**Operational rule — one notification resource per consumer.**
+Coalescing is in-process, per connection: each `GcsBackend` owns its own
+coalescer. It cannot stop two backend connections, two broker replicas,
+or two application processes from each attaching an independent puller to
+the **same** Pub/Sub subscription and splitting its notifications. So
+each live connection that consumes a subscription must have **its own**
+subscription (or use a fan-out delivery model), or the pullers
+cannibalize each other.
 
 Event mapping:
 `OBJECT_FINALIZE` → `Created`;
@@ -268,6 +341,29 @@ short-lived signed redirects. Bearer tokens are cached on the backend
 instance behind a `Mutex` and rotated 5 minutes before expiry. Signed
 URLs and resumable session URLs are bearer credentials until expiry
 and are redacted everywhere the core redacts presigned redirects.
+
+Storage and Pub/Sub error response bodies are never interpolated into
+error text. Only an allowlisted error-code token survives into
+`error.message` — JSON `error.status`, else the first
+`errors[].reason`, else the first `<Code>` element that is a direct
+child of the root `<Error>` element of the XML-API error shape, within
+the first 8 KiB of the body — and the rest of the body is discarded. A body from
+which no code can be recovered is reported by its length alone and
+nothing else. So a failed request cannot disclose its response text
+through a logged exception.
+
+The same holds when a *successful* response fails to deserialize —
+a resumable-write object, a Pub/Sub subscription lookup, a pull
+response. A serde type error renders the offending value, so every
+one of those paths reports the decode failure by classification,
+position and body length instead of by its `Display`. The pull
+response matters most of the three: it is the one carrying
+notification payloads and attributes.
+
+The OAuth token endpoint is not covered by that guarantee: a failed
+token exchange reports the response text, which carries an
+OAuth error code and description rather than the service-account
+private key.
 
 ## Deferred capabilities
 

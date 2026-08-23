@@ -9,24 +9,30 @@ shape that pins each scenario.
 ## Bundled with the release archive
 
 The cdylib ships alongside the production plugins in
-`<archive>/plugins/`. The manifest carries `test_only = true` and the
-loader gates it behind `Builder::allow_test_plugins(true)` (default
-`false`).
+`<archive>/plugins/`. It is built from the sibling
+`ovstorage-plugin-test-abi` crate (artifact
+`libovstorage_plugin_test_abi.so` / `.dylib` /
+`ovstorage_plugin_test_abi.dll`; manifest
+`name = "ovstorage-plugin-test-abi"`), which wraps the rlib-only
+`ovstorage-plugin-test` harness crate — the ABI export was split out
+so the harness can be linked into other plugins' test binaries
+without entry-point symbol collisions. The manifest carries
+`test_only = true` and the loader gates it behind
+the host's `allow_test_plugins` setting (default `false`).
 
 Two host code paths interact differently with that gate:
 
-- `Library::load_plugins_from_dir` — bulk discovery (the broker and
+- Directory discovery — the broker and
   REST gateway use this at startup). When `allow_test_plugins` is
   off, the test plugin is **skipped** at debug-log level and the
   scan continues. A default-posture host that points at the release
   archive's `plugins/` directory ignores the test plugin and starts
   cleanly.
-- `Library::load_plugin` — direct, by-path load. When
+- Direct, by-path loading — when
   `allow_test_plugins` is off, the call returns
   `ErrorCode::PluginRejected`. A caller that explicitly asks for the
   test plugin gets a clear refusal rather than silent inaction.
 
 Consumers who want to drive their host through the conformance edge
-cases build the host with `allow_test_plugins(true)` and either call
-`load_plugin` directly with the cdylib path, or set the bulk-load
-plugin directory to one containing the test plugin.
+cases enable `allow_test_plugins` in the host configuration and point
+plugin discovery at a directory containing the test cdylib.

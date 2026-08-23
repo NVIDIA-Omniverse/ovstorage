@@ -18,7 +18,7 @@ from pathlib import Path
 
 import ovstorage
 
-from _common import add_file_connection, load_plugin_kind
+from _common import build_file_stack
 
 
 def _parse_args() -> argparse.Namespace:
@@ -41,47 +41,46 @@ def _print_info(label: str, info: object) -> None:
 async def _run(plugin_dir: str | None) -> None:
     with tempfile.TemporaryDirectory(prefix="ovstorage-hello-") as tmp:
         root = Path(tmp).resolve()
-        library = ovstorage.Library.open()
-        await load_plugin_kind(library, plugin_dir, "file")
-        connection = await add_file_connection(library, root, "hello-storage-local")
+        # `file` is the one built-in backend; --plugin-dir is accepted for
+        # command-line compatibility but is not needed here.
+        del plugin_dir
+        storage = await build_file_stack(root, "hello-storage-local")
 
         address = (root / "hello.txt").as_uri()
         payload = b"hello from ovstorage\n"
 
-        try:
-            print(f"connected: {connection.id}")
-            print(f"root:      {root}")
-            print()
+        connection = (await storage.list_connections())[0]
+        print(f"connected: {connection.id}")
+        print(f"root:      {root}")
+        print()
 
-            written = await library.write(address, payload)
-            _print_info("write", written)
-            print()
+        written = await storage.write(address, payload)
+        _print_info("write", written)
+        print()
 
-            stat = await library.stat(address)
-            _print_info("stat", stat)
-            print()
+        stat = await storage.stat(address)
+        _print_info("stat", stat)
+        print()
 
-            page = await library.list(root.as_uri() + "/", max_results=20)
-            print("list:")
-            for item in page.items:
-                print(f"  {item.kind:18} {item.size or '-':>8} {item.address}")
-            print()
+        page = await storage.list(root.as_uri() + "/", max_results=20)
+        print("list:")
+        for item in page.items:
+            print(f"  {item.kind:18} {item.size or '-':>8} {item.address}")
+        print()
 
-            data, info = await library.read_bytes(address, max_bytes=1024)
-            _print_info("read", info)
-            print(f"  payload: {data.decode('utf-8').rstrip()}")
-            print()
+        data, info = await storage.read_bytes(address, max_bytes=1024)
+        _print_info("read", info)
+        print(f"  payload: {data.decode('utf-8').rstrip()}")
+        print()
 
-            async with await library.materialize(address) as delegate:
-                print("materialize:")
-                print(f"  local path: {os.fspath(delegate)}")
-                print(f"  bytes:      {Path(delegate).read_text(encoding='utf-8').rstrip()}")
-            print()
+        async with await storage.materialize(address) as delegate:
+            print("materialize:")
+            print(f"  local path: {os.fspath(delegate)}")
+            print(f"  bytes:      {Path(delegate).read_text(encoding='utf-8').rstrip()}")
+        print()
 
-            await library.delete(address)
-            print(f"delete: {address}")
-        finally:
-            await library.remove_connection(connection.id)
+        await storage.delete(address)
+        print(f"delete: {address}")
 
 
 async def _main() -> None:

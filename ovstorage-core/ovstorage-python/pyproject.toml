@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ovstorage"
+version = "0.2.1"
+requires-python = ">=3.10"
+description = "Python bindings for ovstorage"
+readme = { file = "PYPI_README.md", content-type = "text/markdown" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
+[dependency-groups]
+dev = ["mypy>=1.10", "pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.maturin]
+bindings = "pyo3"
+manifest-path = "Cargo.toml"
+module-name = "ovstorage.ovstorage"
+python-source = "."
+# LICENSE and THIRD_PARTY_NOTICES.md are staged into this directory by
+# `make dist-wheel` from the repo root. Both are gitignored locally.
+include = [
+    "ovstorage/*.pyi",
+    "ovstorage/py.typed",
+    "THIRD_PARTY_NOTICES.md",
+    # The bundled plugin cdylibs, staged here by `make dist-wheel`. Scoped to
+    # the wheel: an unscoped entry also pulls these host-specific binaries into
+    # the sdist, which must stay a source distribution.
+    { path = "ovstorage/plugins/*", format = "wheel" },
+]

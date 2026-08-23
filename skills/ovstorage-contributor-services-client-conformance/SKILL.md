@@ -103,6 +103,6 @@ behavior.
 - Plugin user reference:
   [`docs/public/plugin-storage/plugin-services-client.md`](../../docs/public/plugin-storage/plugin-services-client.md)
 - Plugin internals:
-  [`ovstorage-services-client/crates/ovstorage-plugin-services-client/README.md`](../../ovstorage-services-client/crates/ovstorage-plugin-services-client/README.md)
+  [`ovstorage-services-client/ovstorage-plugin-services-client/README.md`](../../ovstorage-services-client/ovstorage-plugin-services-client/README.md)
 - Suite's own configuration reference:
   [`ovstorage-services/apis/storage-api/conformance_tests/README.md`](../../ovstorage-services/apis/storage-api/conformance_tests/README.md)

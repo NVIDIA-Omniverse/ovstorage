@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-authz"
+version.workspace = true
+edition = "2024"
+description = "Shared host request-context types (Principal/RequestContext) + attribution overlay for ovstorage remote hosts."
+license = "Apache-2.0"
+
+[dependencies]
+ovstorage = { workspace = true }
+ovstorage-plugin = { workspace = true }
+ovstorage-authz-context = { workspace = true }
+async-trait = "0.1.83"
+tracing = "0.1.44"
+
+[dev-dependencies]
+# Test-only: drives the async `AttributionWrapper` Layer verbs. The crate's own
+# code is sync, so tokio is dev-only.
+tokio = { version = "1.52.3", features = ["macros", "rt"] }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

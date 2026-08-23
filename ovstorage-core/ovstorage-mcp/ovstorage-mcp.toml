@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Default ovstorage mcp config. Copy to ./ovstorage.toml or
+# $XDG_CONFIG_HOME/ovstorage/ovstorage.toml and edit. See docs/public/configuration.md.
+[ovstorage]
+root = "alias"
+
+[ovstorage.layers.alias]
+inner = "copy_rename_fallback"
+
+[ovstorage.layers.copy_rename_fallback]
+inner = "redirect_follower"
+
+[ovstorage.layers.redirect_follower]
+inner = "retry"
+
+[ovstorage.layers.retry]
+inner = "router"
+
+[ovstorage.layers.router]
+children = ["file"]
+
+[ovstorage.layers.file]
+
+[[ovstorage.connections]]
+backend_kind = "file"
+config = { root = "/data" }

@@ -22,7 +22,7 @@ match the storage task.
 |---|---|---|---|
 | `file` | Data is on a local or mounted filesystem visible to this process | `file:///absolute/path` | Best for local smoke tests, dev fixtures, and direct POSIX semantics. |
 | `http` | Data is read from an HTTP(S) endpoint | `https://host/path` | Read-oriented and URL-shaped; confirm write/list support before depending on it. |
-| `omniverse-storage-service` | Targeting a deployed Omniverse Storage Service | gRPC; configured via `discovery_url` | Needs `discovery_url` (host of `/api/v1/services` and `/api/v1/auth-config`) and OIDC credentials. See per-backend section below. |
+| `omniverse-storage-service` | Targeting a deployed Omniverse Storage Service | gRPC; configured via `address` | Needs `address` — either a discovery root (host of `/api/v1/services` and `/api/v1/auth-config`) with OIDC credentials, or a `grpc://` / `grpcs://` storage endpoint dialed directly. See per-backend section below. |
 | `s3` | AWS S3 or S3-compatible object stores (MinIO, R2, B2, custom endpoint) | `s3://<bucket>/<key>` | `aws_access_key_id` + `aws_secret_access_key` (+ optional `aws_session_token`); env vars and `~/.aws/credentials` honoured. |
 | `gcs` | Google Cloud Storage | `gs://<bucket>/<object>` | `service_account_key` (JSON blob) or ADC `file_path`; no IMDS, no impersonation. |
 | `azure` | Azure Blob and ADLS Gen2 (HNS-aware accounts) | `azure://<account>/<container>/<path>` | One of `account_key`, `sas_token`, service principal, or workload identity. |
@@ -37,9 +37,11 @@ match the storage task.
 A Omniverse Storage Service deployment, accessed over gRPC with
 OIDC bearer-token auth. Configure with:
 
-- `discovery_url` — HTTP root that serves `/api/v1/services` and
-  `/api/v1/auth-config`. The plugin discovers the gRPC endpoint and
-  OIDC client from there.
+- `address` — where the service is. Either an HTTP root that serves
+  `/api/v1/services` and `/api/v1/auth-config`, from which the plugin
+  discovers the gRPC endpoint and the OIDC client; or a `grpc://` /
+  `grpcs://` storage endpoint, dialed directly with no discovery
+  service and no OIDC.
 - `oidc_client_name` (optional, default `"default"`) — picks an entry
   from `auth-config.clients`.
 
@@ -114,6 +116,24 @@ whitelist), so don't add a `prefix` field. Config keys:
 - `account` (**required**) and `container` (**required**).
 - `endpoint_suffix` — optional; default `core.windows.net` (override
   for sovereign clouds).
+- `blob_endpoint` — optional full blob-tier URL (scheme, host, port,
+  path prefix); overrides `endpoint_suffix` for that tier. Use
+  `https://` for real custom, private-link and sovereign endpoints.
+  `http://127.0.0.1:10000/devstoreaccount1` is the **Azurite emulator**
+  form and is emulator-only.
+- `dfs_endpoint` — the same for the ADLS Gen2 `dfs` tier. May be set
+  on its own (the blob tier then stays on `endpoint_suffix`); an HNS
+  connection that sets `blob_endpoint` must set this too.
+- **Prefer `https://`.** A plain-`http://` endpoint is accepted with
+  any credential mode and on any host — `http://azurite:10000` is a
+  supported emulator shape, and needs no extra key. On a non-loopback
+  host the connection logs a `warn`, because object bytes and metadata
+  cross the link in the clear, a caller `sas_token` is readable in the
+  request URL, an OAuth token in the `Authorization` header, and the
+  redirect-following read and write paths hand out a five-minute
+  Service SAS that can travel in the clear. Use `http://` only for an
+  emulator; for real custom, private-link and sovereign endpoints use
+  `https://`.
 - `hierarchical_namespace` — bool; set to `true` for ADLS Gen2 HNS
   accounts. `instantiate` checks this matches the account's actual
   mode.
@@ -193,7 +213,7 @@ credentials off the calling host. Pick this backend when:
 - You want a credential boundary: the calling process holds only
   short-lived broker bearers, not S3 / GCS / Azure keys.
 - You want per-call authorization (allow / deny / audit) against a
-  configured `AuthzPlugin` policy.
+  configured built-in authorization policy.
 - You're running zero-trust fleets, workload-identity-federated
   deployments, or want a shared metadata cache in front of the
   cloud.
@@ -229,7 +249,9 @@ broker-driven interactive PKCE / device flow.
 ## Recipe
 
 1. Run [`ovstorage-user-getting-started`](../ovstorage-user-getting-started/SKILL.md) and confirm
-   the backend kind exists in `backend_kinds`.
+   the backend kind appears in `backend_kinds`. That list is the layers this
+   stack declares, so a kind you know the library supports — `file` included —
+   is absent until the config declares a layer for it.
 2. Match the address root you need to the backend's URL scheme and configured
    `address_roots`.
 3. Check capabilities before relying on writes, recursive list, directory

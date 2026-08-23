@@ -1,0 +1,91 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-services-client"
+description = "Omniverse Storage Service backend plugin for ovstorage (gRPC + OIDC)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ovstorage = { workspace = true }
+ovstorage-plugin = { workspace = true }
+ovstorage-services-protos = { workspace = true }
+
+async-trait = "0.1.89"
+bytes = "1.11.1"
+futures = "0.3.32"
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+parking_lot = "0.12.5"
+reqwest = { version = "0.12.28", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+    "blocking",
+] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+tokio-util = { version = "0.7.18", features = ["io", "rt"] }
+# tonic 0.14 stack pinned inline (coexists with the broker's tonic 0.12).
+tonic = { version = "0.14.6", default-features = false, features = [
+    "channel",
+    "codegen",
+    "transport",
+    "tls-ring",
+    "tls-native-roots",
+    "router",
+] }
+tower = "0.5.3"
+tracing = "0.1.44"
+url = "2.5.8"
+
+[dev-dependencies]
+# Activates `ovstorage-plugin::connection::credential_conformance`, the shared
+# credential-transaction expectation this crate's real driver is held to
+# alongside the plugin crate's `MockDriver` and the broker's. Dev-only:
+# production builds of this plugin leave the harness out.
+ovstorage-plugin = { workspace = true, features = ["test-credential-conformance"] }
+# Registry-as-spec conformance harness (rlib-only; emits no Layer ABI export
+# symbols, so it links cleanly next to this crate's own plugin exports).
+ovstorage-plugin-test = { workspace = true }
+# `net` (beyond the crate's own `sync`) for `TcpListenerStream`, so the
+# direct-endpoint tests serve the listener they bound rather than re-binding a
+# port they had released.
+tokio-stream = { version = "0.1.18", features = ["sync", "net"] }
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+    "test-util",
+] }
+# In-process OIDC provider mock (auth-config / discovery / token endpoint) for
+# the connection-lifecycle end-to-end tests. Already vetted in the workspace
+# (ovstorage-core/ovstorage dev-deps).
+wiremock = "0.6.5"
+# Captures the transport's own tracing events, so the redaction of a locator on
+# the way to a log line is asserted on what is EMITTED rather than on what an
+# accessor returns. Already vetted in the workspace (ovstorage-core/ovstorage).
+tracing-subscriber = "0.3.23"
+
+[lints]
+workspace = true

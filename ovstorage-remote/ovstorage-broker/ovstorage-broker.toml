@@ -1,0 +1,174 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# ovstorage broker — default configuration.
+#
+# The broker builds its shared inner data-plane Stack directly from the
+# `[ovstorage]` table below through `ovstorage::host::build_stack`: the layer
+# graph, the byte/metadata cache roots, and the follower's follow policy are all
+# layer config here, not host concerns. The per-listener built-in auth layer is
+# attached over this inner from `[listener].auth`.
+#
+# Copy and edit: point the `file` connection `root` at your data directory and
+# the `byte_cache` `cache_root`/`state_root` at writable spool/state dirs, or
+# delete the `byte_cache`/`metadata_cache` layers (relinking the neighbours'
+# `inner`) to run forward-only with no caching.
+
+# Trust-boundary attribution for `modified_by`: `user_metadata` (default) stamps
+# the authenticated principal; `passthrough` forwards an upstream broker's stamp.
+# Top-level key: read by `BrokerConfig`, NOT `[listener]` — keep it above the
+# first table header so TOML does not nest it.
+#
+# The strategy is process-wide: every `attribution` layer in the graph below is
+# built from this one value, so branches differ by whether they declare the layer
+# at all, never by how it behaves.
+attribution_strategy = "user_metadata"
+
+# Whether a redirect carrying a credential broader than the redirected request
+# may be handed to the client that asked for it. Top-level key, like
+# `attribution_strategy` — keep it above the first table header.
+#
+# This is a property of the deployment, not of the credential. A broker is not
+# always a credential boundary: it is sometimes a central configuration point
+# for clients already inside the trust boundary — a pod of render agents in one
+# datacenter behind one broker — and handing those clients a credential
+# discloses nothing they were not already entitled to, while refusing costs them
+# the redirect path entirely. Only you can say which deployment this is.
+#
+# `refuse` (default) — the broker moves the bytes itself instead of handing
+#   over such a redirect. A read falls back to the broker streaming the object;
+#   a write falls back to the client sending the body through the broker, which
+#   is capped at 64 MiB, so a larger write fails rather than degrading.
+# `allow` — any valid redirect may be handed to the client.
+#
+# Either way, a redirect whose credential is scoped to the redirected request —
+# an S3 presigned URL, an Azure service SAS the broker minted, a GCS signed URL
+# — is handed over. Those are the reason redirects exist. See the broker
+# operator guide for what each backend and auth mode actually discloses.
+#
+# One key governs the read and the write path together. The follower layer below
+# reads it from here; setting `disclose_redirect_credentials` on that layer by
+# hand is a startup error rather than a second spelling of this policy.
+redirect_credential_disclosure = "refuse"
+
+# Single listener per broker process. Auth is FAIL-CLOSED: an absent `auth`
+# refuses to start, forcing a conscious choice — so no allow-all default ships.
+# Uncomment exactly one:
+#   auth = "anonymous"          # unauthenticated allow-all — dev / local only
+# or a gating `[listener.auth]` table (`builtin-auth` policy and TCP authn mode):
+#   [listener.auth]
+#   kind = "builtin-auth"
+#   [listener.auth.config]
+#   authn_mode = "jwt_verify"
+#   # policy rules, jwt_issuer / jwt_audience / jwt_jwks_url, ...
+[listener]
+bind = "127.0.0.1:8787"
+
+[discovery]
+name = "ovstorage broker"
+
+# --- The shared inner data-plane Stack -------------------------------------
+#
+# upstream_credential → alias → copy_rename_fallback → byte_cache →
+# metadata_cache → redirect_follower → retry → router → attribution_file → file
+#
+# Attribution sits BELOW the router, one instance per branch. Two things follow
+# from that placement, and both are why it is there:
+#
+#   * `copy_rename_fallback` emulates a copy or rename by fabricating a write and
+#     issuing it downward. A branch-level attribution layer is in that write's
+#     path, so an emulated copy stamps its destination.
+#   * A branch whose backend cannot carry a `user_metadata` key omits the layer,
+#     so the broker never manufactures metadata that backend must refuse. Declare
+#     the layer on `file`, `s3`, `gcs`, `azure`, `omniverse-storage-service`
+#     and `broker` branches; omit it on `nucleus` (which rejects non-empty `user_metadata`),
+#     `opendal` (which rejects it on presigned writes, and on ordinary writes
+#     whenever the connection's driver cannot store it) and `http` (read-only).
+#
+# A branch without the layer also gets no harvest and no inbound sanitizing: a
+# reserved `ovstorage-*` key already stored on one of its objects surfaces to
+# clients verbatim in `user_metadata` rather than being promoted to the typed
+# `modified_by` and hidden, and a client-supplied value for the reserved key
+# reaches that backend unaltered. On that branch it stays a raw `user_metadata`
+# entry and `modified_by` reports whatever the backend natively knows, if
+# anything.
+#
+# That does NOT stay on the branch. A `broker` branch carries the layer — so an
+# upstream stamp survives a chain — and harvests whatever the host beneath it
+# returned, so a value planted on an unsanitized branch of an upstream broker is
+# promoted into the attested `modified_by` when read through a broker fronting
+# it. `modified_by` from a chained broker is only as trustworthy as the
+# sanitizing on every branch beneath it. On `nucleus` and `http` none of this
+# happens at all: neither stores nor returns user metadata. On `opendal` it does,
+# over a driver that persists metadata.
+[ovstorage]
+root = "upstream_credential"
+
+# Per-principal broker-side upstream OAuth credential handling — the broker's
+# security boundary at the top of the graph. If omitted, the broker injects it
+# at the root; declaring it anywhere but the boundary is a startup error.
+[ovstorage.layers.upstream_credential]
+inner = "alias"
+
+# Credential-less address rewrites + visibility overrides (none by default).
+[ovstorage.layers.alias]
+inner = "copy_rename_fallback"
+
+# Copy/rename staging for transfers the layer below declines.
+[ovstorage.layers.copy_rename_fallback]
+inner = "byte_cache"
+
+# Validator-keyed byte cache. `max_object_bytes` caps both the tee/warm fills
+# and (matching) the follower's `follow_reads_max_bytes` below. The broker is
+# the sanctioned survive-backing-loss (`lost_backing_fallback`) and
+# warm-delegates opt-in.
+[ovstorage.layers.byte_cache]
+inner = "metadata_cache"
+cache_root = "/var/cache/ovstorage-broker/blobs"
+state_root = "/var/lib/ovstorage-broker/cache-state"
+partition = "local"
+lost_backing_fallback = true
+warm_delegates = true
+max_object_bytes = 1048576
+
+# Stat/list metadata cache (serves the byte cache's validating stat).
+[ovstorage.layers.metadata_cache]
+inner = "redirect_follower"
+max_entries = 4096
+ttl_seconds = 30
+
+# Single global follower: follow small read redirects into the byte cache.
+# An oversize read surfaces the redirect unfollowed when it is delegable; when
+# it is not, the bytes are streamed through this host instead. The size cap
+# decides what is worth caching, not what is readable. Delegability is the
+# minting backend's declared credential scope, not an inspection of the
+# redirect's headers.
+[ovstorage.layers.redirect_follower]
+inner = "retry"
+follow_reads = true
+follow_reads_max_bytes = 1048576
+
+[ovstorage.layers.retry]
+inner = "router"
+
+# Forks to one branch per connected kind. A branch is the backend Layer itself
+# (`target = kind`), or an attribution wrapper over it — the router resolves a
+# child by the targets that child owns, and a wrapper reports its inner's.
+[ovstorage.layers.router]
+children = ["attribution_file"]
+
+# Broker-attested `modified_by` overlay for the `file` branch (strategy from the
+# top-level `attribution_strategy`).
+[ovstorage.layers.attribution_file]
+kind = "attribution"
+inner = "file"
+
+[ovstorage.layers.file]
+kind = "file"
+
+# One connection per backend. The `file` backend roots at a local directory.
+[[ovstorage.connections]]
+backend_kind = "file"
+display_name = "local files"
+
+[ovstorage.connections.config]
+root = "/srv/ovstorage/data"

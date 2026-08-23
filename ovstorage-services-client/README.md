@@ -9,9 +9,9 @@ crate it compiles against.
 
 ## Crates
 
-- [`ovstorage-plugin-services-client`](crates/ovstorage-plugin-services-client/README.md)
+- [`ovstorage-plugin-services-client`](ovstorage-plugin-services-client/README.md)
   — the plugin (cdylib).
-- [`ovstorage-services-protos`](crates/ovstorage-services-protos/README.md)
+- [`ovstorage-services-protos`](ovstorage-services-protos/README.md)
   — tonic-generated stubs compiled from the canonical contracts at
   `ovstorage-services/apis/`.
 
@@ -22,4 +22,4 @@ crate it compiles against.
 into the host's plugin directory (`OVSTORAGE_PLUGIN_DIR` or
 `<exe>/plugins/`) or register programmatically — see the user
 reference in `docs/public/plugin-storage/` for the current
-`ovstorage::init_auth_substrate(...)` + `Library::builder()` flow.
+`ovstorage::host::build_stack(...)` flow.

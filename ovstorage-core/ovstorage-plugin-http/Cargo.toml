@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-http"
+version.workspace = true
+edition = "2024"
+description = "HTTP backend for ovstorage."
+license = "Apache-2.0"
+
+[dependencies]
+ovstorage-layer = { workspace = true }
+ovstorage-plugin = { workspace = true }
+ovstorage-retry = { workspace = true }
+async-trait = "0.1.89"
+async-stream = "0.3.6"
+base64 = "0.22.1"
+bytes = "1.11.1"
+crc32c = "0.6.8"
+futures = "0.3.32"
+httpdate = "1.0.3"
+md-5 = "0.10.6"
+parking_lot = "0.12.5"
+reqwest = { version = "0.12.28", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+    "blocking",
+] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util = { version = "0.7.18", features = ["io", "rt"] }
+tracing = "0.1.44"
+sha2 = "0.10.9"
+tempfile = "3.27.0"
+time = { version = "0.3.47", features = ["parsing"] }
+url = "2.5.8"
+zeroize = "1.8.2"
+
+[package.metadata.cargo-machete]
+# `md-5` exposes its module as `md5`; cargo-machete does not follow that
+# package-to-module name difference without `--with-metadata`.
+ignored = ["md-5"]
+
+[dev-dependencies]
+ovstorage = { workspace = true }
+ovstorage-plugin-test = { workspace = true }
+hmac = "0.12.1"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+    "rt",
+] }
+urlencoding = "2.1.3"
+
+[lints]
+workspace = true

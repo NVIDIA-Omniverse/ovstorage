@@ -1,8 +1,13 @@
 # Agent Envelope v0.1
 
+> **`v0.1` here is the envelope schema version, not an ovstorage release.**
+> Every `v0.1` / `v=0.1` on this page refers to the schema; the package
+> version is never written this way.
+
 Stable JSON contract for ovstorage agent-facing surfaces. Used by CLI
-`--json` output, starting with `ovstorage doctor --json`, and by future
-transports such as an MCP server.
+`--json` output (starting with `ovstorage doctor --json`) and by the
+`ovstorage-mcp` server, whose tool surface is documented in
+[`mcp-tools.md`](mcp-tools.md).
 
 Schema artifact: [`schema/v0.1.json`](schema/v0.1.json).
 
@@ -39,19 +44,30 @@ Schema artifact: [`schema/v0.1.json`](schema/v0.1.json).
 |---|---|---|---|
 | `code` | string | always | Stable variant name from the Rust `ErrorCode` enum, such as `"NotFound"`, `"NoRoute"`, or `"CredentialUnavailable"`. |
 | `message` | string | always | Human-readable explanation. Redacted at construction by `Error::new`. |
-| `retryable` | boolean | always | `true` iff blind retry of the same operation might succeed. As of v0.1: `Transient`, `BrokerUnavailable`, `ResourceExhausted`, `DeadlineExceeded`, `CacheLockContention`, and `AuthorizationLeaseExpired`. |
-| `next_action` | string | optional | Recovery hint when known. Pre-populated at high-value SPI sites; absent otherwise. Never fabricated. |
+| `retryable` | boolean | always | `true` iff blind retry of the same operation might succeed. The set is `Transient`, `BrokerUnavailable`, `ResourceExhausted`, `DeadlineExceeded`, `CacheLockContention`, and `AuthorizationLeaseExpired`. |
+| `next_action` | string | optional | Recovery hint when known. Pre-populated at high-value Layer call sites; absent otherwise. Never fabricated. |
+| `partial` | object | optional | Present only when `code` is `PartialCompletion`. Carries the committed/uncommitted stage detail for that error. |
 
 ## Versioning Rules
 
-- The envelope shape is pinned at `v=0.1` until a breaking change is needed.
+- The envelope shape is pinned at schema `v=0.1` until a breaking change is needed.
 - Adding a new optional field is not a breaking change: existing clients ignore unknown fields.
 - Changing a field's type, removing a field, or changing an operation's `result` payload shape is breaking: bump `v` and publish a new schema artifact.
+
+## Validating strictly
+
+The error sub-object's schema sets `"additionalProperties": false`, so a
+strict validator rejects any envelope carrying a property its pinned copy of
+`schema/v0.1.json` does not declare. Because an added optional property does
+not bump `v`, the version token gives no warning that the artifact has moved.
+If you validate strictly, pin the schema artifact itself and re-fetch it from
+the tree you are running against. If you validate leniently or not at all,
+this does not affect you.
 
 ## Redaction Contract
 
 Every string field that may carry a URL or signed parameter is passed
-through `ovstorage_plugin::redact_message` before serialization:
+through `ovstorage::redact_message` before serialization:
 
 - `resource`
 - `error.message`
@@ -65,7 +81,12 @@ preserved.
 
 ## Stability Commitment
 
-Agents pin against the envelope schema version (`v`), not the library
-version. Library refactors that do not change the envelope shape are
+Agents pin against the envelope schema version (`v`), not the package
+version. Internal refactors that do not change the envelope shape are
 safe for agents. New operations may be added at any time; existing
 operation shapes are stable within a schema version.
+
+The one thing `v` does not tell you is whether optional fields have been
+added, since additions do not bump it. A strict validator therefore has to
+track the schema artifact, not the schema version — see [Validating
+strictly](#validating-strictly) for the case where this actually bites.

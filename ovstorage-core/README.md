@@ -10,21 +10,18 @@ and dependency graph.
 
 ## Crates
 
-- [`ovstorage`](crates/ovstorage/README.md) — the public library; `Storage` trait, `Library`, dispatcher, routing, retries, OAuth surface.
-- [`ovstorage-plugin`](crates/ovstorage-plugin/README.md) — plugin SPI: types, capabilities, manifest, C ABI handshake.
-- [`ovstorage-plugin-macros`](crates/ovstorage-plugin-macros/README.md) — `ovstorage_plugin!` proc-macro that emits the C ABI for storage plugins.
-- [`ovstorage-cache`](crates/ovstorage-cache/README.md) — on-disk state and content-addressed byte cache. Library, not a daemon.
-- [`ovstorage-capi`](crates/ovstorage-capi/README.md) — C ABI cdylib + the C++20 header-only wrapper `ovstorage.hpp`.
-- [`ovstorage-python`](crates/ovstorage-python/README.md) — PyO3 + `abi3-py310` Python wheel.
-- [`ovstorage-cli`](crates/ovstorage-cli/README.md) — `ovstorage` command-line binary.
-- [`ovstorage-plugin-file`](crates/ovstorage-plugin-file/README.md) — `file://` backend.
-- [`ovstorage-plugin-http`](crates/ovstorage-plugin-http/README.md) — public HTTP(S) read-mostly backend.
-- [`ovstorage-plugin-test`](crates/ovstorage-plugin-test/README.md) — controllable test plugin + the workspace's conformance harness, including the [streaming-seams](crates/ovstorage-plugin-test/README.md#streaming-seams) gold reference.
+- [`ovstorage`](ovstorage/README.md) — the public library; Stack construction, `LayerExt` operations, routing, wrappers, authentication, and the built-in native `file://` backend (in `ovstorage/src/file/`).
+- [`ovstorage-plugin`](ovstorage-plugin/README.md) — plugin SPI: types, capabilities, manifest, C ABI handshake.
+- [`ovstorage-plugin-macros`](ovstorage-plugin-macros/README.md) — `ovstorage_layer_plugin!` proc-macro that exports ABI-v2 Layer plugins.
+- [`ovstorage-cache`](ovstorage-cache/README.md) — embedded on-disk state and content-addressed byte cache, not a daemon.
+- [`ovstorage-python`](ovstorage-python/README.md) — PyO3 + `abi3-py310` Python wheel.
+- [`ovstorage-cli`](ovstorage-cli/README.md) — `ovstorage` command-line binary.
+- [`ovstorage-plugin-http`](ovstorage-plugin-http/README.md) — public HTTP(S) read-mostly backend (ABI-v2 Layer cdylib). The `file://` backend is no longer a plugin crate — it is built into `ovstorage` (see above).
+- [`ovstorage-plugin-test`](ovstorage-plugin-test/README.md) — controllable test plugin + the workspace's conformance harness, including the [streaming-seams](ovstorage-plugin-test/README.md#streaming-seams) gold reference.
 
 ## Examples
 
 - [`examples/plugin-rust/`](examples/plugin-rust/) — minimal Rust storage plugin (the `plugin-storage` persona's working example).
-- `examples/cpp-async/` — CMake project showing `ovstorage::task<T>` coroutines + `sync_wait` over the C ABI.
 - [`examples/python/`](examples/python/) — dependency-free Python examples
   for calling `ovstorage` through the Python binding.
 

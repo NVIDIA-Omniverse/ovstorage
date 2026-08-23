@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-test"
+version.workspace = true
+edition = "2024"
+description = "Configurable test backend plugin for ovstorage. Drives every edge case (redirects, multipart, auth flows, watch streams, error injection, retries) via connection-config knobs so host tests can cover dispatch shapes file/http plugins can't reach."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+ovstorage-plugin = { workspace = true }
+async-trait = "0.1.89"
+futures = "0.3.32"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+    "rt",
+] }
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+    "rt",
+] }
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[lints]
+workspace = true

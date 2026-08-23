@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin"
+version.workspace = true
+edition = "2024"
+description = "Plugin ABI traits, manifest types, and loader for ovstorage."
+license = "Apache-2.0"
+build = "build.rs"
+
+[dependencies]
+async-channel = "2.5.0"
+async-trait = "0.1.89"
+base64 = "0.22.1"
+bytes = "1.11.1"
+futures = "0.3.32"
+ovstorage-authz-context = { workspace = true }
+ovstorage-layer = { workspace = true }
+ovstorage-plugin-macros = { workspace = true }
+parking_lot = "0.12.5"
+serde_json = "1.0.150"
+sha2 = "0.10.9"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+tokio-util = { version = "0.7.18", features = ["io", "rt"] }
+tracing = "0.1.44"
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json", "tracing-log"] }
+url = "2.5.8"
+zeroize = "1.8.2"
+
+[features]
+# `test-codec` re-exports the crate-private `RootInfoChange` /
+# `ConnectionChange` FFI encoders (`thunks_v2`) as `*_for_test` hooks so the
+# host crate's cross-crate round-trip tests can drive them against the host
+# decoder. `ovstorage` turns this on only via its dev-dependency; production
+# builds leave the encoders crate-private.
+test-codec = []
+# `test-credential-conformance` exposes
+# `connection::credential_conformance`, the shared expectation for the
+# credential transaction that both this crate's `MockDriver` and the real
+# connection drivers are held to. A driver crate turns this on only via its
+# dev-dependency; production builds leave the harness out.
+test-credential-conformance = []
+
+[build-dependencies]
+cbindgen = "0.29.3"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

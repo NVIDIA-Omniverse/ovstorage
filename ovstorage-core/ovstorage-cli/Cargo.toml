@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-cli"
+version.workspace = true
+edition = "2024"
+description = "Command-line tool for ovstorage."
+license = "Apache-2.0"
+
+[dependencies]
+base64 = "0.22.1"
+clap = { version = "4.6.1", features = ["derive"] }
+futures = "0.3.32"
+inquire = "0.7.5"
+rustyline = "14.0.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+shell-words = "1.1.1"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+    "rt",
+] }
+toml = "0.8.23"
+webbrowser = "1.2.1"
+ovstorage = { workspace = true }
+ovstorage-cache = { workspace = true }
+ovstorage-envelope = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+ovstorage-plugin-core = { workspace = true }
+ovstorage-plugin-cache = { workspace = true }
+ovstorage-plugin-http = { workspace = true }
+
+[[bin]]
+name = "ovstorage"
+path = "src/main.rs"
+# The binary name intentionally matches the Rust library crate name. Skip
+# rustdoc for this bin target to avoid cargo doc output-path collisions.
+doc = false
+
+[lints]
+workspace = true

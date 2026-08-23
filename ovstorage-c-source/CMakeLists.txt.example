@@ -1,0 +1,160 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+cmake_minimum_required(VERSION 3.16)
+project(ovstorage_source_examples LANGUAGES C CXX)
+
+set(THREADS_PREFER_PTHREAD_FLAG TRUE)
+find_package(Threads REQUIRED)
+
+if(NOT WIN32)
+    add_compile_definitions(
+        _POSIX_C_SOURCE=200809L
+        _XOPEN_SOURCE=700
+        _FILE_OFFSET_BITS=64
+    )
+endif()
+
+set(OVSTORAGE_C_SOURCES
+    src/auth_credential.c
+    src/cancel.c
+    src/dispatch.c
+    src/file_backend.c
+    src/host_callbacks.c
+    src/plat.c
+    src/plugin_values.c
+    src/registry.c
+    src/runtime.c
+    src/stack.c
+    src/streams.c
+    src/temp_dir.c
+    src/utf8.c
+    src/values.c
+    src/values_conn.c
+    src/vtables.c
+)
+
+# An OBJECT library keeps this a source-distribution example: the C sources are
+# compiled by the consumer and linked directly into each executable.
+add_library(ovstorage_source OBJECT ${OVSTORAGE_C_SOURCES})
+target_include_directories(
+    ovstorage_source
+    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_link_libraries(
+    ovstorage_source
+    PUBLIC Threads::Threads ${CMAKE_DL_LIBS}
+)
+
+set_target_properties(
+    ovstorage_source
+    PROPERTIES
+        C_STANDARD 99
+        C_STANDARD_REQUIRED YES
+        C_EXTENSIONS NO
+)
+
+if(MSVC)
+    target_compile_options(ovstorage_source PRIVATE /W4)
+else()
+    target_compile_options(ovstorage_source PRIVATE -Wall -Wextra)
+endif()
+
+add_executable(c_roundtrip examples/c_roundtrip.c)
+target_link_libraries(c_roundtrip PRIVATE ovstorage_source)
+set_target_properties(
+    c_roundtrip
+    PROPERTIES
+        C_STANDARD 99
+        C_STANDARD_REQUIRED YES
+        C_EXTENSIONS NO
+)
+if(MSVC)
+    target_compile_options(c_roundtrip PRIVATE /W4)
+else()
+    target_compile_options(c_roundtrip PRIVATE -Wall -Wextra)
+endif()
+
+# ovstorage.hpp needs a C++20 toolchain with working coroutine support.
+# Probe by compiling the header itself: a narrower coroutine probe passes
+# on compilers that then reject the header, so this reports the floor
+# instead of burying it under template diagnostics from inside the wrapper.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED YES)
+# Compile only. The wrapper's inline coroutine bodies reference the C ABI,
+# so the default executable try-compile would fail to LINK on every
+# toolchain rather than answer the question.
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+check_cxx_source_compiles(
+    "#include \"ovstorage.hpp\"\n"
+    OVSTORAGE_CXX20_WRAPPER_COMPILES
+)
+unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
+unset(CMAKE_REQUIRED_INCLUDES)
+
+enable_testing()
+add_test(NAME c_roundtrip COMMAND c_roundtrip)
+
+# Below the C++ floor, omit the C++ example and keep configuring. A
+# FATAL_ERROR here would take the C99 targets down with it, which is
+# exactly the fallback the failure message recommends — CMake would never
+# generate `c_roundtrip` for the consumer to build. See
+# CMakeFiles/CMakeError.log for the compiler's own diagnostics.
+if(OVSTORAGE_CXX20_WRAPPER_COMPILES)
+    add_executable(cpp20_roundtrip examples/cpp20_roundtrip.cpp)
+    target_link_libraries(cpp20_roundtrip PRIVATE ovstorage_source)
+    set_target_properties(
+        cpp20_roundtrip
+        PROPERTIES
+            CXX_STANDARD 20
+            CXX_STANDARD_REQUIRED YES
+            CXX_EXTENSIONS NO
+    )
+    if(MSVC)
+        target_compile_options(cpp20_roundtrip PRIVATE /W4)
+    else()
+        target_compile_options(cpp20_roundtrip PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME cpp20_roundtrip COMMAND cpp20_roundtrip)
+
+    set(OVSTORAGE_CPP_TUTORIALS
+        01_file
+        02_object_operations
+        03_load_a_plugin
+        04_file_and_http
+        05_cache
+        06_native_layer
+    )
+    foreach(tutorial IN LISTS OVSTORAGE_CPP_TUTORIALS)
+        set(target "tutorial_${tutorial}")
+        add_executable(${target} "examples/tutorial/${tutorial}.cpp")
+        target_link_libraries(${target} PRIVATE ovstorage_source)
+        set_target_properties(
+            ${target}
+            PROPERTIES
+                CXX_STANDARD 20
+                CXX_STANDARD_REQUIRED YES
+                CXX_EXTENSIONS NO
+        )
+        if(MSVC)
+            target_compile_options(${target} PRIVATE /W4)
+        else()
+            target_compile_options(${target} PRIVATE -Wall -Wextra)
+        endif()
+    endforeach()
+    foreach(tutorial IN ITEMS 01_file 02_object_operations 06_native_layer)
+        add_test(
+            NAME "tutorial_${tutorial}"
+            COMMAND "tutorial_${tutorial}"
+        )
+    endforeach()
+else()
+    message(WARNING
+        "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} cannot "
+        "compile include/ovstorage.hpp, so the C++ examples are omitted; "
+        "the C99 targets still build. The C++ wrapper needs "
+        "C++20 with working coroutine support: GCC 13+, Clang 17+, or "
+        "MSVC 19.40+. Set CMAKE_CXX_COMPILER to use it.")
+endif()

@@ -48,8 +48,8 @@ trail.
      `drain_complete`.
    - `broker_uptime_seconds`.
 4. Pipe `grpc.health.v1.Health/Check` to your health-check probe.
-   Reports `Serving` whenever `library.list_backend_kinds()`
-   succeeds. **Readiness is not flipped during drain** (the gRPC
+   Reports `Serving` whenever backend-kind introspection on the active
+   Stack succeeds. **Readiness is not flipped during drain** (the gRPC
    server stops accepting new connections via
    `serve_with_incoming_shutdown` but `Health/Check` keeps the
    last reported state until the server thread exits).
@@ -99,9 +99,9 @@ credential bytes, or usable signed URLs.
 - `rate(broker_lifecycle_events_total{event="reload_failed"}[5m]) > 0`
   — a SIGHUP reload failed validation; the old broker is still live
   on stale config.
-- `rate(broker_authz_decisions_total{outcome="error"}[5m]) > 0` —
-  the authz plugin returned errors (not denies). Check the plugin's
-  reachability if it consults a remote PDP.
+- `rate(ovstorage_auth_decisions_total{outcome="error"}[5m]) > 0` —
+  the built-in auth Layer returned evaluation errors (not denies). Check the
+  active policy and listener authentication configuration.
 - `broker_uptime_seconds` reset implies a restart — pair with
   `broker_policy_epoch_advances_total` to distinguish a clean
   reload-induced advance from a process crash.

@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-services-protos"
+description = "Tonic-generated bindings for the Omniverse Storage Service contracts in ovstorage-services/."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+
+# tonic 0.14 stack pinned inline: it coexists with the broker's tonic 0.12
+# in the single workspace lockfile (disjoint dependency subtrees).
+[dependencies]
+tonic = { version = "0.14.6", default-features = false, features = [
+    "channel",
+    "codegen",
+    "transport",
+    "tls-ring",
+    "tls-native-roots",
+    "router",
+] }
+
+# Used in the generated proto modules (`tonic::include_proto!`) but
+# cargo-machete can't see through the macro.
+[package.metadata.cargo-machete]
+ignored = ["prost", "prost-types", "tonic-prost"]
+
+[dependencies.prost]
+version = "0.14"
+
+[dependencies.prost-types]
+version = "0.14"
+
+[dependencies.tonic-prost]
+version = "0.14"
+
+[build-dependencies]
+protoc-bin-vendored = "3.2.0"
+tonic-prost-build = "0.14.6"
+
+[lints]
+workspace = true

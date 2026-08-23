@@ -24,10 +24,9 @@ from urllib.parse import parse_qs, urlparse
 import ovstorage
 
 from _common import (
-    add_file_connection,
+    build_file_stack,
     display_name,
     format_size,
-    load_plugin_kind,
     looks_text,
 )
 
@@ -330,8 +329,7 @@ class StorageApp:
     def __init__(self, plugin_dir: str | None, root: Path) -> None:
         self._plugin_dir = plugin_dir
         self._root = root
-        self.library: ovstorage.Library | None = None
-        self.connection: ovstorage.Connection | None = None
+        self.storage: ovstorage.LayerBase | None = None
         self.root_address = root.as_uri() + "/"
         asyncio.run(self._setup())
 
@@ -339,23 +337,18 @@ class StorageApp:
         return asyncio.run(coro)
 
     async def _setup(self) -> None:
-        library = ovstorage.Library.open()
-        await load_plugin_kind(library, self._plugin_dir, "file")
-        connection = await add_file_connection(library, self._root, "file-browser-web-local")
-        self.library = library
-        self.connection = connection
+        self.storage = await build_file_stack(self._root, "file-browser-web-local")
 
     async def close_async(self) -> None:
-        if self.library is not None and self.connection is not None:
-            await self.library.remove_connection(self.connection.id)
+        self.storage = None
 
     def close(self) -> None:
         self.run(self.close_async())
 
     async def list(self, prefix: str) -> dict[str, Any]:
-        if self.library is None:
+        if self.storage is None:
             raise RuntimeError("storage not initialized")
-        page = await self.library.list(prefix, max_results=200)
+        page = await self.storage.list(prefix, max_results=200)
         items = []
         for item in page.items:
             address = getattr(item, "address")
@@ -377,9 +370,9 @@ class StorageApp:
         }
 
     async def preview(self, address: str, max_bytes: int) -> dict[str, Any]:
-        if self.library is None:
+        if self.storage is None:
             raise RuntimeError("storage not initialized")
-        data, info = await self.library.read_bytes(address, max_bytes=max_bytes)
+        data, info = await self.storage.read_bytes(address, max_bytes=max_bytes)
         if looks_text(address, data):
             preview = data.decode("utf-8", errors="replace")
         else:

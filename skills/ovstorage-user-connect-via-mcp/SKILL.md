@@ -44,8 +44,10 @@ Call `ovstorage_doctor` before object I/O:
 }
 ```
 
-Confirm the desired backend kind is loaded and the target address root
-is visible before calling read/write/list tools.
+Confirm the desired backend kind is among the layers this stack declares,
+and that the target address root is visible, before calling
+read/write/list tools. A kind absent from `backend_kinds` is a kind this
+stack's config never declared a layer for.
 
 ## MCP to CLI equivalence
 

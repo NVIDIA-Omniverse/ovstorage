@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-python"
+version.workspace = true
+edition = "2024"
+description = "Python bindings for ovstorage."
+license = "Apache-2.0"
+
+[features]
+# Manual/downstream-only opt-in for consumers that override the workspace
+# `pyo3` to drop `extension-module`, allowing the Rust unit-test block in
+# `src/lib.rs` to compile + link as a normal cargo test binary. No in-tree CI
+# command compiles that block; default builds keep `extension-module`
+# (required for the wheel) and use the gating pytest suite instead.
+no-extension-module-link = []
+# `test-probes` compiles the private Rust-backed handoff probe
+# (`_probe_drive_foreign_import`) into the extension. It needs
+# `import_handle_force_foreign` (the same-binary fast-path bypass), reached
+# through `ovstorage-rust/test-codec`. `make test-python` turns it on; the
+# published wheel leaves it off so the production surface stays clean of the
+# test-only hooks.
+test-probes = ["ovstorage-rust/test-codec"]
+
+[dependencies]
+ovstorage-rust = { workspace = true }
+ovstorage-plugin-core = { workspace = true }
+ovstorage-authz-context = { workspace = true }
+async-trait = "0.1.89"
+async-channel = "2.5.0"
+futures = "0.3.32"
+pyo3 = { version = "0.21.2", features = [
+    "abi3-py310",
+    "extension-module",
+    "generate-import-lib",
+    "multiple-pymethods",
+] }
+pyo3-async-runtimes = { version = "0.21.0", features = ["tokio-runtime"] }
+# For the directory-scan skip diagnostic, so a skipped candidate is not silent
+# here while the native sibling logs it.
+tracing = "0.1.44"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+
+[lib]
+name = "ovstorage_python"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+# Default `pyo3` enables `extension-module`, which leaves the CPython
+# symbols undefined at link time. That is correct for the wheel (the
+# host interpreter resolves them at load) but breaks `cargo test`,
+# which produces a standalone binary the linker insists on satisfying.
+# The Rust-level tests are manual/downstream-only and gated behind the
+# `no-extension-module-link` feature for consumers that swap pyo3 to drop
+# `extension-module`; routine `cargo test` skips this crate entirely. They are
+# not counted as repository CI coverage. Functional coverage, including
+# private Rust-backed probes for native-only bridge invariants, lives in
+# `tests/*.py`, installed and run by the gating `make test-python` target.
+# `bench` must also be disabled:
+# `cargo build --all-targets` includes `--benches`, which compiles the
+# lib as a benchmark harness (a standalone executable) and hits the same
+# missing-CPython-symbol link failure as the test harness.
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true

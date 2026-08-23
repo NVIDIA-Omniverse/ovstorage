@@ -1,5 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-[alias]
-xtask = "run -p xtask --"
+# `ovstorage-python` builds against the stable ABI (pyo3 `abi3-py310`), so
+# cargo must not probe for a host interpreter when building the workspace
+# (e.g. `cargo clippy --workspace`, `cargo doc`). Wheel builds via maturin
+# supply their own interpreter.
+[env]
+PYO3_NO_PYTHON = "1"
+RUST_LOG = "info"

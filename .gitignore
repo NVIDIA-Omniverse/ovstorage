@@ -6,6 +6,7 @@ __pycache__/
 *.egg-info/
 *.egg
 build/
+build-win/
 dist/
 .pytest_cache/
 .ruff_cache/
@@ -27,6 +28,11 @@ env/
 target/
 Cargo.lock.bak
 
+# MSVC build artifacts
+*.obj
+*.pdb
+*.ilk
+
 # Editor
 .vscode/
 .idea/
@@ -42,3 +48,20 @@ reports/
 .swarmforge/
 swarmforge/
 swarmtools/
+
+# Local agent tooling — per-developer, machine-specific, never committed.
+# Several entries under `.claude/` (`hooks`, `skills`, `workflows`,
+# `output-styles`, `routines`) are directories in a working checkout, so a
+# tracked file of the same name makes the checkout fail with "Directory not
+# empty" for anyone who has one. Worktrees also live under `.claude/worktrees/`.
+/.claude/
+/.mcp.json
+
+# The local stack config. Config discovery reads `./ovstorage.toml` FIRST —
+# `ovstorage::default_config_paths`, and the REST and broker mains each default
+# to the same path — so a committed one silently replaces every developer's own
+# stack when their cwd is the repo root. The shipped templates live beside their
+# crates (`ovstorage-cli.toml`, `ovstorage-mcp.toml`) under names discovery does
+# not pick up, and say "copy to ./ovstorage.toml"; this entry is what keeps that
+# convention from being undone by a `git add -A` during a local repro.
+/ovstorage.toml

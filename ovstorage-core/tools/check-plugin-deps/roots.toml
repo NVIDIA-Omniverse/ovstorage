@@ -3,4 +3,43 @@
 
 [[roots]]
 label = "core"
-path = "../../crates"
+path = "../.."
+
+# ovstorage-plugin-test-abi is the conformance backend's cdylib export
+# shell: it exists precisely to keep the harness rlib free of the
+# fixed-name ABI symbols, so its [dependencies] on ovstorage-plugin-test
+# is the point of the crate, not a layering leak.
+#
+# The core/cache/HTTP `-abi` packages are the same cdylib-only shells over
+# their reusable implementation crates. Keeping exports there prevents Cargo
+# feature unification from adding or removing fixed-name symbols in Rust
+# consumers.
+#
+# ovstorage-plugin-test-abi-alloc is the same shell over an instrumented
+# #[global_allocator], and exists to prove ABI values do not ride the
+# per-binary Rust global allocator. Its test reads the plugin's own
+# allocator counter, so it also holds a [dev-dependencies] grant on
+# ovstorage-plugin for the `Url` type its round-trip drives.
+#
+# ovstorage-plugin-http drives the standard conformance scenarios in
+# tests/conformance_scenarios.rs against the scripted HTTP fixtures, so it
+# holds a [dev-dependencies] grant: test-only code that never reaches the
+# shipped plugin.
+#
+# ovstorage-plugin-test-layer's auth-capable fixture decodes the canonical
+# credential wire format through the pure ovstorage-authz-context crate. The
+# exception stays scoped to that test plugin; production plugins remain on the
+# SDK-only allowlist.
+#
+# The exemptions are scoped per crate: any other core plugin adding a
+# dependency on ovstorage-plugin-test still fails the lint.
+[roots.exceptions]
+"ovstorage-plugin-test-abi" = ["ovstorage-plugin-test"]
+"ovstorage-plugin-core-abi" = ["ovstorage-plugin-core"]
+"ovstorage-plugin-cache-abi" = ["ovstorage-plugin-cache"]
+"ovstorage-plugin-http-abi" = ["ovstorage-plugin-http"]
+"ovstorage-plugin-test-abi-alloc" = ["ovstorage-plugin-test", "ovstorage-plugin"]
+"ovstorage-plugin-test-layer" = ["ovstorage-authz-context"]
+"ovstorage-plugin-core" = ["ovstorage-layer", "ovstorage-retry"]
+"ovstorage-plugin-cache" = ["ovstorage-cache", "ovstorage-layer"]
+"ovstorage-plugin-http" = ["ovstorage-layer", "ovstorage-plugin-test", "ovstorage-retry"]

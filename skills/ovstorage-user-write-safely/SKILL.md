@@ -39,8 +39,9 @@ fails with `AlreadyExists` if the address is taken.
 
 Pass `if_dest: { "kind": "match_etag", "etag": "<s>" }` with the etag
 you read earlier. If another writer has changed the object since then,
-the call fails with `ObjectModified` and you can decide whether to
-merge or restart.
+the call fails with `PreconditionFailed` and you can decide whether to
+merge or restart. Nothing was written — the destination is checked
+before anything is committed.
 
 ```json
 {
@@ -101,7 +102,8 @@ read.
 | `error.code` | Likely cause | What to do |
 |---|---|---|
 | `AlreadyExists` | `if_dest: {"kind": "fail"}` and the destination exists | Pick a different address, or drop `if_dest` (or set `{"kind": "overwrite"}`) after confirming you really want to clobber |
-| `ObjectModified` | `if_dest: {"kind": "match_etag", ...}` didn't match current identity | Re-read with `ovstorage_stat`, decide whether to merge, retry with the new etag |
+| `PreconditionFailed` | `if_dest: {"kind": "match_etag", ...}` didn't match current identity; nothing was written | Re-read with `ovstorage_stat`, decide whether to merge, retry with the new etag |
+| `ObjectModified` | The object moved *during* a call that had already started — a read whose bytes shifted, or a copy source replaced after staging | Retry the whole call; the new etag rides `Error.context` as `Identity { new_etag }` |
 | `PermissionDenied` | Credentials can't write here | Check `ovstorage_doctor` connection state |
 | `IntegrityFailure` | Bytes received didn't match a checksum (rare) | Retry the write |
 | `Transient` | Backend hiccup | `retryable: true` — try again |

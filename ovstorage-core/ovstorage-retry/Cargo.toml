@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-retry"
+version.workspace = true
+edition = "2024"
+description = "Shared retry policy and instrumentation for ovstorage hosts and Layer plugins."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+metrics = "0.24.6"
+ovstorage-layer = { workspace = true }
+rand = "0.8.6"
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.52.3", features = ["time"] }
+tracing = "0.1.44"
+
+[lints]
+workspace = true

@@ -7,42 +7,42 @@ reference backends are `file`, `http`, `omniverse-storage-service`,
 conformance plugin.
 Foundation lives in
 [`../plugin-development/AGENTS.md`](../plugin-development/AGENTS.md);
-read it first for shared substrate (C ABI, Rust shim, conformance,
+read it first for shared substrate (C ABI, Rust marshalling, conformance,
 build, ABI stability). This page is the storage-specific routing.
 
 ## Where to start
 
 - The minimum-viable scaffold lives inline in the
-  [plugin-storage README § Working example](README.md#working-example):
+  [plugin-storage README § Build and export](README.md#build-and-export):
   `Cargo.toml` with `crate-type = ["cdylib"]`, one `src/lib.rs`
-  implementing `shim::Factory`, and
-  `ovstorage_plugin!(MyFactory::default)` at module scope.
-- Macro: `ovstorage_plugin!(constructor)` — function-like, not
-  attribute. Constructor is an `fn() -> impl shim::Factory`. The
-  macro emits the two cdylib symbols
-  (`ovstorage_plugin_manifest_v1` and `ovstorage_plugin_init_v1`)
-  and pulls `name` / `version` from `CARGO_PKG_*`. The factory
-  vtable (`BackendFactoryVTableV1`) is a static inside
-  `ovstorage_plugin::thunks` whose pointer the init function returns
-  in `BackendPluginInitResultV1.factory_vtable`; the host borrows
-  that pointer for the cdylib's lifetime — there is no third
-  `ovstorage_plugin_vtable_v1` symbol.
+  implementing `BackendFactory`, and
+  `ovstorage_layer_plugin!(backend, MyFactory::default)` at module
+  scope.
+- Macro: `ovstorage_layer_plugin!(tag, constructor)` — function-like,
+  not attribute. `tag` is the layer type (`backend` / `wrapper` /
+  `router`); the constructor is an `fn() -> impl BackendFactory` (or
+  the matching wrapper/router factory trait). The macro emits the two
+  cdylib symbols (`ovstorage_plugin_manifest_v1` and
+  `ovstorage_plugin_init_v1` — the symbol names are frozen; the manifest
+  they emit selects the Layer ABI version, 13 in ovstorage 0.2.1) and
+  pulls `name` / `version` from `CARGO_PKG_*`. Use
+  `ovstorage_layer_plugin!(((backend, BackendFactory::default), (wrapper,
+  WrapperFactory::default)))` to export multiple factories from one cdylib.
+  Kind names in a bundle must be unique, `file` is reserved for the built-in
+  backend, and a trailing `test_only` flag applies to the whole plugin.
 
 ## Two traits to implement
 
-- `ovstorage_plugin::shim::Factory` — `descriptor` (sync),
-  `instantiate`, `update_credentials`, `authenticate` (all async
-  with `cancel: Option<CancellationToken>`). `instantiate` returns a
-  `BackendInstance { backend_id, backend: Arc<dyn Backend>,
-  address_roots, display_name, auth_state }` (per-root capabilities
-  live on each `AddressRoot`). (The persona docs sometimes call this
-  role `StorageBackendFactory` — the Rust trait name is `Factory`;
-  `StorageBackendFactory` is a documentation-only synonym.)
-- `ovstorage_plugin::shim::Backend` — object I/O. Methods you don't
-  implement default to `Unsupported`. SPI source of truth:
-  [`../plugin-development/README.md` § Plugin SPI](../plugin-development/README.md#plugin-spi).
-  (Personas sometimes call this role `StorageBackend` — the Rust
-  trait name is `Backend`.)
+- `BackendFactory` — `descriptor` (sync, the `LayerKindDescriptor`)
+  and `create_backend(name, config, cancel)`, which returns your
+  `Arc`'d `Layer` bound to the instance config.
+- `Layer` — the operational vtable slots: object I/O (`stat`, `read`,
+  the write family, `list`, …) plus connection lifecycle
+  (`add_connection`, `authenticate_connection`,
+  `update_connection_credentials`, `list_connections`) and
+  introspection (`root_info_for`, `list_address_roots`). Slots you
+  don't implement default to `Unsupported`. Behavioral source of
+  truth: [`CONFORMANCE.md`](CONFORMANCE.md).
 
 ## Capability matrix is mandatory
 
@@ -51,14 +51,15 @@ gates dispatch on these bits and callers gate UX on them.
 Mis-advertising produces errors that look like backend bugs.
 Vocabulary:
 [`../plugin-development/README.md` § Capability vocabulary](../plugin-development/README.md#capability-vocabulary).
-Capability values are per backend instance and immutable for the
-instance's lifetime.
+Capability values are advertised per root (`RootInfo.capabilities`)
+and immutable for the owning connection's lifetime.
 
 ## Conformance harness
 
 The host's conformance tests run against your plugin (loaded as a
 real cdylib). They use the trusted in-tree test plugin (the
-`ovstorage-plugin-test` cdylib) to drive scenarios the host needs
+`ovstorage-plugin-test` harness, exported as the
+`ovstorage-plugin-test-abi` cdylib) to drive scenarios the host needs
 to observe; you don't write a separate "plugin TCK" — you make the
 host's tests pass against your plugin. Skipped tests cite the
 missing capability; if your plugin advertises a capability, the
@@ -86,19 +87,22 @@ A plugin that can't stream returns `Unsupported` from
   `struct_size: usize`, `abi_version: u32`, `name` and `version`
   pointers (NUL-terminated, fed from `CARGO_PKG_NAME` /
   `CARGO_PKG_VERSION`), and `test_only: bool` (false for vendor
-  plugins). There is **no** `plugin_kind` field on the manifest or
-  on `StorageBackendKindDescriptor`; backend vs. authz
-  disambiguation is by cdylib filename prefix
-  (`libovstorage_plugin_*` vs `libovstorage_authz_*`) and by the
-  symbol prefix the loader resolves (`ovstorage_plugin_*` vs
-  `ovstorage_authz_plugin_*`).
-- `StorageBackendKindDescriptor` carries `kind` (URL scheme prefix),
-  `display_name`, `description`, `config_schema`,
-  `credential_schema`, `capabilities`, optional `icon`,
-  `supports_runtime_add`.
+  plugins). There is **no** `plugin_kind` field on the manifest;
+  every dynamically loaded plugin implements the storage Layer ABI.
+- `LayerKindDescriptor` — what `BackendFactory::descriptor` returns —
+  carries `kind` (URL scheme prefix), `layer_type`, `display_name`,
+  `description`, `config_schema`, `credential_schema`,
+  `credential_methods`, optional `icon`, `accepts_connections`, and
+  `supports_user_metadata` (whether the kind accepts the host's
+  attribution stamp in a write's `user_metadata`; a host composes its
+  attribution layer only over a branch that declares `true`).
+  Capabilities are **not** on the descriptor; they are advertised per
+  root through `RootInfo.capabilities` (see § Capability matrix above).
 - New required `ConfigField` without a default = breaking change =
-  2.0. Evolve descriptors additively; the per-kind version handshake
-  fails fast on mis-binding.
+  a **plugin C ABI 2.0**, not an ovstorage 2.0 release. The ABI freezes
+  at 1.0 and a break after that is what forces the ABI major bump; the
+  ovstorage package version moves independently. Evolve descriptors
+  additively; the per-kind version handshake fails fast on mis-binding.
 - Credential fields are flagged `secret = true`; `SecretBytes`
   redacts in `Debug`; the public API never returns plaintext after
   `add_connection`.
@@ -109,16 +113,17 @@ A plugin that can't stream returns `Unsupported` from
 ## Worked references
 
 The cross-cutting behavioral contract every backend implements lives
-in [CONFORMANCE.md](CONFORMANCE.md) — the Storage SPI behavioral
+in [CONFORMANCE.md](CONFORMANCE.md) — the storage Layer behavioral
 contract that complements the per-backend pages below. Read it first
 when implementing a new backend; each per-backend page illustrates one
 valid branch of the contracts spelled out there.
 
-1. [plugin-file](plugin-file.md) — reference implementation of the
-   `Backend` SPI against the local filesystem. Atomic publish via
-   temp + fsync + rename.
-2. [plugin-http](plugin-http.md) — read-only plugin for anonymous
-   HTTP/HTTPS URLs.
+1. [plugin-file](plugin-file.md) — the built-in `file` backend: the
+   library's native local-filesystem implementation, served in-Stack
+   with no cdylib to build or load. Atomic publish via temp + fsync +
+   rename.
+2. [plugin-http](plugin-http.md) — read-only plugin for HTTP/HTTPS
+   URLs, anonymous or authenticated (bearer / basic).
 3. [plugin-services-client](plugin-services-client.md) —
    `omniverse-storage-service` client over Storage API gRPC + OIDC.
 4. [plugin-s3](plugin-s3.md) — AWS S3 and S3-compatible object stores
@@ -138,7 +143,7 @@ valid branch of the contracts spelled out there.
 9. [plugin-broker](plugin-broker.md) — `broker-client` cdylib for
    the brokered topology. No scheme of its own; address roots come
    from the upstream `ovstorage-broker` daemon via
-   `ListAddressRoots`. Forwards every SPI call across the library
+   `ListAddressRoots`. Forwards every Layer call across the library
    <-> broker gRPC protocol with `if_match` (etag),
    `if_source` (etag), and `if_dest` (`IfDestExists`)
    pass-through.

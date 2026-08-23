@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -67,6 +68,7 @@ fn resolve_roots(manifest_dir: &Path) -> Result<Vec<Root>, String> {
             extra_dependencies: Vec::new(),
             extra_dev_dependencies: Vec::new(),
             extra_build_dependencies: Vec::new(),
+            exceptions: BTreeMap::new(),
         }]);
     }
     let roots_toml = manifest_dir.join("roots.toml");
@@ -86,5 +88,6 @@ fn resolve_roots(manifest_dir: &Path) -> Result<Vec<Root>, String> {
         extra_dependencies: Vec::new(),
         extra_dev_dependencies: Vec::new(),
         extra_build_dependencies: Vec::new(),
+        exceptions: BTreeMap::new(),
     }])
 }

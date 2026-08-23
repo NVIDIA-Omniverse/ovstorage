@@ -24,7 +24,7 @@ any backend dispatch.
    [`docs/public/broker-operator/README.md`](../../docs/public/broker-operator/README.md)
    § *Debug runbook* for the structured walkthrough.
 2. For startup failures, run
-   `cargo run -p xtask -- list-routes --config /etc/ovstorage/broker.toml`
+   `cargo run -p ovstorage-cli -- list-routes --config /etc/ovstorage/broker.toml`
    against the broker's config. The same TOML validator the daemon
    runs at startup will report bad routes, unresolvable secret
    refs, and invalid listener authn config without binding any
@@ -33,10 +33,11 @@ any backend dispatch.
    `broker_authz_decisions_total{outcome="deny"}`. The deny path
    threads the plugin's `reason` and `explanation` into the gRPC
    `PermissionDenied` message; the `explanation` is typically a
-   stable rule id from the configured authz plugin.
+   stable rule id from the built-in policy evaluator.
 4. For `PolicyEpochStale` errors, the request was stamped with a
-   pre-reload epoch. Have the SDK refresh-and-retry (it's wired
-   in `broker-client`'s `with_route_retry`).
+   pre-reload epoch. Nothing in the SDK refreshes and retries it:
+   it reaches the caller as `FailedPrecondition` (HTTP 409), which
+   the caller re-issues itself against the reloaded policy.
 5. For listener authn failures (`Unauthenticated`), confirm the
    mode matches what your callers send:
    - `jwt_verify` mode: bearer JWT against the configured
@@ -82,11 +83,9 @@ any backend dispatch.
   implemented.
 - **JWKS unreachable.** `Unauthenticated` for every `jwt_verify`
   request. Check the IdP's reachability from the broker host.
-- **Authz plugin wedged.** A remote-PDP plugin hung on its
-  upstream pins the broker's outer RPC timeout (the
-  `AuthzPlugin` cdylib FFI does not propagate cancellation
-  today; plugin authors are expected to bound their own work).
-  Watch
+- **Authorization latency.** The built-in policy evaluator is local and
+  synchronous; rising RPC latency points to listener authentication, storage
+  dispatch, or an outer timeout rather than a remote policy plugin. Watch
   `histogram_quantile(0.99, rate(broker_rpc_seconds_bucket[5m]))`
   trending up — though note the RPC-latency histogram is
   dormant today (registered but not observed), so this query
@@ -94,15 +93,14 @@ any backend dispatch.
 - **State root I/O error.** Policy-epoch persistence fails;
   `broker_lifecycle_events_total{event="reload_failed"}`
   increments and the broker keeps the previous epoch.
-- **Watch fan-out exhausted.** The 257th downstream watcher
-  against a default upstream watch_directory key receives
-  `ResourceExhausted` (the cap is the hard-coded
-  `DEFAULT_WATCH_DIRECTORY_FANOUT_LIMIT = 256`).
+- **Watch fan-out exhausted.** The 257th concurrent watcher for one
+  principal (summed across every watch key on the connection) receives
+  `ResourceExhausted` (the per-principal cap is 256).
 
 ## Pre-deploy validation
 
 Always run
-`cargo run -p xtask -- list-routes --config <broker-config>`
+`cargo run -p ovstorage-cli -- list-routes --config <broker-config>`
 against a config change before SIGHUP or restart. The same
 validator the daemon runs at startup will surface typed errors
 without binding any socket.

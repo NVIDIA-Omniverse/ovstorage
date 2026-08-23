@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "nucleus-auth"
+version.workspace = true
+edition = "2024"
+description = "Native Omniverse Nucleus authentication library."
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = { version = "1.0.102", features = ["backtrace"] }
+nucleus-transport = { workspace = true }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tracing = "0.1.44"
+url = "2.5.8"
+
+[package.metadata.cargo-machete]
+# `serde` is referenced from code emitted by the `nucleus-codegen`
+# build-dependency. cargo-machete only walks `src/` and so flags it
+# as unused.
+ignored = ["serde"]
+
+[dev-dependencies]
+anyhow = { version = "1.0.102", features = ["backtrace"] }
+nucleus-discovery = { workspace = true }
+nucleus-transport = { workspace = true }
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+
+[build-dependencies]
+nucleus-codegen = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

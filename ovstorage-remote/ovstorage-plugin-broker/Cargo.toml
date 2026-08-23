@@ -1,0 +1,87 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-broker"
+version.workspace = true
+edition = "2024"
+description = "Broker backend plugin for ovstorage."
+license = "Apache-2.0"
+
+[dependencies]
+ovstorage = { workspace = true }
+ovstorage-broker-protocol = { workspace = true }
+ovstorage-plugin = { workspace = true }
+async-stream = "0.3.6"
+async-trait = "0.1.89"
+bytes = "1.11.1"
+futures = "0.3.32"
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+parking_lot = "0.12.5"
+reqwest = { version = "0.12.28", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+    "blocking",
+] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+toml = "0.8.23"
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+tonic = { version = "0.12.3", features = ["tls-roots"] }
+tower = "0.5.3"
+tracing = "0.1.44"
+url = "2.5.8"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Exposes `BrokerClientBackend::new_for_tests`, a hidden constructor that
+# wires a pre-built `BrokerClientTransport` directly into the per-backend
+# cache cell. Used by `tests/precondition.rs` to drive the SPI surface
+# against a recording transport without standing up a gRPC fake-server.
+# Not part of the public API; gated so release builds never see it.
+_test_support = []
+
+[dev-dependencies]
+# Self-reference activates the `_test_support` feature for the
+# integration tests under `tests/`, which need the hidden
+# `BrokerClientBackend::new_for_tests` constructor. The workspace
+# dependency supplies the registry version and local path.
+ovstorage-plugin-broker = { workspace = true, features = ["_test_support"] }
+# Activates `ovstorage-plugin::connection::credential_conformance`, the shared
+# credential-transaction expectation this crate's real driver is held to
+# alongside the plugin crate's `MockDriver`. Dev-only: production builds of the
+# broker plugin leave the harness out.
+ovstorage-plugin = { workspace = true, features = ["test-credential-conformance"] }
+# Registry-as-spec conformance harness driven by
+# `tests/conformance_scenarios.rs`.
+ovstorage-plugin-test = { workspace = true }
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+# A local IDP standing in for the token endpoint, so the redaction assertions
+# run against the real HTTP response path rather than the helper alone.
+wiremock = "0.6.5"
+
+[lints]
+workspace = true

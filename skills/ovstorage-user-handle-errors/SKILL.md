@@ -29,7 +29,7 @@ this — it's the cross-cutting primer the other runbooks reference.
     "code": "NotFound",
     "message": "NotFound: object missing at s3://my-bucket/missing.bin",
     "retryable": false,
-    "next_action": "Call library.add_connection(...) for a backend that serves this address prefix, or load a saved configuration via library.load_config(...)."
+    "next_action": "Add a matching connection to ovstorage.toml and restart the host."
   }
 }
 ```
@@ -49,7 +49,8 @@ on this, not on `error.message`. Common codes:
 | `AuthRequired` / `CredentialExpired` | Connection needs auth refresh |
 | `NoRoute` / `NotConfigured` | No backend handles this address |
 | `Unsupported` | Backend exists but doesn't support this op |
-| `ObjectModified` | `if_match` precondition failed |
+| `PreconditionFailed` | A write-side `if_match` / `if_dest` precondition failed before anything was committed |
+| `ObjectModified` | The object changed *during* a call already under way, or a read's `if_match` failed |
 | `ResourceExhausted` | Hit a cap (`max_bytes`, quota, rate) |
 | `InvalidArgument` | The arguments you passed are wrong |
 | `Transient` / `BrokerUnavailable` / `ResourceExhausted` / `DeadlineExceeded` | Backend hiccup, cap, or throttling; retry-friendly |
@@ -86,8 +87,14 @@ to `error.code` and the table above.
 ### 4. `error.message` — for logging / surfacing to humans
 
 Human-readable. Signed-URL query params and bearer tokens are
-redacted. Use it for logs and for messages you show the user, **not**
-for branching logic.
+redacted, and a failed object-storage request surfaces the provider's
+error code (for example `AuthenticationFailed`) rather than its
+response body. Two paths are carved out of that: a provider's
+*credential* endpoint, whose response text can still reach the
+message, and per-entry queue batch failures, which carry the
+provider's own free-form failure message. So treat `error.message` as
+sensitive whenever you forward it off-host. Use it for logs and for
+messages you show the user, **not** for branching logic.
 
 ## Decision tree
 

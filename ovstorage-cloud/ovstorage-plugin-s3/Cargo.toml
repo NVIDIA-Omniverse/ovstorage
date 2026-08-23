@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-s3"
+version.workspace = true
+edition = "2024"
+description = "S3-compatible ovstorage backend crate."
+license = "Apache-2.0"
+
+[dependencies]
+ovstorage-plugin = { workspace = true }
+# Official AWS SDK for Rust. default-features=false drops the SDK's default
+# rustls+default-https-client features, which route through aws-lc-rs/aws-lc-sys
+# (a C toolchain + new license surface). We inject a custom rustls+ring HTTP
+# client via aws-smithy-http-client instead, reusing the rustls/ring/webpki-roots
+# already in the lock (shared with reqwest's rustls-tls). Keep `cargo tree -i
+# aws-lc-sys` empty.
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "http-1x",
+    "behavior-version-latest",
+] }
+aws-sdk-sqs = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "behavior-version-latest",
+] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
+async-trait = "0.1.89"
+parking_lot = "0.12.5"
+rust-ini = "0.21.3"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.10.9"
+time = { version = "0.3.47", features = ["formatting", "parsing", "macros"] }
+tracing = "0.1.44"
+url = "2.5.8"
+urlencoding = "2.1.3"
+
+[dev-dependencies]
+# The redirect conformance suite composes the host's real `RedirectFollower`
+# over this plugin, so it needs both the host crate and that public Layer
+# implementation. `check-plugin-deps` permits these as dev-dependencies.
+ovstorage = { workspace = true }
+ovstorage-plugin-http = { workspace = true }
+ovstorage-plugin-test = { workspace = true }
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+# rust-ini's lib name is `ini`, so cargo-machete's package-name match misses
+# its use in credentials.rs.
+[package.metadata.cargo-machete]
+ignored = ["rust-ini"]

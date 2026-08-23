@@ -1,0 +1,16 @@
+# Wheel-build staging area. Maturin's PEP 639 `license-files` and
+# `[tool.maturin].include` only resolve paths inside the project root
+# (the directory containing pyproject.toml) -- they can't reach above to
+# the repo-root LICENSE / THIRD_PARTY_NOTICES.md, so `make dist-wheel`
+# copies them in here before invoking maturin. The staged files are not
+# source and must not be committed. Both LICENSE names are listed to
+# cover the LICENSE.txt -> LICENSE rename transition window so stale
+# artifacts from pre-rename local builds don't show up as untracked.
+/LICENSE
+/LICENSE.txt
+/THIRD_PARTY_NOTICES.md
+
+# Bundled plugin cdylibs plus their inventory, staged here by `make dist-wheel`
+# for maturin's wheel-scoped `include` and removed again once the wheel is
+# built. Build outputs, never source.
+/ovstorage/plugins/

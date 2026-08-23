@@ -10,6 +10,10 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import ovstorage
+from ovstorage.file import FileBackend
+from ovstorage.plugin import PluginBackend
+from ovstorage.redirect_follower import RedirectFollower
+from ovstorage.router import Router
 
 
 TEXT_SUFFIXES = {
@@ -28,10 +32,18 @@ TEXT_SUFFIXES = {
 def plugin_path(plugin_dir: str | None, kind: str) -> Path:
     root = plugin_dir or os.environ.get("OVSTORAGE_PLUGIN_DIR")
     if root is None:
-        raise SystemExit(
-            "set OVSTORAGE_PLUGIN_DIR or pass --plugin-dir so the example can load "
-            f"the {kind!r} plugin"
-        )
+        # A wheel installed from PyPI carries the first-party plugins, so the
+        # examples run with no configuration at all. An explicit --plugin-dir
+        # or OVSTORAGE_PLUGIN_DIR still wins, which is how a checkout points
+        # them at `target/release` or an archive's `plugins/`.
+        try:
+            root = str(ovstorage.bundled_plugins_dir())
+        except FileNotFoundError:
+            raise SystemExit(
+                "this build of ovstorage bundles no plugins, so set "
+                "OVSTORAGE_PLUGIN_DIR or pass --plugin-dir so the example can "
+                f"load the {kind!r} plugin"
+            ) from None
     directory = Path(root)
     candidates = [
         directory / f"libovstorage_plugin_{kind}.so",
@@ -44,37 +56,69 @@ def plugin_path(plugin_dir: str | None, kind: str) -> Path:
     raise SystemExit(f"could not find {kind!r} plugin in {directory}")
 
 
-async def load_plugin_kind(
-    library: ovstorage.Library,
-    plugin_dir: str | None,
-    kind: str,
-) -> None:
-    # Examples load one known plugin explicitly. Applications that want every
-    # available backend can use library.load_plugins_from_dir(...) instead.
-    await library.load_plugin(str(plugin_path(plugin_dir, kind)))
+def plugin_registry(
+    plugin_dir: str | None, *kinds: str
+) -> ovstorage.PluginRegistry:
+    """Load the requested plugin libraries into one explicit registry."""
+    paths: list[str] = []
+    for kind in dict.fromkeys(kinds):
+        paths.append(str(plugin_path(plugin_dir, kind)))
+    return ovstorage.PluginRegistry(paths)
 
 
-async def add_file_connection(
-    library: ovstorage.Library,
-    root: Path,
-    display_name: str,
-) -> ovstorage.Connection:
+def file_connection_request(root: Path, display_name: str) -> ovstorage.ConnectionRequest:
     root.mkdir(parents=True, exist_ok=True)
     request = ovstorage.ConnectionRequest("file")
     request.add_config("root", ovstorage.ConfigValue.string(str(root)))
     request.set_display_name(display_name)
-    return await library.add_connection(request)
+    return request
 
 
-async def add_http_connection(
-    library: ovstorage.Library,
-    root_url: str,
-    display_name: str,
-) -> ovstorage.Connection:
+def http_connection_request(root_url: str, display_name: str) -> ovstorage.ConnectionRequest:
     request = ovstorage.ConnectionRequest("http")
     request.add_config("root_url", ovstorage.ConfigValue.string(root_url))
     request.set_display_name(display_name)
-    return await library.add_connection(request)
+    return request
+
+
+async def build_file_stack(root: Path, display_name: str) -> ovstorage.LayerBase:
+    """Build the built-in file backend with its connection declared up front."""
+    return await (
+        ovstorage.Stack(root="files")
+        .backend(FileBackend("files"))
+        .connection("files", file_connection_request(root, display_name))
+        .build()
+    )
+
+
+async def build_plugin_stack(
+    plugin_dir: str | None,
+    plugin_kind: str,
+    backend_kind: str,
+    request: ovstorage.ConnectionRequest,
+    *,
+    interactive_auth_capability: int | None = None,
+) -> ovstorage.LayerBase:
+    """Build one plugin-backed route and declare its connection before build.
+
+    A redirect follower fronts the router: plugin backends such as the
+    services client answer reads with a ``ReadResult::Redirect``, which the
+    ``read_bytes`` bridge only resolves when a ``RedirectFollower`` is present
+    in the graph.
+    """
+    return await (
+        ovstorage.Stack(
+            root="redirects", interactive_auth_capability=interactive_auth_capability
+        )
+        .with_registry(
+            plugin_registry(plugin_dir, "core", "http", plugin_kind)
+        )
+        .wrapper(RedirectFollower("redirects", "routes"))
+        .router(Router("routes", ["backend"]))
+        .backend(PluginBackend(backend_kind, "backend"))
+        .connection("backend", request)
+        .build()
+    )
 
 
 def origin_prefix(address: str) -> str:

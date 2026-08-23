@@ -6,11 +6,11 @@
 # `make fmt-toml` to write the formatted output back.
 
 include = ["**/*.toml"]
-# `target/` directories are build output. Tracked `.cargo/config.toml`
-# files (repo root and per-workspace) DO get formatted — they're real
-# checked-in config and should obey the project's TOML style like
-# everything else.
-exclude = ["**/target/**"]
+# `target/`, `dist/`, and `_archive/` are build/output trees, not source.
+# `ovstorage-services/` is vendored source-of-truth and must not be reformatted
+# in place. Everything else — root TOMLs, `.cargo/config.toml`, every crate
+# `Cargo.toml`, and the Python crate's `pyproject.toml` — gets formatted.
+exclude = ["**/target/**", "dist/**", "_archive/**", "ovstorage-services/**"]
 
 [formatting]
 # Modest knobs that read well on a 100-col terminal and keep

@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-c-source-cc-test"
+version.workspace = true
+edition = "2024"
+description = "Compile, link, and runtime tests for the standalone ovstorage C source set."
+license = "Apache-2.0"
+publish = false
+build = "build.rs"
+
+[[test]]
+name = "roundtrip"
+path = "tests/roundtrip.rs"
+
+[dev-dependencies]
+# The permissions-sync test compares the shipped C EffectivePermissions
+# macros against the Rust definitions they must stay in lock-step with.
+ovstorage-layer = { workspace = true }
+
+[build-dependencies]
+cc = "1.2.63"
+
+[lints]
+workspace = true

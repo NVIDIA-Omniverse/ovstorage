@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Repo-wide cargo-deny policy. Shared by active ovstorage workspaces via
-# xtask passing `--config <repo>/deny.toml` to each invocation.
+# Repo-wide cargo-deny policy for the single ovstorage workspace, applied by
+# `make cargo-deny` (`cargo deny --all-features check --config <repo>/deny.toml`).
 #
 # Schema docs: https://embarkstudios.github.io/cargo-deny/
 
@@ -31,6 +31,22 @@ ignore = [
     # upgrade; revisit once we plan that migration. Tracked here, not
     # silently dropped.
     { id = "RUSTSEC-2025-0020", reason = "unused vulnerable API; pyo3 0.24 migration tracked separately" },
+    # PyO3 0.21 `PyCFunction::new_closure` lacks a `Sync` bound, so a
+    # closure-backed Python callable could be invoked concurrently. We never
+    # build closure callables — the Python bindings register functions via
+    # `#[pyfunction]` + `wrap_pyfunction!` only. Fixed in pyo3 >= 0.29, a
+    # breaking upgrade tracked with the migration above, not silently dropped.
+    { id = "RUSTSEC-2026-0177", reason = "unused vulnerable API (no PyCFunction::new_closure); pyo3 >=0.29 upgrade tracked separately" },
+    # quick-xml < 0.41 `NsReader` DoS pair: quadratic duplicate-attribute
+    # checking (RUSTSEC-2026-0194) and unbounded per-element namespace
+    # declarations (RUSTSEC-2026-0195). Reached only when the azure/opendal
+    # cloud plugins parse XML responses from their configured storage
+    # endpoint (semi-trusted origin; DoS-only, no memory corruption).
+    # quick-xml >= 0.41 is semver-incompatible with opendal 0.50 /
+    # reqsign 0.16, so the fix rides the cloud-plugin dependency refresh
+    # tracked separately, not silently dropped.
+    { id = "RUSTSEC-2026-0194", reason = "DoS-only; XML parsed from the configured storage endpoint; quick-xml >=0.41 needs the opendal/reqsign upgrade tracked separately" },
+    { id = "RUSTSEC-2026-0195", reason = "DoS-only; XML parsed from the configured storage endpoint; quick-xml >=0.41 needs the opendal/reqsign upgrade tracked separately" },
 ]
 
 [licenses]

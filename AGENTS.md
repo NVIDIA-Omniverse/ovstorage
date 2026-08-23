@@ -1,17 +1,30 @@
 # ovstorage Agent Entry
 
 You are in the ovstorage repository. This is the canonical agent-neutral entry
-point; [`CLAUDE.md`](CLAUDE.md) is only a compatibility shim.
+point; [`CLAUDE.md`](CLAUDE.md) is only a forwarding entrypoint.
 
 `ovstorage` is a portable storage abstraction with a stable plugin ABI. The
 core Rust library, CLI, MCP server, result-envelope contract, C/C++/Python
 bindings, and first-party `file://` and HTTP(S) plugins live in
 [`ovstorage-core/`](ovstorage-core/). The remote-deployment surface — gRPC
-broker daemon, REST gateway, authz SPI, and the in-tree TOML authz plugin —
+broker daemon, REST gateway, built-in auth Layer, and TOML policy engine —
 lives in [`ovstorage-remote/`](ovstorage-remote/). Service/API contracts,
 conformance material, Kubernetes deployment guidance, and service-stack
 operator skills live in [`ovstorage-services/`](ovstorage-services/) as
 vendored source of truth.
+
+**Start here.** For the grounding fact — what ovstorage *is* — read
+[`README.md`](README.md) §1 ("What is ovstorage?") first: ovstorage is a
+specification realized by two or more independent host implementations, kept
+aligned to one contract. The Rust host runs the conformance suite today; the C
+baseline has separate ABI and round-trip tests while shared scenario coverage
+is extended to it. Then pick one route from the table below.
+
+> **RFC-0066 (layered architecture).** The operational surface is `Layer`,
+> composed by the immutable `Stack` builder and extended by ABI-v2 storage
+> plugins. For layer-design or migration work, load
+> [`docs/rfcs/0066-layered-architecture.md`](docs/rfcs/0066-layered-architecture.md)
+> (the decision record).
 
 ## Route by Task
 
@@ -25,7 +38,7 @@ vendored source of truth.
 | Work on storage plugin behavior | [`docs/public/plugin-storage/AGENTS.md`](docs/public/plugin-storage/AGENTS.md) and [`docs/public/plugin-development/AGENTS.md`](docs/public/plugin-development/AGENTS.md) |
 | Work on the Omniverse Storage Service client plugin | [`docs/public/plugin-storage/plugin-services-client.md`](docs/public/plugin-storage/plugin-services-client.md) |
 | Work on the broker-client plugin | [`docs/public/plugin-storage/plugin-broker.md`](docs/public/plugin-storage/plugin-broker.md) plus [`docs/public/plugin-storage/AGENTS.md`](docs/public/plugin-storage/AGENTS.md) |
-| Author or operate an authz plugin | [`docs/public/plugin-authz/AGENTS.md`](docs/public/plugin-authz/AGENTS.md) |
+| Configure or modify authorization policy | [`docs/public/authz-policy/AGENTS.md`](docs/public/authz-policy/AGENTS.md) |
 | Operate the broker daemon | [`docs/public/broker-operator/AGENTS.md`](docs/public/broker-operator/AGENTS.md) |
 | Operate the REST gateway | [`docs/public/library-web/AGENTS.md`](docs/public/library-web/AGENTS.md) |
 | Work on repository maintenance or CI | Source-developer skills under [`skills/`](skills/) |
@@ -49,7 +62,7 @@ Plus three plugin / operator personas:
 | Persona | Audience |
 |---|---|
 | [`plugin-storage`](docs/public/plugin-storage/README.md) | Storage backend plugin authors |
-| [`plugin-authz`](docs/public/plugin-authz/README.md) | Authz plugin authors |
+| [`authz-policy`](docs/public/authz-policy/README.md) | Authorization policy operators and contributors |
 | [`broker-operator`](docs/public/broker-operator/README.md) | `ovstorage-broker` deployment + policy management |
 
 ## Invocable Skills
@@ -89,7 +102,7 @@ Source-developer skills:
 | Skill | Use when |
 |---|---|
 | [`ovstorage-contributor-author-storage-plugin`](skills/ovstorage-contributor-author-storage-plugin/SKILL.md) | Adding or reviewing a storage backend plugin |
-| [`ovstorage-contributor-author-authz-plugin`](skills/ovstorage-contributor-author-authz-plugin/SKILL.md) | Adding or reviewing an authz plugin |
+| [`ovstorage-contributor-modify-authz-layer`](skills/ovstorage-contributor-modify-authz-layer/SKILL.md) | Changing the built-in auth Layer or policy engine |
 | [`ovstorage-contributor-run-broker-locally`](skills/ovstorage-contributor-run-broker-locally/SKILL.md) | Standing up a local broker for development or integration testing |
 | [`ovstorage-contributor-regenerate-c-headers`](skills/ovstorage-contributor-regenerate-c-headers/SKILL.md) | Refreshing generated C/C++ headers |
 | [`ovstorage-contributor-verify-before-merge`](skills/ovstorage-contributor-verify-before-merge/SKILL.md) | Running checks before review or merge |
@@ -114,6 +127,19 @@ fix the public doc or skill route before publication.
 
 ## House Rules
 
+- Run `make verify` after every change and before finalizing any work. This is
+  the non-test CI gate (skills + public-doc lint + source notices + headers +
+  Rust/TOML format checks + cargo-deny + cargo-machete + clippy + doc), so it
+  catches formatting and basic issues before review. Fix anything it reports and
+  re-run until it passes. See
+  [`ovstorage-contributor-verify-before-merge`](skills/ovstorage-contributor-verify-before-merge/SKILL.md)
+  for the full pre-merge sequence, including `make test`.
+- **Docs and comments describe the code as it is today.** Present tense, no
+  framing against past states ("no longer", "used to"), and no embedded
+  tracking identifiers — Jira keys, PR-series labels, or design-decision
+  numbers. A GitHub issue number appears only as a live pointer to open,
+  unfinished work. The maintainer guide carries the full norms under
+  "Commenting and file-size norms".
 - Treat `ovstorage-services/` as vendored source-of-truth material. Do not
   modify it in place. If a feature requires that subtree to change, it's a
   separate vendor-sync that goes through the upstream repo first. Before
@@ -123,7 +149,7 @@ fix the public doc or skill route before publication.
   - Per-plugin notes about scheme handling, capability deltas, etc. →
     `docs/public/plugin-storage/<plugin>/README.md` or equivalent under
     `docs/public/`.
-  - SPI contract clarifications → `docs/public/plugin-development/README.md`.
+  - Layer contract clarifications → `docs/public/plugin-development/README.md`.
   - Crate-local module docs → rustdoc in the relevant crate's source.
 - Keep service-mode wire-contract changes routed through
   [`ovstorage-services/apis/`](ovstorage-services/apis/).

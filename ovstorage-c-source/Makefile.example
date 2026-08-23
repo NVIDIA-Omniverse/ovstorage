@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# This example uses GNU make, a POSIX shell, and cc-style flags. Windows
+# consumers build the same sources and examples with CMakeLists.txt.example.
+
+CC ?= cc
+CXX ?= c++
+
+BUILD_DIR ?= build
+
+CPPFLAGS += -Iinclude \
+	-D_POSIX_C_SOURCE=200809L \
+	-D_XOPEN_SOURCE=700 \
+	-D_FILE_OFFSET_BITS=64
+CFLAGS += -std=c99 -Wall -Wextra
+CXXFLAGS += -std=c++20 -Wall -Wextra
+
+# Keep these explicit for systems where pthread and dl are not part of libc.
+# Libraries deliberately follow object files in the link commands below.
+LDLIBS += -lpthread -ldl
+
+C_SOURCES := $(wildcard src/*.c)
+C_HEADERS := $(wildcard include/*.h) src/internal.h src/temp_dir.h
+
+# A BUILD_DIR containing a space needs two spellings. Make splits rule heads on
+# whitespace and honours a backslash escape there, so targets and prerequisites
+# use $(BUILD_DIR_ESC). Automatic variables expand to the unescaped name and
+# recipes are shell text, so recipes quote instead. Make's functions do not
+# honour the escape, so any word list a recipe consumes is built from the
+# unescaped BUILD_DIR with each word quoted individually.
+empty :=
+space := $(empty) $(empty)
+BUILD_DIR_ESC := $(subst $(space),\$(space),$(BUILD_DIR))
+
+C_OBJECT_NAMES := $(patsubst src/%.c,%.o,$(C_SOURCES))
+C_OBJECTS := $(addprefix $(BUILD_DIR_ESC)/,$(C_OBJECT_NAMES))
+C_OBJECT_PATHS := $(foreach o,$(C_OBJECT_NAMES),"$(BUILD_DIR)/$(o)")
+
+# ovstorage.hpp needs a C++20 toolchain with working coroutine support:
+# GCC 13+, Clang 17+, or MSVC 19.40+. Probe by compiling the header itself —
+# a narrower coroutine probe passes on compilers that then reject it.
+#
+# Below the floor the C++ example is SKIPPED, not failed: the C sources need
+# only C99, so a consumer whose C++ toolchain is too old can still build and
+# use the C API. Failing here would deny them that.
+#
+# The result is cached in $(BUILD_DIR) and recomputed only when a header
+# changes, so an up-to-date tree does not recompile the wrapper on every
+# invocation. Diagnostics are kept in cxx_probe.log: the floor is the likely
+# cause of a failure but not the only one — a regressed header or a
+# conflicting CXXFLAGS look identical from here, and only the log tells them
+# apart.
+CXX_PROBE_LOG := $(BUILD_DIR)/cxx_probe.log
+CXX_PROBE_STAMP := $(BUILD_DIR)/cxx_probe.status
+
+CXX20_SUPPORTED := $(shell \
+	mkdir -p "$(BUILD_DIR)"; \
+	if [ -f "$(CXX_PROBE_STAMP)" ] \
+	   && [ "$(CXX_PROBE_STAMP)" -nt include/ovstorage.hpp ] \
+	   && [ "$(CXX_PROBE_STAMP)" -nt include/ovstorage.h ]; then \
+		cat "$(CXX_PROBE_STAMP)"; \
+	else \
+		printf '#include "ovstorage.hpp"\n' > "$(BUILD_DIR)/cxx_probe.cpp"; \
+		if $(CXX) $(CPPFLAGS) $(CXXFLAGS) -c "$(BUILD_DIR)/cxx_probe.cpp" \
+			-o "$(BUILD_DIR)/cxx_probe.o" 2>"$(CXX_PROBE_LOG)"; then \
+			echo yes > "$(CXX_PROBE_STAMP)"; \
+		else \
+			echo no > "$(CXX_PROBE_STAMP)"; \
+		fi; \
+		cat "$(CXX_PROBE_STAMP)"; \
+	fi)
+
+ifeq ($(CXX20_SUPPORTED),yes)
+TUTORIAL_NAMES := \
+	tutorial_01_file \
+	tutorial_02_object_operations \
+	tutorial_03_load_a_plugin \
+	tutorial_04_file_and_http \
+	tutorial_05_cache \
+	tutorial_06_native_layer
+EXAMPLE_NAMES := c_roundtrip cpp20_roundtrip $(TUTORIAL_NAMES)
+RUNNABLE_EXAMPLE_NAMES := \
+	c_roundtrip \
+	cpp20_roundtrip \
+	tutorial_01_file \
+	tutorial_02_object_operations \
+	tutorial_06_native_layer
+else
+EXAMPLE_NAMES := c_roundtrip
+RUNNABLE_EXAMPLE_NAMES := c_roundtrip
+$(warning $(CXX) cannot compile include/ovstorage.hpp, so the C++ examples are \
+skipped and only the C example is built. The C++ wrapper needs C++20 with \
+working coroutine support: GCC 13+, Clang 17+, or MSVC 19.40+. Read \
+$(CXX_PROBE_LOG) before assuming that is the cause, and set CXX to build it.)
+endif
+
+EXAMPLE_BINARIES := $(addprefix $(BUILD_DIR_ESC)/,$(EXAMPLE_NAMES))
+RUNNABLE_EXAMPLE_PATHS := $(foreach b,$(RUNNABLE_EXAMPLE_NAMES),"$(BUILD_DIR)/$(b)")
+
+.PHONY: all examples check clean
+
+all: examples
+
+examples: $(EXAMPLE_BINARIES)
+
+check: examples
+	@for binary in $(RUNNABLE_EXAMPLE_PATHS); do \
+		echo "running $$binary"; \
+		"$$binary" || exit 1; \
+	done
+
+$(BUILD_DIR_ESC):
+	mkdir -p "$@"
+
+$(BUILD_DIR_ESC)/%.o: src/%.c $(C_HEADERS) | $(BUILD_DIR_ESC)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
+
+# $^ and $< join names with spaces, which a spaced BUILD_DIR makes ambiguous,
+# so the link lines name their inputs explicitly.
+$(BUILD_DIR_ESC)/c_roundtrip: examples/c_roundtrip.c $(C_OBJECTS) | $(BUILD_DIR_ESC)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o "$@" \
+		examples/c_roundtrip.c $(C_OBJECT_PATHS) $(LDLIBS)
+
+# The implementation objects remain C99 objects; only the wrapper example is
+# compiled and linked with the C++ driver.
+$(BUILD_DIR_ESC)/cpp20_roundtrip: examples/cpp20_roundtrip.cpp include/ovstorage.hpp $(C_OBJECTS) | $(BUILD_DIR_ESC)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o "$@" \
+		examples/cpp20_roundtrip.cpp $(C_OBJECT_PATHS) $(LDLIBS)
+
+$(BUILD_DIR_ESC)/tutorial_%: examples/tutorial/%.cpp examples/tutorial/common.hpp include/ovstorage.hpp include/ovstorage_defaults.h $(C_OBJECTS) | $(BUILD_DIR_ESC)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o "$@" \
+		"$<" $(C_OBJECT_PATHS) $(LDLIBS)
+
+clean:
+	rm -rf "$(BUILD_DIR)"

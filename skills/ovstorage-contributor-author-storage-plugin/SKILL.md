@@ -23,9 +23,11 @@ the plugin conformance harness.
    for the shared C ABI, manifest, loader, and build loop.
 2. Use [`docs/public/plugin-storage/README.md`](../../docs/public/plugin-storage/README.md)
    for the storage-specific `Factory` and `Backend` contract.
-3. Mirror the small reference backend in
-   [`ovstorage-plugin-file`](../../ovstorage-core/crates/ovstorage-plugin-file/README.md)
-   before introducing vendor SDK complexity.
+3. Mirror a small reference plugin such as
+   [`ovstorage-plugin-http`](../../ovstorage-core/ovstorage-plugin-http/README.md)
+   before introducing vendor SDK complexity. (The `file` backend is
+   built into the library, not a plugin crate, so it is not a template
+   for a loadable plugin.)
 4. Set capability bits only for operations the backend actually honors.
 5. Add streaming-invariant coverage for any streaming read or write path.
 6. Run `make verify` before merge.

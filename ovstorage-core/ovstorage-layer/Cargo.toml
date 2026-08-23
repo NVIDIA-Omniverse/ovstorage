@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-layer"
+version.workspace = true
+edition = "2024"
+description = "Foundational Layer traits, Stack builder, and shared domain types for ovstorage."
+license = "Apache-2.0"
+
+[dependencies]
+async-trait = "0.1.89"
+bytes = "1.11.1"
+futures = "0.3.32"
+parking_lot = "0.12.5"
+percent-encoding = "2.3.2"
+regex = "1.12.3"
+tokio = { version = "1.52.3", features = ["sync"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+tracing = "0.1.44"
+url = "2.5.8"
+zeroize = "1.8.2"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt", "test-util", "time"] }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

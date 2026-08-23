@@ -83,6 +83,33 @@
         },
         "next_action": {
           "type": "string"
+        },
+        "partial": {
+          "$ref": "#/$defs/EnvelopePartialContext"
+        }
+      },
+      "additionalProperties": false
+    },
+    "EnvelopePartialContext": {
+      "description": "Present only when code is PartialCompletion. Describes the committed and uncommitted stages. Callers must read rollback before taking any recovery action — destroys_requested_work means do NOT roll back the committed stage.",
+      "type": "object",
+      "required": ["completed", "failed", "failed_outcome", "rollback"],
+      "properties": {
+        "completed": {
+          "type": "string",
+          "enum": ["object_data", "user_metadata", "source_removal"]
+        },
+        "failed": {
+          "type": "string",
+          "enum": ["object_data", "user_metadata", "source_removal"]
+        },
+        "failed_outcome": {
+          "type": "string",
+          "enum": ["not_applied", "unknown"]
+        },
+        "rollback": {
+          "type": "string",
+          "enum": ["restores_prior_state", "destroys_requested_work"]
         }
       },
       "additionalProperties": false

@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-test-layer"
+version.workspace = true
+edition = "2024"
+description = "Minimal ABI-v2 Layer test backend cdylib for plugin loading and mixed-layer Stack tests."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+ovstorage-plugin = { workspace = true }
+ovstorage-authz-context = { workspace = true }
+async-trait = "0.1.89"
+bytes = "1.10.1"
+futures = "0.3.32"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true

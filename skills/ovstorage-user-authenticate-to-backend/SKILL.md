@@ -26,28 +26,41 @@ in `ovstorage_doctor`.
 
 ## Recipe
 
-1. Inspect available backend kinds and configured connections with
+1. Inspect the configured backend layers and connections with
    [`ovstorage-user-getting-started`](../ovstorage-user-getting-started/SKILL.md).
 2. Read the backend descriptor and credential schema before prompting for
-   anything secret. Library callers get this from
-   `Storage::list_backend_kinds`; CLI users can use the `connect` wizard.
+   anything secret. Stack callers get this from the root Layer's
+   `list_kinds`; CLI users can use the `connect` wizard.
 3. For `file`, no external credential is normally required. Register the root
    path and keep credentials empty.
-4. For `http`, prefer public or pre-authorized URLs. If an HTTP route
-   needs credentials, pass them through the connection credential schema or a
-   host-provided credential callback, not through the address string.
+4. For `http`, prefer public URLs where they exist. If an HTTP route needs
+   credentials, pass them through the connection credential schema —
+   `bearer_token`, `username` + `password`, `signed_query`, or
+   `secret_headers` — never through the address string; a query in `root_url`
+   or `prefix` is rejected as `InvalidArgument` at `instantiate`.
 5. If `authenticate_connection` returns an auth event stream, surface
    `OpenBrowser`, `DeviceCode`, `Progress`, `Succeeded`, `Failed`, and
    `Cancelled` events to the user exactly as events, then stop on a terminal
    event.
+6. If it returns `Unsupported`, no flow ran and the connection's state is
+   unchanged, so keep the registration and report the state rather than
+   treating it as a failure. Backends that always answer this way: `s3`,
+   `gcs`, `azure`, `opendal`; broker connections on a direct endpoint (any
+   address that is not `http(s)://`); and `file` and `http`, which have no
+   connection-auth driver at all. `Unsupported` can also come from a layer
+   that does not implement the call — a credentialless visibility-override row,
+   or a remote service that has not implemented the RPC — so read it as "no flow
+   was offered here", not as a statement about the backend kind. Where a
+   credential is what is missing, supply one the origin accepts; re-running
+   the flow is not the fix.
 
 ## Backend-specific auth
 
 ### `omniverse-storage-service`
 
-The `omniverse-storage-service` backend authenticates over OIDC. The plugin reads
-`/api/v1/auth-config` from the configured `discovery_url` to learn the
-OIDC issuer and client; the standard OIDC discovery doc supplies the
+The `omniverse-storage-service` backend authenticates over OIDC when its
+`address` names a discovery root. The plugin reads `/api/v1/auth-config`
+from that root to learn the OIDC issuer and client; the standard OIDC discovery doc supplies the
 auth / token / device endpoints.
 
 Two interactive flows:
@@ -70,6 +83,14 @@ configured method). No intervention required for long-running processes.
 To pre-seed credentials (e.g. for CI), populate `oauth` with a long-lived
 refresh token; the plugin will exchange it for an access token on first
 use.
+
+When `address` names a `grpc://` or `grpcs://` endpoint instead, there is
+no discovery root and therefore no OIDC configuration: no sign-in flow,
+no client-credentials grant, and no background refresh. Such a connection
+takes an access token the host already holds — put it in the `oauth`
+field with no refresh token — and the host rotates it by calling
+`update_connection_credentials` again with a fresh one. An empty bundle
+removes it.
 
 ### `s3`
 
@@ -117,6 +138,59 @@ bundle-resolution layer before handing the bundle to the plugin.
 GCE/GKE metadata, workload-identity federation
 (`external_account`), and service-account impersonation
 (`impersonated_service_account`) are not implemented in-process.
+
+### `http`
+
+The descriptor exposes four credential methods. Distinct channels combine —
+for example, a connection may hold a signed query and secret headers at once —
+and a connection with none of them is anonymous:
+
+- `bearer` — opaque token sent as `Authorization: Bearer <token>`
+  on every request. Populate `bearer_token`.
+- `basic` — HTTP Basic authentication. Populate both `username` and
+  `password`; either value may be empty, but not both.
+- `signed_query` — pre-issued query string appended verbatim to every
+  request URL (leading `?` optional). Populate `signed_query`, and set
+  the `signed_query_scope` **config** key to declare the token's scope
+  family.
+- `secret_headers` — credential-bearing headers in wire form, one
+  `Name: Value` per line, sent with every request. Populate
+  `secret_headers`. The separator is a line break, not a comma, so a
+  value may contain commas. This is the secret-bearing counterpart to
+  the `default_headers` config key, which rejects `Authorization`,
+  `Cookie`, and `Proxy-Authorization`; those names are accepted here,
+  while `Host`, `Range`, `If-Match`, and the framing and hop-by-hop
+  headers are refused.
+
+A signature is a credential with a declared scope, not part of the
+address. Writing a query into `root_url` or `prefix` returns
+`InvalidArgument` at `instantiate`: the object key is appended after the
+route prefix, and a signature buried in config can be neither scoped nor
+rotated. `signed_query_scope` accepts `prefix` (the token authorizes
+everything under `root_url` — an Azure account, container, or directory
+SAS, a CloudFront signed URL with a custom policy) or `object` (a
+per-object presign, which a connection cannot hold and which returns
+`Unsupported`; dispatch such a URL as a per-request address). The plugin
+also refuses a token whose parameters name a per-object signature —
+`X-Amz-Signature`, `sr=b`, a CloudFront canned policy — while
+`signed_query_scope` says `prefix`. Supplying `signed_query` with no
+scope, or a scope with no `signed_query`, is `InvalidArgument`; so is
+setting Basic or Bearer credentials together with a `secret_headers` entry
+named `Authorization`. Userinfo in `root_url` is the legacy Basic channel and
+likewise conflicts with another `Authorization` writer, while it may coexist
+with a signed query or non-Authorization secret header.
+
+All channels are hot-swappable through
+`update_connection_credentials` while the connection is live, but the
+rotation may not change the connection's exact shape: the Authorization
+method, presence of a signed query, and secret-header names and multiplicity
+must remain fixed. Remove and re-add the connection to change that shape.
+`signed_query_scope` is configuration rather than a credential, so rotating
+into a signed query without that key (or supplying the key with no token) is
+`InvalidArgument`. A replacement is probed before the atomic swap; reads keep
+using the old snapshot while the probe runs. Credentials over a plaintext
+`http://` route are refused except on loopback, and any secret-bearing
+connection refuses an `https://` to `http://` redirect downgrade.
 
 ### `azure`
 
@@ -255,7 +329,7 @@ for the daemon side.
 - [`plugin-nucleus`](../../docs/public/plugin-storage/plugin-nucleus.md)
   for the Omniverse Nucleus auth flows.
 - [`plugin-broker`](../../docs/public/plugin-storage/plugin-broker.md)
-  for the broker-client SPI surface, discovery URL normalization,
+  for the broker-client Layer surface, discovery URL normalization,
   and the broker-held three-tier OAuth model.
 - [`docs/public/broker-operator/README.md`](../../docs/public/broker-operator/README.md)
   for the daemon-side listener authn modes a broker operator

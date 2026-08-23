@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Python dependencies for the ovtasks repo-task tooling. Installed by
+# `make install-tools` and in CI.
+#
+# tomlkit gives format-preserving TOML edits so `bump_release_version` rewrites
+# pyproject.toml's `project.version` without reflowing the file.
+#
+# PyYAML is intentionally NOT required: skill-frontmatter validation uses a
+# deliberate line-based parser (see ovtasks/_skills.py) so publication rules
+# don't shift under a general YAML parser.
+tomlkit>=0.12
+
+# pytest is only needed to run the ovtasks tests (tools/ovtasks/tests).
+pytest>=7

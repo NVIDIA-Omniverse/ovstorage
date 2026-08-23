@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-opendal"
+version.workspace = true
+edition = "2024"
+description = "OpenDAL-compatible ovstorage backend crate."
+license = "Apache-2.0"
+
+[dependencies]
+ovstorage-plugin = { workspace = true }
+parking_lot = "0.12.5"
+async-trait = "0.1.89"
+futures = "0.3.32"
+opendal = { version = "0.50.2", default-features = false, features = [
+    "services-fs",
+    "services-http",
+    "services-s3",
+    "services-webdav",
+] }
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+ovstorage-plugin-test = { workspace = true }
+tempfile = "3.27.0"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true

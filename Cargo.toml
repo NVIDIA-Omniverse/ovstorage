@@ -2,15 +2,98 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [workspace]
-resolver = "2"
-members = ["xtask"]
-exclude = [
-    "ovstorage-cloud",
-    "ovstorage-core",
-    "ovstorage-nucleus",
-    "ovstorage-remote",
-    "ovstorage-services-client",
+resolver = "3"
+members = [
+    "ovstorage-core/ovstorage",
+    "ovstorage-core/ovstorage-cache",
+    "ovstorage-core/ovstorage-c-source-cc-test",
+    "ovstorage-core/ovstorage-cli",
+    "ovstorage-core/ovstorage-envelope",
+    "ovstorage-core/ovstorage-layer",
+    "ovstorage-core/ovstorage-mcp",
+    "ovstorage-core/ovstorage-plugin",
+    "ovstorage-core/ovstorage-plugin-cache",
+    "ovstorage-core/ovstorage-plugin-cache-abi",
+    "ovstorage-core/ovstorage-plugin-core",
+    "ovstorage-core/ovstorage-plugin-core-abi",
+    "ovstorage-core/ovstorage-plugin-http",
+    "ovstorage-core/ovstorage-plugin-http-abi",
+    "ovstorage-core/ovstorage-plugin-macros",
+    "ovstorage-core/ovstorage-plugin-test",
+    "ovstorage-core/ovstorage-plugin-test-abi",
+    "ovstorage-core/ovstorage-plugin-test-abi-alloc",
+    "ovstorage-core/ovstorage-plugin-test-incompatible-abi",
+    "ovstorage-core/ovstorage-plugin-test-layer",
+    "ovstorage-core/ovstorage-retry",
+    "ovstorage-core/ovstorage-python",
+    "ovstorage-core/examples/plugin-rust",
+    "ovstorage-core/tools/check-plugin-deps",
+    "ovstorage-cloud/ovstorage-plugin-azure",
+    "ovstorage-cloud/ovstorage-plugin-gcs",
+    "ovstorage-cloud/ovstorage-plugin-opendal",
+    "ovstorage-cloud/ovstorage-plugin-s3",
+    "ovstorage-nucleus/nucleus-auth",
+    "ovstorage-nucleus/nucleus-client",
+    "ovstorage-nucleus/nucleus-codegen",
+    "ovstorage-nucleus/nucleus-discovery",
+    "ovstorage-nucleus/nucleus-transport",
+    "ovstorage-nucleus/ovstorage-plugin-nucleus",
+    "ovstorage-remote/ovstorage-authz",
+    "ovstorage-remote/ovstorage-authz-context",
+    "ovstorage-remote/ovstorage-authz-layer",
+    "ovstorage-remote/ovstorage-authz-policy",
+    "ovstorage-remote/ovstorage-broker",
+    "ovstorage-remote/ovstorage-broker-protocol",
+    "ovstorage-remote/ovstorage-plugin-broker",
+    "ovstorage-remote/ovstorage-rest",
+    "ovstorage-services-client/ovstorage-plugin-services-client",
+    "ovstorage-services-client/ovstorage-services-protos",
 ]
+
+[workspace.package]
+version = "0.2.1"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.96.0"
+
+[workspace.dependencies]
+nucleus-auth = { version = "0.2.1", path = "ovstorage-nucleus/nucleus-auth" }
+nucleus-client = { version = "0.2.1", path = "ovstorage-nucleus/nucleus-client" }
+nucleus-codegen = { version = "0.2.1", path = "ovstorage-nucleus/nucleus-codegen" }
+nucleus-discovery = { version = "0.2.1", path = "ovstorage-nucleus/nucleus-discovery" }
+nucleus-transport = { version = "0.2.1", path = "ovstorage-nucleus/nucleus-transport" }
+ovstorage = { version = "0.2.1", path = "ovstorage-core/ovstorage" }
+ovstorage-authz = { version = "0.2.1", path = "ovstorage-remote/ovstorage-authz" }
+ovstorage-authz-context = { version = "0.2.1", path = "ovstorage-remote/ovstorage-authz-context" }
+ovstorage-authz-layer = { version = "0.2.1", path = "ovstorage-remote/ovstorage-authz-layer" }
+ovstorage-authz-policy = { version = "0.2.1", path = "ovstorage-remote/ovstorage-authz-policy" }
+ovstorage-broker-protocol = { version = "0.2.1", path = "ovstorage-remote/ovstorage-broker-protocol" }
+ovstorage-cache = { version = "0.2.1", path = "ovstorage-core/ovstorage-cache" }
+ovstorage-cli = { version = "0.2.1", path = "ovstorage-core/ovstorage-cli" }
+ovstorage-envelope = { version = "0.2.1", path = "ovstorage-core/ovstorage-envelope" }
+ovstorage-layer = { version = "0.2.1", path = "ovstorage-core/ovstorage-layer" }
+ovstorage-plugin = { version = "0.2.1", path = "ovstorage-core/ovstorage-plugin" }
+ovstorage-plugin-broker = { version = "0.2.1", path = "ovstorage-remote/ovstorage-plugin-broker" }
+ovstorage-plugin-cache = { version = "0.2.1", path = "ovstorage-core/ovstorage-plugin-cache" }
+ovstorage-plugin-core = { version = "0.2.1", path = "ovstorage-core/ovstorage-plugin-core" }
+ovstorage-plugin-http = { version = "0.2.1", path = "ovstorage-core/ovstorage-plugin-http" }
+ovstorage-plugin-macros = { version = "0.2.1", path = "ovstorage-core/ovstorage-plugin-macros" }
+ovstorage-plugin-nucleus = { version = "0.2.1", path = "ovstorage-nucleus/ovstorage-plugin-nucleus" }
+ovstorage-plugin-test = { version = "0.2.1", path = "ovstorage-core/ovstorage-plugin-test" }
+ovstorage-retry = { version = "0.2.1", path = "ovstorage-core/ovstorage-retry" }
+ovstorage-rust = { package = "ovstorage", version = "0.2.1", path = "ovstorage-core/ovstorage" }
+ovstorage-services-protos = { version = "0.2.1", path = "ovstorage-services-client/ovstorage-services-protos" }
+
+[profile.release]
+lto = "thin"
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.test]
+opt-level = 1
+debug = "line-tables-only"
 
 [workspace.lints.rust]
 future_incompatible = { level = "warn", priority = -1 }

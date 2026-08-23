@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-cache"
+version.workspace = true
+edition = "2024"
+description = "Local cache primitives for ovstorage."
+license = "Apache-2.0"
+
+[dependencies]
+fs2 = "0.4.3"
+async-trait = "0.1.89"
+metrics = "0.24.6"
+ovstorage-layer = { workspace = true }
+parking_lot = "0.12.5"
+rusqlite = { version = "0.39.0", features = ["bundled", "fallible_uint"] }
+serde = { version = "1.0.228", features = ["derive"] }
+sha2 = "0.10.9"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+    "rt",
+] }
+tracing = "0.1.44"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.186"
+
+[dev-dependencies]
+fs2 = "0.4.3"
+tempfile = "3.27.0"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Exposes deterministic interposition hooks to dependent-crate tests. Production
+# builds leave the hooks and their storage out entirely.
+test-seams = []
+
+[lints]
+workspace = true

@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-authz-layer"
+version.workspace = true
+edition = "2024"
+description = "Built-in PermissionCheckLayer: authorization as a storage Layer for ovstorage."
+license = "Apache-2.0"
+
+[dependencies]
+ovstorage = { workspace = true }
+ovstorage-authz-policy = { workspace = true }
+ovstorage-authz-context = { workspace = true }
+arc-swap = "1.9.1"
+async-trait = "0.1.89"
+base64 = "0.22.1"
+futures = "0.3.32"
+jsonwebtoken = "9.3.1"
+metrics = "0.24.6"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.10.9"
+tokio = { version = "1.52.3", features = ["rt", "time", "sync"] }
+toml = "0.8.23"
+tracing = "0.1.44"
+
+[dev-dependencies]
+futures = "0.3.32"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tokio = { version = "1.52.3", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

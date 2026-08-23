@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "nucleus-transport"
+version.workspace = true
+edition = "2024"
+description = "Native Omniverse Nucleus transport library."
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = { version = "1.0.102", features = ["backtrace"] }
+futures = "0.3.32"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-tungstenite = { version = "0.24.0", features = ["rustls-tls-native-roots"] }
+tokio-util = { version = "0.7.18", features = ["io", "rt"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "registry"] }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

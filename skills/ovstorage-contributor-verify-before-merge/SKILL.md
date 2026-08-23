@@ -20,7 +20,7 @@ Run the same checks CI uses and catch common mistakes before review.
 1. Run `git status --short` and make sure only intended files changed.
 2. Run `make verify`.
 3. Run `make test`.
-4. If skills changed, run `cargo run -p xtask -- validate-skills`.
+4. If skills changed, run `make validate-skills`.
 5. Confirm no vendored services files changed with
    `git diff --name-only -- ovstorage-services/`.
 6. If generated headers changed, verify they were regenerated with

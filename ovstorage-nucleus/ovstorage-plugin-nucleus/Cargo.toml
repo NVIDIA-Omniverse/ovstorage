@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-nucleus"
+version.workspace = true
+edition = "2024"
+description = "Native Omniverse Nucleus ovstorage backend crate."
+license = "Apache-2.0"
+
+[dependencies]
+url = "2.5.8"
+ovstorage-plugin = { workspace = true }
+nucleus-transport = { workspace = true }
+nucleus-auth = { workspace = true }
+nucleus-discovery = { workspace = true }
+nucleus-client = { workspace = true }
+anyhow = { version = "1.0.102", features = ["backtrace"] }
+async-trait = "0.1.89"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+parking_lot = "0.12.5"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tracing = "0.1.44"
+
+[features]
+# Test-only construction paths: the in-process `MockTransport` seam and
+# the `__test_only_*` backend builders. Not part of the public
+# API; gated so release cdylib builds never compile the auth-bypassing
+# mock-ops construction path.
+_test_support = []
+
+[dev-dependencies]
+# Self-reference activates the `_test_support` feature for the
+# integration tests under `tests/` (conformance + precondition), which
+# need the hidden `__test_only_*` builders. The workspace dependency
+# supplies the registry version and local path.
+ovstorage-plugin-nucleus = { workspace = true, features = ["_test_support"] }
+ovstorage-plugin-test = { workspace = true }
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+    "test-util",
+] }
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true

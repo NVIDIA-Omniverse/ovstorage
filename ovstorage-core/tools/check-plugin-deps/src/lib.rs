@@ -3,8 +3,9 @@
 
 //! Layering lint for ovstorage plugin crates.
 //!
-//! Walks every `crates/ovstorage-plugin-*/Cargo.toml` (excluding the ABI
-//! crates themselves) and verifies that each `ovstorage-`-prefixed key in
+//! Walks every `ovstorage-plugin-*/Cargo.toml` under each configured root
+//! (excluding the ABI crates themselves) and verifies that each
+//! `ovstorage-`-prefixed key in
 //! `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, and
 //! every `[target.<cfg>.<table>]` permutation appears in the matching
 //! allowlist. The intent is to keep plugin crates layered on top of
@@ -12,9 +13,12 @@
 //! tightens as plugins migrate.
 //!
 //! The lint is root-configured: `tools/check-plugin-deps/roots.toml` lists
-//! the active first-party `crates/` directories and may extend the base
-//! allowlist per root.
+//! the active first-party workspace directories, may extend the base
+//! allowlist per root, and may grant per-crate `exceptions` when a single
+//! crate needs a dependency that must stay forbidden for every other
+//! plugin under the root.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -26,6 +30,10 @@ pub struct AllowList {
     pub dependencies: Vec<String>,
     pub dev_dependencies: Vec<String>,
     pub build_dependencies: Vec<String>,
+    /// Per-crate escape hatch: crate name -> extra dependency names allowed
+    /// for that crate only (in any dependency table). Crates not listed here
+    /// are unaffected.
+    pub exceptions: BTreeMap<String, Vec<String>>,
 }
 
 impl AllowList {
@@ -34,6 +42,7 @@ impl AllowList {
             dependencies: vec!["ovstorage-plugin".into()],
             dev_dependencies: vec!["ovstorage".into(), "ovstorage-cache".into()],
             build_dependencies: Vec::new(),
+            exceptions: BTreeMap::new(),
         }
     }
 
@@ -42,13 +51,26 @@ impl AllowList {
         extra_deps: &[String],
         extra_dev_deps: &[String],
         extra_build_deps: &[String],
+        exceptions: &BTreeMap<String, Vec<String>>,
     ) -> Self {
         let mut out = self.clone();
         out.dependencies.extend(extra_deps.iter().cloned());
         out.dev_dependencies.extend(extra_dev_deps.iter().cloned());
         out.build_dependencies
             .extend(extra_build_deps.iter().cloned());
+        for (crate_name, deps) in exceptions {
+            out.exceptions
+                .entry(crate_name.clone())
+                .or_default()
+                .extend(deps.iter().cloned());
+        }
         out
+    }
+
+    fn is_excepted(&self, crate_name: &str, dep_name: &str) -> bool {
+        self.exceptions
+            .get(crate_name)
+            .is_some_and(|deps| deps.iter().any(|allowed| allowed == dep_name))
     }
 }
 
@@ -76,6 +98,7 @@ pub struct Root {
     pub extra_dependencies: Vec<String>,
     pub extra_dev_dependencies: Vec<String>,
     pub extra_build_dependencies: Vec<String>,
+    pub exceptions: BTreeMap<String, Vec<String>>,
 }
 
 impl Root {
@@ -84,6 +107,7 @@ impl Root {
             &self.extra_dependencies,
             &self.extra_dev_dependencies,
             &self.extra_build_dependencies,
+            &self.exceptions,
         )
     }
 }
@@ -152,15 +176,67 @@ pub fn load_roots(roots_toml: &Path, base_dir: &Path) -> io::Result<Vec<Root>> {
         let extra_dependencies = string_array(table, "extra_dependencies");
         let extra_dev_dependencies = string_array(table, "extra_dev_dependencies");
         let extra_build_dependencies = string_array(table, "extra_build_dependencies");
+        let exceptions = exceptions_table(table, roots_toml, &label)?;
         roots.push(Root {
             label,
             crates_dir,
             extra_dependencies,
             extra_dev_dependencies,
             extra_build_dependencies,
+            exceptions,
         });
     }
     Ok(roots)
+}
+
+fn exceptions_table(
+    table: &toml::value::Table,
+    roots_toml: &Path,
+    label: &str,
+) -> io::Result<BTreeMap<String, Vec<String>>> {
+    let Some(value) = table.get("exceptions") else {
+        return Ok(BTreeMap::new());
+    };
+    let exceptions = value.as_table().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: [[roots]] entry {label} has a non-table exceptions value",
+                roots_toml.display()
+            ),
+        )
+    })?;
+    let mut out = BTreeMap::new();
+    for (crate_name, deps) in exceptions {
+        let deps = deps
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|v| {
+                        v.as_str().map(|s| s.to_string()).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "{}: [[roots]] entry {label} exceptions.{crate_name} contains a non-string dependency",
+                                    roots_toml.display()
+                                ),
+                            )
+                        })
+                    })
+                    .collect::<io::Result<Vec<String>>>()
+            })
+            .unwrap_or_else(|| {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: [[roots]] entry {label} exceptions.{crate_name} is not an array",
+                        roots_toml.display()
+                    ),
+                ))
+            })?;
+        out.insert(crate_name.clone(), deps);
+    }
+    Ok(out)
 }
 
 fn string_array(table: &toml::value::Table, key: &str) -> Vec<String> {
@@ -290,6 +366,7 @@ fn lint_manifest(manifest_path: &Path, allowlist: &AllowList) -> Vec<Violation> 
                 spec.id,
                 &label,
                 spec.allowed,
+                allowlist,
                 &mut violations,
             );
         }
@@ -318,6 +395,7 @@ fn lint_manifest(manifest_path: &Path, allowlist: &AllowList) -> Vec<Violation> 
                     spec.id,
                     &label,
                     spec.allowed,
+                    allowlist,
                     &mut violations,
                 );
             }
@@ -326,6 +404,7 @@ fn lint_manifest(manifest_path: &Path, allowlist: &AllowList) -> Vec<Violation> 
     violations
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_table(
     table: &toml::value::Table,
     crate_name: &str,
@@ -333,6 +412,7 @@ fn scan_table(
     table_id: DependencyTable,
     table_label: &str,
     allowed: &[String],
+    allowlist: &AllowList,
     violations: &mut Vec<Violation>,
 ) {
     for (dep_name, _) in table {
@@ -340,6 +420,9 @@ fn scan_table(
             continue;
         }
         if allowed.iter().any(|allowed_name| allowed_name == dep_name) {
+            continue;
+        }
+        if allowlist.is_excepted(crate_name, dep_name) {
             continue;
         }
         violations.push(Violation {
@@ -382,9 +465,9 @@ pub fn format_violations(violations: &[Violation]) -> String {
     }
     out.push_str(
         "\nFix: drop the offending dependency, switch to ovstorage-plugin, or update the \
-         allowlist in tools/check-plugin-deps/src/lib.rs (or extra_* in roots.toml) if the \
-         dependency is intentional. Tables checked: [dependencies], [dev-dependencies], \
-         [build-dependencies], and every [target.<cfg>.<table>] variant.\n",
+         allowlist in tools/check-plugin-deps/src/lib.rs (or extra_* / per-crate exceptions \
+         in roots.toml) if the dependency is intentional. Tables checked: [dependencies], \
+         [dev-dependencies], [build-dependencies], and every [target.<cfg>.<table>] variant.\n",
     );
     out
 }
@@ -406,6 +489,7 @@ mod tests {
             dependencies: vec!["ovstorage-plugin".into()],
             dev_dependencies: vec!["ovstorage".into(), "ovstorage-plugin".into()],
             build_dependencies: Vec::new(),
+            exceptions: BTreeMap::new(),
         }
     }
 
@@ -496,6 +580,83 @@ ovstorage-cache = "0.4"
         assert_eq!(violations[0].crate_name, "ovstorage-plugin-file");
         assert_eq!(violations[0].table, DependencyTable::Dependencies);
         assert_eq!(violations[0].table_label, "[dependencies]");
+        assert_eq!(violations[0].offending_dep, "ovstorage-cache");
+    }
+
+    #[test]
+    fn per_crate_exception_admits_only_the_named_crate() {
+        let temp = TempDir::new().unwrap();
+        let crates_dir = temp.path().join("crates");
+        fs::create_dir_all(&crates_dir).unwrap();
+        // The crate the exception is scoped to: its dependency passes.
+        write_manifest(
+            &crates_dir,
+            "ovstorage-plugin-test-abi",
+            r#"
+[package]
+name = "ovstorage-plugin-test-abi"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+ovstorage-plugin = "0.4"
+ovstorage-plugin-test = "0.4"
+"#,
+        );
+        // Any other plugin crate taking the same dependency still fails.
+        write_manifest(
+            &crates_dir,
+            "ovstorage-plugin-http",
+            r#"
+[package]
+name = "ovstorage-plugin-http"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+ovstorage-plugin = "0.4"
+ovstorage-plugin-test = "0.4"
+"#,
+        );
+        let mut allowlist = allowlist();
+        allowlist.exceptions.insert(
+            "ovstorage-plugin-test-abi".into(),
+            vec!["ovstorage-plugin-test".into()],
+        );
+        let violations = lint_crates_dir(&crates_dir, &allowlist).unwrap();
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].crate_name, "ovstorage-plugin-http");
+        assert_eq!(violations[0].table, DependencyTable::Dependencies);
+        assert_eq!(violations[0].offending_dep, "ovstorage-plugin-test");
+    }
+
+    #[test]
+    fn per_crate_exception_does_not_admit_other_deps_for_the_named_crate() {
+        let temp = TempDir::new().unwrap();
+        let crates_dir = temp.path().join("crates");
+        fs::create_dir_all(&crates_dir).unwrap();
+        write_manifest(
+            &crates_dir,
+            "ovstorage-plugin-test-abi",
+            r#"
+[package]
+name = "ovstorage-plugin-test-abi"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+ovstorage-plugin = "0.4"
+ovstorage-cache = "0.4"
+"#,
+        );
+        let mut allowlist = allowlist();
+        allowlist.exceptions.insert(
+            "ovstorage-plugin-test-abi".into(),
+            vec!["ovstorage-plugin-test".into()],
+        );
+        let violations = lint_crates_dir(&crates_dir, &allowlist).unwrap();
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].crate_name, "ovstorage-plugin-test-abi");
         assert_eq!(violations[0].offending_dep, "ovstorage-cache");
     }
 
@@ -857,5 +1018,74 @@ extra_build_dependencies = ["ovstorage-plugin"]
                 .build_dependencies
                 .contains(&"ovstorage-plugin".to_string())
         );
+    }
+
+    #[test]
+    fn load_roots_parses_per_crate_exceptions() {
+        let temp = TempDir::new().unwrap();
+        let base = temp.path();
+        let crates = base.join("crates");
+        fs::create_dir_all(&crates).unwrap();
+        let roots_path = base.join("roots.toml");
+        fs::write(
+            &roots_path,
+            r#"
+[[roots]]
+label = "core"
+path = "crates"
+
+[roots.exceptions]
+"ovstorage-plugin-test-abi" = ["ovstorage-plugin-test"]
+"#,
+        )
+        .unwrap();
+        let roots = load_roots(&roots_path, base).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            roots[0].exceptions.get("ovstorage-plugin-test-abi"),
+            Some(&vec!["ovstorage-plugin-test".to_string()])
+        );
+        let extended = roots[0].allowlist(&AllowList::permissive_starting());
+        // The exception is per-crate: the blanket dependencies allowlist
+        // must not pick up ovstorage-plugin-test.
+        assert!(
+            !extended
+                .dependencies
+                .contains(&"ovstorage-plugin-test".to_string())
+        );
+        assert!(extended.is_excepted("ovstorage-plugin-test-abi", "ovstorage-plugin-test"));
+        assert!(!extended.is_excepted("ovstorage-plugin-http", "ovstorage-plugin-test"));
+    }
+
+    #[test]
+    fn load_roots_rejects_malformed_exceptions() {
+        let temp = TempDir::new().unwrap();
+        let base = temp.path();
+        let roots_path = base.join("roots.toml");
+        fs::write(
+            &roots_path,
+            r#"
+[[roots]]
+label = "core"
+path = "crates"
+exceptions = ["ovstorage-plugin-test"]
+"#,
+        )
+        .unwrap();
+        assert!(load_roots(&roots_path, base).is_err());
+
+        fs::write(
+            &roots_path,
+            r#"
+[[roots]]
+label = "core"
+path = "crates"
+
+[roots.exceptions]
+"ovstorage-plugin-test-abi" = "ovstorage-plugin-test"
+"#,
+        )
+        .unwrap();
+        assert!(load_roots(&roots_path, base).is_err());
     }
 }

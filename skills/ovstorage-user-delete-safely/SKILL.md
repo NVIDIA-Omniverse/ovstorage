@@ -134,7 +134,7 @@ This fails with `DirectoryNotEmpty` if anything's underneath.
 | `DirectoryNotEmpty` | Non-recursive delete on a non-empty directory | Either drop the contents first, or use `recursive: true` (with dry-run!) |
 | `PermissionDenied` | Credentials can't delete | Check `ovstorage_doctor` |
 | `Unsupported` | Backend doesn't support delete | Rare — check `ovstorage_capabilities` for that prefix |
-| `ResourceExhausted` | Dry-run found >100k entries | Target a narrower prefix and delete in batches |
+| `Internal` | Dry-run found >100k entries — a fixed cap on one call, not a passing shortage, so retrying hits it again | Target a narrower prefix and delete in batches |
 
 ## See also
 

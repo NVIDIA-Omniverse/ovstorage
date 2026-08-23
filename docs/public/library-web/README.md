@@ -1,16 +1,22 @@
 # library-web persona
 
+> **Not recommended for new deployments.** `ovstorage-rest` ships in the release
+> archive and it runs, but it has not had enough validation for us to recommend
+> building on it yet, and this document is not linked from the docs index for
+> that reason. It is maintained for deployments that already exist. Interfaces
+> described here may change.
+
 > *I'm calling ovstorage over HTTP — from Go, Java, Node, browser JS, a
 > shell pipeline, or anything else that speaks HTTP. I don't link an
 > ovstorage SDK; I want a JSON-shaped REST surface with bearer-token
 > auth.*
 
 This persona lands you at `ovstorage-rest`, the standalone HTTP gateway
-binary that links the `ovstorage` Rust crate and exposes the `Library`
-API over a versioned `/v1/` REST surface. The gateway is a peer of
-[`ovstorage-broker`](../broker-operator/README.md): same library
-underneath, different front end. The broker speaks gRPC to library
-processes; the gateway speaks REST to anything that speaks HTTP. It is
+binary that composes an `ovstorage::Stack` and exposes its root `Layer`
+over a versioned `/v1/` REST surface. The gateway is a peer of
+[`ovstorage-broker`](../broker-operator/README.md): same Layer contract
+underneath, different front end. The broker speaks gRPC to native
+clients; the gateway speaks REST to anything that speaks HTTP. It is
 the right fit for services and tools written in languages without an
 ovstorage binding (Go, Java, browser JS, ad-hoc shell scripts),
 polyglot environments, and anything that already speaks HTTP.
@@ -57,9 +63,9 @@ by construction.
 
 ### Object I/O
 
-| Method + path | `Library` method | Notes |
+| Method + path | `Layer` operation | Notes |
 |---|---|---|
-| `GET /v1/objects?address=...` | `read_raw` | `200` with body for `Bytes` / `Stream` / `LocalDelegate`; `307 Temporary Redirect` with `Location` + `X-OV-Audit-Id` for `Redirect`. Range reads via `Range:` header. |
+| `GET /v1/objects?address=...` | `Stack::read` | `200` with body for `Bytes` / `Stream` / `LocalDelegate`; `307 Temporary Redirect` with `Location` + `X-OV-Audit-Id` for `Redirect` (the REST stack's follower runs `follow_reads=false`, so a backend `Redirect` surfaces unfollowed). Range reads via `Range:` header. |
 | `GET /v1/objects:stat?address=...&full_metadata=true` | `stat` | Input-guided directory handling: `.../foo` stats exact object first, then `.../foo/` on `NotFound`; `.../foo/` stats only the directory spelling. |
 | `PUT /v1/objects?dest=...` | `write` | Request body propagates as `Body::Stream` chunk-by-chunk (no host-side `Vec<u8>` drain) through a 16-slot bounded mpsc. |
 | `DELETE /v1/objects?address=...` | `delete` | |
@@ -74,22 +80,32 @@ by construction.
 | `POST /v1/objects:check-access` | `check_access` | |
 | `GET /v1/objects:watch-directory?prefix=...` | `watch_directory` | Server-Sent Events. `poll_interval_ms` enforces a 100 ms floor. Per-event authz drops are silent (no `Lapsed` synthesis). |
 
-### Routing introspection and management
+### Routing introspection
 
-| Method + path | `Library` method |
+| Method + path | `Layer` operation |
 |---|---|
 | `GET /v1/capabilities?prefix=...` | `capabilities_for(prefix)` |
 | `GET /v1/address-roots` | `list_address_roots` |
-| `GET /v1/backend-kinds` | `list_backend_kinds` |
-| `POST /v1/connections` | `add_connection` |
-| `GET /v1/connections` | `list_connections` |
-| `DELETE /v1/connections/{id}` | `remove_connection` |
-| `POST /v1/connections:authenticate?id=...` | `authenticate_connection` (Server-Sent Events) |
-| `POST /v1/aliases` | `add_alias` |
-| `GET /v1/aliases` | `list_aliases` |
-| `DELETE /v1/aliases/{id}` | `remove_alias` |
-| `PUT /v1/address-visibility` | `set_address_visibility` |
-| `GET /v1/address-visibility` | `list_address_visibility_overrides` |
+| `GET /v1/backend-kinds` | none — see below |
+
+`GET /v1/backend-kinds` is the one row here that is not a `Layer` call. It
+answers **which backend kinds this gateway can connect**: every backend
+factory the process has, built in or loaded from a plugin, captured when the
+gateway is built. Each descriptor's `supports_runtime_add` is true only when
+the Stack graph declares a Layer that a new connection of that kind could bind
+against.
+
+The in-process Rust API `LayerExt::list_backend_kinds` answers a narrower
+question — the backend Layers a given Stack was **built with** — so the two
+lists need not agree, and `supports_runtime_add` is not gated on routed kinds
+there: on that path it reports only whether the kind accepts connections at
+all. Neither list is a statement that a connection of that kind exists; the
+gateway's connections are declared as config, not enumerated over REST.
+
+These are read-only. Connections, aliases, and address visibility are
+declared as data in the gateway's `[ovstorage]` Stack config and built by
+the standard loader at startup — not mutated through REST (see
+*Connection, alias, and visibility declaration* below).
 
 ### OpenAPI
 
@@ -110,32 +126,65 @@ with `400 InvalidArgument`.
 
 ## Authentication
 
-OIDC bearer tokens only. The gateway validates JWTs against a
-configured JWKS using its built-in `JwtAuthenticator`. Configure
-through `[server.oidc]` in `ovstorage.toml`:
+Every gateway config must select a fail-closed auth wrapper. Use
+`auth = "anonymous"` only as an explicit unauthenticated allow-all opt-in:
 
 ```toml
-[server.oidc]
-issuer    = "https://login.example.com"
-audience  = "ovstorage"
-jwks_url  = "https://login.example.com/.well-known/jwks.json"
+[server]
+listen = "127.0.0.1:8443"
+auth = "anonymous"
 ```
 
-Or matching `OVSTORAGE_REST_OIDC_*` env vars (env wins). All three
-must resolve, or none — partial config is a startup error. With no
-OIDC config the gateway runs in **dev mode** and skips bearer
-validation; do not expose dev mode on a public interface.
+For first-party signed-JWT authentication and TOML authorization policy,
+select `builtin-auth`:
 
-The JWKS document is fetched through a long-lived `reqwest::Client`
-with a 10 s connect/read timeout and cached behind a 10-minute TTL. A
-token presenting an unknown `kid` triggers a one-shot refetch before
-being rejected, so routine IdP key rotation is absorbed without a
-gateway restart.
+```toml
+[server.auth]
+kind = "builtin-auth"
 
-API keys, Basic auth, mTLS, and other schemes are out of scope.
-Deployments that need them put a reverse proxy in front. The gateway
-doesn't accept mTLS because the typical caller is a human at an HTTP
-client without a client cert.
+[server.auth.config]
+authn_mode = "jwt_verify"
+jwt_issuer = "https://login.example.com"
+jwt_audience = "ovstorage"
+jwt_jwks_url = "https://login.example.com/.well-known/jwks.json"
+
+[server.auth.config.policy]
+
+[[server.auth.config.policy.policy]]
+id = "team-read"
+effect = "allow"
+principal = "team-*"
+operations = ["read", "stat", "list"]
+prefix = "s3://corp-prod/team/"
+```
+
+The three `jwt_*` values are all required for `authn_mode = "jwt_verify"`.
+The JWKS document is fetched through a long-lived `reqwest::Client` with a
+10 s connect/read timeout and cached behind a 10-minute TTL. A token presenting
+an unknown `kid` triggers a one-shot refetch before being rejected, so routine
+IdP key rotation does not require a gateway restart. REST does not expose a
+verified TLS client certificate, trusted-proxy peer, or forwarded identity
+headers to built-in authn, so its built-in form rejects `mtls`,
+`trusted_unsigned_jwt`, and `trusted_forwarded_headers` modes.
+
+A loaded storage Layer wrapper may also serve as auth when its descriptor
+declares `auth_capable = true`:
+
+```toml
+[server.auth]
+kind = "corp-auth"
+
+[server.auth.config]
+issuer_alias = "production"
+```
+
+The gateway passes plugin auth config verbatim to the selected factory. The
+plugin owns its schema and credential decoding; each request supplies the
+undecoded bearer from `Authorization` plus the TCP peer address. The built-in
+`authn_mode`, `jwt_*`, and policy settings do not configure a plugin kind.
+A missing or unknown kind, a backend or router kind, or a wrapper without
+`auth_capable = true` refuses startup. The gateway has no live auth-policy
+reload surface, so an auth config change requires a process restart.
 
 ### Precondition headers
 
@@ -197,48 +246,30 @@ backend's capability bits (`supports_if_match_write`,
 honored or refused — read `GET /v1/capabilities?prefix=...` first when
 in doubt.
 
-## Connection, alias, and visibility management
+## Connection, alias, and visibility declaration
 
-Routing state changes through REST:
+The gateway does not mutate routing state at runtime. Connections,
+aliases, and address visibility are **declared as data** in the
+`[ovstorage]` Stack config and built by the standard loader at startup —
+the same schema the CLI, MCP server, and broker load. There are no
+runtime connection, alias, or visibility REST endpoints.
 
-```http
-POST /v1/connections HTTP/1.1
-Authorization: Bearer <token>
-Content-Type: application/json
+- **Connections** are `[[ovstorage.connections]]` entries — a backend
+  kind plus its `config` and `credentials` (with `${ENV}` substitution).
+  See the *Configuration TOML shape* below.
+- **Aliases and visibility** are the `alias` layer's own data: an
+  `AliasWrapper` composed into the Stack. Rewrite rules
+  (`[[ovstorage.layers.alias.aliases]]`) map a virtual prefix onto a
+  physical target; visibility overrides
+  (`[[ovstorage.layers.alias.visibility]]`) mark a prefix `visible`
+  (the default), `hidden`, or `suppressed`. See
+  [`../configuration.md`](../configuration.md) for the full `alias`
+  schema.
 
-{
-  "backend_kind": "s3",
-  "config": { "bucket": "my-bucket", "region": "us-east-1" },
-  "credentials": { "fields": { "aws_access_key_id": "...", "aws_secret_access_key": "..." } },
-  "persist": true,
-  "display_name": "prod"
-}
-```
-
-The response carries the new `Connection { id, current_addresses, ... }`.
-`POST /v1/connections:authenticate?id=...` returns Server-Sent Events
-for the auth flow (`OpenBrowser`, `DeviceCode`, `Progress`, `Succeeded`,
-`Failed`, `Cancelled`); surface those events directly to the caller.
-
-Aliases (`POST /v1/aliases`) and visibility overrides
-(`PUT /v1/address-visibility`) operate on caller-facing `ObjectAddress`
-values; authz checks `AddAlias(from)` plus `Read(to)` for alias
-creation.
-
-## Authenticate-flow SSE endpoint
-
-`POST /v1/connections:authenticate?id=<connection-id>` returns
-`text/event-stream`. Each `event:` line is one of:
-
-- `OpenBrowser` — `data: { "url": "..." }`. The caller opens the URL.
-- `DeviceCode` — `data: { "user_code": "ABCD-1234", "verification_url":
-  "..." }`. The caller surfaces the code + URL.
-- `Progress` — `data: { "message": "..." }`. Informational.
-- `Succeeded` — terminal; the connection is now authenticated.
-- `Failed` — terminal; the connection failed to authenticate.
-- `Cancelled` — terminal; the caller cancelled.
-
-Stop reading on any terminal event. Re-issue the request to retry.
+`GET /v1/address-roots` is the read-side view: it returns the current
+roots as `RootInfo` values, each carrying its `visibility`, with
+`suppressed` prefixes omitted. Callers introspect routing there instead
+of enumerating a mutable alias or connection registry.
 
 ## Configuration TOML shape
 
@@ -246,43 +277,61 @@ Stop reading on any terminal event. Re-issue the request to retry.
 # ovstorage.toml — gateway-side
 
 [server]
-bind = "127.0.0.1:8443"
+listen = "127.0.0.1:8443"
 
-[server.oidc]
-issuer    = "https://login.example.com"
-audience  = "ovstorage"
-jwks_url  = "https://login.example.com/.well-known/jwks.json"
+[server.auth]
+kind = "builtin-auth"
 
-# Optional: per-call authz (shared with the broker).
-[authz]
-plugin = "ovstorage-authz-toml"
+[server.auth.config]
+authn_mode = "jwt_verify"
+jwt_issuer = "https://login.example.com"
+jwt_audience = "ovstorage"
+jwt_jwks_url = "https://login.example.com/.well-known/jwks.json"
 
-[[authz.policy]]
+[server.auth.config.policy]
+
+[[server.auth.config.policy.policy]]
 id        = "team-read"
 effect    = "allow"
 principal = "team-*"
 operations = ["read", "stat", "list"]
 prefix    = "s3://corp-prod/team/"
 
-# Routes flow through the embedded `Library`. Define backend
-# connections inline or load them from XDG config; the shape is the
-# same the CLI uses.
-[[connections]]
+# The gateway serves an `[ovstorage]` Stack: a layer graph plus its
+# connections. This is the same schema the CLI and MCP server load and
+# `ovstorage write-config` emits — see ../configuration.md. The gateway
+# adds only its own `[server]` section on top.
+[ovstorage]
+root = "router"
+
+[ovstorage.layers.router]
+children = ["broker", "file"]
+
+[ovstorage.layers.broker]
+
+[ovstorage.layers.file]
+
+[[ovstorage.connections]]
 backend_kind = "broker"
 display_name = "corp"
 config       = { address = "https://broker.corp.example.com" }
 
-[[connections]]
+[[ovstorage.connections]]
 backend_kind = "file"
 display_name = "scratch"
 config       = { root = "/var/lib/ovstorage/scratch" }
 ```
 
-Resolution order: env vars (`OVSTORAGE_REST_OIDC_*`) override the TOML.
-Partial OIDC config (any one of `issuer` / `audience` / `jwks_url`
-present without the others) is a startup error. No `[authz]` section
-runs in dev mode (allow-all); production deployments must configure
-`[authz]` explicitly or place an authorization layer in front of REST.
+See [`../configuration.md`](../configuration.md) for the full
+`[ovstorage]` stack schema (layers, connections, env overrides, and the
+canonical default).
+
+Environment variables under `OVSTORAGE_REST__` override TOML using `__` as
+the nesting separator; for example,
+`OVSTORAGE_REST__SERVER__AUTH__CONFIG__JWT_AUDIENCE=ovstorage`. Missing auth
+is a startup error. Use `auth = "anonymous"` only when unauthenticated access
+is intentional. Plugin kinds are validated against the loaded factory set and
+must be wrappers marked `auth_capable = true`.
 
 ## Streaming reads
 
@@ -352,7 +401,7 @@ honor any `Retry-After` header.
   access depends on a reverse proxy.
 - **Rate limiting.** Deferred to a reverse proxy by policy.
 - **TLS termination.** Deferred to a reverse proxy by policy.
-- **Body-size limit.** No `DefaultBodyLimit` is configured today; the
+- **Body-size limit.** No `DefaultBodyLimit` is configured; the
   streaming-write pipeline bounds peak per-request memory, but a
   request-size cap is sensible defence-in-depth at the proxy.
 - **Audit attribution.** `ovstorage` has no audit subsystem; only the
@@ -361,11 +410,13 @@ honor any `Retry-After` header.
   the only HTTP surface ovstorage owns. Deployments that need
   S3-API tooling against ovstorage targets put an existing S3-gateway
   product in front of `ovstorage-rest`.
-- **Server-side caching of read bytes.** REST reads go through
-  `Library::read_raw`, which bypasses the byte cache by design — the
-  gateway can hand `Redirect`, `Stream`, and `LocalDelegate` results
-  back to the caller untouched. In-process Rust callers and the broker
-  still see the cache.
+- **Redirect-following on REST reads.** REST composes a bespoke `Stack`
+  whose redirect follower is configured `follow_reads=false`, so a backend
+  `Redirect` passes up unfollowed and the gateway returns it as a 307;
+  `Stream` and `LocalDelegate` results are handed back to the caller
+  untouched. The REST stack composes **no byte cache** — every REST read
+  reaches the backend (unlike in-process Rust callers or the broker, which
+  can include a cache layer).
 
 For policy management, listener authn modes, observability, and the
 broker's role in the brokered topology, see

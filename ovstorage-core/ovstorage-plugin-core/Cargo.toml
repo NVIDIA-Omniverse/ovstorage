@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-core"
+version.workspace = true
+edition = "2024"
+description = "Router and general-purpose wrapper plugin for ovstorage."
+license = "Apache-2.0"
+
+[dependencies]
+ovstorage-layer = { workspace = true }
+ovstorage-plugin = { workspace = true }
+ovstorage-retry = { workspace = true }
+async-trait = "0.1.89"
+async-channel = "2.5.0"
+futures = "0.3.32"
+parking_lot = "0.12.5"
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.52.3", features = ["fs", "io-util", "rt", "sync", "time"] }
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+tracing = "0.1.44"
+toml = "0.8.23"
+url = "2.5.8"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

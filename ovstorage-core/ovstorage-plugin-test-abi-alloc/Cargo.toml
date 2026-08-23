@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-test-abi-alloc"
+version.workspace = true
+edition = "2024"
+description = "ABI-v2 cdylib export of the ovstorage-plugin-test conformance backend built on an instrumented #[global_allocator]. Proves that values crossing the plugin ABI are minted and reclaimed on the shared ABI heap rather than on whichever Rust global allocator each binary installs."
+license = "Apache-2.0"
+publish = false
+build = "build.rs"
+
+[dependencies]
+ovstorage-plugin = { workspace = true }
+ovstorage-plugin-test = { workspace = true }
+
+[dev-dependencies]
+libloading = "0.8.9"
+ovstorage = { workspace = true }
+ovstorage-plugin = { workspace = true }
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true

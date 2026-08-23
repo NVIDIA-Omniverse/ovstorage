@@ -3,6 +3,12 @@
 This area documents the ovstorage MCP and v=0.1 result-envelope contract for
 agents and automation.
 
+> **Three version spaces meet on these pages and none of them is the ovstorage
+> release.** `v=0.1` is the *envelope schema* version; `tools v0` in
+> [`mcp-tools.md`](mcp-tools.md) is the *MCP tool surface* version; ovstorage
+> itself is at 0.2.1. The envelope's `v=0.1` is not a statement about which
+> release you are running.
+
 - [`envelope.md`](envelope.md) defines the shared success/error envelope.
 - [`mcp-tools.md`](mcp-tools.md) lists every MCP tool, parameter shape, and
   return shape.

@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-test-incompatible-abi"
+version.workspace = true
+edition = "2024"
+description = "Frozen stale-ABI cdylib fixture for ovstorage plugin loader tests."
+license = "Apache-2.0"
+publish = false
+
+# Only for the ABI version constant: the fixture derives its stale version
+# from the current one so a bump cannot silently turn it into a test of
+# something else. The rlib exports no fixed-name ABI symbols, so linking it
+# leaves this cdylib's manifest the only one.
+[dependencies]
+ovstorage-plugin = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true

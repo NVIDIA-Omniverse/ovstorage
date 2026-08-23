@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-authz-policy"
+version.workspace = true
+edition = "2024"
+description = "Pure authorization policy engine (operations, TOML rules, policy epoch) for ovstorage."
+license = "Apache-2.0"
+
+[dependencies]
+ovstorage-plugin = { workspace = true }
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.8.23"
+tracing = "0.1.44"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

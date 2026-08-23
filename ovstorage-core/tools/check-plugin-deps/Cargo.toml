@@ -3,17 +3,17 @@
 
 [package]
 name = "check-plugin-deps"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "Layering lint that forbids ovstorage plugin crates from depending on host-side ovstorage crates."
 license = "Apache-2.0"
 publish = false
 
 [dependencies]
-toml = { workspace = true }
+toml = "0.8.23"
 
 [dev-dependencies]
-tempfile = { workspace = true }
+tempfile = "3.27.0"
 
 [lib]
 path = "src/lib.rs"

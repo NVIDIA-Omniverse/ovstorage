@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-broker-protocol"
+version.workspace = true
+edition = "2024"
+description = "Generated protobuf/tonic protocol for ovstorage brokered mode."
+license = "Apache-2.0"
+
+[dependencies]
+async-trait = "0.1.89"
+futures = "0.3.32"
+ovstorage-plugin = { workspace = true }
+prost = "0.13.5"
+tonic = "0.12.3"
+
+[build-dependencies]
+protoc-bin-vendored = "3.2.0"
+tonic-build = "0.12.3"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

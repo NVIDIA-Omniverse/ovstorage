@@ -18,9 +18,9 @@ from urllib.parse import urlsplit
 import ovstorage
 
 from _common import (
-    add_http_connection,
+    build_plugin_stack,
     format_size,
-    load_plugin_kind,
+    http_connection_request,
     looks_text,
     origin_prefix,
 )
@@ -62,29 +62,24 @@ async def _run(
     preview_lines: int,
 ) -> None:
     _require_https(url)
-    library = ovstorage.Library.open()
-    await load_plugin_kind(library, plugin_dir, "http")
-    connection = await add_http_connection(
-        library,
-        origin_prefix(url),
-        "anonymous-https-preview",
+    storage = await build_plugin_stack(
+        plugin_dir,
+        "http",
+        "http",
+        http_connection_request(origin_prefix(url), "anonymous-https-preview"),
     )
+    data, info = await storage.read_bytes(url, max_bytes=max_bytes)
+    print("read:")
+    _print_info(info)
+    print(f"bytes:   {len(data)}")
+    print()
 
-    try:
-        data, info = await library.read_bytes(url, max_bytes=max_bytes)
-        print("read:")
-        _print_info(info)
-        print(f"bytes:   {len(data)}")
-        print()
-
-        print("preview:")
-        if looks_text(url, data):
-            for line in data.decode("utf-8", errors="replace").splitlines()[:preview_lines]:
-                print(f"  {line}")
-        else:
-            print(f"  {data[:256].hex(' ')}")
-    finally:
-        await library.remove_connection(connection.id)
+    print("preview:")
+    if looks_text(url, data):
+        for line in data.decode("utf-8", errors="replace").splitlines()[:preview_lines]:
+            print(f"  {line}")
+    else:
+        print(f"  {data[:256].hex(' ')}")
 
 
 async def _main() -> None:

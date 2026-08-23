@@ -1,0 +1,134 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage"
+version.workspace = true
+edition = "2024"
+description = "ovstorage dispatcher and public Rust library."
+license = "Apache-2.0"
+build = "build.rs"
+
+[dependencies]
+ovstorage-cache = { workspace = true }
+ovstorage-layer = { workspace = true }
+ovstorage-plugin = { workspace = true }
+ovstorage-retry = { workspace = true }
+async-stream = "0.3.6"
+async-trait = "0.1.89"
+base64 = "0.22.1"
+bytes = "1.11.1"
+figment = { version = "0.10.19", features = ["toml", "env"] }
+fs2 = "0.4.3"
+futures = "0.3.32"
+libloading = "0.8.9"
+log = "0.4.31"
+metrics = "0.24.6"
+opentelemetry = { version = "0.31.0", features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.31.1", default-features = false, features = [
+    "http-proto",
+    "reqwest-blocking-client",
+    "trace",
+    "metrics",
+] }
+opentelemetry_sdk = { version = "0.31.0", features = ["trace", "metrics"] }
+parking_lot = "0.12.5"
+rand = "0.8.6"
+reqwest = { version = "0.12.28", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+    "blocking",
+] }
+rusqlite = { version = "0.39.0", features = ["bundled", "fallible_uint"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.10.9"
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util = { version = "0.7.18", features = ["io", "rt"] }
+toml = "0.8.23"
+tracing = "0.1.44"
+tracing-log = "0.2.0"
+tracing-opentelemetry = "0.32.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json", "tracing-log"] }
+url = "2.5.8"
+
+# Platform deps for the built-in `file://` backend's best-effort owner
+# resolution (`src/file/owner.rs`): Unix uid→username via `getpwuid_r`,
+# Windows DACL owner SID→`domain\username`. Already present transitively
+# in the workspace lockfile (tokio/keyring/rusqlite/reqwest), so these add
+# the direct-dep edge without pulling new crate versions.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.186"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    # `FILE_ALL_ACCESS`, the access mask in the auth directory's owner-only ACE.
+    "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+ovstorage-cache = { workspace = true, features = ["test-seams"] }
+ovstorage-plugin-cache = { workspace = true }
+ovstorage-plugin-core = { workspace = true }
+ovstorage-plugin-http = { workspace = true }
+ovstorage-plugin-test = { workspace = true }
+# Enable the `test-codec` hooks so the `loaded_v2` round-trip tests can reach
+# the otherwise crate-private FFI change encoders. Dev-only: production builds
+# use the plain `ovstorage-plugin` dependency above without this feature.
+ovstorage-plugin = { workspace = true, features = ["test-codec"] }
+async-trait = "0.1.89"
+futures = "0.3.32"
+# `tests/plugin_loading.rs` reads `cargo metadata` to tell a plugin artifact
+# this checkout can build from one a different branch left in `target/`.
+serde_json = "1.0.150"
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+    "rt",
+    # `start_paused` tests: assert a timeout bound without a real wait.
+    "test-util",
+] }
+wiremock = "0.6.5"
+
+[features]
+# `test-support` exposes `auth::flow::test_support::FakeIdp` (an
+# in-process fake OAuth IdP) so downstream test crates — notably
+# `ovstorage-broker`'s three-tier integration test — can drive both
+# hops of an upstream-OAuth flow without a real network IdP.
+# Production builds leave this off; the production surface stays
+# clean of the fake-IdP HTTP server.
+test-support = []
+# `test-codec` forwards `ovstorage-plugin/test-codec`, re-exporting the
+# crate-private FFI change encoders plus `import_handle_force_foreign` (the
+# fast-path bypass that drives a same-binary handle through the full foreign
+# vtable bridge). Downstream test-only opt-in — notably the ovstorage-python
+# `test-probes` feature — so a Rust-backed probe can force
+# the foreign path in-process. Production builds leave it off.
+test-codec = ["ovstorage-plugin/test-codec"]
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

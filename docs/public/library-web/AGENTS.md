@@ -16,14 +16,20 @@ prose, see [README.md](README.md).
 
 ## Authentication
 
-- OIDC bearer JWT only. `Authorization: Bearer <token>` on every
-  request.
-- JWKS-based validation against `[server.oidc]` issuer / audience /
-  jwks_url, 10-minute TTL with unknown-`kid` refetch.
-- No OIDC config = dev mode (allow-all). Production deployments must
-  configure `[server.oidc]`; do not expose dev mode publicly.
-- API keys, Basic auth, mTLS: out of scope. Put a reverse proxy in
-  front for non-OIDC schemes.
+- Auth is fail-closed: the server `auth` field is required. `auth =
+  "anonymous"` is the explicit unauthenticated allow-all opt-in.
+- `[server.auth]` accepts `kind = "builtin-auth"` or a loaded wrapper
+  kind whose descriptor declares `auth_capable = true`. Missing, unknown,
+  non-wrapper, and non-auth-capable kinds fail startup.
+- The built-in signed-JWT form reads `authn_mode = "jwt_verify"` plus
+  `jwt_issuer`, `jwt_audience`, and `jwt_jwks_url` from
+  `[server.auth.config]`. REST does not expose mTLS client certificates,
+  trusted-proxy peers, or forwarded identity headers to built-in authn.
+- A plugin auth factory receives `[server.auth.config]` verbatim and owns
+  its schema and credential decoding. The gateway supplies the undecoded
+  bearer from `Authorization` plus the TCP peer address.
+- The REST process has no live auth-policy reload surface. Restart it to
+  reconstruct either auth wrapper after changing its config.
 
 ## Precondition headers
 
@@ -91,9 +97,6 @@ whether each precondition is honored; check
 - **Watches**: `GET /v1/objects:watch-directory` is Server-Sent
   Events. Per-event authz drops are silent (no `Lapsed` synthesis);
   upstream `Lapsed` events pass through.
-- **Auth flow**: `POST /v1/connections:authenticate?id=...` is
-  Server-Sent Events. Stop on any terminal event (`Succeeded`,
-  `Failed`, `Cancelled`).
 
 ## Errors and etags
 
@@ -125,5 +128,5 @@ whether each precondition is honored; check
 - Broker operator concerns (deployment, listener authn modes, policy,
   TLS, observability) are in
   [broker-operator README](../broker-operator/README.md).
-- Authz plugin author concerns are in
-  [plugin-authz README](../plugin-authz/README.md).
+- Authorization policy concerns are in the
+  [authorization policy guide](../authz-policy/README.md).

@@ -18,10 +18,9 @@ from pathlib import Path
 import ovstorage
 
 from _common import (
-    add_file_connection,
+    build_file_stack,
     display_name,
     format_size,
-    load_plugin_kind,
     looks_text,
 )
 
@@ -36,7 +35,7 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def _seed(library: ovstorage.Library, root: Path) -> None:
+async def _seed(storage: ovstorage.LayerBase, root: Path) -> None:
     objects = {
         "README.txt": b"ovstorage file browser demo\n",
         "scene.usda": (
@@ -51,44 +50,40 @@ async def _seed(library: ovstorage.Library, root: Path) -> None:
         "metadata.json": b"{\n  \"source\": \"ovstorage demo\",\n  \"version\": 1\n}\n",
     }
     for name, data in objects.items():
-        await library.write((root / name).as_uri(), data)
+        await storage.write((root / name).as_uri(), data)
 
 
 async def _run(plugin_dir: str | None, preview_bytes: int) -> None:
     with tempfile.TemporaryDirectory(prefix="ovstorage-browser-") as tmp:
         root = Path(tmp).resolve()
-        library = ovstorage.Library.open()
-        await load_plugin_kind(library, plugin_dir, "file")
-        connection = await add_file_connection(library, root, "file-browser-local")
+        del plugin_dir
+        storage = await build_file_stack(root, "file-browser-local")
         prefix = root.as_uri() + "/"
 
-        try:
-            await _seed(library, root)
+        await _seed(storage, root)
 
-            print("ovstorage file browser")
-            print(f"root: {root}")
-            print()
+        print("ovstorage file browser")
+        print(f"root: {root}")
+        print()
 
-            page = await library.list(prefix, max_results=100)
-            print("list:")
-            for index, item in enumerate(page.items, start=1):
-                address = getattr(item, "address")
-                name = display_name(prefix, address)
-                size = format_size(getattr(item, "size", None))
-                print(f"  {index:2}. {getattr(item, 'kind'):18} {size:>10}  {name}")
+        page = await storage.list(prefix, max_results=100)
+        print("list:")
+        for index, item in enumerate(page.items, start=1):
+            address = getattr(item, "address")
+            name = display_name(prefix, address)
+            size = format_size(getattr(item, "size", None))
+            print(f"  {index:2}. {getattr(item, 'kind'):18} {size:>10}  {name}")
 
-            print()
-            print("preview:")
-            for item in page.items:
-                address = getattr(item, "address")
-                data, info = await library.read_bytes(address, max_bytes=preview_bytes)
-                if not looks_text(address, data):
-                    continue
-                print(f"  {display_name(prefix, info.address)} ({len(data)} bytes)")
-                for line in data.decode("utf-8", errors="replace").splitlines()[:5]:
-                    print(f"    {line}")
-        finally:
-            await library.remove_connection(connection.id)
+        print()
+        print("preview:")
+        for item in page.items:
+            address = getattr(item, "address")
+            data, info = await storage.read_bytes(address, max_bytes=preview_bytes)
+            if not looks_text(address, data):
+                continue
+            print(f"  {display_name(prefix, info.address)} ({len(data)} bytes)")
+            for line in data.decode("utf-8", errors="replace").splitlines()[:5]:
+                print(f"    {line}")
 
 
 async def _main() -> None:

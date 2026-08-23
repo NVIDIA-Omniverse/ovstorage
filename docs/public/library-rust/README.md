@@ -1,548 +1,234 @@
-# library-rust persona
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
 
-> *I'm writing a Rust app that needs to read and write objects across local
-> files, S3 / GCS / Azure / Nucleus / public HTTP, with one address-routed
-> API and minimal coupling to any specific backend.*
+# Persona: Rust application using `ovstorage`
 
-This persona lands you at `ovstorage::Library` running in **Direct mode** —
-your process links plugins in-process, no daemon required. You link the
-crate into your binary, hand it a `LibraryBuilder`, register one or more
-backend plugins, and issue every read / write / list / watch through the
-address-routed `Storage` trait. The dispatcher matches caller-facing
-`ObjectAddress` values (`url::Url`) against the routing table and forwards
-each call to the right backend. Application code never branches on backend
-kind, never composes URLs out of pieces, and never sees plaintext credentials
-after `add_connection`. The alternative — Brokered mode — runs an
-`ovstorage-broker` daemon and is described in §"What's not supported".
+Rust callers compose an immutable `ovstorage::Stack` and drive it through the
+async `Layer` interface. A Stack is a graph of three Layer shapes:
 
-## Where to find each piece
+- backend Layers serve one or more address roots;
+- wrapper Layers have one `inner` child and add policy or behavior;
+- router Layers select one of several children.
 
-- **API entry and method semantics.** `ovstorage::Library` and the
-  `Storage` trait are documented below under [Storage trait](#storage-trait),
-  [Listing and paging types](#listing-and-paging-types),
-  [Change-notification types](#change-notification-types),
-  [Address-root introspection types](#address-root-introspection-types),
-  and [Routing-table types](#routing-table-types). The trait lists every
-  method (`stat`, `read_bytes`, `read_stream`, `materialize`, `write`,
-  `delete`, `list`, `list_versions`, `copy`, `rename`, directory ops,
-  watch APIs, plus connection / alias / visibility management) and is
-  the source of truth for dispatcher guarantees.
-- **Type vocabulary.**
-  [plugin-development README § Type vocabulary](../plugin-development/README.md#type-vocabulary)
-  is the canonical home for `ObjectAddress` / `Url`, `ObjectInfo`,
-  `ObjectKind`, `IfDestExists`, the options structs, the `ErrorCode`
-  taxonomy, the `Capabilities` bitset, `LocalDelegate`, and
-  `SecretBytes`. `ovstorage`
-  re-exports these so `use ovstorage::ObjectAddress;` keeps working.
-- **Backend-specific behavior.** The active direct backends each have
-  their own reference describing URL shape, config keys, capability
-  matrix, and credential story:
-  [file](../plugin-storage/plugin-file.md),
-  [http](../plugin-storage/plugin-http.md).
-- **Glossary.** Project terms (Address root, Backend, Connection, Direct
-  mode, ResolvedTarget, SecretBytes, …) are defined once in
-  [`docs/public/GLOSSARY.md`](../GLOSSARY.md).
+Application code should not add a second dispatcher around `Stack`;
+composition, canonicalization, and dispatch already live at the Layer boundary.
 
-## Loading plugins
-
-Plugins are first-party cdylibs (`libovstorage_plugin_*.{so,dylib,dll}`).
-The library does not link them statically.
-
-> **Already ran `make dist` from the repo root?** Skip the per-plugin build below — `<repo-root>/dist/plugins/` already has every first-party plugin built. Just `export OVSTORAGE_PLUGIN_DIR="$(git rev-parse --show-toplevel)/dist/plugins"` (or the absolute path) and continue at the *Tell `LibraryBuilder` which ones to load* paragraph.
-
-**Build at least one plugin first.** Add `ovstorage` to your
-`Cargo.toml`, then build the plugin you want — for example, the file
-backend:
-
-```sh
-cargo build -p ovstorage-plugin-file --release
-```
-
-The cdylib lands in `target/release/libovstorage_plugin_file.so` (or
-`.dylib`/`.dll` per platform). The `LibraryBuilder` finds plugins via
-`OVSTORAGE_PLUGIN_DIR` (an explicit env var) or, if that's unset,
-`<your-binary's-exe-dir>/plugins/`. Either copy the `.so` into one of
-those locations, or set `OVSTORAGE_PLUGIN_DIR=$PWD/target/release` and
-the dispatcher will pick it up.
-
-Open the library first, then load trusted plugin cdylibs with either
-`load_plugin(path)` or `load_plugins_from_dir(dir)`. Both are `unsafe` —
-`dlopen` runs platform loader hooks; load only trusted plugins. The
-helper `ovstorage::default_plugin_dir()` resolves to
-`$OVSTORAGE_PLUGIN_DIR` if set, else `<exe-dir>/plugins/`. Python and
-C/C++ callers use the same helper when `load_plugins_from_dir(None)` is
-called, so a single `OVSTORAGE_PLUGIN_DIR` can populate plugins
-consistently across every binding. `Library::open(None)` and
-`LibraryBuilder::open()` initialize the process-global
-[**auth substrate**](../GLOSSARY.md) automatically; callers that need a
-custom auth state directory can call
-`ovstorage::init_auth_substrate(Some(path))` before the first open.
-
-After registration, instantiate backends with
-`Storage::add_connection(ConnectionRequest, cancel)`. The request names a
-`backend_kind` (`"file"`, `"s3"`, …), a `HashMap<String, ConfigValue>`,
-and an optional `SecretBundle`. The returned `Connection` exposes the
-address roots the backend serves; those become the prefixes you pass to
-every object operation.
-
-### Picking up connections saved by the CLI
-
-If you've already used `ovstorage connect` and `ovstorage write-config`
-to set up a backend interactively, your app can pick those connections
-up automatically:
-
-```rust
-let library = Library::open(None)?;
-unsafe { library.load_plugins_from_dir(None)?; }   // None = OVSTORAGE_PLUGIN_DIR / <exe-dir>/plugins
-library.load_config(None).await?;                  // None = ./ovstorage.toml then XDG path
-```
-
-`load_config(None)` searches `./ovstorage.toml` then
-`$XDG_CONFIG_HOME/ovstorage/ovstorage.toml` (matching the CLI) and
-registers every `[[connections]]` entry on the live library. Credential
-refs (env / keyring) resolve against the same `SecretStore` you opened
-with, so a CLI `write-config --secrets keyring` flow Just Works. No
-file? `load_config` returns `Ok(Vec::new())`. Pass `Some(&path)` for a
-non-default location. Per-route overrides and `[state]` are
-builder-time concerns — wire those via `LibraryBuilder::with_cache`
-and `LibraryBuilder::add_route` before `open` if your TOML carries
-them.
-
-## Why management lives on the `Storage` trait
-
-`add_connection`, `add_alias`, `set_address_visibility`, and
-`authenticate_connection` share the trait with `read_bytes` because they
-affect routing and operation success in-process. A UI, CLI, or
-long-running app needs one coherent handle that can register a connection,
-watch its address roots, authenticate it, add an alias, and read from the
-resulting address — without racing a separate local state channel.
-
-Brokered mode does **not** project these management calls through
-`broker-client`. Object operations route by `ObjectAddress`, but
-`add_connection` does not name an address the library could route to a
-broker. The `broker-client` plugin sits behind the `StorageBackend` SPI,
-which deliberately omits management APIs. Operators run a broker, edit
-its TOML, and reload; client-side `Storage` management is local to the
-library process.
-
-## Stable read / modify / write
-
-`stat` (and reads, writes, lists, directory ops) returns `ObjectInfo`
-carrying the backend-observed `etag` (plus descriptive `version` /
-`size` / `mtime`). To make a later call conditional on the same
-bytes, pass the etag back as `ReadOptions::if_match` /
-`DeleteOptions::if_match` / `UpdateMetadataOptions::if_match`, or
-inside `WriteOptions::if_dest = IfDestExists::MatchEtag(etag)` /
-`CopyOptions::if_source` / `RenameOptions::if_source`. The address
-names *which* object; the etag asserts *which version of its bytes*.
-Backends with native versioning expose version selection through
-version-pinned addresses. Preconditions are etag-only: pass
-`ObjectInfo.etag` back through the relevant `if_match` /
-`if_source` / `if_dest` field to validate the object you observed.
-Backends without etag-bound writes advertise that through the
-`Capabilities::supports_if_match_write` bit and reject etag-bound
-writes with a typed error rather than silently last-writer-wins.
-
-## Address building
-
-The library never composes URLs by string concat or `format!` — caller
-code shouldn't either. Use the helpers in `ovstorage::address`
-(re-exported from `ovstorage_plugin::address`):
-`address::parse(s)` validates and normalizes a caller-facing string;
-`address::join_relative(prefix, key)` joins a child key onto an
-address-root prefix without re-encoding existing percent-escapes.
-Roll-your-own concatenation breaks on roots whose paths don't end in `/`,
-on keys with reserved characters, and on multi-byte UTF-8.
-
-## Secrets
-
-`SecretBytes` is redacted in `Debug`, zeroizes on drop, refuses
-serialization. Every `CredentialField` in a `StorageBackendKindDescriptor`
-is flagged `secret = true`; the public API never returns plaintext after
-`add_connection`. A descriptor-driven UI that respects `secret = true`
-can render the schema, accept user-supplied bytes as `SecretBytes`, and
-only ever read back redacted values.
-
-## Direct-mode trust boundary
-
-Routes are local naming concerns. The library trusts the process it runs
-in: anything that can call `add_connection` or edit the config files
-feeding it can register a backend. Operator control over who can mutate
-the routing table is the defense; library-side hardening against a
-principal who already has process access is not. For cross-process
-authorization, run a broker — it enforces authz on incoming caller-facing
-addresses and only dispatches addresses in its own table.
-
-## End-to-end example: file backend round-trip
-
-The pattern below is exactly what
-`ovstorage-core/crates/ovstorage-plugin-file/tests/loaded.rs` exercises
-against the dlopen'd file plugin. Minimum `Cargo.toml`:
+## Add the crate
 
 ```toml
 [dependencies]
-ovstorage = "0.1"
-ovstorage-plugin = "0.1"
+ovstorage = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-tempfile = "3"
-anyhow = "1"
+url = "2"
 ```
 
-Build the file plugin once with `cargo build -p ovstorage-plugin-file
---release` (or the HTTP plugin with
-`cargo build -p ovstorage-plugin-http --release`; "first-party" here means a
-cdylib in this repo, never statically linked).
+Workspace users can use `ovstorage = { path = "ovstorage-core/ovstorage" }`.
 
-```rust,ignore
-use std::collections::HashMap;
+Retry and redirect following are opt-in wrapper Layers: a Stack that does not
+declare a `retry` Layer and a `redirect_follower` Layer has neither behavior.
+`file` is a built-in kind, so `register_default_layer_factories` gives you a
+`file` backend without a plugin build. Resolved credentials are cached in
+memory only; the crate exposes no credential-cache persistence seam.
 
-use ovstorage::Library;
-use ovstorage::Storage as _;
-use ovstorage::address;
-use ovstorage_plugin::{
-    Body, ConfigValue, ConnectionRequest, DeleteOptions,
-    ListOptions, ReadOptions, SecretBundle, StatOptions, WriteOptions,
+## Compose a Stack
+
+`StackBuilder` is explicit and one-shot: register the factory for every kind,
+declare named Layer instances, attach connections, choose a root, then call
+`build().await`. The built Stack is immutable and implements `Layer`.
+
+The plugin-free factory is available through
+`ovstorage::layers::register_default_layer_factories`: it registers exactly
+the `file` backend, which is built in. Everything else, including every
+wrapper, must be declared.
+Routers and public wrappers come from ABI-v2 plugins loaded
+with `load_layer_plugin` or `load_layer_plugins_from_dir`; register each
+returned `LoadedLayerFactory` on the builder according to its variant.
+
+```rust
+use ovstorage::{LayerSpec, Stack};
+
+let builder = ovstorage::layers::register_default_layer_factories(
+    Stack::builder("files"),
+)
+.layer(LayerSpec::backend(
+    "files",
+    ovstorage::layers::FILE_BACKEND_KIND,
+));
+
+// Add a LayerConnectionRequest targeting "files", then build:
+// let stack = builder.connection(connection).build().await?;
+```
+
+Connections carry backend config and credentials separately from graph shape.
+For deployment configuration, prefer the shared `[ovstorage]` TOML schema in
+[`../configuration.md`](../configuration.md). `StackConfig` parses that schema
+and `stack_config_to_spec` resolves named kinds against loaded factories.
+
+## Load plugins
+
+Storage plugins are ABI-v2 Layer plugins. Rust hosts initialize the process
+auth substrate, load only trusted cdylibs, and register their advertised
+factories before building:
+
+```rust
+use ovstorage::{LoadedLayerFactory, Stack};
+
+ovstorage::init_auth_substrate(None)?;
+let factories = unsafe {
+    ovstorage::load_layer_plugin("./plugins/libovstorage_plugin_http.so", false)?
 };
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let library = Library::open(None)?;
-    // SAFETY: only load plugin paths you trust; `dlopen` runs loader hooks.
-    unsafe { library.load_plugins_from_dir(None)?; }
-
-    let root = tempfile::tempdir()?;
-    let mut config = HashMap::new();
-    config.insert(
-        "root".into(),
-        ConfigValue::String(root.path().to_string_lossy().into_owned()),
-    );
-    let connection = library
-        .add_connection(
-            ConnectionRequest {
-                backend_kind: "file".into(),
-                config,
-                credentials: SecretBundle::default(),
-                persist: false,
-                display_name: Some("scratch".into()),
-            },
-            None,
-        )
-        .await?;
-    // `current_addresses: Vec<Url>` carries every address root the
-    // connection serves. The file plugin publishes exactly one root —
-    // the configured `root` directory — so `[0]` is the only element.
-    // Backends that publish multiple roots (S3 multi-bucket, broker-
-    // delivered fan-out) hand back a list; iterate or pick by display
-    // hint depending on what the connection advertises.
-    let prefix = connection.current_addresses[0].clone();
-    let object = address::join_relative(&prefix, "hello.txt")?;
-
-    library
-        .write(object.clone(), Body::Bytes(b"hello".to_vec()),
-               WriteOptions::default(), None)
-        .await?;
-    let (bytes, _info) =
-        library.read_bytes(object.clone(), ReadOptions::default(), None).await?;
-    assert_eq!(bytes, b"hello");
-    let _listing =
-        library.list(prefix.clone(), ListOptions::default(), None).await?;
-    library.delete(object.clone(), DeleteOptions::default(), None).await?;
-    let _ = library.stat(object, StatOptions::default(), None).await; // NotFound
-    Ok(())
+let mut builder = Stack::builder("root");
+for factory in factories {
+    builder = match factory {
+        LoadedLayerFactory::Backend(f) => builder.backend_factory(f),
+        LoadedLayerFactory::Wrapper(f) => builder.wrapper_factory(f),
+        LoadedLayerFactory::Router(f) => builder.router_factory(f),
+    };
 }
 ```
 
-## Streaming write limits
+Plugin loading is unsafe because opening a shared library runs platform loader
+hooks. The host permanently pins a successfully loaded plugin for process
+lifetime. `test_only` manifests are rejected unless the load call explicitly
+sets `allow_test_plugins = true`.
 
-`Body::Stream` propagates chunk-by-chunk through every seam (dispatcher,
-redirect follower, plugin SPI) — never drained to a `Vec<u8>`. The
-single restriction: streaming writes are limited to one redirect round.
-A second redirect round on a consumed stream surfaces `Unsupported`,
-because the body bytes are gone after the first round. In practice
-this means streaming uploads to S3 multipart (which can need a fresh
-redirect for each part-completion phase) currently return `Unsupported`
-on the second round; one-shot S3 PUTs, GCS resumable uploads, Azure
-block blobs, and the file plugin all complete in one round and stream
-fine.
+## Layer operations
 
-## What's not supported
+`Layer` is the authoritative typed interface. Every async operation accepts a
+`Request<T>` plus an optional `CancellationToken`. The request's `Extensions`
+bag carries request facts such as principal identity; it is not an instruction
+channel.
 
-Direct mode runs in your process. A few capabilities require a broker:
+The operational groups are:
 
-- **Group cancellation.** Direct mode cancels per-call via the `cancel:
-  Option<&CancellationToken>` parameter. There is no "cancel everything
-  for principal X" library API.
-- **Cross-process authorization.** Allow / deny / audit policy runs in
-  the broker against an `AuthzPlugin`. Direct-mode `Library` trusts the
-  process.
-- **Per-principal limits and quotas.** Rate limits, quotas, and
-  per-principal credentials live broker-side.
-- **`add_connection` against `broker-client`.** Brokered backends are
-  configured operator-side in the broker's TOML and published to clients
-  as address roots through the `address_roots` stream. Clients consume
-  them; they do not register them.
+- object I/O: `stat`, `read`, `write`, `write_stream`, `delete`, `copy`,
+  `rename`, `materialize`, metadata and directory operations;
+- enumeration and change notification: `list`, `list_versions`,
+  `get_latest_version`, `watch_directory`;
+- introspection: `root_info_for`, `list_kinds`, `list_address_roots`;
+- connection lifecycle: add, remove, update, list, and authenticate.
 
-Those capabilities require a broker deployment, which is outside the
-scope of the current in-repo surface. The application surface
-(`Library`, `Storage`, addresses, options, errors) is designed so the
-same caller code works against both modes.
+Wrappers return `inner_layer()` and inherit delegation defaults for operations
+they do not intercept. Backends and routers implement the slots they support;
+unsupported optional behavior returns `ErrorCode::Unsupported`.
 
-## Storage trait
+### Ergonomic calls
 
-`Storage` is the abstract operation surface every binding ultimately
-calls into. The `Library` handle implements it; test doubles implement
-the same shape so generic application code works against either.
+`ovstorage::ext::LayerExt` provides URL-plus-options helpers over any Layer,
+including `Stack`: `read_bytes`, `read_stream`, `list_page`, and ergonomic
+forms of stat/write/delete/copy/rename/materialize.
 
-The current surface includes the object-addressed core
-(`capabilities_for`, `stat`, the three read entry points plus
-`read_raw` for binding-side gateways, `write`, `write_redirect` +
-`continue_write` for body-less / multi-stage redirect flows, `delete`,
-`list`, `list_versions`, `get_latest_version`, `copy`, `rename`,
-`create_directory`, `delete_directory`, `update_metadata`, and
-`check_access`) plus the direct-mode control APIs: `watch_directory`,
-`list_address_roots`, backend-kind descriptors, connection
-add/remove/list/watch, alias add/remove/list/watch, exact-row
-visibility overrides, and `authenticate_connection`.
+```rust
+use ovstorage::ext::LayerExt as _;
+use ovstorage::{ReadOptions, Url};
 
-The trait signature below names methods, address types, options, and
-return types. The actual trait carries `#[async_trait]`; every
-byte-moving method is `async` and takes a final
-`cancel: Option<CancellationToken>` parameter that propagates through
-`StorageBackend` SPI calls. State-reader methods (`list_*`, `watch_*`
-setup, `capabilities_for`) stay synchronous because they only touch
-in-memory state. The names below match the actual trait one-to-one —
-the `async` and `cancel` modifiers are elided for readability. *(Note:
-Rust signatures use `url::Url` for the address parameter type; this
-section uses `ObjectAddress` as the conceptual name. The crate
-re-exports `ovstorage_plugin::address` so `use ovstorage::ObjectAddress`
-keeps working.)*
+let address = Url::parse("file:///data/scene.usd")?;
+let (bytes, info) = stack.read_bytes(address, ReadOptions::default(), None).await?;
+```
+
+Some helper names intentionally overlap typed `Layer` methods. Where both
+traits are in scope, use UFCS (`LayerExt::stat(...)` or `Layer::stat(...)`) to
+select the intended form.
+
+## Address and routing contract
+
+The Stack boundary canonicalizes every address-bearing request before the root
+Layer sees it. Routers match canonical address roots; aliases and caches can
+therefore use canonical URLs as stable keys. Result addresses remain
+caller-facing unless an operation's contract explicitly returns another
+address.
+
+`RootInfo.capabilities` advertises optional behavior for a route — metadata
+patching, directory watches, versioning, conditional writes, server-side copy
+and rename. The bits are **hints, and the two answers are not symmetric**:
+`false` is actionable (the operation is known to be unavailable, so skip it or
+grey it out in a UI), while `true` means only "not known to be impossible."
+An advertised operation can still return `Unsupported` — the deployment behind
+a protocol may not implement it, a policy Layer may intercept the slot, or the
+specific arguments may fall outside what the backend supports. Check
+capabilities to avoid round-trips that cannot succeed; still handle
+`Unsupported` from the ones you attempt.
+
+For `copy` and `rename` the bits separate three questions. `supports_copy` /
+`supports_rename` answer **availability** — whether the operation can be
+attempted at all — and are what you want when deciding whether to offer the
+action. `supports_server_side_copy` / `supports_server_side_rename` answer
+**mechanism**: the backend moves the bytes itself, so there is no egress
+through this process and native metadata and checksums survive. Reach for the
+mechanism bits only when optimizing; a stack configured with the
+`copy_rename_fallback` Layer serves `copy` and `rename` even where the backend
+offers neither, by reading the source and writing the destination (and deleting
+the source, for `rename`), carrying your `if_source` and `if_dest`
+preconditions onto both halves. That fallback is not atomic and does not
+preserve backend-native metadata.
+
+`supports_server_side_*` and `supports_atomic_rename` describe what the backend
+does when it handles the operation itself. Whether any particular call takes
+that path is decided per request — a backend can rename most objects
+server-side and decline the one carrying a precondition it cannot express — so
+those bits are not lowered when a `copy_rename_fallback` Layer is composed, and
+a successful call may still have been emulated. The Layer emits a `tracing`
+event each time it emulates; watch that if you need to know whether a given
+transfer stayed on the server or a given rename was atomic.
+
+## Errors, cancellation, and streaming
+
+All operations return the closed `ovstorage::ErrorCode` taxonomy. Retry is a
+wrapper policy, not implicit behavior of `Stack`; include a `retry` Layer when
+the deployment wants it. Cancellation is cooperative through
+`tokio_util::sync::CancellationToken`.
+
+Use `LayerExt::read_stream` for bounded-memory reads. `read_bytes` buffers and
+enforces `ReadOptions.max_bytes`. `Body::Stream` stays streaming through the
+Layer and plugin seams and is not replayable by retry wrappers after
+consumption.
+
+## Built-in composition
+
+The common direct-mode chain is:
 
 ```text
-pub trait Storage {
-    fn capabilities_for(&self, prefix: &ObjectAddress) -> Result<Capabilities>;
-    fn list_address_roots(&self) -> Result<Vec<AddressRoot>>;
-    fn list_backend_kinds(&self) -> Result<Vec<StorageBackendKindDescriptor>>;
-    fn add_connection(&self, request: ConnectionRequest) -> Result<Connection>;
-    fn remove_connection(&self, id: &ConnectionId) -> Result<()>;
-    fn update_connection_credentials(&self, id: &ConnectionId, credentials: SecretBundle) -> Result<Connection>;
-    fn list_connections(&self) -> Result<Vec<Connection>>;
-    fn watch_connections(&self) -> Result<ConnectionChangeStream>;
-    fn add_alias(&self, request: AliasRequest) -> Result<Alias>;
-    fn remove_alias(&self, id: &AliasId) -> Result<()>;
-    fn list_aliases(&self) -> Result<Vec<Alias>>;
-    fn watch_address_roots(&self) -> Result<AddressRootSnapshotStream>;
-    fn set_address_visibility(&self, address: ObjectAddress, visibility: AddressVisibility, persist: bool) -> Result<AddressVisibilityOverride>;
-    fn list_address_visibility_overrides(&self) -> Result<Vec<AddressVisibilityOverride>>;
-    fn authenticate_connection(&self, id: &ConnectionId) -> Result<AuthEventStream>;
-    fn stat(&self, addr: ObjectAddress, opts: StatOptions) -> Result<ObjectInfo>;
-    fn read_bytes(&self, addr: ObjectAddress, opts: ReadOptions) -> Result<(Vec<u8>, ObjectInfo)>;
-    fn read_stream(&self, addr: ObjectAddress, opts: ReadOptions) -> Result<(ReadStream, ObjectInfo)>;
-    fn materialize(&self, addr: ObjectAddress, opts: ReadOptions) -> Result<LocalDelegate>;
-    fn read_raw(&self, addr: ObjectAddress, opts: ReadOptions) -> Result<ReadResult>;
-    fn write(&self, dest: ObjectAddress, body: Body, opts: WriteOptions) -> Result<WriteResult>;
-    fn write_redirect(&self, dest: ObjectAddress, opts: WriteOptions) -> Result<WriteRedirectBatch>;
-    fn continue_write(&self, dest: ObjectAddress, redirects: WriteRedirectBatch, results: RedirectResultBatch) -> Result<WriteStep>;
-    fn delete(&self, addr: ObjectAddress, opts: DeleteOptions) -> Result<()>;
-    fn list(&self, prefix: ObjectAddress, opts: ListOptions) -> Result<Vec<ObjectInfo>>;
-    fn list_versions(&self, addr: ObjectAddress, opts: ListVersionsOptions) -> Result<Vec<ObjectInfo>>;
-    fn get_latest_version(&self, addr: ObjectAddress) -> Result<ObjectInfo>;
-    fn watch_directory(&self, prefix: ObjectAddress, opts: WatchDirectoryOptions) -> Result<ChangeStream>;
-    fn create_directory(&self, addr: ObjectAddress, opts: CreateDirectoryOptions) -> Result<ObjectInfo>;
-    fn delete_directory(&self, addr: ObjectAddress, opts: DeleteDirectoryOptions) -> Result<()>;
-    fn copy(&self, src: ObjectAddress, dest: ObjectAddress, opts: CopyOptions) -> Result<WriteResult>;
-    fn rename(&self, src: ObjectAddress, dest: ObjectAddress, opts: RenameOptions) -> Result<()>;
-    fn update_metadata(&self, addr: ObjectAddress, opts: UpdateMetadataOptions) -> Result<ObjectInfo>;
-    fn check_access(&self, addr: ObjectAddress, ops: AccessOps) -> Result<AccessDecision>;
-}
+alias -> copy_rename_fallback -> redirect_follower -> retry -> router -> backends
 ```
 
-`read_raw` returns the raw `ReadResult` from the backend without
-following redirects or materializing local-delegate files; the REST
-gateway uses it to surface `ReadResult::Redirect` as `307` and stream
-`ReadResult::LocalDelegate` directly to the caller. `write_redirect`
-is a body-less entry that resolves the route and asks the plugin for
-redirect requests directly — used by the broker's gRPC `WriteRedirect`
-handler. `continue_write` feeds executed redirect results back to the
-plugin and returns either the final `WriteResult` (`WriteStep::Done`)
-or another `WriteStep::Redirects` for multi-stage multipart uploads.
+Byte and metadata caches are optional wrappers and belong where the deployment
+wants their semantics. The exact graph is configuration, not a hidden default.
+See [configuration](../configuration.md) for a complete TOML example.
 
-The trait carries only the signatures and the contracts they imply;
-the type definitions are in
-[plugin-development README § Type vocabulary](../plugin-development/README.md#type-vocabulary).
+Concurrent successful `watch_directory` calls are independent logical
+subscriptions: each sees all eligible events from the point it returns. On a
+competing-consumer backend (where each notification is delivered to exactly one
+reader), the backend self-coalesces overlapping subscriptions on one connection
+via the SDK `WatchCoalescer` so every subscriber still receives every event. A
+subscription with `since` requests replay: a resumable backend may serve it from
+a dedicated seek reader with real replay, while a non-resumable
+competing-consumer backend coalesces onto the live stream and prepends a single
+initial `Lapsed`.
 
-The trait is async (`#[async_trait]`); pure state-reader methods
-(`list_*`, `watch_*` setup, `capabilities_for`) stay synchronous
-because they only touch in-memory state. `list` and `list_versions`
-return finite vectors, and `Library::list_page` returns a
-`ListPage { items, next_page_token }` struct for boundary APIs that
-need paging. `read_stream` returns an async
-`futures::Stream<Item = Result<bytes::Bytes>>`; `watch_directory`,
-connection watches, alias watches, and auth events are synchronous
-boxed iterators (`Box<dyn Iterator<Item = Result<…>> + Send>`)
-returned by an async setup call — those are notification-rate watch
-channels, not data paths, and the iterator shape is fine for them.
+There is no `read_raw` operation. A `read` returns whatever the backend
+produces — including a `ReadResult::Redirect` — unless a `redirect_follower`
+wrapper above the backend resolves it first. To get the raw, unfollowed
+redirect (for example, to hand a pre-signed URL straight to a caller), compose
+the Stack without a `redirect_follower` on that path, or configure the wrapper
+with `follow_reads = false`; the backend `Redirect` then surfaces to the caller
+unchanged. This is how the REST gateway runs — `follow_reads = false`,
+surfacing redirects as HTTP 307. One exception: a redirect whose credential
+authorizes more than the redirected request is followed locally and returned as
+a `Stream` even under `follow_reads = false`, because that credential may not
+cross the host boundary. What decides that is the minting backend's own
+declaration of what its credential authorizes — an account-scoped signature and
+an object-scoped one are indistinguishable on the wire, so it cannot be
+inferred from the redirect. A host that means to disclose such redirects
+anyway sets `disclose_redirect_credentials` on the layer, which defaults to
+refusing.
 
-For API framing, treat `Storage` as one trait with four groups. The
-first two groups together are the object-addressed core; the split
-below keeps byte-moving I/O distinct from adjacent control:
+## Related references
 
-- **Object I/O:** `stat`, `read_bytes`, `read_stream`, `materialize`,
-  `write`, `delete`, `list`, `list_versions`, `copy`, `rename`,
-  `create_directory`, `delete_directory`, `update_metadata`.
-- **Object-adjacent control:** `check_access`, `capabilities_for`;
-  `watch_directory` joins this group when change notifications land.
-- **Routing and connection management:** `list_address_roots`,
-  connection add / remove / list / watch / credential update, alias
-  add / remove / list / watch, visibility overrides.
-- **Authentication streams:** `authenticate_connection` and
-  `watch_auth_events`.
-
-The first group is the data-plane surface application authors usually
-learn first. The other groups are still public API; bindings and the
-CLI expose them rather than inventing crate-specific management APIs.
-
-## Listing, versions, and paging types
-
-```text
-pub enum ObjectKind { File, Directory, DirectoryMarker, DirectoryInferred }
-
-pub struct ListPage {
-    pub items:           Vec<ObjectInfo>,
-    pub next_page_token: Option<String>,
-}
-
-pub struct VersionPage {
-    pub items:           Vec<ObjectInfo>,
-    pub next_page_token: Option<String>,
-}
-```
-
-`list` returns `ObjectInfo` values directly. `ObjectInfo.kind`
-distinguishes files from directories, so a non-recursive list can
-return object entries and immediate child directory entries in the
-same vector; recursive lists return the subtree and include directory
-facts (`Directory`, `DirectoryMarker`, or `DirectoryInferred`). On
-flat backends, descendant objects imply missing inferred ancestor
-directories. Display names are derived from the listed prefix and each
-returned `ObjectInfo.address`; they are not a separate API field.
-
-`list_versions` is public API because versioned-object workflows need
-caller-facing, version-pinned addresses. The dispatcher calls the
-plugin's `list_versions`, projects each returned `ObjectInfo.address`
-into the caller-facing namespace, and leaves the backend-native
-version pin in the address. `get_latest_version` returns the same
-shape for one address: if the input is unpinned, the returned
-`ObjectInfo.address` pins the current head; if the input is already
-pinned, it describes that exact version. Ordering is whatever the
-backend naturally produces;
-`Capabilities.supports_version_listing` gates the operation, and
-`Capabilities.version_list_order` tells callers whether the native
-order is `Newest`, `Oldest`, or `Unordered` when listing is supported.
-
-Rust callers consume finite `Vec<ObjectInfo>` values from the trait.
-Boundary APIs that need page envelopes use
-`ListPage` / `VersionPage`; the page token is opaque and is owned by
-the library/adapter, not by application code.
-
-## Change-notification types
-
-```text
-pub enum ChangeEvent {
-    Object {
-        address:  ObjectAddress,
-        kind:     ChangeKind,
-        etag:     Option<String>,
-        at:       SystemTime,
-        cursor:   WatchDirectoryCursor,
-    },
-    Lapsed {
-        since:  Option<SystemTime>,
-        cursor: WatchDirectoryCursor,
-    },
-}
-```
-
-`watch_directory` streams are at-least-once with explicit gap
-signaling. Events are best-effort. Ordering within a single object's
-URL is preserved when the native feed preserves it. Total ordering
-across a prefix is **not** guaranteed. Whenever the plugin knows it
-has dropped events, it emits an explicit
-`ChangeEvent::Lapsed { since }` and the caller is responsible for
-re-listing if correctness matters. `ChangeKind` and
-`WatchDirectoryCursor` are defined in
-[plugin-development README § Type vocabulary](../plugin-development/README.md#type-vocabulary).
-
-## Address-root introspection types
-
-```text
-pub struct AddressRoot {
-    pub address:        ObjectAddress,
-    pub display_name:   Option<String>,
-    pub backend_kind:   String,
-    pub connection_id:  Option<ConnectionId>,
-    pub capabilities:   Capabilities,
-    pub source:         RouteSource,
-    pub visibility:     AddressVisibility,
-    pub user_metadata:  UserMetadata,
-}
-
-pub enum RouteSource {
-    Static { layer: ConfigLayer },
-    ConnectionContributed { connection_id: ConnectionId },
-    BrokerDelivered { broker_principal: String, connection_id: ConnectionId },
-    Alias { to: ObjectAddress, alias_source: AliasSource },
-}
-
-pub enum AliasSource {
-    Static { layer: ConfigLayer },
-    Runtime { added_by: Option<PrincipalView>, persisted: bool },
-    BrokerDelivered { broker_principal: String },
-}
-
-pub enum AddressVisibility {
-    Visible,
-    Hidden,
-    Suppressed,
-}
-
-pub enum ConfigLayer { Programmatic, Env, Project, User, Machine }
-```
-
-## Routing-table types
-
-The routing table is the merge of three sources, all producing rows
-keyed by **absolute `ObjectAddress`** — there is no library-side URL
-composition (plugins own all URL knowledge; see
-[plugin-development README § Surface boundary](../plugin-development/README.md#surface-boundary)):
-
-1. **Static rows** — programmatic config, env, project, user, machine
-   config. `RouteSource = Static { layer }`.
-2. **Connection-contributed rows** — every address returned by an
-   active connection's `StorageBackend::address_roots` becomes a row.
-   `RouteSource = ConnectionContributed { connection_id }` for direct
-   connections, `BrokerDelivered { broker_principal, connection_id }`
-   for addresses flowing in through a `broker-client` connection.
-3. **Alias rows** — every alias produces a row whose `from` is the
-   row's address and whose `to` is an `ObjectAddress` somewhere else
-   in the table. `RouteSource = Alias { to, alias_source }`.
-
-```text
-pub struct RouteRow {
-    pub address:          ObjectAddress,
-    pub backend_instance: Option<BackendId>,    // None for alias rows
-    pub capabilities:     Capabilities,
-    pub source:           RouteSource,
-    pub visibility:       AddressVisibility,
-    pub display_name:     Option<String>,
-    pub user_metadata:    UserMetadata,
-}
-```
-
-Resolution is **prefix-only and longest-prefix wins**. Equal-prefix
-conflicts are resolved by source priority. Configuration sources, in
-order of precedence (highest first): programmatic > env > project >
-user > machine > broker-delivered.
-
-The `Storage` trait above is the abstract operation surface; generic
-code can be written once and run against either a real `Library` or a
-test double that implements the same trait.
+- [Rust caller routing notes](AGENTS.md)
+- [Configuration](../configuration.md)
+- [Storage plugin behavior](../plugin-storage/README.md)
+- [Plugin development](../plugin-development/README.md)
+- [Glossary](../GLOSSARY.md)

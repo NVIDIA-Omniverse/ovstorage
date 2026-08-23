@@ -1,5 +1,9 @@
 # ovstorage-mcp tools v0
 
+> **`v0` is the MCP tool-surface version and `v=0.1` is the envelope schema
+> version. Neither is the ovstorage release.** The tool surface is `v0`;
+> ovstorage itself is at 0.2.1.
+
 `ovstorage-mcp` exposes ovstorage over MCP stdio. Every tool response is a
 single text content block containing the [v=0.1 agent envelope](envelope.md).
 Tool failures also set MCP `isError: true`.
@@ -18,6 +22,14 @@ Tool failures also set MCP `isError: true`.
 
 The server uses the CLI config precedence: `OVSTORAGE_CONFIG`, then the
 default user config path. `OVSTORAGE_MCP_NO_CONFIG=1` skips config loading.
+`ovstorage.toml` is the `[ovstorage]` Stack schema (layers + connections)
+documented in [`../configuration.md`](../configuration.md); with no config
+the stack is empty. Object I/O then returns `Unsupported`, as does
+`ovstorage_capabilities`. The three introspection tools —
+`ovstorage_doctor`, `ovstorage_connections_list`, and
+`ovstorage_address_roots_list` — succeed and report empty, as does
+`ovstorage_release`, which is served from the session lease store rather
+than the stack.
 
 ## MCP To CLI Equivalence
 
@@ -49,6 +61,14 @@ diagnostic commands such as `cache-status`, `cache-doctor`, and
 
 - `ovstorage_doctor` takes no params. Returns version, backend kinds,
   connections, address roots, and aliases with URL-like fields redacted.
+  Its `backend_kinds` enumerates the backend layers this stack was built
+  with — not the kinds the library could construct — so a stack with no
+  declared layers reports an empty list. **An empty `backend_kinds` on a
+  host you believe is configured usually means the config file carries no
+  `[ovstorage]` table**: such a file loads without error and yields an
+  empty stack. Check it against
+  [`../configuration.md`](../configuration.md) rather than treating the empty
+  list as a doctor bug.
 - `ovstorage_capabilities` takes `{ "prefix": string }`. Returns capability
   bits for the backend serving the prefix.
 
@@ -88,7 +108,7 @@ Three concrete shapes are used across the write-side tools:
   - `{"kind": "fail"}` — refuse to overwrite. Returns `AlreadyExists` if
     the destination exists.
   - `{"kind": "match_etag", "etag": "<s>"}` — overwrite only when the
-    destination's current etag matches `<s>`. Returns `ObjectModified`
+    destination's current etag matches `<s>`. Returns `PreconditionFailed`
     on mismatch.
 
 ## Write
@@ -176,7 +196,7 @@ Tool errors use the envelope error object:
     "code": "NotFound",
     "message": "file does not exist",
     "retryable": false,
-    "next_action": "Call library.add_connection(...) ..."
+    "next_action": "Add a matching connection to ovstorage.toml and restart the MCP server."
   }
 }
 ```

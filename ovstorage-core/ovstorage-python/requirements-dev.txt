@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Keep these in sync with pyproject.toml's dev dependency group. In particular,
+# pytest-asyncio and mypy are required gates: absence must not turn async tests
+# or stub drift detection into vacuous green runs.
+mypy>=1.10
+pytest>=8
+pytest-asyncio>=0.23

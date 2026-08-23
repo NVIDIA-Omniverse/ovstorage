@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-test-abi"
+version.workspace = true
+edition = "2024"
+description = "ABI-v2 cdylib export of the ovstorage-plugin-test conformance backend. Split from the harness crate so its rlib carries no fixed-name FFI export symbols and can be linked into other plugins' test binaries (they export the same ovstorage_plugin_* entry points from their own cdylibs)."
+license = "Apache-2.0"
+publish = false
+build = "build.rs"
+
+[dependencies]
+ovstorage-plugin = { workspace = true }
+ovstorage-plugin-test = { workspace = true }
+async-trait = "0.1.89"
+futures = "0.3.32"
+
+[dev-dependencies]
+ovstorage = { workspace = true }
+serde_json = "1.0.150"
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+    "rt",
+] }
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true

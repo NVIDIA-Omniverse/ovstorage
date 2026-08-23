@@ -1,0 +1,1224 @@
+openapi: 3.1.0
+info:
+  title: ovstorage REST
+  description: Public REST gateway for ovstorage. The OpenAPI document is the versioned contract; the gRPC `.proto` is internal between the broker daemon and the broker plugin.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  version: 0.2.1
+paths:
+  /v1/address-roots:
+    get:
+      tags:
+      - discovery
+      summary: |-
+        List every address root currently routed by this gateway.
+        Aliases appear only if their `visibility` is `visible`.
+      operationId: list_address_roots
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AddressRootList'
+  /v1/backend-kinds:
+    get:
+      tags:
+      - discovery
+      summary: List the backend kinds this gateway can serve.
+      operationId: list_backend_kinds
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackendKindList'
+  /v1/capabilities:
+    get:
+      tags:
+      - discovery
+      summary: |-
+        Look up the capabilities of the backend serving a prefix
+        (feature detection for clients).
+      operationId: get_capabilities
+      parameters:
+      - name: prefix
+        in: query
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilitiesResponse'
+  /v1/directories:
+    put:
+      tags:
+      - directories
+      summary: |-
+        Create a directory; emulated via a zero-byte marker on flat
+        namespaces (S3, GCS), real directory on hierarchical backends.
+      operationId: create_directory
+      parameters:
+      - name: address
+        in: query
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectInfoResponse'
+    delete:
+      tags:
+      - directories
+      summary: Delete an empty directory; returns `409` if non-empty.
+      operationId: delete_directory
+      parameters:
+      - name: address
+        in: query
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Deleted
+        '409':
+          description: Directory not empty
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /v1/objects:
+    get:
+      tags:
+      - objects
+      summary: |-
+        Read an object's bytes; the gateway may respond `307` with an
+        upstream `Location` and `X-OV-Audit-Id` when the backend prefers
+        the client fetch directly.
+      description: |-
+        An optional `If-Match: "<etag>"` header (RFC 7232) refuses the
+        read unless the target's current etag matches. The etag MAY be
+        sent unquoted; the `W/` weak-etag prefix is tolerated. The
+        wildcard form `If-Match: *` is rejected because ovstorage
+        preconditions require a concrete etag.
+      operationId: read_object
+      parameters:
+      - name: address
+        in: query
+        description: Object address to read
+        required: true
+        schema:
+          type: string
+      - name: If-Match
+        in: header
+        description: 'Etag precondition: refuse the read unless the target''s current etag matches'
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      - name: Range
+        in: header
+        description: Byte range as `bytes=START-END` (inclusive); `END` may be omitted for open-ended
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      responses:
+        '200':
+          description: Object bytes
+          content:
+            application/octet-stream:
+              schema:
+                type: array
+                items:
+                  type: integer
+                  format: int32
+                  minimum: 0
+        '307':
+          description: Redirect to upstream — body is at the URL in the Location header
+        '400':
+          description: 'If-Match: * is not supported; supply a concrete etag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '403':
+          description: The backend's redirect carries a credential broader than this request and `redirect_credential_disclosure` is `refuse`, with no follower in the graph to fetch the bytes instead
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Object not found at the given address
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '412':
+          description: If-Match precondition failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+    put:
+      tags:
+      - objects
+      summary: |-
+        Write an object. Destination preconditions are expressed with
+        standard RFC 7232 headers:
+        - no precondition header — clobber unconditionally.
+        - `If-None-Match: *` — refuse if the destination exists
+          (`409 AlreadyExists`).
+        - `If-Match: "<etag>"` — overwrite only when the destination's
+          current etag matches (`412` on mismatch). The etag MAY also be
+          sent unquoted; the `W/` weak-etag prefix is tolerated. The
+          wildcard form `If-Match: *` is rejected because ovstorage
+          preconditions require a concrete etag.
+      description: |-
+        `If-Match` and `If-None-Match` are mutually exclusive on a single
+        request: sending both returns `400 InvalidArgument`. Only the
+        literal `*` is accepted for `If-None-Match`; any other value
+        returns `400` (negative etag matching is not supported).
+      operationId: write_object
+      parameters:
+      - name: dest
+        in: query
+        description: Destination address
+        required: true
+        schema:
+          type: string
+      - name: If-Match
+        in: header
+        description: Overwrite only when the destination's current etag matches
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      - name: If-None-Match
+        in: header
+        description: 'Only the literal `*` is accepted: refuse if the destination already exists'
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      requestBody:
+        content:
+          application/octet-stream:
+            schema:
+              type: array
+              items:
+                type: integer
+                format: int32
+                minimum: 0
+        required: true
+      responses:
+        '200':
+          description: Object written; response reflects the new etag/version/size/mtime
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectInfoResponse'
+        '400':
+          description: If-Match and If-None-Match both present, If-Match is '*', or If-None-Match value is not '*'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: '`If-None-Match: *` specified and the target already exists, or `PartialCompletion`: a later stage failed after an earlier one committed durably. Read `error.code` to tell them apart — 409 is NOT safe to treat as a benign conditional-create conflict — and `error.partial` before undoing anything.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '412':
+          description: If-Match precondition failed against the destination's current etag
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+    delete:
+      tags:
+      - objects
+      summary: |-
+        Delete an object. An optional `If-Match: "<etag>"` header (RFC 7232)
+        guards against concurrent writes. The etag MAY be sent unquoted;
+        the `W/` weak-etag prefix is tolerated. The wildcard form
+        `If-Match: *` is rejected because ovstorage preconditions require
+        a concrete etag.
+      operationId: delete_object
+      parameters:
+      - name: address
+        in: query
+        description: Object address to delete
+        required: true
+        schema:
+          type: string
+      - name: If-Match
+        in: header
+        description: 'Etag precondition: refuse the delete unless the target''s current etag matches'
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      responses:
+        '204':
+          description: Deleted
+        '400':
+          description: 'If-Match: * is not supported; supply a concrete etag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Object did not exist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '412':
+          description: If-Match precondition failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /v1/objects:check-access:
+    post:
+      tags:
+      - objects
+      summary: |-
+        Probe whether the caller could perform the requested operations
+        against the address; returns `Unsupported` without
+        `capabilities.supports_access_check`.
+      operationId: check_access
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckAccessBody'
+        required: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessDecisionResponse'
+  /v1/objects:copy:
+    post:
+      tags:
+      - objects
+      summary: |-
+        Copy an object; server-side when supported, else read+write
+        fallback. Copy has two precondition operands (source and
+        destination), each carried on its own header:
+        - Source-side: `X-OV-If-Source-Match: "<etag>"` — the source must
+          match this etag.
+        - Destination-side: `X-OV-If-Dest-Match: "<etag>"` — the
+          destination must match this etag, or `If-None-Match: *` — the
+          destination must not exist.
+      description: |-
+        RFC 7232's `If-Match` header has no operand binding and is
+        ambiguous on a two-operand route; sending it on copy returns
+        `400 InvalidArgument`. `X-OV-If-Dest-Match` and `If-None-Match`
+        both target the destination, so sending both also returns `400`.
+        Etag values accept the quoted (`"<etag>"`) or bare form; a leading
+        `W/` weak-etag prefix is tolerated.
+      operationId: copy_object
+      parameters:
+      - name: X-OV-If-Source-Match
+        in: header
+        description: 'Source-side etag precondition: refuse the copy unless the source''s current etag matches'
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      - name: X-OV-If-Dest-Match
+        in: header
+        description: 'Destination-side etag precondition: refuse the copy unless the destination''s current etag matches'
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      - name: If-None-Match
+        in: header
+        description: 'Only the literal `*` is accepted: refuse if the destination already exists'
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CopyRenameBody'
+        required: true
+      responses:
+        '200':
+          description: Destination identity after copy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectInfoResponse'
+        '400':
+          description: If-Match present (ambiguous on copy), X-OV-If-Dest-Match and If-None-Match both present, or If-None-Match value is not '*'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '403':
+          description: Authz denied source or destination
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: '`If-None-Match: *` specified and the destination already exists, or `PartialCompletion`: a later stage failed after an earlier one committed durably. Read `error.code` to tell them apart — 409 is NOT safe to treat as a benign conditional-create conflict — and `error.partial` before undoing anything.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '412':
+          description: Source or destination precondition failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /v1/objects:latest-version:
+    get:
+      tags:
+      - objects
+      summary: Resolve an address to the latest object version.
+      operationId: get_latest_version
+      parameters:
+      - name: address
+        in: query
+        description: Object whose latest version to resolve
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LatestVersionResponse'
+  /v1/objects:list:
+    get:
+      tags:
+      - objects
+      summary: |-
+        List objects under a prefix; defaults to immediate children.
+        `recursive=true` deep-walks (or returns `Unsupported`).
+      operationId: list_objects
+      parameters:
+      - name: prefix
+        in: query
+        description: Address prefix to list under
+        required: true
+        schema:
+          type: string
+      - name: recursive
+        in: query
+        description: Walk all descendants, not just immediate children
+        required: false
+        schema:
+          type: boolean
+      - name: full_metadata
+        in: query
+        description: Populate per-item user metadata
+        required: false
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectInfoList'
+  /v1/objects:metadata:
+    patch:
+      tags:
+      - objects
+      summary: |-
+        Patch user metadata; sets `set` keys and removes `remove` keys.
+        `allow_rewrite_emulation=true` opts into the non-atomic rewrite
+        fallback when only `supports_metadata_rewrite_emulation` is set.
+      operationId: update_metadata
+      parameters:
+      - name: address
+        in: query
+        required: true
+        schema:
+          type: string
+      - name: If-Match
+        in: header
+        description: 'Etag precondition: refuse the metadata update unless the target''s current etag matches'
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MetadataPatchBody'
+        required: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectInfoResponse'
+        '400':
+          description: 'If-Match: * is not supported; supply a concrete etag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '412':
+          description: If-Match precondition failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /v1/objects:rename:
+    post:
+      tags:
+      - objects
+      summary: |-
+        Rename (move) an object; atomic when the backend advertises
+        `supports_atomic_rename`, else copy+delete with a non-atomic window.
+        Rename has two precondition operands (source and destination),
+        each carried on its own header:
+        - Source-side: `X-OV-If-Source-Match: "<etag>"` — the source must
+          match this etag.
+        - Destination-side: `X-OV-If-Dest-Match: "<etag>"` — the
+          destination must match this etag, or `If-None-Match: *` — the
+          destination must not exist.
+      description: |-
+        RFC 7232's `If-Match` header has no operand binding and is
+        ambiguous on a two-operand route; sending it on rename returns
+        `400 InvalidArgument`. `X-OV-If-Dest-Match` and `If-None-Match`
+        both target the destination, so sending both also returns `400`.
+        Etag values accept the quoted (`"<etag>"`) or bare form; a leading
+        `W/` weak-etag prefix is tolerated.
+      operationId: rename_object
+      parameters:
+      - name: X-OV-If-Source-Match
+        in: header
+        description: 'Source-side etag precondition: refuse the rename unless the source''s current etag matches'
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      - name: X-OV-If-Dest-Match
+        in: header
+        description: 'Destination-side etag precondition: refuse the rename unless the destination''s current etag matches'
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      - name: If-None-Match
+        in: header
+        description: 'Only the literal `*` is accepted: refuse if the destination already exists'
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CopyRenameBody'
+        required: true
+      responses:
+        '204':
+          description: Renamed
+        '400':
+          description: If-Match present (ambiguous on rename), X-OV-If-Dest-Match and If-None-Match both present, or If-None-Match value is not '*'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: '`If-None-Match: *` specified and the destination already exists, or `PartialCompletion`: a later stage failed after an earlier one committed durably. Read `error.code` to tell them apart — 409 is NOT safe to treat as a benign conditional-create conflict — and `error.partial` before undoing anything.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '412':
+          description: Source or destination precondition failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /v1/objects:stat:
+    get:
+      tags:
+      - objects
+      summary: Look up an object's metadata without reading its bytes.
+      operationId: stat_object
+      parameters:
+      - name: address
+        in: query
+        description: Object to stat
+        required: true
+        schema:
+          type: string
+      - name: full_metadata
+        in: query
+        description: Include user metadata (may require an extra backend call on listing-backed stat implementations)
+        required: false
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectInfoResponse'
+        '404':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /v1/objects:versions:
+    get:
+      tags:
+      - objects
+      summary: |-
+        List an object's version history; empty on backends without
+        `capabilities.supports_version_listing`.
+      operationId: list_versions
+      parameters:
+      - name: address
+        in: query
+        description: Object whose versions to list
+        required: true
+        schema:
+          type: string
+      - name: max_results
+        in: query
+        description: Page size cap
+        required: false
+        schema:
+          type: integer
+          format: int32
+          minimum: 0
+      - name: page_token
+        in: query
+        description: Continuation token from a prior page
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionList'
+  /v1/objects:watch-directory:
+    get:
+      tags:
+      - objects
+      summary: |-
+        Stream directory change events as SSE; pass the latest `cursor`
+        as `since` to resume. A `lapsed` event signals the client should
+        re-list before resuming.
+      operationId: watch_directory_sse
+      parameters:
+      - name: prefix
+        in: query
+        description: Directory prefix to watch
+        required: true
+        schema:
+          type: string
+      - name: recursive
+        in: query
+        description: Include changes in subdirectories
+        required: false
+        schema:
+          type: boolean
+      - name: include_metadata_changes
+        in: query
+        description: 'Emit events for metadata-only changes (default: bytes-changing events only)'
+        required: false
+        schema:
+          type: boolean
+      - name: since
+        in: query
+        description: Resume cursor from a previous watch session
+        required: false
+        schema:
+          type: string
+      - name: poll_interval_ms
+        in: query
+        description: Polling cadence for backends without push notifications (default 1000ms)
+        required: false
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+      responses:
+        '200':
+          description: SSE stream of ChangeEventResponse JSON frames
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/ChangeEventResponse'
+  /v1/openapi.json:
+    get:
+      tags:
+      - spec
+      summary: Render the OpenAPI document as JSON.
+      operationId: openapi_json
+      responses:
+        '200':
+          description: OpenAPI 3 document
+          content:
+            application/json: {}
+  /v1/openapi.yaml:
+    get:
+      tags:
+      - spec
+      summary: Render the OpenAPI document as YAML.
+      operationId: openapi_yaml
+      responses:
+        '200':
+          description: OpenAPI 3 document
+          content:
+            application/yaml: {}
+components:
+  schemas:
+    AccessDecisionResponse:
+      type: object
+      description: |-
+        Outcome of `POST /v1/objects:check-access`; `denied_ops` lists
+        the operations that failed when `allowed = false`.
+      required:
+      - allowed
+      - denied_ops
+      properties:
+        allowed:
+          type: boolean
+        denied_ops:
+          $ref: '#/components/schemas/AccessOpsResponse'
+        reason:
+          type:
+          - string
+          - 'null'
+    AccessOpsResponse:
+      type: object
+      description: Bit-set of operations a check-access call can ask about.
+      required:
+      - read
+      - write
+      - delete
+      - update_metadata
+      properties:
+        delete:
+          type: boolean
+        read:
+          type: boolean
+        update_metadata:
+          type: boolean
+        write:
+          type: boolean
+    AddressRootList:
+      type: object
+      description: Returned by `GET /v1/address-roots`.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AddressRootResponse'
+    AddressRootResponse:
+      type: object
+      description: One address root currently routed by the gateway.
+      required:
+      - address
+      - backend_kind
+      - capabilities
+      properties:
+        address:
+          type: string
+          description: Root address (URL-prefix form).
+        backend_kind:
+          type: string
+          description: Plugin kind backing this root (`file`, `s3`, `gcs`, etc.).
+        capabilities:
+          $ref: '#/components/schemas/CapabilitiesResponse'
+          description: Capabilities of the backing backend.
+        connection_id:
+          type:
+          - string
+          - 'null'
+          description: Connection this root belongs to; `None` for static routes.
+        display_name:
+          type:
+          - string
+          - 'null'
+          description: Operator-supplied human-readable label.
+    BackendKindList:
+      type: object
+      description: Returned by `GET /v1/backend-kinds`.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/BackendKindResponse'
+    BackendKindResponse:
+      type: object
+      description: One backend kind installed in this gateway.
+      required:
+      - kind
+      - display_name
+      - supports_runtime_add
+      properties:
+        description:
+          type:
+          - string
+          - 'null'
+        display_name:
+          type: string
+        kind:
+          type: string
+          description: Stable `backend_kind` identifier (`file`, `s3`, etc.).
+        supports_runtime_add:
+          type: boolean
+          description: Whether this kind can be added at runtime (vs. config-file only).
+    CapabilitiesResponse:
+      type: object
+      description: |-
+        Capabilities advertised by a backend route; drives client-side
+        feature detection.
+      required:
+      - supports_if_match_write
+      - supports_no_overwrite_write
+      - supports_native_metadata_patch
+      - supports_metadata_rewrite_emulation
+      - writes_are_atomic
+      - supports_copy
+      - supports_rename
+      - supports_server_side_copy
+      - supports_server_side_rename
+      - supports_atomic_rename
+      - has_real_directories
+      - supports_list
+      - wants_list_backed_stat
+      - supports_recursive_list
+      - populates_subdirectory_metadata
+      - supports_version_listing
+      - populates_effective_permissions_on_stat
+      - supports_access_check
+      - supports_watch_directory
+      - watch_directory_resumable
+      - supports_write
+      - supports_write_stream
+      - supports_write_redirect
+      - supports_delete
+      - supports_create_directory
+      - supports_delete_directory
+      properties:
+        has_real_directories:
+          type: boolean
+          description: First-class directories (vs. prefix-simulated).
+        populates_effective_permissions_on_stat:
+          type: boolean
+          description: Stat results include the caller's effective permissions.
+        populates_subdirectory_metadata:
+          type: boolean
+          description: List entries for subdirectories include populated metadata.
+        supports_access_check:
+          type: boolean
+          description: '`POST /v1/objects:check-access` is supported.'
+        supports_atomic_rename:
+          type: boolean
+          description: Rename is atomic (no non-resolving window).
+        supports_copy:
+          type: boolean
+          description: A copy naming this root can be attempted (natively or emulated).
+        supports_create_directory:
+          type: boolean
+          description: Backend implements explicit directory creation.
+        supports_delete:
+          type: boolean
+          description: Backend implements object delete.
+        supports_delete_directory:
+          type: boolean
+          description: Backend implements explicit directory delete.
+        supports_if_match_write:
+          type: boolean
+          description: Backend honors `If-Match` on writes.
+        supports_list:
+          type: boolean
+          description: Single-level (non-recursive) listing is supported.
+        supports_metadata_rewrite_emulation:
+          type: boolean
+          description: Backend can emulate metadata patches by rewriting the object.
+        supports_native_metadata_patch:
+          type: boolean
+          description: Backend can patch user metadata in place without rewriting the body.
+        supports_no_overwrite_write:
+          type: boolean
+          description: 'Backend honors `If-None-Match: *` (no-overwrite create).'
+        supports_recursive_list:
+          type: boolean
+          description: Recursive listing is supported.
+        supports_rename:
+          type: boolean
+          description: A rename naming this root can be attempted (natively or emulated).
+        supports_server_side_copy:
+          type: boolean
+          description: Server-side copy is supported (no bytes through the gateway).
+        supports_server_side_rename:
+          type: boolean
+          description: Server-side rename is supported.
+        supports_version_listing:
+          type: boolean
+          description: Object versions are tracked; `/v1/objects:versions` is non-empty.
+        supports_watch_directory:
+          type: boolean
+          description: '`GET /v1/objects:watch-directory` produces non-empty streams.'
+        supports_write:
+          type: boolean
+          description: Backend implements the buffered single-shot write path.
+        supports_write_redirect:
+          type: boolean
+          description: Backend can mint presigned-URL redirects for writes.
+        supports_write_stream:
+          type: boolean
+          description: Backend implements the streaming-write path.
+        wants_list_backed_stat:
+          type: boolean
+          description: '`stat` resolves via listing; clients should batch stats.'
+        watch_directory_resumable:
+          type: boolean
+          description: Watch streams support resume-from-cursor.
+        writes_are_atomic:
+          type: boolean
+          description: Writes commit atomically (readers never see partial state).
+    ChangeEventResponse:
+      oneOf:
+      - type: object
+        description: An object changed under the watched prefix.
+        required:
+        - address
+        - kind
+        - cursor
+        - type
+        properties:
+          address:
+            type: string
+          cursor:
+            type: string
+            description: Resume cursor (pass as `since` on reconnect).
+          etag:
+            type:
+            - string
+            - 'null'
+            description: Etag at event time; `None` for deletes.
+          kind:
+            type: string
+            description: One of `created`, `modified`, `deleted`, `metadata_changed`.
+          mtime_unix_nanos:
+            type:
+            - integer
+            - 'null'
+            description: |-
+              Last-modified time of the object after the change as Unix
+              nanoseconds, when the backend surfaces it on the
+              notification.
+          size:
+            type:
+            - integer
+            - 'null'
+            format: int64
+            description: |-
+              Object size in bytes after the change, when the backend
+              surfaces it on the notification.
+            minimum: 0
+          type:
+            type: string
+            enum:
+            - object
+          version:
+            type:
+            - string
+            - 'null'
+            description: |-
+              Backend-specific version identifier when the backend
+              surfaces it on the notification (e.g. S3 versionId, GCS
+              generation, Azure blob version-id). `None` on deletes and
+              on backends that don't version.
+      - type: object
+        description: |-
+          Events were missed from the previous cursor; client should
+          re-list and resume from the new cursor.
+        required:
+        - cursor
+        - type
+        properties:
+          cursor:
+            type: string
+          type:
+            type: string
+            enum:
+            - lapsed
+      description: One event from `GET /v1/objects:watch-directory`.
+    CheckAccessBody:
+      type: object
+      description: |-
+        Request body for `POST /v1/objects:check-access`; each `true`
+        flag probes one operation.
+      required:
+      - address
+      properties:
+        address:
+          type: string
+        delete:
+          type: boolean
+        read:
+          type: boolean
+        update_metadata:
+          type: boolean
+        write:
+          type: boolean
+    CopyRenameBody:
+      type: object
+      description: Request body for `POST /v1/objects:copy` and `POST /v1/objects:rename`.
+      required:
+      - src
+      - dest
+      properties:
+        dest:
+          type: string
+        src:
+          type: string
+    ErrorBody:
+      type: object
+      required:
+      - code
+      - message
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable error code.
+        message:
+          type: string
+        next_action:
+          type:
+          - string
+          - 'null'
+          description: Recovery hint, when the producer attached one.
+        partial:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/PartialBody'
+            description: |-
+              Present only on `PartialCompletion`. Without it an HTTP caller sees a
+              409 naming a code that means "your request half-happened" and has no
+              way to learn whether undoing the committed part is safe — the natural
+              guess (delete and re-issue) destroys data on the shipped case. 409 also
+              carries `AlreadyExists`, where nothing was written at all, so the
+              status alone cannot be acted on: read `error.code` first.
+    ErrorEnvelope:
+      type: object
+      description: |-
+        Error response shape returned by every error path; HTTP status
+        gives the coarse category, `error.code` the machine-readable code.
+      required:
+      - error
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorBody'
+    LatestVersionResponse:
+      type: object
+      description: Returned by `GET /v1/objects:latest-version`.
+      required:
+      - version
+      properties:
+        version:
+          $ref: '#/components/schemas/ObjectInfoResponse'
+    MetadataPatchBody:
+      type: object
+      description: |-
+        Request body for `PATCH /v1/objects:metadata`; partial update
+        applying `set` and `remove`, other keys untouched.
+      properties:
+        allow_rewrite_emulation:
+          type: boolean
+          description: |-
+            Opt into the non-atomic rewrite-emulation fallback when the
+            backend lacks native metadata patches.
+        message:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Optional annotation attached to this operation; backends that
+            support per-operation annotations stash it under the
+            `x-ov-message` user-metadata key.
+        remove:
+          type: array
+          items:
+            type: string
+          description: Keys to remove.
+        set:
+          type: object
+          description: Keys to set or overwrite.
+    ObjectInfoList:
+      type: object
+      description: Returned by `GET /v1/objects:list`.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ObjectInfoResponse'
+    ObjectInfoResponse:
+      type: object
+      description: Metadata describing a single object.
+      required:
+      - address
+      - kind
+      properties:
+        address:
+          type: string
+          description: Caller-facing address of the object.
+        etag:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Opaque entity tag used for optimistic-concurrency preconditions
+            (`If-Match: "<etag>"` on read/delete/update_metadata and the
+            destination side of write/copy/rename; `X-OV-If-Source-Match:
+            <etag>` on the source side of copy/rename).
+        kind:
+          type: string
+          description: One of `file`, `directory`, `directory_marker`, `directory_inferred`.
+        mtime_unix_nanos:
+          type:
+          - integer
+          - 'null'
+          description: |-
+            Last-modified time as Unix nanoseconds since epoch. `None` for
+            inferred directories (no backing object).
+        size:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Object size in bytes. `None` for directories of any kind.
+          minimum: 0
+        system_metadata:
+          type:
+          - object
+          - 'null'
+          description: Backend-controlled metadata; keys are opaque to clients.
+        user_metadata:
+          type:
+          - object
+          - 'null'
+          description: User-set metadata; round-trips unchanged through ovstorage.
+        version:
+          type:
+          - string
+          - 'null'
+          description: Backend-assigned version identifier (descriptive; not a precondition).
+    PartialBody:
+      type: object
+      description: |-
+        Wire form of `ErrorContext::Partial`. Field values are the stable
+        snake_case names from the corresponding `as_str()` helpers.
+      required:
+      - completed
+      - failed
+      - failed_outcome
+      - rollback
+      properties:
+        completed:
+          type: string
+          description: |-
+            The stage that committed durably and will not be undone.
+            One of: `object_data`, `user_metadata`, `source_removal`.
+        failed:
+          type: string
+          description: |-
+            The stage that did not complete.
+            One of: `object_data`, `user_metadata`, `source_removal`.
+        failed_outcome:
+          type: string
+          description: |-
+            Whether the failed stage took effect: `not_applied` means the stage
+            left no durable mark; `unknown` means we cannot tell from the client
+            side (a lost response is indistinguishable from a refusal).
+            One of: `not_applied`, `unknown`.
+        rollback:
+          type: string
+          description: |-
+            What undoing the committed stage would cost.
+            `destroys_requested_work` means undoing it throws away work the caller
+            asked for and must not be done blindly.
+            `restores_prior_state` means undoing it returns the system to where it
+            was before the operation.
+            Read together with `failed_outcome`, never alone: rolling back is
+            unconditionally safe only when `rollback` is `restores_prior_state`
+            AND `failed_outcome` is `not_applied`. When `failed_outcome` is
+            `unknown` the failed stage may already have taken effect, so undoing
+            the committed stage can destroy the last surviving copy — verify the
+            failed stage's actual state before acting.
+            One of: `restores_prior_state`, `destroys_requested_work`.
+    VersionList:
+      type: object
+      description: Returned by `GET /v1/objects:versions`; newest-first by default.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ObjectInfoResponse'
+tags:
+- name: objects
+  description: Object operations (read/write/list/etc.)
+- name: directories
+  description: Directory create/delete
+- name: discovery
+  description: Capabilities, address roots, backend kinds
+- name: spec
+  description: OpenAPI document
