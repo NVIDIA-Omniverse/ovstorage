@@ -4,7 +4,9 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use ovstorage::ext::LayerExt;
-use ovstorage::{ByteRange, Error, ErrorCode, ListOptions, ObjectInfo, ReadOptions, StatOptions};
+use ovstorage::{
+    ByteRange, Error, ErrorCode, EtagStrength, ListOptions, ObjectInfo, ReadOptions, StatOptions,
+};
 use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -54,6 +56,10 @@ pub struct StatParams {
     pub address: String,
     #[serde(default)]
     pub full_metadata: bool,
+    /// Pay for the version lookup so `versioned_address` is populated where
+    /// it is not free.
+    #[serde(default)]
+    pub versioned_address: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -66,7 +72,12 @@ pub struct StatResult {
     pub size: Option<u64>,
     pub mtime_unix_nanos: Option<i128>,
     pub etag: Option<String>,
+    pub etag_strength: Option<String>,
     pub version: Option<String>,
+    /// Address that names this version of the object (a pin, not an
+    /// identity); `null` when the backend does not version it or the caller
+    /// did not ask.
+    pub versioned_address: Option<String>,
     pub user_metadata: serde_json::Map<String, serde_json::Value>,
     pub system_metadata: serde_json::Map<String, serde_json::Value>,
     pub modified_by: Option<String>,
@@ -82,6 +93,10 @@ pub struct ListParams {
     pub page_token: Option<String>,
     #[serde(default)]
     pub full_metadata: bool,
+    /// Pay for the version lookup so every item carries `versioned_address`
+    /// where it is not free.
+    #[serde(default)]
+    pub versioned_address: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -91,7 +106,11 @@ pub struct ListEntry {
     pub size: Option<u64>,
     pub mtime_unix_nanos: Option<i128>,
     pub etag: Option<String>,
+    pub etag_strength: Option<String>,
     pub version: Option<String>,
+    /// Address that names this version of the object (a pin, not an
+    /// identity); `null` when absent.
+    pub versioned_address: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -200,6 +219,7 @@ impl OvstorageServer {
                     addr,
                     StatOptions {
                         full_metadata: params.full_metadata,
+                        versioned_address: params.versioned_address,
                     },
                     None,
                 )
@@ -226,6 +246,7 @@ impl OvstorageServer {
                         max_results: params.max_results,
                         page_token: params.page_token,
                         full_metadata: params.full_metadata,
+                        versioned_address: params.versioned_address,
                     },
                     None,
                 )
@@ -269,7 +290,9 @@ pub fn info_to_result(info: ObjectInfo) -> StatResult {
         size: info.size,
         mtime_unix_nanos: info.mtime.and_then(system_time_to_unix_nanos),
         etag: info.etag,
+        etag_strength: etag_strength_to_result(info.etag_strength),
         version: info.version,
+        versioned_address: info.versioned_address.map(|url| url.to_string()),
         user_metadata: map_to_json(info.user_metadata),
         system_metadata: map_to_json(info.system_metadata),
         modified_by: info.modified_by,
@@ -277,14 +300,23 @@ pub fn info_to_result(info: ObjectInfo) -> StatResult {
 }
 
 fn info_to_list_entry(info: ObjectInfo) -> ListEntry {
-    let info = info_to_result(info);
     ListEntry {
-        kind: info.kind,
-        address: info.address,
+        kind: info.kind.as_str().to_string(),
+        address: info.address.to_string(),
         size: info.size,
-        mtime_unix_nanos: info.mtime_unix_nanos,
+        mtime_unix_nanos: info.mtime.and_then(system_time_to_unix_nanos),
         etag: info.etag,
+        etag_strength: etag_strength_to_result(info.etag_strength),
         version: info.version,
+        versioned_address: info.versioned_address.map(|url| url.to_string()),
+    }
+}
+
+fn etag_strength_to_result(strength: EtagStrength) -> Option<String> {
+    match strength {
+        EtagStrength::Unspecified => None,
+        EtagStrength::Strong => Some("strong".to_owned()),
+        EtagStrength::Weak => Some("weak".to_owned()),
     }
 }
 
@@ -326,4 +358,96 @@ fn system_time_to_unix_nanos(value: std::time::SystemTime) -> Option<i128> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|duration| i128::try_from(duration.as_nanos()).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn etag_strength_projects_to_mcp_values() {
+        assert_eq!(
+            etag_strength_to_result(EtagStrength::Strong).as_deref(),
+            Some("strong")
+        );
+        assert_eq!(
+            etag_strength_to_result(EtagStrength::Weak).as_deref(),
+            Some("weak")
+        );
+        assert_eq!(etag_strength_to_result(EtagStrength::Unspecified), None);
+    }
+
+    #[test]
+    fn stat_and_list_project_etag_strength() {
+        fn info(strength: EtagStrength) -> ObjectInfo {
+            ObjectInfo {
+                address: ovstorage::Url::parse("test://mcp/object").unwrap(),
+                kind: ovstorage::ObjectKind::File,
+                etag: Some("validator".into()),
+                etag_strength: strength,
+                version: None,
+                size: Some(1),
+                mtime: None,
+                checksums: ovstorage::ChecksumSet::default(),
+                effective_permissions: None,
+                system_metadata: None,
+                user_metadata: None,
+                modified_by: None,
+                versioned_address: None,
+            }
+        }
+
+        assert_eq!(
+            info_to_result(info(EtagStrength::Weak))
+                .etag_strength
+                .as_deref(),
+            Some("weak")
+        );
+        assert_eq!(
+            info_to_list_entry(info(EtagStrength::Strong))
+                .etag_strength
+                .as_deref(),
+            Some("strong")
+        );
+        assert_eq!(
+            info_to_list_entry(info(EtagStrength::Unspecified)).etag_strength,
+            None
+        );
+    }
+
+    #[test]
+    fn stat_and_list_project_versioned_address() {
+        fn info(versioned_address: Option<&str>) -> ObjectInfo {
+            ObjectInfo {
+                address: ovstorage::Url::parse("test://mcp/object").unwrap(),
+                kind: ovstorage::ObjectKind::File,
+                etag: None,
+                etag_strength: EtagStrength::Unspecified,
+                version: None,
+                size: Some(1),
+                mtime: None,
+                checksums: ovstorage::ChecksumSet::default(),
+                effective_permissions: None,
+                system_metadata: None,
+                user_metadata: None,
+                modified_by: None,
+                versioned_address: versioned_address
+                    .map(|pin| ovstorage::address::parse(pin).unwrap()),
+            }
+        }
+
+        let pin = "test://mcp/object?versionId=v1";
+        assert_eq!(
+            info_to_result(info(Some(pin))).versioned_address.as_deref(),
+            Some(pin)
+        );
+        assert_eq!(
+            info_to_list_entry(info(Some(pin)))
+                .versioned_address
+                .as_deref(),
+            Some(pin)
+        );
+        assert_eq!(info_to_result(info(None)).versioned_address, None);
+        assert_eq!(info_to_list_entry(info(None)).versioned_address, None);
+    }
 }

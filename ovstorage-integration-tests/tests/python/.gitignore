@@ -1,0 +1,4 @@
+# Python test artifacts — not source.
+__pycache__/
+.pytest_cache/
+*.pyc

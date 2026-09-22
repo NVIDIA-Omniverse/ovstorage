@@ -47,7 +47,7 @@ on this, not on `error.message`. Common codes:
 | `AlreadyExists` | Destination is taken (write with `if_dest: {"kind": "fail"}`) |
 | `PermissionDenied` | Auth allows the call but not on this resource |
 | `AuthRequired` / `CredentialExpired` | Connection needs auth refresh |
-| `NoRoute` / `NotConfigured` | No backend handles this address |
+| `NoRoute` / `NotConfigured` | No backend serves this address and no anonymous fallback is granted for its scheme |
 | `Unsupported` | Backend exists but doesn't support this op |
 | `PreconditionFailed` | A write-side `if_match` / `if_dest` precondition failed before anything was committed |
 | `ObjectModified` | The object changed *during* a call already under way, or a read's `if_match` failed |

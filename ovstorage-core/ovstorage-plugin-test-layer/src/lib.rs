@@ -43,7 +43,6 @@
 //! the "Cross-binary export symbol" section near the bottom of this file.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::time::SystemTime;
@@ -51,6 +50,7 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use futures::channel::mpsc;
 use ovstorage_plugin::*;
+use sha2::{Digest, Sha256};
 
 /// Backend layer kind this cdylib ships.
 pub const KIND: &str = "mini-v2";
@@ -63,8 +63,34 @@ pub const AUTH_KIND: &str = "mini-auth";
 /// URL scheme the backend owns by default.
 pub const DEFAULT_ROOT: &str = "mini://store/";
 /// Unique-suffix source for `materialize` scratch files (see
-/// [`MiniV2Backend::materialize`]).
+/// [`MiniWrapper::materialize`]).
 static MATERIALIZE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn cancellable_list_items(items: Vec<ObjectInfo>, cancel: Option<CancellationToken>) -> ListStream {
+    Box::pin(futures::stream::unfold(
+        (items.into_iter(), cancel, false),
+        |(mut items, cancel, terminal)| async move {
+            if terminal {
+                return None;
+            }
+            if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                return Some((
+                    Err(Error::new(
+                        ErrorCode::Cancelled,
+                        "mini-v2: list_stream cancelled",
+                    )),
+                    (items, cancel, true),
+                ));
+            }
+            items.next().map(|item| (Ok(item), (items, cancel, false)))
+        },
+    ))
+}
+
+/// SHA-256 of an empty byte string. Scripted metadata slots synthesize this
+/// identity for an absent object without hashing on every call.
+const EMPTY_PAYLOAD_ETAG: &str =
+    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 fn descriptor() -> LayerKindDescriptor {
     LayerKindDescriptor {
@@ -154,19 +180,42 @@ fn malformed_descriptor() -> LayerKindDescriptor {
     }
 }
 
-fn object_info(address: Url, size: u64) -> ObjectInfo {
+#[derive(Clone)]
+struct StoredPayload {
+    bytes: Arc<[u8]>,
+    /// Content identity computed once when the immutable payload is stored.
+    etag: String,
+}
+
+impl StoredPayload {
+    fn new(bytes: Vec<u8>) -> Self {
+        let etag = format!("sha256:{:x}", Sha256::digest(&bytes));
+        Self {
+            bytes: bytes.into(),
+            etag,
+        }
+    }
+
+    fn info(&self, address: Url) -> ObjectInfo {
+        payload_info(address, &self.etag, self.bytes.len())
+    }
+}
+
+fn payload_info(address: Url, etag: &str, size: usize) -> ObjectInfo {
     ObjectInfo {
+        etag_strength: EtagStrength::Strong,
         address,
         kind: ObjectKind::File,
-        etag: Some(format!("size:{size}")),
+        etag: Some(etag.to_string()),
         version: None,
-        size: Some(size),
+        size: Some(size as u64),
         mtime: None,
         checksums: ChecksumSet::new(),
         effective_permissions: None,
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
@@ -174,6 +223,7 @@ fn capabilities() -> Capabilities {
     Capabilities {
         supports_write: true,
         supports_list: true,
+        supports_list_stream: true,
         // The layer implements both verbs; these report availability, not a
         // server-side mechanism.
         supports_copy: true,
@@ -320,7 +370,7 @@ impl MiniState {
 struct MiniV2Backend {
     name: String,
     state: Mutex<MiniState>,
-    store: Mutex<HashMap<String, Vec<u8>>>,
+    store: Mutex<HashMap<String, StoredPayload>>,
     /// Test-only rendezvous placed *between* subscriber registration and the
     /// snapshot read in `list_address_roots`, so a test can inject a root-add
     /// into that exact window and prove the ordering keeps it at-least-once.
@@ -347,6 +397,26 @@ impl MiniV2Backend {
                 "address not owned by backend",
             ))
         }
+    }
+
+    fn list_items(&self, prefix: &Url, recursive: bool) -> Result<Vec<ObjectInfo>> {
+        self.require_owned(prefix)?;
+        let mut items: Vec<ObjectInfo> = self
+            .store
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(raw, stored)| {
+                let address = Url::parse(raw).ok()?;
+                let relative = ovstorage_plugin::address::relative_suffix(&address, prefix)?;
+                if !recursive && relative.contains('/') {
+                    return None;
+                }
+                Some(stored.info(address))
+            })
+            .collect();
+        items.sort_by(|a, b| a.address.as_str().cmp(b.address.as_str()));
+        Ok(items)
     }
 
     /// The `RootInfo` a subscriber and a snapshot see for one served root.
@@ -381,14 +451,13 @@ impl MiniV2Backend {
         }
     }
 
-    /// The stored byte length of `url`, or 0 when absent — used by the
-    /// scripted metadata slots to fill a plausible `size`.
-    fn stored_size(&self, url: &Url) -> u64 {
-        self.store
-            .lock()
-            .unwrap()
-            .get(url.as_str())
-            .map_or(0, |bytes| bytes.len() as u64)
+    /// Stored metadata at `url`, or empty-object metadata when absent. The
+    /// scripted slots need only identity and size, so they do not clone bytes.
+    fn stored_info(&self, url: &Url) -> ObjectInfo {
+        self.store.lock().unwrap().get(url.as_str()).map_or_else(
+            || payload_info(url.clone(), EMPTY_PAYLOAD_ETAG, 0),
+            |stored| stored.info(url.clone()),
+        )
     }
 
     /// A synthetic [`Connection`] carrying the given id and addresses — the
@@ -405,6 +474,10 @@ impl MiniV2Backend {
             auth_state: ConnectionAuthState::Anonymous,
             last_probed: Some(SystemTime::now()),
             user_metadata: UserMetadata::new(),
+            // A plugin attributes its OWN rows: this is the name a host builds
+            // a `ConnectionKey` from, and it crosses the ABI rather than being
+            // recovered on the far side.
+            owning_target: Some(self.name.clone()),
         }
     }
 }
@@ -521,6 +594,7 @@ impl Layer for MiniV2Backend {
             auth_state: ConnectionAuthState::Anonymous,
             last_probed: Some(SystemTime::now()),
             user_metadata: UserMetadata::new(),
+            owning_target: Some(self.name.clone()),
         };
         {
             // The mutation and BOTH emissions happen under one `state` guard.
@@ -591,7 +665,7 @@ impl Layer for MiniV2Backend {
         self.require_owned(&address)?;
         let store = self.store.lock().unwrap();
         match store.get(address.as_str()) {
-            Some(bytes) => Ok(object_info(address, bytes.len() as u64)),
+            Some(stored) => Ok(stored.info(address)),
             None => Err(Error::new(ErrorCode::NotFound, "object not found")),
         }
     }
@@ -608,14 +682,13 @@ impl Layer for MiniV2Backend {
         if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
             return Err(Error::new(ErrorCode::Cancelled, "read cancelled"));
         }
-        let bytes = {
+        let (bytes, info) = {
             let store = self.store.lock().unwrap();
             match store.get(address.as_str()) {
-                Some(bytes) => bytes.clone(),
+                Some(stored) => (Arc::clone(&stored.bytes), stored.info(address.clone())),
                 None => return Err(Error::new(ErrorCode::NotFound, "object not found")),
             }
         };
-        let info = object_info(address.clone(), bytes.len() as u64);
         // A `/stream` suffix returns the bytes as a chunk stream, so the
         // host's `ReadResult::Stream` marshalling path is exercised
         // (otherwise only the buffered `Bytes` variant is).
@@ -627,7 +700,10 @@ impl Layer for MiniV2Backend {
             let stream: ReadStream = Box::pin(futures::stream::iter(chunks));
             Ok(ReadResult::Stream { stream, info })
         } else {
-            Ok(ReadResult::Bytes { bytes, info })
+            Ok(ReadResult::Bytes {
+                bytes: bytes.to_vec(),
+                info,
+            })
         }
     }
 
@@ -650,14 +726,13 @@ impl Layer for MiniV2Backend {
                 buf
             }
         };
-        let size = bytes.len() as u64;
+        let stored = StoredPayload::new(bytes);
+        let info = stored.info(address.clone());
         self.store
             .lock()
             .unwrap()
-            .insert(address.as_str().to_string(), bytes);
-        Ok(WriteResult {
-            info: object_info(address, size),
-        })
+            .insert(address.as_str().to_string(), stored);
+        Ok(WriteResult { info })
     }
 
     async fn write_stream(
@@ -668,44 +743,43 @@ impl Layer for MiniV2Backend {
         self.write(request, cancel).await
     }
 
+    async fn list(
+        &self,
+        request: Request<ListRequest>,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<ListPage> {
+        let ListRequest { prefix, options } = request.input;
+        let items = self.list_items(&prefix, options.recursive)?;
+        let items = fold_markers_and_infer_subdir_kinds(&prefix, items, false, options.recursive);
+        paginate_list_items(items, options.max_results, options.page_token)
+    }
+
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        if request.input.options.max_results.is_some() || request.input.options.page_token.is_some()
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+        let ListRequest { prefix, options } = request.input;
+        let recursive = options.recursive;
+        let items = self.list_items(&prefix, recursive)?;
+        let stream_cancel = cancel.clone();
+        let stream = cancellable_list_items(items, cancel);
+        Ok(cancel_list_stream(
+            Box::pin(IncrementalListFold::new(stream, &prefix, false, recursive)),
+            stream_cancel,
+        ))
+    }
+
     // ---- Scripted slots for the characterization suite ---------------
     // Cheap, in-memory implementations of the remaining operational slots so a
     // host can drive every `LoadedV2Layer` trait method across the FFI vtable.
-
-    async fn materialize(
-        &self,
-        request: Request<ReadRequest>,
-        cancel: Option<CancellationToken>,
-    ) -> Result<LocalDelegate> {
-        let address = request.input.address;
-        self.require_owned(&address)?;
-        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
-            return Err(Error::new(ErrorCode::Cancelled, "materialize cancelled"));
-        }
-        let bytes = {
-            let store = self.store.lock().unwrap();
-            match store.get(address.as_str()) {
-                Some(bytes) => bytes.clone(),
-                None => return Err(Error::new(ErrorCode::NotFound, "object not found")),
-            }
-        };
-        // The plugin has no host-side cache lease to pin (that is
-        // `ByteCacheWrapper`'s concern), so materialize hands back a plain
-        // scratch file with `guard: None`. A unique per-call name avoids
-        // cross-test collisions in the shared temp dir.
-        let seq = MATERIALIZE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path: PathBuf = std::env::temp_dir().join(format!(
-            "mini-v2-materialize-{}-{seq}.bin",
-            std::process::id()
-        ));
-        std::fs::write(&path, &bytes)
-            .map_err(|e| Error::new(ErrorCode::Internal, format!("write scratch file: {e}")))?;
-        Ok(LocalDelegate {
-            path,
-            info: object_info(address, bytes.len() as u64),
-            guard: None,
-        })
-    }
 
     async fn copy(
         &self,
@@ -719,21 +793,19 @@ impl Layer for MiniV2Backend {
         } = request.input;
         self.require_owned(&source)?;
         self.require_owned(&destination)?;
-        let bytes = {
+        let stored = {
             let store = self.store.lock().unwrap();
             match store.get(source.as_str()) {
-                Some(bytes) => bytes.clone(),
+                Some(stored) => stored.clone(),
                 None => return Err(Error::new(ErrorCode::NotFound, "copy source not found")),
             }
         };
-        let size = bytes.len() as u64;
+        let info = stored.info(destination.clone());
         self.store
             .lock()
             .unwrap()
-            .insert(destination.as_str().to_string(), bytes);
-        Ok(WriteStep::Done(WriteResult {
-            info: object_info(destination, size),
-        }))
+            .insert(destination.as_str().to_string(), stored);
+        Ok(WriteStep::Done(WriteResult { info }))
     }
 
     async fn rename(
@@ -748,17 +820,17 @@ impl Layer for MiniV2Backend {
         } = request.input;
         self.require_owned(&source)?;
         self.require_owned(&destination)?;
-        let bytes = {
+        let stored = {
             let mut store = self.store.lock().unwrap();
             match store.remove(source.as_str()) {
-                Some(bytes) => bytes,
+                Some(stored) => stored,
                 None => return Err(Error::new(ErrorCode::NotFound, "rename source not found")),
             }
         };
         self.store
             .lock()
             .unwrap()
-            .insert(destination.as_str().to_string(), bytes);
+            .insert(destination.as_str().to_string(), stored);
         Ok(())
     }
 
@@ -769,8 +841,7 @@ impl Layer for MiniV2Backend {
     ) -> Result<BackendItemInfo> {
         let address = request.input.address;
         self.require_owned(&address)?;
-        let size = self.stored_size(&address);
-        Ok(BackendItemInfo::from(object_info(address, size)))
+        Ok(BackendItemInfo::from(self.stored_info(&address)))
     }
 
     async fn check_access(
@@ -793,9 +864,8 @@ impl Layer for MiniV2Backend {
     ) -> Result<VersionPage> {
         let address = request.input.address;
         self.require_owned(&address)?;
-        let size = self.stored_size(&address);
         Ok(VersionPage {
-            items: vec![object_info(address, size)],
+            items: vec![self.stored_info(&address)],
             next_page_token: None,
         })
     }
@@ -807,14 +877,11 @@ impl Layer for MiniV2Backend {
     ) -> Result<ObjectInfo> {
         let address = request.input.address;
         self.require_owned(&address)?;
-        let size = {
-            let store = self.store.lock().unwrap();
-            match store.get(address.as_str()) {
-                Some(bytes) => bytes.len() as u64,
-                None => return Err(Error::new(ErrorCode::NotFound, "object not found")),
-            }
-        };
-        Ok(object_info(address, size))
+        let store = self.store.lock().unwrap();
+        match store.get(address.as_str()) {
+            Some(stored) => Ok(stored.info(address)),
+            None => Err(Error::new(ErrorCode::NotFound, "object not found")),
+        }
     }
 
     async fn create_directory(
@@ -1211,8 +1278,55 @@ impl Layer for MiniWrapper {
         wrapper_descriptor()
     }
 
+    async fn materialize(
+        &self,
+        request: Request<ReadRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<LocalDelegate> {
+        let (bytes, info) = match self.inner.read(request, cancel).await? {
+            ReadResult::LocalDelegate(local) => return Ok(local),
+            ReadResult::Bytes { bytes, info } => (bytes, info),
+            ReadResult::Stream { mut stream, info } => {
+                let mut bytes = Vec::new();
+                while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+                    bytes.extend_from_slice(&chunk?);
+                }
+                (bytes, info)
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorCode::Unsupported,
+                    "mini wrapper materializes bytes",
+                ));
+            }
+        };
+        // The wrapper has no host-side cache lease to pin, so it hands back a
+        // plain scratch file with `guard: None`. A unique per-call name avoids
+        // cross-test collisions in the shared temp dir.
+        let seq = MATERIALIZE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mini-wrapper-materialize-{}-{seq}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes)
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("write scratch file: {e}")))?;
+        Ok(LocalDelegate {
+            path,
+            info,
+            guard: None,
+        })
+    }
+
     fn inner_layer(&self) -> Option<&LayerHandle> {
         Some(&self.inner)
+    }
+
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        self.inner.list_stream(request, cancel).await
     }
 }
 
@@ -1266,6 +1380,30 @@ impl Layer for MiniRouter {
             .iter()
             .flat_map(|child| child.owned_targets())
             .collect()
+    }
+
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        for child in &self.children {
+            match child
+                .root_info_for(&request.input.prefix, &Extensions::new(), cancel.clone())
+                .await
+            {
+                Ok(_) => return child.list_stream(request, cancel).await,
+                Err(error) if matches!(error.code(), ErrorCode::NoRoute | ErrorCode::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::new(
+            ErrorCode::NoRoute,
+            format!(
+                "mini-router: no child owns {}",
+                request.input.prefix.as_str()
+            ),
+        ))
     }
 }
 
@@ -1408,7 +1546,7 @@ const HANDOFF_KIND: &str = "handoff-test";
 /// composition characterizations that reuse `MiniV2Backend`.
 struct HandoffBackend {
     name: String,
-    store: Mutex<HashMap<String, Vec<u8>>>,
+    store: Mutex<HashMap<String, StoredPayload>>,
     /// This backend's export generation — see
     /// [`OVSTORAGE_TEST_HANDOFF_DROPPED_GEN`]. Carried on the instance so its
     /// release identifies *itself* rather than merely reporting that some
@@ -1421,7 +1559,7 @@ impl HandoffBackend {
         let mut store = HashMap::new();
         store.insert(
             "handoff://data/a.bin".to_string(),
-            b"handoff cross-binary payload".to_vec(),
+            StoredPayload::new(b"handoff cross-binary payload".to_vec()),
         );
         let generation = HANDOFF_GEN.fetch_add(1, Ordering::SeqCst);
         LAST_SEEDED_GEN.with(|slot| slot.set(generation));
@@ -1460,7 +1598,7 @@ impl Layer for HandoffBackend {
         let address = request.input.address;
         let store = self.store.lock().unwrap();
         match store.get(address.as_str()) {
-            Some(bytes) => Ok(object_info(address, bytes.len() as u64)),
+            Some(stored) => Ok(stored.info(address)),
             None => Err(Error::new(ErrorCode::NotFound, "object not found")),
         }
     }
@@ -1491,14 +1629,13 @@ impl Layer for HandoffBackend {
                 return Err(Error::new(ErrorCode::Cancelled, "gated read cancelled"));
             }
         }
-        let bytes = {
+        let (bytes, info) = {
             let store = self.store.lock().unwrap();
             match store.get(base) {
-                Some(bytes) => bytes.clone(),
+                Some(stored) => (Arc::clone(&stored.bytes), stored.info(address.clone())),
                 None => return Err(Error::new(ErrorCode::NotFound, "object not found")),
             }
         };
-        let info = object_info(address.clone(), bytes.len() as u64);
         if streamed {
             // Same chunked-stream marshalling exercise as `MiniV2Backend`'s
             // own `/stream` suffix: proves `ReadResult::Stream` crosses the
@@ -1510,7 +1647,10 @@ impl Layer for HandoffBackend {
             let stream: ReadStream = Box::pin(futures::stream::iter(chunks));
             Ok(ReadResult::Stream { stream, info })
         } else {
-            Ok(ReadResult::Bytes { bytes, info })
+            Ok(ReadResult::Bytes {
+                bytes: bytes.to_vec(),
+                info,
+            })
         }
     }
 
@@ -1532,14 +1672,13 @@ impl Layer for HandoffBackend {
                 buf
             }
         };
-        let size = bytes.len() as u64;
+        let stored = StoredPayload::new(bytes);
+        let info = stored.info(address.clone());
         self.store
             .lock()
             .unwrap()
-            .insert(address.as_str().to_string(), bytes);
-        Ok(WriteResult {
-            info: object_info(address, size),
-        })
+            .insert(address.as_str().to_string(), stored);
+        Ok(WriteResult { info })
     }
 
     async fn list(
@@ -1562,7 +1701,7 @@ impl Layer for HandoffBackend {
                     ovstorage_plugin::address::is_ancestor_or_self(&prefix, &address)
                 })
             })
-            .map(|(key, bytes)| object_info(Url::parse(key).unwrap(), bytes.len() as u64))
+            .map(|(key, stored)| stored.info(Url::parse(key).unwrap()))
             .collect();
         items.sort_by(|a, b| a.address.as_str().cmp(b.address.as_str()));
         Ok(ListPage {
@@ -1814,6 +1953,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn content_etags_are_strong_and_change_on_equal_length_rewrites() {
+        let backend = MiniV2Backend::for_test(DEFAULT_ROOT);
+        let address = Url::parse("mini://store/object.bin").unwrap();
+        let write = |bytes: &[u8]| {
+            futures::executor::block_on(backend.write(
+                Request::new(WriteRequest {
+                    address: address.clone(),
+                    body: Body::Bytes(bytes.to_vec()),
+                    options: WriteOptions::default(),
+                }),
+                None,
+            ))
+            .unwrap()
+            .info
+        };
+
+        let first = write(b"fixture");
+        let second = write(b"content");
+        let stat = futures::executor::block_on(backend.stat(
+            Request::new(StatRequest {
+                address: address.clone(),
+                options: StatOptions::default(),
+            }),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(first.etag_strength, EtagStrength::Strong);
+        assert_eq!(second.etag_strength, EtagStrength::Strong);
+        assert_eq!(first.size, second.size);
+        assert_ne!(first.etag, second.etag);
+        assert_eq!(stat.etag, second.etag);
+    }
+
+    #[test]
+    fn cloned_payload_reuses_bytes_and_cached_identity() {
+        let stored = StoredPayload::new(b"fixture".to_vec());
+        let cloned = stored.clone();
+
+        assert!(Arc::ptr_eq(&stored.bytes, &cloned.bytes));
+        assert_eq!(stored.etag, cloned.etag);
+        assert_eq!(
+            stored
+                .info(Url::parse("mini://store/object.bin").unwrap())
+                .etag,
+            cloned
+                .info(Url::parse("mini://store/copied.bin").unwrap())
+                .etag
+        );
+    }
+
     /// `list_address_roots` must register its update subscriber BEFORE reading
     /// the snapshot, so a root added concurrently in that window is delivered on
     /// the stream rather than lost (the 89ef4844 fix). We drive the race
@@ -1880,6 +2070,74 @@ mod tests {
                 display_name: None,
             },
         })
+    }
+
+    fn list_request(prefix: &str, options: ListOptions) -> Request<ListRequest> {
+        Request::new(ListRequest {
+            prefix: Url::parse(prefix).unwrap(),
+            options,
+        })
+    }
+
+    #[test]
+    fn mini_backend_wrapper_and_router_preserve_native_list_stream() {
+        futures::executor::block_on(async {
+            let backend = MiniV2Backend::for_test("mini://stream/");
+            for index in 0..8 {
+                backend.store.lock().unwrap().insert(
+                    format!("mini://stream/item-{index:02}.txt"),
+                    StoredPayload::new(vec![index as u8]),
+                );
+            }
+            let backend: LayerHandle = backend;
+            let wrapper: LayerHandle = Arc::new(MiniWrapper {
+                name: "wrapper".to_string(),
+                inner: backend,
+            });
+            let router = MiniRouter {
+                name: "router".to_string(),
+                children: vec![wrapper],
+            };
+
+            let cancel = CancellationToken::new();
+            let mut stream = router
+                .list_stream(
+                    list_request("mini://stream/", ListOptions::default()),
+                    Some(cancel.clone()),
+                )
+                .await
+                .expect("router opens the child's native stream");
+            stream
+                .next()
+                .await
+                .expect("stream has a first entry")
+                .expect("first entry succeeds");
+            cancel.cancel();
+            let error = stream
+                .next()
+                .await
+                .expect("cancellation emits a terminal frame")
+                .expect_err("cancellation cannot yield another entry");
+            assert_eq!(error.code(), ErrorCode::Cancelled);
+            assert!(stream.next().await.is_none(), "cancellation is terminal");
+
+            let paging = router
+                .list_stream(
+                    list_request(
+                        "mini://stream/",
+                        ListOptions {
+                            max_results: Some(1),
+                            ..ListOptions::default()
+                        },
+                    ),
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(paging, Err(error) if error.code() == ErrorCode::InvalidArgument),
+                "paging fields must be refused by the streamed surface"
+            );
+        });
     }
 
     /// Poll one already-queued item off an update stream.

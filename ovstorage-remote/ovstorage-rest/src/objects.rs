@@ -295,6 +295,7 @@ pub(crate) async fn delete_object(
     params(
         ("address" = String, Query, description = "Object to stat"),
         ("full_metadata" = Option<bool>, Query, description = "Include user metadata (may require an extra backend call on listing-backed stat implementations)"),
+        ("versioned_address" = Option<bool>, Query, description = "Populate `versioned_address`, paying for the version lookup where it is not free"),
     ),
     responses(
         (status = 200, body = schema::ObjectInfoResponse),
@@ -314,7 +315,21 @@ pub(crate) async fn stat_object(
         Ok(value) => value,
         Err(error) => return error_response(error),
     };
-    match stat_object_or_directory(&stack, &cx, address, StatOptions { full_metadata }).await {
+    let versioned_address = match bool_param(&params, "versioned_address") {
+        Ok(value) => value,
+        Err(error) => return error_response(error),
+    };
+    match stat_object_or_directory(
+        &stack,
+        &cx,
+        address,
+        StatOptions {
+            full_metadata,
+            versioned_address,
+        },
+    )
+    .await
+    {
         Ok(info) => Json(to_object_info(&info)).into_response(),
         Err(error) => error_response(error),
     }
@@ -367,6 +382,7 @@ async fn stat_object_or_directory(
         ("prefix" = String, Query, description = "Address prefix to list under"),
         ("recursive" = Option<bool>, Query, description = "Walk all descendants, not just immediate children"),
         ("full_metadata" = Option<bool>, Query, description = "Populate per-item user metadata"),
+        ("versioned_address" = Option<bool>, Query, description = "Populate `versioned_address`, paying for the version lookup where it is not free"),
     ),
     responses((status = 200, body = schema::ObjectInfoList)),
 )]
@@ -387,6 +403,10 @@ pub(crate) async fn list_objects(
         Ok(value) => value,
         Err(error) => return error_response(error),
     };
+    let versioned_address = match bool_param(&params, "versioned_address") {
+        Ok(value) => value,
+        Err(error) => return error_response(error),
+    };
     // Pass the prefix into the Stack as the caller wrote it. The trailing
     // slash is not part of node identity, so authorization decides the same
     // way for either spelling (List pre-check + per-item Stat post-filter) and
@@ -398,6 +418,7 @@ pub(crate) async fn list_objects(
         options: ListOptions {
             recursive,
             full_metadata,
+            versioned_address,
             ..ListOptions::default()
         },
     });
@@ -838,7 +859,8 @@ pub(crate) async fn get_capabilities(
 }
 
 /// List every address root currently routed by this gateway.
-/// Aliases appear only if their `visibility` is `visible`.
+/// Visible and hidden roots appear carrying their visibility; suppressed
+/// prefixes are omitted.
 #[utoipa::path(
     get,
     path = "/v1/address-roots",

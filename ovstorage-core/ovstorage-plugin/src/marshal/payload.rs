@@ -424,6 +424,11 @@ pub fn backend_item_info_to_ffi(value: BackendItemInfo) -> ffi::BackendItemInfo 
             metadata::user_metadata_to_ffi,
         ),
         modified_by: primitive::optional_to_ffi(value.modified_by, primitive::str_to_ffi),
+        etag_strength: identity::etag_strength_to_ffi(value.etag_strength),
+        versioned_address: primitive::optional_to_ffi(
+            value.versioned_address,
+            address::object_address_to_ffi,
+        ),
     }
 }
 
@@ -445,9 +450,11 @@ pub unsafe fn backend_item_info_from_ffi(
         let system_ffi = value.system_metadata;
         let user_ffi = value.user_metadata;
         let modified_by_ffi = value.modified_by;
+        let etag_strength_ffi = value.etag_strength;
+        let versioned_address_ffi = value.versioned_address;
 
-        let etag = primitive::optional_from_ffi(etag_ffi, |s| primitive::str_from_ffi(s));
-        let version = primitive::optional_from_ffi(version_ffi, |s| primitive::str_from_ffi(s));
+        let etag = primitive::optional_str_unset_as_none(etag_ffi);
+        let version = primitive::optional_str_unset_as_none(version_ffi);
         let size = primitive::optional_from_ffi::<u64, u64, Error>(size_ffi, Ok);
         let mtime = primitive::optional_from_ffi::<i64, SystemTime, Error>(mtime_ffi, |ms| {
             Ok(primitive::system_time_from_unix_ms(ms))
@@ -462,10 +469,13 @@ pub unsafe fn backend_item_info_from_ffi(
             primitive::optional_from_ffi(system_ffi, |kv| primitive::key_value_list_from_ffi(kv));
         let user_metadata =
             primitive::optional_from_ffi(user_ffi, |kv| primitive::key_value_list_from_ffi(kv));
-        let modified_by =
-            primitive::optional_from_ffi(modified_by_ffi, |s| primitive::str_from_ffi(s));
+        let modified_by = primitive::optional_str_unset_as_none(modified_by_ffi);
+        let versioned_address = primitive::optional_from_ffi(versioned_address_ffi, |s| {
+            address::object_address_from_ffi(s)
+        });
 
         Ok(BackendItemInfo {
+            etag_strength: identity::etag_strength_from_ffi(etag_strength_ffi),
             kind: identity::object_kind_from_ffi(kind_ffi),
             etag: etag?,
             version: version?,
@@ -476,6 +486,7 @@ pub unsafe fn backend_item_info_from_ffi(
             system_metadata: system_metadata?,
             user_metadata: user_metadata?,
             modified_by: modified_by?,
+            versioned_address: versioned_address?,
         })
     }
 }
@@ -499,7 +510,7 @@ pub unsafe fn access_decision_from_ffi(
         let denied_ops = access::access_ops_from_ffi(value.denied_ops);
         let allowed = value.allowed;
         let reason_ffi = value.reason;
-        let reason = primitive::optional_from_ffi(reason_ffi, |s| primitive::str_from_ffi(s))?;
+        let reason = primitive::optional_str_unset_as_none(reason_ffi)?;
         Ok(AccessDecision {
             allowed,
             denied_ops,

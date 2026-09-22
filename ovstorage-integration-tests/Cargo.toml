@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Single, top-level application-level integration suite. It drives the SHIPPED
+# routed `Stack`/`LayerExt` API exactly as an application developer would:
+# compose one `Stack` over the default wrapper chain, dlopen the plugin
+# cdylibs, register a connection per backend, and operate by address.
+#
+# It depends on HOST crates only (`ovstorage`, plus `ovstorage-authz` for the
+# attribution overlay) and never on a storage plugin: the plugins are loaded at
+# runtime via dlopen, so the per-plugin `#[unsafe(no_mangle)]` exports never
+# collide and one binary drives every backend.
+[dependencies]
+ovstorage.workspace = true
+# Host-side attribution overlay (not a storage plugin). Composed over the
+# routed Stack so the suite can write through an attributing host the way a
+# broker branch does.
+ovstorage-authz = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+futures = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# The C++ leg (`tests/cpp.rs`) `dlopen`s its driver `.so` rather than linking
+# it: that image bundles the pure-C source distribution, which exports the same
+# `ovstorage_plugin_*` symbols as `ovstorage-plugin`'s rlib, and linking both
+# into one binary is a hard collision. Test-only, so it stays out of the
+# shipped dependency set.
+[dev-dependencies]
+libloading = "0.8.9"
+
+[lints]
+workspace = true

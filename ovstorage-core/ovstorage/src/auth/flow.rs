@@ -815,6 +815,16 @@ fn build_succeeded_connection(
         },
         last_probed: None,
         user_metadata: std::collections::HashMap::new(),
+        // **This helper has no layer identity to report.** An `OAuthFlow` is
+        // keyed by `BackendId` and a connection id; it is not a `Layer` and has
+        // no name a connection op could address, so `None` is the honest value
+        // rather than a gap. The tiers that DO know fill it on the way out: a
+        // `Router` attributes the `Succeeded` row it forwards, and the loaded-
+        // plugin consumer back-fills from the plugin's sole owned target. A
+        // layer driving this flow directly and sitting under neither is the one
+        // shape that reaches a caller unattributed, and it can stamp its own
+        // name on the row before yielding it.
+        owning_target: None,
     }
 }
 

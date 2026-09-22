@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -25,11 +25,12 @@ use crate::routing::{fresh_id, paginate_list_items};
 use crate::*;
 
 mod errors;
-mod metadata;
 mod owner;
+mod temp;
 mod watch;
 
 use errors::map_io;
+use temp::{TempFileGuard, create_new_temp_sibling, is_atomic_write_temp_sibling};
 
 #[derive(Default)]
 pub struct FileBackendFactory;
@@ -319,6 +320,9 @@ struct RootScope {
     confine_to_root: bool,
 }
 
+type SelectedRootScope<'a> = Option<(&'a RootScope, PathBuf)>;
+type ScopeResolution<'a> = (SelectedRootScope<'a>, Option<PathBuf>);
+
 struct FileBackend {
     name: String,
     roots: RwLock<Vec<RootScope>>,
@@ -326,7 +330,7 @@ struct FileBackend {
     /// Per-path async locks, interned on first use (see
     /// [`FileBackend::target_lock`]). Each mutex is held across a check-then-act
     /// sequence on its path so in-process precondition races on the same path
-    /// serialize: `write_atomic`/`delete`/`update_metadata`/`create_directory`/
+    /// serialize: `write_atomic`/`delete`/`create_directory`/
     /// `delete_directory` take a single path lock, while `copy`/`rename` take a
     /// source+destination pair in canonical order via
     /// [`FileBackend::lock_source_and_destination`]. Cross-process races on the
@@ -352,6 +356,13 @@ impl Layer for FileBackend {
         cancel: Option<CancellationToken>,
     ) -> Result<RootInfo> {
         bail_if_cancelled(&cancel)?;
+        #[cfg(windows)]
+        if self.roots.read().is_empty() {
+            if !is_file_scheme_root(url) {
+                self.checked_path_for(url)?;
+            }
+            return Ok(self.root_info(file_scheme_root()));
+        }
         // NOT unconditionally no-I/O: the scope scan itself is an in-memory
         // read, but `checked_path_for` performs bounded `canonicalize`
         // syscalls for any root configured with `confine_to_root` (see
@@ -359,12 +370,9 @@ impl Layer for FileBackend {
         // thread — the same shape every other slot in this backend has, not
         // something this slot does differently — so `cancel` is honoured at
         // entry only, and cannot interrupt a walk already under way.
-        self.checked_path_for(url)?;
-        self.roots
-            .read()
-            .iter()
-            .find(|scope| address::relative_suffix(url, &scope.url).is_some())
-            .map(|scope| self.root_info(scope.url.clone()))
+        let (_, _, selected_root) = self.checked_scope_for_root(url)?;
+        selected_root
+            .map(|root| self.root_info(root))
             .ok_or_else(|| Error::new(ErrorCode::NoRoute, "no file root matches address"))
     }
 
@@ -376,6 +384,16 @@ impl Layer for FileBackend {
         bail_if_cancelled(&cancel)?;
         // In-memory snapshot of the configured root scopes; no filesystem
         // access, so past the entry check there is nothing left to interrupt.
+        #[cfg(windows)]
+        if self.roots.read().is_empty() {
+            return Ok((
+                RootInfoSnapshot {
+                    roots: vec![self.root_info(file_scheme_root())],
+                    updates: false,
+                },
+                None,
+            ));
+        }
         Ok((
             RootInfoSnapshot {
                 roots: self
@@ -395,6 +413,10 @@ impl Layer for FileBackend {
         request: Request<StatRequest>,
         _cancel: Option<CancellationToken>,
     ) -> Result<ObjectInfo> {
+        #[cfg(windows)]
+        if self.roots.read().is_empty() && is_file_scheme_root(&request.input.address) {
+            return Ok(synthetic_directory_info(file_scheme_root()));
+        }
         let path = self.checked_path_for(&request.input.address)?;
         stat_path(
             &request.input.address,
@@ -503,15 +525,8 @@ impl Layer for FileBackend {
         // remove (the same check-then-act class write_atomic closes).
         let lock = self.target_lock(&path);
         let _guard_lock = lock.lock().await;
-        // delete is idempotent: a missing target is success, matching the
-        // cdylib, and a precondition on a missing target is satisfied
-        // vacuously. Both cases still fall through to the sidecar cleanup. The
-        // sidecar is keyed by pathname, so an orphan left at an object-free
-        // path is handed to whatever object is created there next, and `delete`
-        // is the only API route that clears one: `update_metadata` refuses a
-        // missing address before it reaches any removal list. Skipping the
-        // cleanup here would make the very call the remedy names report success
-        // over a sidecar it never touched.
+        // delete is idempotent: a missing target is success, and a
+        // precondition on a missing target is satisfied vacuously.
         let mut target_missing = false;
         if let Some(expected) = &request.input.options.if_match {
             match tokio::fs::metadata(&path).await {
@@ -543,13 +558,7 @@ impl Layer for FileBackend {
                 }
             }
         }
-        // The object is gone by the time this runs, so a cleanup failure is a
-        // partial completion, not a failed delete. `io_error` would map most
-        // errnos to `Transient` and have a retry Layer replay a delete that
-        // already committed.
-        metadata::remove_metadata_file(&path).await.map_err(|err| {
-            metadata::into_post_commit_partial(err, metadata::SidecarStage::DeleteClear)
-        })
+        Ok(())
     }
 
     async fn list(
@@ -557,6 +566,15 @@ impl Layer for FileBackend {
         request: Request<ListRequest>,
         _cancel: Option<CancellationToken>,
     ) -> Result<ListPage> {
+        #[cfg(windows)]
+        if self.roots.read().is_empty() && is_file_scheme_root(&request.input.prefix) {
+            reject_recursive_synthetic_root_list(&request.input.options)?;
+            return paginate_list_items(
+                windows_drive_roots()?,
+                request.input.options.max_results,
+                request.input.options.page_token,
+            );
+        }
         let mut items = Vec::new();
         let (prefix_path, confine_root) = self.checked_scope_for(&request.input.prefix)?;
         if let Err(err) = collect_file_list(
@@ -584,6 +602,88 @@ impl Layer for FileBackend {
             request.input.options.max_results,
             request.input.options.page_token,
         )
+    }
+
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        #[cfg(windows)]
+        if self.roots.read().is_empty()
+            && is_file_scheme_root(&request.input.prefix)
+            && request.input.options.recursive
+        {
+            reject_recursive_synthetic_root_list(&request.input.options)?;
+        }
+        if request.input.options.max_results.is_some() || request.input.options.page_token.is_some()
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+        bail_if_cancelled(&cancel)?;
+
+        #[cfg(windows)]
+        if self.roots.read().is_empty() && is_file_scheme_root(&request.input.prefix) {
+            let stream = futures::stream::iter(windows_drive_roots()?.into_iter().map(Ok));
+            return Ok(cancel_list_stream(Box::pin(stream), cancel));
+        }
+
+        let (prefix_path, confine_root) = self.checked_scope_for(&request.input.prefix)?;
+        let recursive = request.input.options.recursive;
+        let full_metadata = request.input.options.full_metadata;
+        let stream_cancel = cancel.clone();
+        let stream = async_stream::try_stream! {
+            // Keep one live cursor per active DFS level. `ReadDir` performs a
+            // bounded pull from the operating system, so a wide directory can
+            // yield its first entry without retaining all of its children.
+            // File roots have real directories, so their streams may preserve
+            // the filesystem's natural traversal order.
+            let root_directory = match tokio::fs::read_dir(&prefix_path).await {
+                Ok(directory) => directory,
+                Err(err) => {
+                    // Match buffered `list`'s leaf diagnostic while leaving
+                    // failures discovered below the prefix untouched.
+                    if let Some(mismatch) = leaf_type_mismatch(
+                        &prefix_path,
+                        true,
+                        "list prefix is a file, not a directory",
+                    )
+                    .await
+                    {
+                        Err(mismatch)?;
+                    }
+                    Err(map_io(err))?
+                }
+            };
+            let mut directories = vec![root_directory];
+
+            while let Some(entry_path) = next_file_list_path(
+                &mut directories,
+                confine_root.as_deref(),
+                &stream_cancel,
+            )
+            .await?
+            {
+                bail_if_cancelled(&stream_cancel)?;
+                let address = path_to_file_url(&entry_path)?;
+                let info = stat_path(&address, &entry_path, full_metadata).await?;
+                bail_if_cancelled(&stream_cancel)?;
+                let is_directory = info.kind.is_directory();
+
+                // `yield` is the backpressure boundary. No child directory is
+                // opened until the consumer asks for the next entry.
+                yield info;
+
+                if recursive && is_directory {
+                    bail_if_cancelled(&stream_cancel)?;
+                    directories.push(tokio::fs::read_dir(entry_path).await.map_err(map_io)?);
+                }
+            }
+        };
+        Ok(cancel_list_stream(Box::pin(stream), cancel))
     }
 
     async fn watch_directory(
@@ -627,9 +727,8 @@ impl Layer for FileBackend {
         _cancel: Option<CancellationToken>,
     ) -> Result<BackendItemInfo> {
         let path = self.checked_path_for(&request.input.address)?;
-        // A directory address shares the per-path lock with update_metadata so
-        // a recreate can't interleave with a metadata patch checked against the
-        // prior directory.
+        // A directory address shares the per-path lock with `delete_directory`
+        // so a recreate cannot interleave with a removal of the same path.
         let lock = self.target_lock(&path);
         let _guard_lock = lock.lock().await;
         tokio::fs::create_dir_all(&path).await.map_err(map_io)?;
@@ -642,12 +741,25 @@ impl Layer for FileBackend {
         _cancel: Option<CancellationToken>,
     ) -> Result<()> {
         let path = self.checked_path_for(&request.input.address)?;
-        // Hold the per-path lock across the empty check, the dir removal, and
-        // the sidecar cleanup so a concurrent update_metadata on the same
-        // directory address can't write a sidecar for a directory being removed
-        // (orphan) or have its precondition invalidated mid-flight.
+        // Hold the per-path lock across the empty check and the dir removal so
+        // a concurrent `create_directory` on the same address serializes with
+        // the removal instead of interleaving with it.
         let lock = self.target_lock(&path);
         let _guard_lock = lock.lock().await;
+        // `rmdir` on a link fails with ENOTDIR, which `map_io` maps to NotFound.
+        // Refuse rather than unlink: no API can create this operator-configured
+        // state, so the link is not this backend's to remove or follow.
+        if let Ok(metadata) = tokio::fs::symlink_metadata(&path).await
+            && metadata.file_type().is_symlink()
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "delete_directory target is a symlink; the entry is operator-configured on disk and delete_directory will not remove or follow it",
+            )
+            .with_next_action(
+                "remove the link on the host filesystem, or address the link's target directly",
+            ));
+        }
         let mut entries = match tokio::fs::read_dir(&path).await {
             Ok(entries) => entries,
             Err(err) => {
@@ -663,31 +775,30 @@ impl Layer for FileBackend {
                 return Err(map_io(err));
             }
         };
-        // Every entry blocks the removal except the sidecar name cleared below,
-        // and the cleanup clears that name for a directory and for a link
-        // alike, so for the entries the API can create this scan's verdict
-        // matches the one `remove_dir` will reach. In particular a
+        // Every entry blocks the removal, so for the entries the API can create
+        // this scan's verdict matches the one `remove_dir` will reach. A
         // same-directory atomic-write staging temp — hidden from `list`/`watch`,
-        // but a real entry to the kernel — is reported here as the
-        // `DirectoryNotEmpty` it is, rather than surfacing as an ENOTEMPTY from
-        // `remove_dir` after the sidecar dir has already been destroyed.
+        // but a real entry to the kernel — is set aside and decided by the lock
+        // its writer holds: a live write refuses the removal as the
+        // `DirectoryNotEmpty` it is, and a temp left by a writer that died is
+        // cleared. Both verdicts are reached before anything is touched. Only a
+        // name the backend's own generator can emit is set aside; any other
+        // entry, hidden or not — a `.ovstorage-meta` directory included — keeps
+        // the honest `DirectoryNotEmpty`.
+        let mut staging = Vec::new();
         while let Some(entry) = entries.next_entry().await.map_err(map_io)? {
-            if !metadata::is_cleared_by_directory_removal(&entry.path()) {
-                return Err(Error::new(
-                    ErrorCode::DirectoryNotEmpty,
-                    "directory is not empty",
-                ));
+            let entry_path = entry.path();
+            if temp::is_clearable_staging_temp(&entry_path) {
+                staging.push(entry_path);
+                continue;
             }
+            return Err(Error::new(
+                ErrorCode::DirectoryNotEmpty,
+                "directory is not empty",
+            ));
         }
-        metadata::remove_directory_metadata_dir(&path).await?;
-        tokio::fs::remove_dir(&path).await.map_err(map_io)?;
-        // Same shape as `delete`: the directory is gone, and the sidecar that
-        // described it lives in the PARENT's metadata directory, so a failure
-        // to clear it leaves keys attached to a pathname a later entry would
-        // inherit.
-        metadata::remove_metadata_file(&path).await.map_err(|err| {
-            metadata::into_post_commit_partial(err, metadata::SidecarStage::DeleteClear)
-        })
+        temp::clear_orphaned_staging_temps(&staging).await?;
+        tokio::fs::remove_dir(&path).await.map_err(map_io)
     }
 
     async fn copy(
@@ -737,22 +848,20 @@ impl Layer for FileBackend {
         // must abort promptly rather than run to completion after the request
         // is cancelled (the armed guard removes the partial temp file).
         let (tmp, tmp_file) = create_new_temp_sibling(&destination).await?;
-        let guard = metadata::TempFileGuard::arm(tmp.clone());
+        let guard = TempFileGuard::arm(tmp.clone());
         let stage_future = write_body(tmp_file, Body::LocalFile(source.clone()));
-        match &cancel {
+        let staged = match &cancel {
             Some(token) => {
                 tokio::select! {
                     biased;
                     () = token.cancelled() => {
                         return Err(Error::new(ErrorCode::Cancelled, "copy cancelled by caller"));
                     }
-                    result = stage_future => { result?; }
+                    result = stage_future => result?,
                 }
             }
-            None => {
-                stage_future.await?;
-            }
-        }
+            None => stage_future.await?,
+        };
         // Re-check `if_source` against the staged bytes before committing. The
         // source lock excludes only writers inside this process, so an external
         // writer can replace the source between the pre-read check above and
@@ -777,35 +886,14 @@ impl Layer for FileBackend {
         tokio::fs::rename(&tmp, &destination)
             .await
             .map_err(map_io)?;
+        // The handle, and the lock it carries, close once the rename has
+        // published; the lock's range never overlaps content, so a reader that
+        // already found the object is unaffected.
+        drop(staged);
         guard.commit();
         sync_parent(&destination).await?;
-        // The destination bytes committed at the `rename` above, so every
-        // metadata step from here is the second commit stage: re-code its
-        // failures so none of them surfaces as a retryable code and has a retry
-        // Layer replay a copy that already landed.
-        metadata::copy_metadata_file(&source, &destination)
-            .await
-            .map_err(metadata::SidecarFailure::into_partial)?;
-        if let Some(message) = request
-            .input
-            .options
-            .message
-            .as_deref()
-            .filter(|m| !m.is_empty())
-        {
-            let mut user_metadata =
-                metadata::read_user_metadata(&destination)
-                    .await
-                    .map_err(|err| {
-                        metadata::into_post_commit_partial(err, metadata::SidecarStage::Annotate)
-                    })?;
-            user_metadata.insert("x-ov-message".to_string(), message.to_string());
-            metadata::write_user_metadata(&destination, &user_metadata)
-                .await
-                .map_err(|err| {
-                    metadata::into_post_commit_partial(err, metadata::SidecarStage::Annotate)
-                })?;
-        }
+        // `CopyOptions.message` is a per-operation annotation this backend has
+        // nowhere to keep; the contract lets a backend drop it.
         Ok(WriteStep::Done(WriteResult {
             info: stat_path(&request.input.destination, &destination, true).await?,
         }))
@@ -836,35 +924,10 @@ impl Layer for FileBackend {
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(map_io)?;
         }
+        // `RenameOptions.message` is dropped for the same reason as in `copy`.
         tokio::fs::rename(&source, &destination)
             .await
-            .map_err(map_io)?;
-        // Same as `copy`: the destination committed at the `rename` above, so
-        // the sidecar move and the message stash are the second stage.
-        metadata::move_metadata_file(&source, &destination)
-            .await
-            .map_err(metadata::SidecarFailure::into_partial)?;
-        if let Some(message) = request
-            .input
-            .options
-            .message
-            .as_deref()
-            .filter(|m| !m.is_empty())
-        {
-            let mut user_metadata =
-                metadata::read_user_metadata(&destination)
-                    .await
-                    .map_err(|err| {
-                        metadata::into_post_commit_partial(err, metadata::SidecarStage::Annotate)
-                    })?;
-            user_metadata.insert("x-ov-message".to_string(), message.to_string());
-            metadata::write_user_metadata(&destination, &user_metadata)
-                .await
-                .map_err(|err| {
-                    metadata::into_post_commit_partial(err, metadata::SidecarStage::Annotate)
-                })?;
-        }
-        Ok(())
+            .map_err(map_io)
     }
 
     async fn update_metadata(
@@ -872,41 +935,10 @@ impl Layer for FileBackend {
         request: Request<UpdateMetadataRequest>,
         _cancel: Option<CancellationToken>,
     ) -> Result<BackendItemInfo> {
-        let path = self.checked_path_for(&request.input.address)?;
-        // Hold the target lock across the if_match check and the
-        // read→merge→write so concurrent metadata updates serialize (no lost
-        // update) and the etag precondition can't be invalidated between the
-        // check and the sidecar write.
-        let lock = self.target_lock(&path);
-        let _guard_lock = lock.lock().await;
-        // Mirror the SPI contract: update_metadata on a missing target is
-        // NotFound, not a vacuous create. stat_path surfaces NotFound via
-        // tokio::fs::metadata, and doubles as the if_match precondition read
-        // (etag only, so the owner resolve is skipped here).
-        let info = stat_path(&request.input.address, &path, false).await?;
-        if let Some(expected) = &request.input.options.if_match
-            && info.etag.as_ref() != Some(expected)
-        {
-            return Err(Error::new(ErrorCode::PreconditionFailed, "etag mismatch"));
-        }
-        let mut user_metadata = metadata::read_user_metadata(&path).await?;
-        for key in &request.input.options.user_metadata_remove {
-            user_metadata.remove(key);
-        }
-        for (key, value) in &request.input.options.user_metadata_set {
-            user_metadata.insert(key.clone(), value.clone());
-        }
-        if let Some(message) = request
-            .input
-            .options
-            .message
-            .as_deref()
-            .filter(|m| !m.is_empty())
-        {
-            user_metadata.insert("x-ov-message".to_string(), message.to_string());
-        }
-        metadata::write_user_metadata(&path, &user_metadata).await?;
-        Ok(stat_path(&request.input.address, &path, true).await?.into())
+        // The address is still validated so a malformed or out-of-scope URL
+        // reports its own error rather than a blanket `Unsupported`.
+        self.checked_path_for(&request.input.address)?;
+        Err(unsupported_user_metadata("update_metadata"))
     }
 
     async fn check_access(
@@ -1010,6 +1042,12 @@ impl Layer for FileBackend {
             auth_state: ConnectionAuthState::Anonymous,
             last_probed: Some(SystemTime::now()),
             user_metadata: UserMetadata::new(),
+            // This layer owns the connection, and its instance name is the
+            // `ConnectionKey::target` that reaches it -- the same name
+            // `owned_targets` reports and `remove_connection` gates on. Stamped
+            // at construction so the row carries it wherever it goes, including
+            // out of `ConnectionSet`'s change stream.
+            owning_target: Some(self.name.clone()),
         };
         self.connections.write().push(connection.clone());
         self.roots.write().push(RootScope {
@@ -1042,19 +1080,58 @@ impl FileBackend {
         Ok(self.checked_scope_for(url)?.0)
     }
 
+    fn scopes_for_path<'a>(path: &Path, roots: &'a [RootScope]) -> Result<ScopeResolution<'a>> {
+        let mut selected = None;
+        let mut tightest_confine = None;
+        for scope in roots {
+            // A root URL that cannot name a native path is unroutable. It must
+            // not make every otherwise valid root fail to resolve.
+            let Ok(root_path) = file_path(&scope.url).map(|path| normalize_path(&path)) else {
+                continue;
+            };
+            if path.starts_with(&root_path) {
+                if scope.confine_to_root {
+                    let canonical_root = canonicalize_scope_root(&root_path)?;
+                    ensure_path_within_root(path, &canonical_root)?;
+                    if tightest_confine.as_ref().is_none_or(|existing: &PathBuf| {
+                        canonical_root.components().count() > existing.components().count()
+                    }) {
+                        tightest_confine = Some(canonical_root);
+                    }
+                }
+                let is_longer = selected.as_ref().is_none_or(
+                    |(existing_scope, existing_root): &(&RootScope, PathBuf)| {
+                        let depth = root_path.components().count();
+                        let existing_depth = existing_root.components().count();
+                        depth > existing_depth
+                            || (depth == existing_depth
+                                && scope.confine_to_root
+                                && !existing_scope.confine_to_root)
+                    },
+                );
+                if is_longer {
+                    selected = Some((scope, root_path));
+                }
+            }
+        }
+        Ok((selected, tightest_confine))
+    }
+
     /// Resolve and namespace-check `url`, returning the native path and — when
     /// the matched root is in `confine_to_root` mode — its canonicalized root so
     /// recursive `list`/`watch_directory` walkers can re-jail each descended
     /// directory (a plain `checked_path_for` only jails the addressed path
     /// itself, not the entries a recursive walk discovers through it).
     fn checked_scope_for(&self, url: &Url) -> Result<(PathBuf, Option<PathBuf>)> {
+        let (path, confine_root, _) = self.checked_scope_for_root(url)?;
+        Ok((path, confine_root))
+    }
+
+    fn checked_scope_for_root(&self, url: &Url) -> Result<(PathBuf, Option<PathBuf>, Option<Url>)> {
         let path = normalize_path(&file_path(url)?);
-        // The user-metadata sidecar namespace (`.ovstorage-meta`) and atomic-
-        // write temp siblings are backend-internal. The internal writers reach
-        // them through `metadata_path` + `tokio::fs` directly, never through
-        // here, so rejecting caller spelling that addresses them keeps a client
-        // from forging or corrupting another object's sidecar.
-        if metadata::is_internal_path(&path) {
+        // An atomic-write temp sibling is backend-internal: it is a write in
+        // flight, not an object, so a caller cannot address one directly.
+        if is_atomic_write_temp_sibling(&path) {
             return Err(Error::new(
                 ErrorCode::InvalidArgument,
                 "file URL addresses backend-internal storage",
@@ -1062,37 +1139,16 @@ impl FileBackend {
         }
         let roots = self.roots.read();
         if roots.is_empty() {
-            return Ok((path, None));
+            return Ok((path, None, None));
         }
-        for scope in roots.iter() {
-            let root_path = normalize_path(&file_path(&scope.url)?);
-            // Lexical namespace check: reject caller spelling that escapes the
-            // exposed namespace textually (residual `..` is already collapsed by
-            // `normalize_path`, so this rejects any path that does not stay
-            // under the root by name).
-            if path == root_path || path.starts_with(&root_path) {
-                // Optional realpath jail. Off by default: an in-root symlink is
-                // operator-configured indirection (no client SPI can create
-                // one), so following it to real data outside `root` is the
-                // "virtual tree" model. When `confine_to_root` is set the jail
-                // additionally rejects a spelling that stays under the root
-                // textually but resolves elsewhere on disk through a symlink —
-                // the guard the deleted file cdylib enforced, kept available for
-                // deployments that run under a privileged service account. The
-                // canonical root is handed back so `list`/`watch_directory` can
-                // apply the same check to every entry a recursive walk reaches.
-                if scope.confine_to_root {
-                    let canonical_root = canonicalize_scope_root(&root_path)?;
-                    ensure_path_within_root(&path, &canonical_root)?;
-                    return Ok((path, Some(canonical_root)));
-                }
-                return Ok((path, None));
-            }
-        }
-        Err(Error::new(
-            ErrorCode::InvalidArgument,
-            "file URL is outside the configured roots",
-        ))
+        let (selected, confine_root) = Self::scopes_for_path(&path, &roots)?;
+        let Some((scope, _)) = selected else {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "file URL is outside the configured roots",
+            ));
+        };
+        Ok((path, confine_root, Some(scope.url.clone())))
     }
 
     fn root_info(&self, root: Url) -> RootInfo {
@@ -1102,6 +1158,7 @@ impl FileBackend {
             .iter()
             .find(|connection| connection.current_addresses.contains(&root))
             .map(|connection| connection.id.clone());
+        let capabilities = file_capabilities();
         RootInfo {
             root,
             display_name: None,
@@ -1111,7 +1168,7 @@ impl FileBackend {
             // name; a static root has no owning connection.
             owning_target: connection_id.as_ref().map(|_| self.name().to_string()),
             connection_id,
-            capabilities: file_capabilities(),
+            capabilities,
             range_read_strategy: RangeReadStrategy::Native,
             visible: true,
             visibility: AddressVisibility::Visible,
@@ -1123,7 +1180,7 @@ impl FileBackend {
 
     /// Per-path async mutex, created on first use. Held across a check-then-act
     /// sequence on `path` so in-process precondition races serialize:
-    /// `write_atomic`/`delete`/`update_metadata`/`create_directory`/
+    /// `write_atomic`/`delete`/`create_directory`/
     /// `delete_directory` take this single lock; `copy`/`rename` take a
     /// source+destination pair via [`FileBackend::lock_source_and_destination`].
     ///
@@ -1166,13 +1223,14 @@ impl FileBackend {
     }
 
     /// Write via temp-sibling + fsync + rename so observers never see a partial
-    /// file.
+    /// file. The rename is the only commit, so `writes_are_atomic` covers the
+    /// whole write.
     ///
-    /// `writes_are_atomic` covers object bytes only; the user-metadata sidecar
-    /// publishes after the bytes commit and a failure between the two surfaces
-    /// as `PartialCompletion`, which is not retryable — the bytes are durable,
-    /// so replaying the write would change the etag under any concurrent
-    /// `if_match` retry. The caller re-applies the metadata instead.
+    /// A non-empty `user_metadata` is refused before anything touches the
+    /// filesystem: this backend stores none, and the contract requires a
+    /// refusal rather than a write that silently drops the caller's map.
+    /// `message` is a per-operation annotation the contract lets a backend
+    /// drop, and this one does.
     ///
     /// In-process if-match / no-overwrite races are closed by a per-destination
     /// async mutex held across the precondition check and the rename. Cross-
@@ -1185,6 +1243,8 @@ impl FileBackend {
         options: WriteOptions,
         body: Body,
     ) -> Result<WriteResult> {
+        reject_user_metadata(&options)?;
+        // A write creates its path: missing ancestors are created before the commit.
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(map_io)?;
         }
@@ -1196,21 +1256,22 @@ impl FileBackend {
         // in-process race.
         apply_destination_precondition(path, &options.if_dest).await?;
         let (tmp, tmp_file) = create_new_temp_sibling(path).await?;
-        let guard = metadata::TempFileGuard::arm(tmp.clone());
+        let guard = TempFileGuard::arm(tmp.clone());
         // Write through the O_EXCL handle returned by create-new rather than
         // reopening by path, so a same-dir writer cannot swap the entry between
         // create and write and have us truncate through to whatever now sits
         // there.
-        write_body(tmp_file, body).await?;
-        let user_metadata = options.user_metadata.unwrap_or_default();
-        let staged_sidecar = metadata::stage_user_metadata(path, &user_metadata).await?;
+        let staged = write_body(tmp_file, body).await?;
         let lock = self.target_lock(path);
         let _guard_lock = lock.lock().await;
         apply_destination_precondition(path, &options.if_dest).await?;
         tokio::fs::rename(&tmp, path).await.map_err(map_io)?;
+        // The handle, and the lock it carries, close once the rename has
+        // published; the lock's range never overlaps content, so a reader that
+        // already found the object is unaffected.
+        drop(staged);
         guard.commit();
         sync_parent(path).await?;
-        metadata::publish_staged_user_metadata(path, staged_sidecar).await?;
         Ok(WriteResult {
             info: stat_path(address, path, true).await?,
         })
@@ -1222,10 +1283,12 @@ impl FileBackend {
 /// durable content. Writing through the handle the create-new call returned —
 /// rather than reopening the temp by path — preserves the O_EXCL exclusivity:
 /// there is no create-then-reopen window for a same-dir writer to slip a
-/// different entry under the path. The handle is dropped (closed) on return, so
-/// the rename that follows never contends with an open handle (matters on
-/// Windows).
-async fn write_body(mut file: tokio::fs::File, body: Body) -> Result<()> {
+/// different entry under the path. The handle is returned still open, carrying
+/// the advisory lock that marks the write live to a directory removal probing
+/// the name; the caller drops it once the rename has published the bytes.
+/// Rust opens with `FILE_SHARE_DELETE` on Windows, so the rename does not
+/// contend with the open handle.
+async fn write_body(mut file: tokio::fs::File, body: Body) -> Result<tokio::fs::File> {
     match body {
         Body::Bytes(bytes) => {
             file.write_all(&bytes).await.map_err(map_io)?;
@@ -1242,55 +1305,43 @@ async fn write_body(mut file: tokio::fs::File, body: Body) -> Result<()> {
             }
         }
     }
-    file.sync_all().await.map_err(map_io)
+    file.sync_all().await.map_err(map_io)?;
+    Ok(file)
 }
 
-/// Create a fresh O_CREAT|O_EXCL temp sibling next to `path`, retrying on the
-/// (vanishingly rare) name collision so two concurrent writers to the same
-/// directory each get a private staging file. Returns the path *and* the open
-/// handle so the caller writes through the same fd it exclusively created (see
-/// [`write_body`]).
-async fn create_new_temp_sibling(path: &Path) -> Result<(PathBuf, tokio::fs::File)> {
-    let mut last_err: Option<io::Error> = None;
-    for _ in 0..16 {
-        let candidate = temp_sibling(path);
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-            .await
-        {
-            Ok(file) => return Ok((candidate, file)),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                last_err = Some(err);
-                continue;
-            }
-            Err(err) => return Err(map_io(err)),
-        }
+/// Refuse a write that carries caller metadata this backend cannot keep. Keyed
+/// on `user_metadata` alone: `message` is an annotation the contract lets a
+/// backend drop, so a message-only write proceeds.
+fn reject_user_metadata(options: &WriteOptions) -> Result<()> {
+    if options
+        .user_metadata
+        .as_ref()
+        .is_some_and(|metadata| !metadata.is_empty())
+    {
+        return Err(unsupported_user_metadata("write"));
     }
-    Err(map_io(last_err.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not allocate a unique temp sibling",
-        )
-    })))
+    Ok(())
 }
 
-/// Hidden temp-name pattern (`.<name>.<stamp>.<pid>.<counter>.tmp`) for the
-/// object's atomic-write staging file. Recognized and filtered by
-/// [`metadata::is_atomic_write_temp_sibling`].
-fn temp_sibling(path: &Path) -> PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let counter = metadata::TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let pid = std::process::id();
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_else(|| "object".into());
-    path.with_file_name(format!(".{name}.{stamp}.{pid}.{counter}.tmp"))
+/// The refusal every user-metadata entry point on this backend returns, worded
+/// per verb so the remedy is one the caller can act on: a `write` can drop its
+/// map, while `update_metadata` has no map to drop and can only go elsewhere.
+/// The message text matches the C baseline's word for word.
+fn unsupported_user_metadata(op: &str) -> Error {
+    let (message, next_action) = match op {
+        "write" => (
+            "file write: backend stores no user metadata; drop user_metadata or target a \
+             backend that supports it",
+            "write the object without user_metadata, or route it to a backend whose kind \
+             declares user-metadata support",
+        ),
+        _ => (
+            "file update_metadata: backend stores no user metadata; target a backend that \
+             supports it",
+            "route the object to a backend whose kind declares user-metadata support",
+        ),
+    };
+    Error::new(ErrorCode::Unsupported, message).with_next_action(next_action)
 }
 
 /// fsync the parent directory after a rename so the directory entry for the
@@ -1389,7 +1440,7 @@ async fn collect_file_list(
     let mut entries = tokio::fs::read_dir(&path).await.map_err(map_io)?;
     while let Some(entry) = entries.next_entry().await.map_err(map_io)? {
         let entry_path = entry.path();
-        if metadata::is_internal_entry(&entry_path) {
+        if is_atomic_write_temp_sibling(&entry_path) {
             continue;
         }
         // In `confine_to_root` mode re-apply the realpath jail to every entry
@@ -1419,6 +1470,39 @@ async fn collect_file_list(
         }
     }
     Ok(())
+}
+
+/// Pull the next visible path from a live directory DFS.
+///
+/// The stack contains directory cursors, not their remaining paths, so
+/// residency grows with traversal depth rather than directory width. The
+/// caller pushes a child cursor after yielding a directory entry.
+async fn next_file_list_path(
+    directories: &mut Vec<tokio::fs::ReadDir>,
+    confine_root: Option<&Path>,
+    cancel: &Option<CancellationToken>,
+) -> Result<Option<PathBuf>> {
+    loop {
+        bail_if_cancelled(cancel)?;
+        let Some(directory) = directories.last_mut() else {
+            return Ok(None);
+        };
+        let Some(entry) = directory.next_entry().await.map_err(map_io)? else {
+            directories.pop();
+            continue;
+        };
+        bail_if_cancelled(cancel)?;
+        let entry_path = entry.path();
+        if is_atomic_write_temp_sibling(&entry_path) {
+            continue;
+        }
+        if let Some(canonical_root) = confine_root
+            && ensure_path_within_root(&entry_path, canonical_root).is_err()
+        {
+            continue;
+        }
+        return Ok(Some(entry_path));
+    }
 }
 
 /// Open an [`AsyncRead`](tokio::io::AsyncRead) over only the bytes in `range`
@@ -1470,6 +1554,11 @@ async fn stat_path(address: &Url, path: &Path, include_modified_by: bool) -> Res
 /// stat instead of taking a second. [`stat_path`] is the thin stat-then-delegate
 /// wrapper for callers that hold only a path. See [`stat_path`] for
 /// `include_modified_by`.
+///
+/// The synthesized `size:N,mtime:T` etag is a weak validator: a same-size
+/// rewrite inside the filesystem clock granularity can retain the same value.
+/// It remains meaningful for compare-and-swap preconditions, but does not
+/// promise byte identity.
 async fn stat_path_with_meta(
     address: &Url,
     path: &Path,
@@ -1482,6 +1571,7 @@ async fn stat_path_with_meta(
         ObjectKind::File
     };
     Ok(ObjectInfo {
+        etag_strength: EtagStrength::Weak,
         address: address.clone(),
         kind,
         etag: Some(file_etag(&metadata)),
@@ -1491,12 +1581,15 @@ async fn stat_path_with_meta(
         checksums: ChecksumSet::new(),
         effective_permissions: Some(effective_permissions_from_metadata(&metadata)),
         system_metadata: None,
-        user_metadata: Some(metadata::read_user_metadata(path).await?),
+        // This backend stores no user metadata, so every object reports an
+        // empty map rather than `None`: the field is known, and known empty.
+        user_metadata: Some(UserMetadata::new()),
         modified_by: if include_modified_by {
             owner::modified_by_for_path(path, &metadata)
         } else {
             None
         },
+        versioned_address: None,
     })
 }
 
@@ -1548,6 +1641,57 @@ fn file_path(url: &Url) -> Result<PathBuf> {
     }
     url.to_file_path()
         .map_err(|_| Error::new(ErrorCode::InvalidArgument, "URL is not a valid file path"))
+}
+
+#[cfg(windows)]
+fn file_scheme_root() -> Url {
+    Url::parse("file:/").expect("the file scheme root is a valid URL")
+}
+
+#[cfg(windows)]
+fn is_file_scheme_root(url: &Url) -> bool {
+    url.scheme().eq_ignore_ascii_case("file") && url.host_str().is_none() && url.path() == "/"
+}
+
+#[cfg(windows)]
+fn synthetic_directory_info(address: Url) -> ObjectInfo {
+    ObjectInfo {
+        etag_strength: EtagStrength::Unspecified,
+        address,
+        kind: ObjectKind::Directory,
+        etag: None,
+        version: None,
+        size: None,
+        mtime: None,
+        checksums: ChecksumSet::new(),
+        effective_permissions: None,
+        system_metadata: None,
+        user_metadata: None,
+        modified_by: None,
+        versioned_address: None,
+    }
+}
+
+/// Return the logical drive roots reported by Windows. This is intentionally a
+/// directory listing, not a set of routes: publishing one route per drive would
+/// make the visible address topology depend on an incidental machine state.
+#[cfg(windows)]
+fn windows_drive_roots() -> Result<Vec<ObjectInfo>> {
+    use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+
+    let mask = unsafe { GetLogicalDrives() };
+    if mask == 0 {
+        return Err(map_io(io::Error::last_os_error()));
+    }
+    (0..26)
+        .filter(|index| mask & (1 << index) != 0)
+        .map(|index| {
+            let letter = char::from(b'A' + index as u8);
+            let address = Url::parse(&format!("file:///{letter}:/"))
+                .expect("an ASCII drive root is a valid file URL");
+            Ok(synthetic_directory_info(address))
+        })
+        .collect()
 }
 
 /// Canonicalize a configured filesystem root so containment checks compare
@@ -1642,11 +1786,30 @@ fn path_to_file_url(path: &Path) -> Result<Url> {
         })
 }
 
+#[cfg(any(windows, test))]
+/// Reject the one recursive-list request that the root-level capability cannot
+/// describe precisely.
+///
+/// An unscoped Windows backend publishes `file:/` as the container for drive
+/// roots, while [`Layer::root_info_for`] returns that same owning root for real
+/// drive descendants. Those descendants do support recursive listing, so the
+/// root consistently advertises the backend capability; only a recursive walk
+/// of the synthetic container itself is refused here.
+fn reject_recursive_synthetic_root_list(options: &ListOptions) -> Result<()> {
+    if options.recursive {
+        return Err(Error::new(
+            ErrorCode::Unsupported,
+            "recursive listing is not supported for the synthetic file root",
+        ));
+    }
+    Ok(())
+}
+
 fn file_capabilities() -> Capabilities {
     Capabilities {
         supports_if_match_write: true,
         supports_no_overwrite_write: true,
-        supports_native_metadata_patch: true,
+        supports_native_metadata_patch: false,
         supports_metadata_rewrite_emulation: false,
         writes_are_atomic: true,
         supports_copy: true,
@@ -1660,6 +1823,7 @@ fn file_capabilities() -> Capabilities {
         supports_write_redirect: false,
         supports_delete: true,
         supports_list: true,
+        supports_list_stream: true,
         wants_list_backed_stat: false,
         supports_recursive_list: true,
         populates_subdirectory_metadata: true,
@@ -1678,7 +1842,10 @@ fn file_capabilities() -> Capabilities {
 }
 
 fn file_descriptor() -> LayerKindDescriptor {
-    let mut descriptor = descriptor(FILE_BACKEND_KIND, LayerType::Backend, true, true);
+    // The backend stores no user metadata, so it declares none: a host then
+    // composes no attribution layer over a `file` branch rather than stamping a
+    // key this backend must refuse.
+    let mut descriptor = descriptor(FILE_BACKEND_KIND, LayerType::Backend, true, false);
     descriptor.display_name = "Local files".to_string();
     descriptor.description = Some("Read and write local file:// URLs".to_string());
     descriptor.config_schema = vec![
@@ -1825,6 +1992,19 @@ mod tests {
             .await
             .unwrap();
 
+        let stat = backend
+            .stat(
+                Request::new(StatRequest {
+                    address: file.clone(),
+                    options: StatOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(stat.etag.is_some());
+        assert_eq!(stat.etag_strength, EtagStrength::Weak);
+
         let read = backend
             .read(
                 Request::new(ReadRequest {
@@ -1954,6 +2134,502 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert!(err.message().contains("not a directory"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unscoped_file_scheme_root_lists_available_drive_roots() {
+        let backend = FileBackendFactory
+            .create_backend("files", &LayerConfig::new(), None)
+            .await
+            .unwrap();
+        let scheme_root = file_scheme_root();
+
+        let roots = backend
+            .list_address_roots(&Extensions::new(), None)
+            .await
+            .unwrap()
+            .0
+            .roots;
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].root, scheme_root);
+
+        let page = backend
+            .list(
+                Request::new(ListRequest {
+                    prefix: scheme_root,
+                    options: ListOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let expected: Vec<_> = windows_drive_roots()
+            .unwrap()
+            .into_iter()
+            .map(|info| info.address)
+            .collect();
+        let actual: Vec<_> = page.items.into_iter().map(|info| info.address).collect();
+        assert_eq!(actual, expected);
+        assert!(actual.iter().all(|address| {
+            let path = address.path().as_bytes();
+            path.len() == 4
+                && path[0] == b'/'
+                && path[1].is_ascii_uppercase()
+                && path[2] == b':'
+                && path[3] == b'/'
+        }));
+
+        let drive = actual.first().expect("Windows reports at least one drive");
+        let drive_info = backend
+            .root_info_for(drive, &Extensions::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(drive_info.root, file_scheme_root());
+        let child_info = backend
+            .root_info_for(&drive.join("child.txt").unwrap(), &Extensions::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(child_info.root, file_scheme_root());
+
+        let root_stat = backend
+            .stat(
+                Request::new(StatRequest {
+                    address: file_scheme_root(),
+                    options: StatOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(root_stat.address, file_scheme_root());
+        assert_eq!(root_stat.kind, ObjectKind::Directory);
+        assert_eq!(root_stat.size, None);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn configured_file_scheme_root_does_not_expose_machine_drive_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        let mut config = LayerConfig::new();
+        config.insert("root".into(), ConfigValue::String(root.to_string()));
+        let backend = FileBackendFactory
+            .create_backend("files", &config, None)
+            .await
+            .unwrap();
+
+        let error = backend
+            .list(
+                Request::new(ListRequest {
+                    prefix: file_scheme_root(),
+                    options: ListOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .expect_err("an explicit root must keep the machine root out of scope");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(error.message().contains("URL is not a valid file path"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unscoped_file_scheme_root_streams_available_drive_roots_without_pagination() {
+        use futures::{StreamExt as _, TryStreamExt as _};
+
+        let backend = FileBackendFactory
+            .create_backend("files", &LayerConfig::new(), None)
+            .await
+            .unwrap();
+        let scheme_root = file_scheme_root();
+        let buffered = backend
+            .list(
+                Request::new(ListRequest {
+                    prefix: scheme_root.clone(),
+                    options: ListOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let streamed: Vec<_> = backend
+            .list_stream(
+                Request::new(ListRequest {
+                    prefix: scheme_root.clone(),
+                    options: ListOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            streamed
+                .into_iter()
+                .map(|item| item.address)
+                .collect::<Vec<_>>(),
+            buffered
+                .items
+                .into_iter()
+                .map(|item| item.address)
+                .collect::<Vec<_>>(),
+        );
+
+        let cancel = CancellationToken::new();
+        let mut cancelled_stream = backend
+            .list_stream(
+                Request::new(ListRequest {
+                    prefix: scheme_root.clone(),
+                    options: ListOptions::default(),
+                }),
+                Some(cancel.clone()),
+            )
+            .await
+            .unwrap();
+        cancel.cancel();
+        let error = cancelled_stream
+            .next()
+            .await
+            .expect("cancelled list stream must report cancellation")
+            .expect_err("cancelled list stream must not yield a drive");
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert!(cancelled_stream.next().await.is_none());
+
+        for options in [
+            ListOptions {
+                max_results: Some(1),
+                ..ListOptions::default()
+            },
+            ListOptions {
+                page_token: Some("not-a-page-token".to_string()),
+                ..ListOptions::default()
+            },
+        ] {
+            let result = backend
+                .list_stream(
+                    Request::new(ListRequest {
+                        prefix: scheme_root.clone(),
+                        options,
+                    }),
+                    None,
+                )
+                .await;
+            let error = match result {
+                Ok(_) => panic!("list_stream must reject pagination options"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert!(error.message().contains("max_results or page_token"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unscoped_file_scheme_root_rejects_recursive_lists() {
+        let backend = FileBackendFactory
+            .create_backend("files", &LayerConfig::new(), None)
+            .await
+            .unwrap();
+        let scheme_root = file_scheme_root();
+        let options = ListOptions {
+            recursive: true,
+            ..ListOptions::default()
+        };
+
+        let root_info = backend
+            .root_info_for(&scheme_root, &Extensions::new(), None)
+            .await
+            .unwrap();
+        assert!(root_info.capabilities.supports_recursive_list);
+        let (snapshot, _) = backend
+            .list_address_roots(&Extensions::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.roots.len(), 1);
+        assert_eq!(snapshot.roots[0].capabilities, root_info.capabilities);
+
+        let error = backend
+            .list(
+                Request::new(ListRequest {
+                    prefix: scheme_root.clone(),
+                    options: options.clone(),
+                }),
+                None,
+            )
+            .await
+            .expect_err("the synthetic drive root must reject recursive buffered lists");
+        assert_eq!(error.code(), ErrorCode::Unsupported);
+
+        let result = backend
+            .list_stream(
+                Request::new(ListRequest {
+                    prefix: scheme_root,
+                    options,
+                }),
+                None,
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("the synthetic drive root must reject recursive streaming lists"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ErrorCode::Unsupported);
+    }
+
+    #[test]
+    fn synthetic_root_recursive_list_option_is_unsupported() {
+        let error = reject_recursive_synthetic_root_list(&ListOptions {
+            recursive: true,
+            ..ListOptions::default()
+        })
+        .expect_err("synthetic root recursion must be unsupported");
+        assert_eq!(error.code(), ErrorCode::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn file_backend_list_stream_matches_buffered_entry_set_with_depth_first_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        std::fs::create_dir(tmp.path().join("a")).unwrap();
+        std::fs::write(tmp.path().join("a").join("z.txt"), b"nested").unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"sibling").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), b"sibling").unwrap();
+        let backend = backend_over_tempdir(&tmp).await;
+
+        let options = ListOptions {
+            recursive: true,
+            ..ListOptions::default()
+        };
+        let buffered = backend
+            .list(
+                Request::new(ListRequest {
+                    prefix: root.clone(),
+                    options: options.clone(),
+                }),
+                None,
+            )
+            .await
+            .unwrap()
+            .items;
+        let streamed = list_stream_items(&backend, &root, options, None)
+            .await
+            .unwrap();
+
+        let address_set = |items: &[ObjectInfo]| {
+            items
+                .iter()
+                .map(|item| item.address.as_str().to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(address_set(&streamed), address_set(&buffered));
+
+        // Sibling order follows the filesystem, but once a directory is
+        // yielded its subtree is consumed before traversal resumes at the
+        // parent level.
+        let streamed_addresses: Vec<_> = streamed.iter().map(|item| &item.address).collect();
+        let directory = root.join("a").unwrap();
+        let nested = root.join("a/z.txt").unwrap();
+        let directory_index = streamed_addresses
+            .iter()
+            .position(|address| *address == &directory)
+            .unwrap();
+        let nested_index = streamed_addresses
+            .iter()
+            .position(|address| *address == &nested)
+            .unwrap();
+        assert_eq!(
+            nested_index,
+            directory_index + 1,
+            "a directory's first child must be the next DFS entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_backend_list_stream_pulls_a_wide_directory_one_entry_at_a_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        for index in 0..2_048 {
+            std::fs::write(tmp.path().join(format!("{index:04}.txt")), b"entry").unwrap();
+        }
+
+        let mut directories = vec![tokio::fs::read_dir(tmp.path()).await.unwrap()];
+        let first = next_file_list_path(&mut directories, None, &None)
+            .await
+            .unwrap()
+            .expect("wide directory must have a first entry");
+
+        assert!(first.parent().is_some_and(|parent| parent == tmp.path()));
+        assert_eq!(
+            directories.len(),
+            1,
+            "the cursor retains one directory handle, not its remaining paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_backend_list_stream_one_level_and_recursive_match_buffered_sets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        std::fs::create_dir(tmp.path().join("nested")).unwrap();
+        std::fs::write(tmp.path().join("direct.txt"), b"direct").unwrap();
+        std::fs::write(tmp.path().join("nested").join("leaf.txt"), b"leaf").unwrap();
+        let backend = backend_over_tempdir(&tmp).await;
+
+        for recursive in [false, true] {
+            let options = ListOptions {
+                recursive,
+                ..ListOptions::default()
+            };
+            let buffered = backend
+                .list(
+                    Request::new(ListRequest {
+                        prefix: root.clone(),
+                        options: options.clone(),
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let streamed = list_stream_items(&backend, &root, options, None)
+                .await
+                .unwrap();
+            let buffered_addresses: std::collections::BTreeSet<_> = buffered
+                .items
+                .iter()
+                .map(|item| item.address.as_str())
+                .collect();
+            let streamed_addresses: std::collections::BTreeSet<_> =
+                streamed.iter().map(|item| item.address.as_str()).collect();
+            assert_eq!(
+                streamed_addresses, buffered_addresses,
+                "recursive={recursive}"
+            );
+            assert_eq!(
+                streamed_addresses.contains(root.join("nested/leaf.txt").unwrap().as_str()),
+                recursive,
+                "nested leaf presence must follow the recursive option"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn file_backend_list_stream_cancellation_stops_mid_walk() {
+        use futures::StreamExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        for index in 0..32 {
+            std::fs::write(tmp.path().join(format!("{index:02}.txt")), b"entry").unwrap();
+        }
+        let backend = backend_over_tempdir(&tmp).await;
+        let cancel = CancellationToken::new();
+        let mut stream = backend
+            .list_stream(
+                Request::new(ListRequest {
+                    prefix: root,
+                    options: ListOptions::default(),
+                }),
+                Some(cancel.clone()),
+            )
+            .await
+            .unwrap();
+
+        stream
+            .next()
+            .await
+            .expect("stream must yield its first entry")
+            .unwrap();
+        cancel.cancel();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("cancelled list stream did not stop promptly")
+            .expect("cancelled list stream must report cancellation")
+            .expect_err("cancelled list stream yielded another entry");
+        assert_eq!(err.code(), ErrorCode::Cancelled);
+        assert!(
+            stream.next().await.is_none(),
+            "cancellation must terminate the stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_backend_list_stream_cancellation_after_final_entry_is_terminal() {
+        use futures::StreamExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("only.txt"), b"entry").unwrap();
+        let backend = backend_over_tempdir(&tmp).await;
+        let cancel = CancellationToken::new();
+        let mut stream = backend
+            .list_stream(
+                Request::new(ListRequest {
+                    prefix: root,
+                    options: ListOptions::default(),
+                }),
+                Some(cancel.clone()),
+            )
+            .await
+            .unwrap();
+
+        stream
+            .next()
+            .await
+            .expect("stream must yield its only entry")
+            .unwrap();
+        cancel.cancel();
+
+        let error = stream
+            .next()
+            .await
+            .expect("cancellation after the final entry must be observable")
+            .expect_err("cancellation must preempt normal completion");
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert!(stream.next().await.is_none(), "cancellation is terminal");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_backend_list_stream_propagates_per_entry_stat_errors() {
+        use futures::StreamExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("missing"), tmp.path().join("broken")).unwrap();
+        let backend = backend_over_tempdir(&tmp).await;
+        let buffered_error = backend
+            .list(
+                Request::new(ListRequest {
+                    prefix: root.clone(),
+                    options: ListOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .expect_err("buffered list must reject the broken entry");
+        let mut stream = backend
+            .list_stream(
+                Request::new(ListRequest {
+                    prefix: root,
+                    options: ListOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let streamed_error = stream
+            .next()
+            .await
+            .expect("stream must surface the stat failure")
+            .expect_err("broken entry must not produce ObjectInfo");
+
+        assert_eq!(streamed_error.code(), buffered_error.code());
+        assert!(
+            stream.next().await.is_none(),
+            "an entry error must terminate the stream"
+        );
     }
 
     // Regression: read on a directory is a type mismatch with guidance, not a
@@ -2964,72 +3640,6 @@ mod tests {
         );
     }
 
-    /// The integration property the whole `PartialCompletion` classification
-    /// rests on, and which the unit tests on `publish_staged_user_metadata`
-    /// cannot show: a REAL `FileBackend::write` whose sidecar publish fails
-    /// surfaces the partial completion **and leaves the object bytes readable**.
-    ///
-    /// Those unit tests call the helper directly, so they stay green if
-    /// `write_atomic` swallows its error or calls it before committing the
-    /// bytes. This drives the backend.
-    ///
-    /// Unix-only: on Windows the sidecar is an NTFS alternate data stream, so
-    /// the directory-in-the-way trick cannot be set up.
-    #[cfg(not(windows))]
-    #[tokio::test]
-    async fn a_real_write_surfaces_a_sidecar_failure_with_the_bytes_readable() {
-        let tmp = tempfile::tempdir().unwrap();
-        let backend = backend_over_tempdir(&tmp).await;
-        let address = Url::from_directory_path(tmp.path())
-            .unwrap()
-            .join("object.usd")
-            .unwrap();
-
-        // Put a DIRECTORY where the sidecar file must be renamed into place,
-        // so staging succeeds and only the publish fails (EISDIR). Deterministic,
-        // and unaffected by running as root.
-        let object_path = tmp.path().join("object.usd");
-        let sidecar = metadata::metadata_path(&object_path).unwrap();
-        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
-        std::fs::create_dir(&sidecar).unwrap();
-
-        let mut user_metadata = UserMetadata::new();
-        user_metadata.insert("label".into(), "hero".into());
-        let err = backend
-            .write(
-                Request::new(WriteRequest {
-                    address: address.clone(),
-                    body: Body::Bytes(b"hello".to_vec()),
-                    options: WriteOptions {
-                        user_metadata: Some(user_metadata),
-                        ..Default::default()
-                    },
-                }),
-                None,
-            )
-            .await
-            .expect_err("a sidecar publish failure must surface");
-
-        assert_eq!(err.code(), ErrorCode::PartialCompletion);
-        assert!(
-            !err.code().retryable(),
-            "a retry Layer must not replay a write whose bytes committed",
-        );
-
-        // The half that makes it a PARTIAL completion: the bytes really are
-        // durable on disk. Without this the error could equally be reporting a
-        // write that never landed.
-        //
-        // Read the file directly rather than through `backend.read`: the
-        // fixture leaves a directory at the sidecar path, and a backend read
-        // also consults user metadata, so it would fail on the sidecar and tell
-        // us nothing about the bytes. The durability claim is about the object,
-        // and this is the assertion that isolates it.
-        let on_disk = std::fs::read(&object_path).expect("the object must exist on disk");
-        assert_eq!(on_disk, b"hello", "the committed bytes must be intact");
-        let _ = address;
-    }
-
     async fn backend_over_tempdir(tmp: &tempfile::TempDir) -> LayerHandle {
         let root = Url::from_directory_path(tmp.path()).unwrap();
         let mut config = LayerConfig::new();
@@ -3038,6 +3648,27 @@ mod tests {
             .create_backend("files", &config, None)
             .await
             .unwrap()
+    }
+
+    async fn list_stream_items(
+        backend: &LayerHandle,
+        prefix: &Url,
+        options: ListOptions,
+        cancel: Option<CancellationToken>,
+    ) -> Result<Vec<ObjectInfo>> {
+        use futures::TryStreamExt as _;
+
+        backend
+            .list_stream(
+                Request::new(ListRequest {
+                    prefix: prefix.clone(),
+                    options,
+                }),
+                cancel,
+            )
+            .await?
+            .try_collect()
+            .await
     }
 
     /// Build a backend the way runtime/brokered compositions do: an empty
@@ -3127,551 +3758,266 @@ mod tests {
         }
     }
 
+    /// The refusal the contract asks for: a write carrying caller metadata this
+    /// backend cannot keep fails with `Unsupported` before anything touches the
+    /// filesystem — no object, no staging temp, not even the parent directory.
+    /// `write_stream` shares the path, so both slots are driven.
     #[tokio::test]
-    async fn update_metadata_then_stat_round_trips_user_metadata() {
+    async fn write_refuses_user_metadata_it_cannot_store() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Url::from_directory_path(tmp.path()).unwrap();
-        let file = root.join("doc.txt").unwrap();
+        let file = root.join("nested/withmeta.txt").unwrap();
         let backend = backend_over_tempdir(&tmp).await;
-        write_file(&backend, &file, b"body").await;
+        let mut user_metadata = UserMetadata::new();
+        user_metadata.insert("origin".into(), "write".into());
+        assert!(!user_metadata.is_empty(), "the fixture must carry a key");
 
-        backend
-            .update_metadata(
-                Request::new(UpdateMetadataRequest {
-                    address: file.clone(),
-                    options: set_one("k", "v"),
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let info = stat(&backend, &file).await;
-        let user_metadata = info.user_metadata.expect("stat populates user_metadata");
-        assert_eq!(user_metadata.get("k").map(String::as_str), Some("v"));
+        for streamed in [false, true] {
+            let request = Request::new(WriteRequest {
+                address: file.clone(),
+                body: Body::Bytes(b"payload".to_vec()),
+                options: WriteOptions {
+                    user_metadata: Some(user_metadata.clone()),
+                    ..WriteOptions::default()
+                },
+            });
+            let result = if streamed {
+                backend.write_stream(request, None).await
+            } else {
+                backend.write(request, None).await
+            };
+            let err = result.expect_err("a write carrying user metadata must be refused");
+            assert_eq!(err.code(), ErrorCode::Unsupported, "{err:?}");
+            assert!(err.message().contains("drop user_metadata"), "{err}");
+            assert!(err.next_action().is_some(), "{err}");
+        }
+        assert!(
+            !file.to_file_path().unwrap().exists(),
+            "the object must not commit"
+        );
+        assert!(
+            !tmp.path().join("nested").exists(),
+            "the refusal must precede any directory creation"
+        );
+        assert_eq!(temp_sibling_count(tmp.path()), 0, "staging temp leaked");
     }
 
+    /// The refusal is keyed on `user_metadata` alone. An absent map, an empty
+    /// map and a `message` are not metadata this backend has to keep, so those
+    /// writes proceed, and every object reports an empty map.
     #[tokio::test]
-    async fn copy_carries_user_metadata_sidecar() {
+    async fn write_accepts_an_absent_or_empty_map_and_a_message() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Url::from_directory_path(tmp.path()).unwrap();
-        let source = root.join("src.txt").unwrap();
-        let destination = root.join("dst.txt").unwrap();
         let backend = backend_over_tempdir(&tmp).await;
+        let cases = [
+            ("absent", WriteOptions::default()),
+            (
+                "empty",
+                WriteOptions {
+                    user_metadata: Some(UserMetadata::new()),
+                    ..WriteOptions::default()
+                },
+            ),
+            (
+                "message",
+                WriteOptions {
+                    message: Some("annotated".into()),
+                    ..WriteOptions::default()
+                },
+            ),
+        ];
+        for (name, options) in cases {
+            let file = root.join(&format!("{name}.txt")).unwrap();
+            write_with_options(&backend, &file, b"payload", options)
+                .await
+                .unwrap_or_else(|err| panic!("{name}: {err:?}"));
+            let info = stat(&backend, &file).await;
+            assert_eq!(info.size, Some(b"payload".len() as u64), "{name}");
+            assert_eq!(info.user_metadata, Some(UserMetadata::new()), "{name}");
+        }
+    }
+
+    /// `copy` and `rename` carry no `user_metadata`, and their `message` is an
+    /// annotation the backend drops, so both proceed and the destination
+    /// reports an empty map.
+    #[tokio::test]
+    async fn copy_and_rename_accept_a_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        let backend = backend_over_tempdir(&tmp).await;
+        let source = root.join("source.txt").unwrap();
+        let copied = root.join("copied.txt").unwrap();
+        let renamed = root.join("renamed.txt").unwrap();
         write_file(&backend, &source, b"body").await;
-        backend
-            .update_metadata(
-                Request::new(UpdateMetadataRequest {
-                    address: source.clone(),
-                    options: set_one("carry", "yes"),
-                }),
-                None,
-            )
-            .await
-            .unwrap();
 
         backend
             .copy(
                 Request::new(CopyRequest {
                     source: source.clone(),
-                    destination: destination.clone(),
-                    options: CopyOptions::default(),
+                    destination: copied.clone(),
+                    options: CopyOptions {
+                        message: Some("copied".into()),
+                        ..CopyOptions::default()
+                    },
                 }),
                 None,
             )
             .await
             .unwrap();
-
-        let info = stat(&backend, &destination).await;
-        let user_metadata = info.user_metadata.expect("stat populates user_metadata");
-        assert_eq!(user_metadata.get("carry").map(String::as_str), Some("yes"));
-    }
-
-    #[tokio::test]
-    async fn delete_removes_user_metadata_sidecar() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Url::from_directory_path(tmp.path()).unwrap();
-        let file = root.join("gone.txt").unwrap();
-        let backend = backend_over_tempdir(&tmp).await;
-        write_file(&backend, &file, b"body").await;
-        backend
-            .update_metadata(
-                Request::new(UpdateMetadataRequest {
-                    address: file.clone(),
-                    options: set_one("k", "v"),
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-        let path = file.to_file_path().unwrap();
-        assert!(metadata::metadata_path(&path).unwrap().exists());
-
-        backend
-            .delete(
-                Request::new(DeleteRequest {
-                    address: file.clone(),
-                    options: DeleteOptions::default(),
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert!(!metadata::metadata_path(&path).unwrap().exists());
-    }
-
-    /// A `delete` whose sidecar cleanup fails runs after the object is already
-    /// unlinked, so it is a partial completion and not a failed delete. The
-    /// classification is only half of it: the second `delete` below is the
-    /// assertion that matters, because `delete` is idempotent and a missing
-    /// object is success. A cleanup skipped on the missing-object path would
-    /// make the repeat — which is exactly the remedy this stage's `next_action`
-    /// asks for — report success while the orphaned keys stayed on disk,
-    /// waiting for the next object created at that pathname.
-    ///
-    /// Unix-only: on Windows the sidecar is an NTFS alternate data stream, so
-    /// the directory-in-the-way trick cannot be set up.
-    #[cfg(not(windows))]
-    #[tokio::test]
-    async fn a_delete_that_cannot_clear_its_sidecar_reports_a_partial_completion() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Url::from_directory_path(tmp.path()).unwrap();
-        let file = root.join("gone.txt").unwrap();
-        let backend = backend_over_tempdir(&tmp).await;
-        write_file(&backend, &file, b"body").await;
-
-        // A DIRECTORY at the sidecar path: the probe finds something there and
-        // `remove_file` then fails with EISDIR. Deterministic, and unlike a
-        // chmod it behaves the same when the suite runs as root.
-        let path = file.to_file_path().unwrap();
-        let sidecar = metadata::metadata_path(&path).unwrap();
-        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
-        std::fs::create_dir(&sidecar).unwrap();
-
-        let err = backend
-            .delete(
-                Request::new(DeleteRequest {
-                    address: file.clone(),
-                    options: DeleteOptions::default(),
-                }),
-                None,
-            )
-            .await
-            .expect_err("a sidecar cleanup failure after the unlink must surface");
-        assert_eq!(err.code(), ErrorCode::PartialCompletion);
-        assert!(
-            !err.code().retryable(),
-            "a retry Layer must not replay a delete that already unlinked",
-        );
-        match err.context() {
-            Some(ErrorContext::Partial {
-                completed,
-                failed,
-                failed_outcome,
-                ..
-            }) => {
-                assert_eq!(*completed, PartialStage::ObjectData);
-                assert_eq!(*failed, PartialStage::UserMetadata);
-                assert_eq!(*failed_outcome, StageOutcome::NotApplied);
-            }
-            other => panic!("delete lost its partial context: {other:?}"),
-        }
-
-        // The half that makes it PARTIAL: the object really is gone.
-        assert!(!path.exists(), "the delete must have committed the unlink");
-
-        // The anti-laundering assertion. The object is missing now, so the
-        // idempotent path is the one taken — and it must still report the
-        // sidecar it cannot clear rather than returning success over it.
-        let repeat = backend
-            .delete(
-                Request::new(DeleteRequest {
-                    address: file.clone(),
-                    options: DeleteOptions::default(),
-                }),
-                None,
-            )
-            .await
-            .expect_err("a repeat delete must not launder the orphaned sidecar into success");
-        assert_eq!(repeat.code(), ErrorCode::PartialCompletion);
-
-        // And with the obstruction gone, the repeat the remedy asks for really
-        // does clear it — the remedy is executed here, not just asserted.
-        std::fs::remove_dir(&sidecar).unwrap();
-        std::fs::write(&sidecar, "").unwrap();
-        backend
-            .delete(
-                Request::new(DeleteRequest {
-                    address: file,
-                    options: DeleteOptions::default(),
-                }),
-                None,
-            )
-            .await
-            .expect("a repeat delete clears an orphaned sidecar once unblocked");
-        assert!(!sidecar.exists(), "the orphaned sidecar must be cleared");
-    }
-
-    /// A successful `rename` must leave nothing at the source sidecar pathname.
-    /// The file backend keys sidecars by pathname, so residue there is not
-    /// inert: the next object created at the source path would be read with the
-    /// renamed object's keys, including its `ovstorage-modified-by`. The move is
-    /// a single `rename(2)`, which is what makes "no residue" a property rather
-    /// than a hope.
-    #[cfg(not(windows))]
-    #[tokio::test]
-    async fn rename_leaves_no_user_metadata_at_the_source_pathname() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Url::from_directory_path(tmp.path()).unwrap();
-        let source = root.join("src.txt").unwrap();
-        let destination = root.join("dst.txt").unwrap();
-        let backend = backend_over_tempdir(&tmp).await;
-        write_file(&backend, &source, b"body").await;
-        backend
-            .update_metadata(
-                Request::new(UpdateMetadataRequest {
-                    address: source.clone(),
-                    options: set_one("label", "hero"),
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-        let source_sidecar = metadata::metadata_path(&source.to_file_path().unwrap()).unwrap();
-        assert!(source_sidecar.exists());
-
         backend
             .rename(
                 Request::new(RenameRequest {
-                    source,
-                    destination: destination.clone(),
-                    options: RenameOptions::default(),
+                    source: copied.clone(),
+                    destination: renamed.clone(),
+                    options: RenameOptions {
+                        message: Some("renamed".into()),
+                        ..RenameOptions::default()
+                    },
                 }),
                 None,
             )
             .await
-            .expect("rename must succeed");
+            .unwrap();
 
-        let info = stat(&backend, &destination).await;
-        let user_metadata = info.user_metadata.expect("stat populates user_metadata");
-        assert_eq!(
-            user_metadata.get("label").map(String::as_str),
-            Some("hero"),
-            "the destination must carry the source's keys",
-        );
-        assert!(
-            !source_sidecar.exists(),
-            "a successful rename must leave no sidecar at the vacated source pathname",
-        );
+        let info = stat(&backend, &renamed).await;
+        assert_eq!(info.size, Some(b"body".len() as u64));
+        assert_eq!(info.user_metadata, Some(UserMetadata::new()));
+        assert!(!copied.to_file_path().unwrap().exists());
     }
 
-    /// Whether the filesystem under the test actually enforces the write bit.
-    ///
-    /// Measured rather than assumed: `root` bypasses permission checks, so a
-    /// test that expects EACCES would silently pass its "no failure occurred"
-    /// path in a root container. Probing the property where it happens is the
-    /// only way to know, and skipping loudly beats asserting vacuously.
-    #[cfg(not(windows))]
-    fn permission_bits_are_enforced() -> bool {
-        use std::os::unix::fs::PermissionsExt;
-        // Its own tempdir, never the backend root: a probe directory inside the
-        // root would show up in any listing assertion a later test adds.
-        let probe_root = tempfile::tempdir().unwrap();
-        let probe = probe_root.path().join("permission-probe");
-        std::fs::create_dir(&probe).unwrap();
-        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o555)).unwrap();
-        // Only a permission refusal answers the question. ENOSPC or an I/O
-        // error would mean the write failed for a reason that says nothing
-        // about the mode bits, and treating those as "enforced" would let the
-        // caller assert on a denial it is not going to get.
-        let refused = matches!(
-            std::fs::write(probe.join("x"), b"x"),
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied
-        );
-        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        refused
-    }
-
-    /// The failure side of the same move, on the trigger a split
-    /// copy-then-unlink cannot report: the source metadata directory is
-    /// readable but not writable, so the object rename and a destination
-    /// sidecar write both succeed and only the source unlink cannot. As one
-    /// `rename(2)` this is a single step that either moves the keys or does
-    /// not; here it does not, and the caller is told so.
-    ///
-    /// The assertions are on both halves deliberately — the return value alone
-    /// cannot distinguish "the keys transferred and a stray file was tolerated"
-    /// from "the transfer failed", and it is the difference that matters.
-    #[cfg(not(windows))]
+    /// `update_metadata` has nothing to patch on this backend, so it is
+    /// `Unsupported` whether or not the target exists; only an address the
+    /// backend cannot serve at all reports its own error first.
     #[tokio::test]
-    async fn rename_that_cannot_clear_the_source_sidecar_reports_a_partial_completion() {
-        use std::os::unix::fs::PermissionsExt;
-        if !permission_bits_are_enforced() {
-            // The harness captures this for a passing test, so treat the
-            // companion test below as the coverage that survives a skip: it
-            // reaches the same stage through a directory in the way, which no
-            // uid can bypass.
-            eprintln!(
-                "skipping rename_that_cannot_clear_the_source_sidecar_reports_a_partial_completion: \
-                 the write bit is not enforced here (running as root?)"
+    async fn update_metadata_is_unsupported_whether_or_not_the_target_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        let backend = backend_over_tempdir(&tmp).await;
+        let file = root.join("present.txt").unwrap();
+        let missing = root.join("ghost.txt").unwrap();
+        write_file(&backend, &file, b"body").await;
+
+        for address in [&file, &missing] {
+            let err = backend
+                .update_metadata(
+                    Request::new(UpdateMetadataRequest {
+                        address: address.clone(),
+                        options: set_one("color", "red"),
+                    }),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Unsupported, "{address}: {err:?}");
+            assert!(err.message().contains("update_metadata"), "{err}");
+            // `UpdateMetadataOptions` has no map to drop, so the write verb's
+            // remedy must not leak into this one.
+            assert!(!err.message().contains("drop user_metadata"), "{err}");
+            assert!(
+                err.next_action()
+                    .is_some_and(|a| !a.contains("write the object")),
+                "{err}"
             );
-            return;
         }
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Url::from_directory_path(tmp.path()).unwrap();
-        // Separate parents so the source and destination have DIFFERENT
-        // metadata directories: sharing one would make the destination write
-        // fail for the same reason and test something else.
-        std::fs::create_dir(tmp.path().join("from")).unwrap();
-        std::fs::create_dir(tmp.path().join("to")).unwrap();
-        let source = root.join("from/").unwrap().join("src.txt").unwrap();
-        let destination = root.join("to/").unwrap().join("dst.txt").unwrap();
-        let backend = backend_over_tempdir(&tmp).await;
-        write_file(&backend, &source, b"body").await;
-        backend
-            .update_metadata(
-                Request::new(UpdateMetadataRequest {
-                    address: source.clone(),
-                    options: set_one("label", "hero"),
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-        let source_path = source.to_file_path().unwrap();
-        let source_sidecar = metadata::metadata_path(&source_path).unwrap();
-        let source_meta_dir = source_sidecar.parent().unwrap().to_path_buf();
-        assert!(source_sidecar.exists());
-        std::fs::set_permissions(&source_meta_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-        let destination_path = destination.to_file_path().unwrap();
-        let outcome = backend
-            .rename(
-                Request::new(RenameRequest {
-                    source,
-                    destination: destination.clone(),
-                    options: RenameOptions::default(),
-                }),
-                None,
-            )
-            .await;
-
-        // Restore before asserting so the tempdir can always clean up.
-        std::fs::set_permissions(&source_meta_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let err = outcome.expect_err("a source sidecar that cannot move must surface");
-        assert_eq!(err.code(), ErrorCode::PartialCompletion);
-        assert!(!err.code().retryable());
-        match err.context() {
-            Some(ErrorContext::Partial { failed_outcome, .. }) => {
-                assert_eq!(*failed_outcome, StageOutcome::NotApplied);
-            }
-            other => panic!("rename lost its partial context: {other:?}"),
-        }
-        // `Relocate` and `SourceResidue` carry identical structured fields, so
-        // the context alone cannot tell which stage the call site tagged. The
-        // message names it.
-        assert!(
-            err.message().contains("relocate"),
-            "the failure must be tagged as the relocation stage: {}",
-            err.message(),
-        );
-
-        // The object moved; its metadata did not follow, and the error says so
-        // rather than reporting a transfer that did not happen.
-        assert_eq!(std::fs::read(&destination_path).unwrap(), b"body");
-        assert!(!source_path.exists());
-        assert!(
-            source_sidecar.exists(),
-            "an atomic relocation that failed must leave the source keys intact",
-        );
-        let info = stat(&backend, &destination).await;
-        assert!(
-            info.user_metadata.is_none_or(|m| m.is_empty()),
-            "a failed relocation must not be reported as though the keys arrived",
-        );
-    }
-
-    /// The same stage reached through an obstruction no uid can bypass, so the
-    /// `Relocate` classification stays covered when the suite runs as root and
-    /// the permission-based sibling above skips.
-    #[cfg(not(windows))]
-    #[tokio::test]
-    async fn rename_onto_an_obstructed_destination_sidecar_reports_a_partial_completion() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Url::from_directory_path(tmp.path()).unwrap();
-        let source = root.join("src.txt").unwrap();
-        let destination = root.join("dst.txt").unwrap();
-        let backend = backend_over_tempdir(&tmp).await;
-        write_file(&backend, &source, b"body").await;
-        backend
-            .update_metadata(
-                Request::new(UpdateMetadataRequest {
-                    address: source.clone(),
-                    options: set_one("label", "hero"),
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-        let source_sidecar = metadata::metadata_path(&source.to_file_path().unwrap()).unwrap();
-
-        // A DIRECTORY at the destination sidecar path: `rename(2)` of a regular
-        // file onto a directory fails with EISDIR and touches neither side.
-        let destination_path = destination.to_file_path().unwrap();
-        let destination_sidecar = metadata::metadata_path(&destination_path).unwrap();
-        std::fs::create_dir_all(destination_sidecar.parent().unwrap()).unwrap();
-        std::fs::create_dir(&destination_sidecar).unwrap();
-
-        let err = backend
-            .rename(
-                Request::new(RenameRequest {
-                    source,
-                    destination,
-                    options: RenameOptions::default(),
-                }),
-                None,
-            )
-            .await
-            .expect_err("a sidecar relocation failure after the object rename must surface");
-        assert_eq!(err.code(), ErrorCode::PartialCompletion);
-        assert!(!err.code().retryable());
-        match err.context() {
-            Some(ErrorContext::Partial { failed_outcome, .. }) => {
-                assert_eq!(*failed_outcome, StageOutcome::NotApplied);
-            }
-            other => panic!("rename lost its partial context: {other:?}"),
-        }
-        assert!(
-            err.message().contains("relocate"),
-            "the failure must be tagged as the relocation stage: {}",
-            err.message(),
-        );
-        assert_eq!(std::fs::read(&destination_path).unwrap(), b"body");
-        assert!(source_sidecar.exists());
-    }
-
-    /// `rename` to the same address is a supported no-op, and the sidecar has
-    /// to survive it. Source and destination resolve to ONE sidecar path there,
-    /// so any transfer that ends by removing the source removes the file it
-    /// just wrote; `rename(2)` onto itself succeeds and changes nothing.
-    #[cfg(not(windows))]
-    #[tokio::test]
-    async fn rename_to_the_same_address_keeps_the_user_metadata() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Url::from_directory_path(tmp.path()).unwrap();
-        let address = root.join("self.txt").unwrap();
-        let backend = backend_over_tempdir(&tmp).await;
-        write_file(&backend, &address, b"body").await;
-        backend
-            .update_metadata(
-                Request::new(UpdateMetadataRequest {
-                    address: address.clone(),
-                    options: set_one("label", "hero"),
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-
-        backend
-            .rename(
-                Request::new(RenameRequest {
-                    source: address.clone(),
-                    destination: address.clone(),
-                    options: RenameOptions::default(),
-                }),
-                None,
-            )
-            .await
-            .expect("rename to the same address must succeed");
-
-        let info = stat(&backend, &address).await;
-        let user_metadata = info.user_metadata.expect("stat populates user_metadata");
         assert_eq!(
-            user_metadata.get("label").map(String::as_str),
-            Some("hero"),
-            "a rename to the same address must not consume its own sidecar",
+            stat(&backend, &file).await.user_metadata,
+            Some(UserMetadata::new())
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        let escaped = Url::from_directory_path(outside.path())
+            .unwrap()
+            .join("elsewhere.txt")
+            .unwrap();
+        let err = backend
+            .update_metadata(
+                Request::new(UpdateMetadataRequest {
+                    address: escaped,
+                    options: set_one("color", "red"),
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_ne!(
+            err.code(),
+            ErrorCode::Unsupported,
+            "an address outside the root reports its own error: {err:?}"
         );
     }
 
-    /// `delete_directory`'s cleanup runs after `remove_dir`, so it carries the
-    /// same classification as `delete`'s — asserted on the real backend rather
-    /// than inferred from the shared helper, because the call site is what
-    /// decides whether the failure is re-coded at all.
-    ///
-    /// The remedy is executed too, and deliberately through `delete` rather
-    /// than `delete_directory`: the directory is gone, so a repeat
-    /// `delete_directory` reports `NotFound` before it reaches any cleanup.
-    /// That asymmetry is what the stage's `next_action` has to name, so it is
-    /// asserted here rather than left to the wording.
-    #[cfg(not(windows))]
+    /// The capability surface says what the verbs do: no native patch and no
+    /// rewrite emulation, while the single-rename write stays atomic.
+    #[test]
+    fn file_capabilities_declare_no_metadata_patch() {
+        let capabilities = file_capabilities();
+        assert!(!capabilities.supports_native_metadata_patch);
+        assert!(!capabilities.supports_metadata_rewrite_emulation);
+        assert!(capabilities.writes_are_atomic);
+        assert!(
+            !file_descriptor().supports_user_metadata,
+            "a kind that refuses user metadata must not invite an attribution layer"
+        );
+    }
+
+    /// A `.ovstorage-meta` directory an earlier installation left on disk is
+    /// ordinary content: `list` shows it, its entries are addressable, it
+    /// blocks `delete_directory` like any other entry, and the name is writable.
     #[tokio::test]
-    async fn a_delete_directory_that_cannot_clear_its_sidecar_reports_a_partial_completion() {
+    async fn a_metadata_directory_left_on_disk_is_ordinary_content() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Url::from_directory_path(tmp.path()).unwrap();
-        let dir_address = root.join("subdir/").unwrap();
         let backend = backend_over_tempdir(&tmp).await;
-        let dir_path = tmp.path().join("subdir");
-        std::fs::create_dir(&dir_path).unwrap();
+        let dir = root.join("legacy/").unwrap();
+        let dir_path = dir.to_file_path().unwrap();
+        let leftover = dir_path.join(".ovstorage-meta");
+        std::fs::create_dir_all(&leftover).unwrap();
+        std::fs::write(leftover.join("deadbeef.meta"), b"6b=76\n").unwrap();
 
-        // The directory's own sidecar lives in the PARENT's metadata directory.
-        let sidecar = metadata::metadata_path(&dir_path).unwrap();
-        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
-        std::fs::create_dir(&sidecar).unwrap();
+        let page = backend
+            .list(
+                Request::new(ListRequest {
+                    prefix: dir.clone(),
+                    options: ListOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let addresses: Vec<_> = page
+            .items
+            .iter()
+            .map(|item| item.address.as_str().to_owned())
+            .collect();
+        assert!(
+            addresses
+                .iter()
+                .any(|address| address.contains(".ovstorage-meta")),
+            "list must show the directory as ordinary content: {addresses:?}"
+        );
+
+        let entry = dir.join(".ovstorage-meta/deadbeef.meta").unwrap();
+        let info = stat(&backend, &entry).await;
+        assert_eq!(info.size, Some(6));
+        assert_eq!(info.user_metadata, Some(UserMetadata::new()));
 
         let err = backend
             .delete_directory(
                 Request::new(DeleteDirectoryRequest {
-                    address: dir_address.clone(),
+                    address: dir.clone(),
                     options: DeleteDirectoryOptions,
                 }),
                 None,
             )
             .await
-            .expect_err("a sidecar cleanup failure after remove_dir must surface");
-        assert_eq!(err.code(), ErrorCode::PartialCompletion);
-        assert!(!err.code().retryable());
-        assert!(!dir_path.exists(), "the directory must have been removed");
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::DirectoryNotEmpty, "{err:?}");
+        assert!(leftover.is_dir(), "a refused removal must leave the entry");
 
-        // A repeat `delete_directory` cannot clear it — this is the asymmetry
-        // the hint names, and asserting it keeps the hint from drifting into
-        // recommending a call that does nothing.
-        let repeat = backend
-            .delete_directory(
-                Request::new(DeleteDirectoryRequest {
-                    address: dir_address.clone(),
-                    options: DeleteDirectoryOptions,
-                }),
-                None,
-            )
-            .await
-            .expect_err("delete_directory on an absent directory reports NotFound");
-        assert_eq!(repeat.code(), ErrorCode::NotFound);
-        // ...and the hint has to say so, or an operator reading it goes to the
-        // call this assertion just showed does nothing.
-        assert!(
-            err.next_action()
-                .is_some_and(|hint| hint.contains("delete_directory")),
-            "the hint must name the delete_directory asymmetry: {:?}",
-            err.next_action(),
-        );
-
-        // `delete` on the same address is the route that works.
-        std::fs::remove_dir(&sidecar).unwrap();
-        std::fs::write(&sidecar, "").unwrap();
-        backend
-            .delete(
-                Request::new(DeleteRequest {
-                    address: dir_address,
-                    options: DeleteOptions::default(),
-                }),
-                None,
-            )
-            .await
-            .expect("delete clears the orphaned sidecar of a removed directory");
-        assert!(!sidecar.exists(), "the orphaned sidecar must be cleared");
+        let fresh = dir.join(".ovstorage-meta/new.txt").unwrap();
+        write_file(&backend, &fresh, b"ok").await;
+        assert_eq!(stat(&backend, &fresh).await.size, Some(2));
     }
 
     #[tokio::test]
@@ -3681,18 +4027,11 @@ mod tests {
         let file = root.join("visible.txt").unwrap();
         let backend = backend_over_tempdir(&tmp).await;
         write_file(&backend, &file, b"body").await;
-        // Setting metadata creates the .ovstorage-meta sidecar directory
-        // (Unix) / ADS (Windows) that list must not surface as an object.
-        backend
-            .update_metadata(
-                Request::new(UpdateMetadataRequest {
-                    address: file.clone(),
-                    options: set_one("k", "v"),
-                }),
-                None,
-            )
-            .await
-            .unwrap();
+        // An in-flight atomic-write staging temp is the one entry the backend
+        // hides from enumeration; seed one in the staging shape.
+        let staged = tmp.path().join(".visible.txt.123456789.4242.7.tmp");
+        std::fs::write(&staged, b"partial").unwrap();
+        assert!(is_atomic_write_temp_sibling(&staged));
 
         let page = backend
             .list(
@@ -3715,49 +4054,16 @@ mod tests {
             "expected the user file in {addresses:?}"
         );
         assert!(
-            !addresses
-                .iter()
-                .any(|address| address.contains(".ovstorage-meta")),
-            "list surfaced an internal sidecar entry: {addresses:?}"
+            !addresses.iter().any(|address| address.ends_with(".tmp")),
+            "list surfaced an in-flight staging temp: {addresses:?}"
         );
-        // The user file's own metadata round-trips through list as well.
+        // Every listed object reports an empty user-metadata map.
         let listed = page
             .items
             .iter()
             .find(|item| item.address == file)
             .expect("listed file");
-        let user_metadata = listed
-            .user_metadata
-            .as_ref()
-            .expect("list populates user_metadata");
-        assert_eq!(user_metadata.get("k").map(String::as_str), Some("v"));
-    }
-
-    #[tokio::test]
-    async fn update_metadata_on_missing_path_returns_not_found_and_leaves_no_sidecar() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Url::from_directory_path(tmp.path()).unwrap();
-        let missing = root.join("ghost.txt").unwrap();
-        let backend = backend_over_tempdir(&tmp).await;
-
-        let err = backend
-            .update_metadata(
-                Request::new(UpdateMetadataRequest {
-                    address: missing.clone(),
-                    options: set_one("color", "red"),
-                }),
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), ErrorCode::NotFound);
-
-        let path = missing.to_file_path().unwrap();
-        let sidecar = metadata::metadata_path(&path).unwrap();
-        assert!(
-            !sidecar.exists(),
-            "sidecar must not be created for nonexistent target"
-        );
+        assert_eq!(listed.user_metadata, Some(UserMetadata::new()));
     }
 
     /// Count `.<name>.<...>.tmp` atomic-write temp siblings directly under `dir`
@@ -3766,7 +4072,7 @@ mod tests {
         std::fs::read_dir(dir)
             .unwrap()
             .filter_map(|entry| entry.ok())
-            .filter(|entry| metadata::is_atomic_write_temp_sibling(&entry.path()))
+            .filter(|entry| is_atomic_write_temp_sibling(&entry.path()))
             .count()
     }
 
@@ -3815,45 +4121,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_carrying_user_metadata_leaves_no_sidecar_temp_orphan() {
+    async fn write_into_fresh_nested_path_creates_missing_ancestors() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Url::from_directory_path(tmp.path()).unwrap();
-        let file = root.join("withmeta.txt").unwrap();
+        let leaf = root.join("a/b/c/leaf.txt").unwrap();
         let backend = backend_over_tempdir(&tmp).await;
 
-        let mut user_metadata = UserMetadata::new();
-        user_metadata.insert("origin".into(), "write".into());
-        write_with_options(
-            &backend,
-            &file,
-            b"payload",
-            WriteOptions {
-                user_metadata: Some(user_metadata),
-                ..WriteOptions::default()
-            },
-        )
-        .await
-        .unwrap();
+        let result = backend
+            .write(
+                Request::new(WriteRequest {
+                    address: leaf,
+                    body: Body::Bytes(b"deep".to_vec()),
+                    options: WriteOptions::default(),
+                }),
+                None,
+            )
+            .await;
+        assert!(result.is_ok(), "write must create its path: {result:?}");
 
-        // The object directory carries no orphaned temp sibling.
-        assert_eq!(
-            temp_sibling_count(tmp.path()),
-            0,
-            "object temp sibling leaked"
+        let on_disk = tmp.path().join("a").join("b").join("c").join("leaf.txt");
+        assert!(
+            on_disk.is_file(),
+            "leaf must exist under freshly created ancestors"
         );
-        // The staged sidecar publishes atomically and round-trips through stat.
-        let info = stat(&backend, &file).await;
-        let metadata = info.user_metadata.expect("stat populates user_metadata");
-        assert_eq!(metadata.get("origin").map(String::as_str), Some("write"));
-        // The sidecar directory carries no orphaned `.tmp` stage file.
-        let path = file.to_file_path().unwrap();
-        let sidecar = metadata::metadata_path(&path).unwrap();
-        let meta_dir = sidecar.parent().unwrap();
-        assert_eq!(
-            temp_sibling_count(meta_dir),
-            0,
-            "sidecar staging temp leaked into {meta_dir:?}"
-        );
+        assert_eq!(std::fs::read(&on_disk).unwrap(), b"deep");
     }
 
     #[tokio::test]
@@ -3953,63 +4244,10 @@ mod tests {
         );
     }
 
-    /// Leave `<dir>` holding nothing but its `.ovstorage-meta` sidecar dir,
-    /// built through real backend calls: an object carrying user metadata
-    /// creates the sidecar dir to hold its keys, and deleting the object clears
-    /// only the sidecar FILE. Returns the sidecar dir's path.
-    #[cfg(unix)]
-    async fn seed_sidecar_dir_only(backend: &LayerHandle, dir: &Url) -> std::path::PathBuf {
-        let seed = dir.join("seed.txt").unwrap();
-        let mut user_metadata = UserMetadata::new();
-        user_metadata.insert("origin".into(), "seed".into());
-        write_with_options(
-            backend,
-            &seed,
-            b"seed",
-            WriteOptions {
-                user_metadata: Some(user_metadata),
-                ..WriteOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-        let seed_path = seed.to_file_path().unwrap();
-        let sidecar_dir = metadata::metadata_path(&seed_path)
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        backend
-            .delete(
-                Request::new(DeleteRequest {
-                    address: seed.clone(),
-                    options: DeleteOptions::default(),
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(
-            sidecar_dir.is_dir(),
-            "deleting the seed object must leave the sidecar dir standing at {sidecar_dir:?}"
-        );
-        let names: Vec<_> = std::fs::read_dir(dir.to_file_path().unwrap())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            names,
-            vec![metadata::METADATA_DIR_NAME.to_string()],
-            "the sidecar dir must be the directory's only entry: {names:?}"
-        );
-        sidecar_dir
-    }
-
     /// A directory holding an in-flight atomic-write staging temp is not empty:
     /// the kernel counts that entry, so `remove_dir` cannot succeed. The refusal
     /// must be reported as `DirectoryNotEmpty` — a retryable code would have a
-    /// caller spin for the whole duration of the upload — and must be reached
-    /// before the sidecar dir is destroyed, since the removal does not happen.
+    /// caller spin for the whole duration of the upload.
     ///
     /// The multi-threaded flavour is a correctness requirement, not a taste
     /// choice. Parking the body means blocking on a `std::sync::mpsc` receive
@@ -4025,7 +4263,7 @@ mod tests {
         // Trailing slash marks this as a directory address.
         let dir = root.join("staging/").unwrap();
         let backend = backend_over_tempdir(&tmp).await;
-        let sidecar_dir = seed_sidecar_dir_only(&backend, &dir).await;
+        std::fs::create_dir_all(dir.to_file_path().unwrap()).unwrap();
 
         // The body yields one chunk, then parks until the test releases it, so
         // the staging temp sits in the directory for a window the test controls.
@@ -4085,9 +4323,13 @@ mod tests {
             ErrorCode::DirectoryNotEmpty,
             "a removal refused because the directory holds something must not be retryable: {err:?}"
         );
-        assert!(
-            sidecar_dir.is_dir(),
-            "a refused removal must leave the sidecar dir intact at {sidecar_dir:?}"
+        // The writer holds the staging lock, so the refusal classified its temp
+        // as live and left it alone; with the writer-side lock removed the
+        // removal would clear the temp and the writer's rename would fail.
+        assert_eq!(
+            temp_sibling_count(&dir_path),
+            1,
+            "a refused removal must leave the live writer's staging temp in place"
         );
 
         release.send(()).unwrap();
@@ -4096,6 +4338,14 @@ mod tests {
             .unwrap()
             .expect("the refused removal must not damage the concurrent writer");
         assert_eq!(committed.info.size, Some(b"first-last".len() as u64));
+        // The writer's handle, and the lock it carried, are gone with the
+        // write: the published bytes read plainly through the filesystem.
+        assert_eq!(
+            std::fs::read(child.to_file_path().unwrap()).unwrap(),
+            b"first-last",
+            "the published object must be readable once the writer returns"
+        );
+        assert_eq!(temp_sibling_count(&dir_path), 0);
         let (bytes, _) = read_content(
             backend
                 .read(
@@ -4112,16 +4362,41 @@ mod tests {
         assert_eq!(bytes, b"first-last");
     }
 
-    /// The honest request: a directory whose only entry is the sidecar dir the
-    /// removal clears itself still deletes.
-    #[cfg(unix)]
+    /// Create `dir` empty through the API and return its on-disk path, so the
+    /// staging-temp cases start from a directory the removal would otherwise
+    /// delete outright.
+    async fn seed_empty_dir(backend: &LayerHandle, dir: &Url) -> std::path::PathBuf {
+        backend
+            .create_directory(
+                Request::new(CreateDirectoryRequest {
+                    address: dir.clone(),
+                    options: CreateDirectoryOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        dir.to_file_path().unwrap()
+    }
+
+    /// A staging temp left by a writer that died without unwinding wears the
+    /// production name but holds no lock, so the removal clears it and the
+    /// directory deletes, where a verdict on the name alone would hold the
+    /// directory for good.
     #[tokio::test]
-    async fn delete_directory_succeeds_when_only_the_sidecar_dir_remains() {
+    async fn delete_directory_clears_a_staging_temp_whose_writer_is_gone() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Url::from_directory_path(tmp.path()).unwrap();
-        let dir = root.join("emptied/").unwrap();
+        let dir = root.join("staging/").unwrap();
         let backend = backend_over_tempdir(&tmp).await;
-        let sidecar_dir = seed_sidecar_dir_only(&backend, &dir).await;
+        seed_empty_dir(&backend, &dir).await;
+        let dir_path = dir.to_file_path().unwrap();
+
+        // A handle created and dropped is exactly what a killed writer leaves:
+        // the name on disk and no lock on it.
+        let orphan = temp::temp_sibling(&dir_path.join("child.bin"));
+        drop(std::fs::File::create_new(&orphan).unwrap());
+        assert_eq!(temp_sibling_count(&dir_path), 1);
 
         backend
             .delete_directory(
@@ -4132,135 +4407,530 @@ mod tests {
                 None,
             )
             .await
-            .expect("a directory holding only its sidecar dir is empty");
-        assert!(!sidecar_dir.exists(), "sidecar dir outlived its directory");
-        assert!(!dir.to_file_path().unwrap().exists(), "directory survived");
+            .expect("a staging temp with no live writer must not hold the directory");
+        assert!(
+            !orphan.exists(),
+            "the orphaned staging temp must be cleared at {orphan:?}"
+        );
+        assert!(
+            !dir_path.exists(),
+            "the directory must be removed once its only occupant was an orphan"
+        );
     }
 
-    /// The counterpart to the case above, and what makes the narrowed scan
-    /// sound: the scan skips the sidecar *name*, so the cleanup has to clear
-    /// that name for an occupant the backend did not create as well as for the
-    /// sidecar directory. Otherwise skipping it would hand `remove_dir` an entry
-    /// nothing removed, and refuse a directory no API call could then empty —
-    /// enumeration hides the name and the address gate refuses to resolve it.
-    ///
-    /// Three occupants exercise the classification, which is `symlink_metadata`
-    /// and so describes the entry rather than what it resolves to: a symlink
-    /// pointing nowhere, a plain file, and a symlink to a live directory
-    /// outside the backend's tree.
-    ///
-    /// The first two carry the discrimination, measured rather than assumed:
-    /// probing with a call that follows links reddens the dangling case, and
-    /// collapsing the directory/entry split reddens the plain-file case. The
-    /// third pins the contract that a link is not followed, but it does not
-    /// discriminate this code — `remove_dir_all` declines to follow a root
-    /// symlink on its own — so it is here as documentation of the intended
-    /// behaviour rather than as a guard on it. The Windows arm of the
-    /// classification has no coverage here at all; this test is Unix-only.
+    /// The lock, not the name, decides: a staging temp whose lock another
+    /// handle holds is a live write, and the removal refuses it without
+    /// touching the temp. Releasing the lock is the writer
+    /// going away, after which the same removal succeeds.
+    #[tokio::test]
+    async fn delete_directory_refuses_a_staging_temp_held_by_a_live_writer_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        let dir = root.join("staging/").unwrap();
+        let backend = backend_over_tempdir(&tmp).await;
+        let dir_on_disk = seed_empty_dir(&backend, &dir).await;
+        let dir_path = dir.to_file_path().unwrap();
+
+        let temp = temp::temp_sibling(&dir_path.join("child.bin"));
+        let holder = std::fs::File::create_new(&temp).unwrap();
+        assert!(
+            matches!(
+                temp::lock_staging_temp(&holder).unwrap(),
+                temp::StagingLock::Held
+            ),
+            "the fresh temp's lock is free"
+        );
+
+        let request = || {
+            Request::new(DeleteDirectoryRequest {
+                address: dir.clone(),
+                options: DeleteDirectoryOptions,
+            })
+        };
+        let err = backend
+            .delete_directory(request(), None)
+            .await
+            .expect_err("a locked staging temp is a live write and holds the directory");
+        assert_eq!(err.code(), ErrorCode::DirectoryNotEmpty, "{err:?}");
+        assert!(
+            err.message().contains("in-flight write"),
+            "the refusal must name the in-flight write: {err:?}"
+        );
+        assert!(
+            temp.exists(),
+            "a refused removal must leave the live staging temp at {temp:?}"
+        );
+        assert!(
+            dir_on_disk.is_dir(),
+            "a refused removal must leave the directory in place at {dir_on_disk:?}"
+        );
+
+        drop(holder);
+        backend
+            .delete_directory(request(), None)
+            .await
+            .expect("once the lock is released the temp is an orphan and the directory deletes");
+        assert!(!temp.exists());
+        assert!(!dir_path.exists());
+    }
+
+    /// A name with three digit groups and nothing before them is hidden by the
+    /// Rust matcher but is an ordinary object to the C host over the same
+    /// on-disk format. The removal must not destroy it: it keeps the honest
+    /// `DirectoryNotEmpty` that every entry the removal cannot positively call
+    /// its own gets.
     #[cfg(unix)]
     #[tokio::test]
-    async fn delete_directory_clears_an_outside_entry_wearing_the_sidecar_name() {
-        for occupant_kind in [
-            "dangling symlink",
-            "plain file",
-            "symlink to a live directory",
-        ] {
+    async fn delete_directory_keeps_a_name_the_c_host_serves_as_an_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        let dir = root.join("staging/").unwrap();
+        let backend = backend_over_tempdir(&tmp).await;
+        let dir_on_disk = seed_empty_dir(&backend, &dir).await;
+        let dir_path = dir.to_file_path().unwrap();
+
+        let object = dir_path.join(".2024.01.15.tmp");
+        std::fs::write(&object, b"dated report").unwrap();
+        assert!(temp::is_atomic_write_temp_sibling(&object));
+        assert!(!temp::is_clearable_staging_temp(&object));
+
+        let err = backend
+            .delete_directory(
+                Request::new(DeleteDirectoryRequest {
+                    address: dir.clone(),
+                    options: DeleteDirectoryOptions,
+                }),
+                None,
+            )
+            .await
+            .expect_err(
+                "an entry the removal cannot call its own staging temp holds the directory",
+            );
+        assert_eq!(err.code(), ErrorCode::DirectoryNotEmpty, "{err:?}");
+        assert_eq!(
+            std::fs::read(&object).unwrap(),
+            b"dated report",
+            "the entry must survive untouched at {object:?}"
+        );
+        assert!(
+            dir_on_disk.is_dir(),
+            "a refused removal must leave the directory"
+        );
+    }
+
+    /// An entry wearing the exact staging shape but of the wrong kind is not
+    /// the backend's temp. It is refused as `DirectoryNotEmpty`, not surfaced
+    /// as the raw errno its open or unlink would produce, and it survives.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_directory_refuses_an_entry_of_the_wrong_kind_wearing_a_staging_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        let backend = backend_over_tempdir(&tmp).await;
+
+        let refused = |dir: Url| {
+            let backend = backend.clone();
+            async move {
+                let err = backend
+                    .delete_directory(
+                        Request::new(DeleteDirectoryRequest {
+                            address: dir,
+                            options: DeleteDirectoryOptions,
+                        }),
+                        None,
+                    )
+                    .await
+                    .expect_err("an entry of the wrong kind holds the directory");
+                assert_eq!(err.code(), ErrorCode::DirectoryNotEmpty, "{err:?}");
+                assert!(
+                    !err.message().contains("in-flight"),
+                    "the refusal must not claim a live write: {err:?}"
+                );
+                err
+            }
+        };
+
+        // A directory wearing the name.
+        let dir = root.join("as-dir/").unwrap();
+        let dir_on_disk = seed_empty_dir(&backend, &dir).await;
+        let dir_path = dir.to_file_path().unwrap();
+        let impostor = temp::temp_sibling(&dir_path.join("child.bin"));
+        assert!(temp::is_clearable_staging_temp(&impostor));
+        std::fs::create_dir(&impostor).unwrap();
+        refused(dir.clone()).await;
+        assert!(
+            impostor.is_dir(),
+            "the directory must survive at {impostor:?}"
+        );
+        assert!(
+            dir_on_disk.is_dir(),
+            "a refused removal must leave the directory"
+        );
+
+        // A regular file wearing the name that cannot be opened. Root can open
+        // anything, so the premise is checked rather than assumed.
+        let dir = root.join("as-unreadable/").unwrap();
+        let dir_on_disk = seed_empty_dir(&backend, &dir).await;
+        let dir_path = dir.to_file_path().unwrap();
+        let impostor = temp::temp_sibling(&dir_path.join("child.bin"));
+        std::fs::write(&impostor, b"sealed").unwrap();
+        std::fs::set_permissions(&impostor, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&impostor).is_err() {
+            refused(dir.clone()).await;
+            assert!(
+                impostor.exists(),
+                "the sealed entry must survive at {impostor:?}"
+            );
+            assert!(
+                dir_on_disk.is_dir(),
+                "a refused removal must leave the directory"
+            );
+        }
+        std::fs::set_permissions(&impostor, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// The sweep holds one descriptor at a time, so the number of orphans a
+    /// removal can clear is not bounded by the descriptor limit. The count is
+    /// pushed past the soft limit where that limit is small enough to reach;
+    /// under a larger limit the case still exercises the many-orphan path, and
+    /// `ulimit -n 256` makes it discriminating.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_directory_clears_more_orphans_than_the_descriptor_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        let dir = root.join("staging/").unwrap();
+        let backend = backend_over_tempdir(&tmp).await;
+        seed_empty_dir(&backend, &dir).await;
+        let dir_path = dir.to_file_path().unwrap();
+
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is a valid, writable rlimit for the duration of the call.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let count = usize::try_from(limit.rlim_cur)
+            .unwrap_or(usize::MAX)
+            .saturating_add(64)
+            .min(8192);
+        for index in 0..count {
+            let orphan = temp::temp_sibling(&dir_path.join(format!("child-{index}.bin")));
+            drop(std::fs::File::create_new(&orphan).unwrap());
+        }
+        assert_eq!(temp_sibling_count(&dir_path), count);
+
+        backend
+            .delete_directory(
+                Request::new(DeleteDirectoryRequest {
+                    address: dir.clone(),
+                    options: DeleteDirectoryOptions,
+                }),
+                None,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{count} orphans must not exhaust the removal: {err:?}"));
+        assert!(!dir_path.exists());
+    }
+
+    /// A temp the scan saw but the probe no longer finds means the directory
+    /// changed under the removal: the way a temp vanishes is its writer's
+    /// rename publishing it as a child, so the directory is not the one the
+    /// scan judged. The sweep refuses with a retry hint rather than carry the
+    /// scan's verdict forward.
+    #[tokio::test]
+    async fn sweep_refuses_when_a_scanned_temp_has_vanished() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vanished = temp::temp_sibling(&tmp.path().join("child.bin"));
+        let orphan = temp::temp_sibling(&tmp.path().join("other.bin"));
+        drop(std::fs::File::create_new(&orphan).unwrap());
+
+        let err = temp::clear_orphaned_staging_temps(&[orphan.clone(), vanished])
+            .await
+            .expect_err("a vanished temp is a changed directory");
+        assert_eq!(err.code(), ErrorCode::DirectoryNotEmpty, "{err:?}");
+        assert!(err.message().contains("changed"), "{err:?}");
+        assert!(
+            orphan.exists(),
+            "a refused sweep must clear nothing, even an orphan probed earlier"
+        );
+    }
+
+    /// Every temp is probed before any is removed: an unlocked orphan listed
+    /// before a live temp survives the refusal, in either order, where an
+    /// eager loop would have unlinked it on the way to the live one.
+    #[tokio::test]
+    async fn sweep_probes_every_temp_before_removing_any() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orphan = temp::temp_sibling(&tmp.path().join("orphan.bin"));
+        drop(std::fs::File::create_new(&orphan).unwrap());
+        let live = temp::temp_sibling(&tmp.path().join("live.bin"));
+        let holder = std::fs::File::create_new(&live).unwrap();
+        assert!(matches!(
+            temp::lock_staging_temp(&holder).unwrap(),
+            temp::StagingLock::Held
+        ));
+
+        for order in [[&orphan, &live], [&live, &orphan]] {
+            let temps: Vec<_> = order.iter().map(|p| (*p).clone()).collect();
+            let err = temp::clear_orphaned_staging_temps(&temps)
+                .await
+                .expect_err("a live temp refuses the sweep");
+            assert_eq!(err.code(), ErrorCode::DirectoryNotEmpty, "{err:?}");
+            assert!(err.message().contains("in-flight write"), "{err:?}");
+            assert!(
+                orphan.exists(),
+                "the orphan must survive a refused sweep in order {order:?}"
+            );
+            assert!(live.exists());
+        }
+
+        drop(holder);
+        temp::clear_orphaned_staging_temps(&[orphan.clone(), live.clone()])
+            .await
+            .expect("with the lock released both are orphans");
+        assert!(!orphan.exists());
+        assert!(!live.exists());
+    }
+
+    /// A link or a fifo wearing the staging name is classified without being
+    /// followed or opened for reading: the link's target is neither locked
+    /// nor removed, the fifo never holds the probe, and both refuse the
+    /// removal as `DirectoryNotEmpty`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_directory_refuses_a_link_or_fifo_wearing_a_staging_name() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        let backend = backend_over_tempdir(&tmp).await;
+        let refused = |dir: Url| {
+            let backend = backend.clone();
+            async move {
+                let err = backend
+                    .delete_directory(
+                        Request::new(DeleteDirectoryRequest {
+                            address: dir,
+                            options: DeleteDirectoryOptions,
+                        }),
+                        None,
+                    )
+                    .await
+                    .expect_err("an entry that is not a regular file holds the directory");
+                assert_eq!(err.code(), ErrorCode::DirectoryNotEmpty, "{err:?}");
+                assert!(!err.message().contains("in-flight"), "{err:?}");
+            }
+        };
+
+        // A symlink to a regular file elsewhere in the root.
+        let target = tmp.path().join("target.bin");
+        std::fs::write(&target, b"linked").unwrap();
+        let dir = root.join("as-link/").unwrap();
+        let dir_on_disk = seed_empty_dir(&backend, &dir).await;
+        let dir_path = dir.to_file_path().unwrap();
+        let link = temp::temp_sibling(&dir_path.join("child.bin"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        refused(dir.clone()).await;
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive at {link:?}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"linked");
+        assert!(
+            dir_on_disk.is_dir(),
+            "a refused removal must leave the directory"
+        );
+
+        // A fifo with no writer: a following, blocking open would never return.
+        let dir = root.join("as-fifo/").unwrap();
+        let dir_on_disk = seed_empty_dir(&backend, &dir).await;
+        let dir_path = dir.to_file_path().unwrap();
+        let fifo = temp::temp_sibling(&dir_path.join("child.bin"));
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        tokio::time::timeout(std::time::Duration::from_secs(10), refused(dir.clone()))
+            .await
+            .expect("the probe must not block on a fifo");
+        assert!(fifo.exists(), "the fifo must survive at {fifo:?}");
+        assert!(
+            dir_on_disk.is_dir(),
+            "a refused removal must leave the directory"
+        );
+    }
+
+    /// A copy staged from a write-only source carries that mode; a read-only
+    /// probe open is refused, so the probe falls back to a write-only open and
+    /// the orphan still clears.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_directory_clears_an_orphan_whose_mode_denies_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        let dir = root.join("staging/").unwrap();
+        let backend = backend_over_tempdir(&tmp).await;
+        seed_empty_dir(&backend, &dir).await;
+        let dir_path = dir.to_file_path().unwrap();
+
+        let orphan = temp::temp_sibling(&dir_path.join("child.bin"));
+        std::fs::write(&orphan, b"staged from a write-only source").unwrap();
+        std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o200)).unwrap();
+        // Root reads anything; the case is only meaningful when read is denied.
+        if std::fs::File::open(&orphan).is_ok() {
+            return;
+        }
+
+        backend
+            .delete_directory(
+                Request::new(DeleteDirectoryRequest {
+                    address: dir.clone(),
+                    options: DeleteDirectoryOptions,
+                }),
+                None,
+            )
+            .await
+            .expect("an orphan whose mode denies read still clears");
+        assert!(!orphan.exists());
+        assert!(!dir_path.exists());
+    }
+
+    /// A name whose leading segment is not UTF-8 is no temp to either matcher
+    /// here and is served as an object; the removal keeps it, and the C host's
+    /// clearable predicate agrees so neither host destroys what the other
+    /// serves.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_directory_keeps_a_non_utf8_name_wearing_the_staging_shape() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        let dir = root.join("staging/").unwrap();
+        let backend = backend_over_tempdir(&tmp).await;
+        seed_empty_dir(&backend, &dir).await;
+        let dir_path = dir.to_file_path().unwrap();
+
+        let object = dir_path.join(std::ffi::OsStr::from_bytes(b".\xff.1.2.3.tmp"));
+        std::fs::write(&object, b"served").unwrap();
+        assert!(!temp::is_clearable_staging_temp(&object));
+        assert!(!temp::is_atomic_write_temp_sibling(&object));
+
+        let err = backend
+            .delete_directory(
+                Request::new(DeleteDirectoryRequest {
+                    address: dir.clone(),
+                    options: DeleteDirectoryOptions,
+                }),
+                None,
+            )
+            .await
+            .expect_err("an object holds the directory");
+        assert_eq!(err.code(), ErrorCode::DirectoryNotEmpty, "{err:?}");
+        assert_eq!(std::fs::read(&object).unwrap(), b"served");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_directory_refuses_a_symlink_entry_and_leaves_link_target_intact() {
+        for target_is_inside_root in [true, false] {
             let tmp = tempfile::tempdir().unwrap();
             let outside = tempfile::tempdir().unwrap();
-            let canary = outside.path().join("canary.txt");
-            std::fs::write(&canary, b"outside the backend tree").unwrap();
+            let target = if target_is_inside_root {
+                tmp.path().join("real")
+            } else {
+                outside.path().to_path_buf()
+            };
+            let target_contents = target.join("contents");
+            let sentinel = target_contents.join("sentinel");
+            std::fs::create_dir_all(&target_contents).unwrap();
+            std::fs::write(&sentinel, b"keep me").unwrap();
 
+            let link = tmp.path().join("vdir");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
             let root = Url::from_directory_path(tmp.path()).unwrap();
-            let dir = root.join("occupied/").unwrap();
             let backend = backend_over_tempdir(&tmp).await;
-            backend
-                .create_directory(
-                    Request::new(CreateDirectoryRequest {
-                        address: dir.clone(),
-                        options: CreateDirectoryOptions::default(),
-                    }),
-                    None,
-                )
-                .await
-                .unwrap();
-            let dir_path = dir.to_file_path().unwrap();
-            let occupant = dir_path.join(metadata::METADATA_DIR_NAME);
-            match occupant_kind {
-                "dangling symlink" => {
-                    std::os::unix::fs::symlink(dir_path.join("no-such-target"), &occupant).unwrap();
-                }
-                "plain file" => std::fs::write(&occupant, b"not a sidecar dir").unwrap(),
-                _ => std::os::unix::fs::symlink(outside.path(), &occupant).unwrap(),
-            }
 
-            backend
+            let err = backend
                 .delete_directory(
                     Request::new(DeleteDirectoryRequest {
-                        address: dir.clone(),
+                        address: root.join("vdir/").unwrap(),
                         options: DeleteDirectoryOptions,
                     }),
                     None,
                 )
                 .await
-                .unwrap_or_else(|err| {
-                    panic!("the cleanup must clear a {occupant_kind} wearing the name: {err:?}")
-                });
+                .unwrap_err();
 
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+            assert!(err.message().contains("symlink"), "{err}");
+            assert!(err.next_action().is_some(), "{err}");
             assert!(
-                !dir_path.exists(),
-                "the directory must be gone ({occupant_kind})"
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the link must survive"
             );
-            assert!(
-                std::fs::symlink_metadata(&occupant).is_err(),
-                "the entry wearing the sidecar name must be gone ({occupant_kind})"
-            );
-            assert!(
-                outside.path().is_dir() && canary.is_file(),
-                "the removal must not reach through a link ({occupant_kind})"
-            );
+            assert!(target.is_dir(), "the target directory must survive");
+            assert!(sentinel.is_file(), "the target's contents must survive");
         }
     }
 
-    /// A cleanup probe that cannot answer must be reported, not read as an
-    /// absent entry. Reading it as absence is what lets the emptiness scan's
-    /// skip stand on nothing: the scan ignores the name, the cleanup silently
-    /// clears nothing, and `remove_dir` refuses over an entry that is still
-    /// there — which is the shape the dangling-symlink case had.
-    ///
-    /// Staged directly against the cleanup rather than through
-    /// `delete_directory`, because the only handle this test has on the probe is
-    /// removing search permission from the parent, and that would fail the
-    /// caller's own `read_dir` first. Root ignores the permission bits, so the
-    /// test asserts its own premise instead of passing vacuously.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_sidecar_cleanup_probe_that_cannot_answer_is_reported() {
-        use std::os::unix::fs::PermissionsExt;
-
+    async fn delete_directory_refuses_a_symlink_to_a_file_and_leaves_both_intact() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("sealed");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::create_dir(dir.join(metadata::METADATA_DIR_NAME)).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let target = tmp.path().join("real.txt");
+        std::fs::write(&target, b"keep me").unwrap();
+        let link = tmp.path().join("vfile");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let root = Url::from_directory_path(tmp.path()).unwrap();
+        let backend = backend_over_tempdir(&tmp).await;
 
-        let probe = tokio::fs::symlink_metadata(dir.join(metadata::METADATA_DIR_NAME)).await;
-        let sealed = probe.is_err();
-        let result = metadata::remove_directory_metadata_dir(&dir).await;
-        // Restore before any assertion, so a failure still leaves a removable
-        // tree for the tempdir's own cleanup.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = backend
+            .delete_directory(
+                Request::new(DeleteDirectoryRequest {
+                    address: root.join("vfile/").unwrap(),
+                    options: DeleteDirectoryOptions,
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
 
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert!(err.message().contains("symlink"), "{err}");
         assert!(
-            sealed,
-            "premise failed: the probe succeeded through a mode-000 parent, so \
-             this test cannot say anything about an unanswerable probe"
+            err.message()
+                .contains("delete_directory will not remove or follow"),
+            "{err}"
         );
-        let err = result.expect_err("an unanswerable probe must be reported");
-        assert_ne!(
-            err.code(),
-            ErrorCode::DirectoryNotEmpty,
-            "the probe failure is not an emptiness refusal: {err:?}"
+        assert!(!err.message().contains("use delete()"), "{err}");
+        assert!(
+            err.next_action().is_some_and(|action| {
+                action.contains("host filesystem") && !action.contains("use delete()")
+            }),
+            "{err}"
         );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive"
+        );
+        assert!(target.is_file(), "the target file must survive");
     }
 
     /// A real `ENOTEMPTY` from the kernel, produced by an actual syscall rather
@@ -4330,78 +5000,6 @@ mod tests {
         assert!(
             !err.code().bucket().retryable(),
             "replaying this rename cannot make the destination empty"
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_directory_removes_directory_sidecar() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Url::from_directory_path(tmp.path()).unwrap();
-        // Trailing slash marks this as a directory address.
-        let dir = root.join("subdir/").unwrap();
-        let backend = backend_over_tempdir(&tmp).await;
-
-        backend
-            .create_directory(
-                Request::new(CreateDirectoryRequest {
-                    address: dir.clone(),
-                    options: CreateDirectoryOptions::default(),
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-        backend
-            .update_metadata(
-                Request::new(UpdateMetadataRequest {
-                    address: dir.clone(),
-                    options: set_one("origin", "first"),
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let dir_path = dir.to_file_path().unwrap();
-        let sidecar = metadata::metadata_path(&dir_path).unwrap();
-        assert!(
-            sidecar.exists(),
-            "directory sidecar should exist after update_metadata"
-        );
-
-        backend
-            .delete_directory(
-                Request::new(DeleteDirectoryRequest {
-                    address: dir.clone(),
-                    options: DeleteDirectoryOptions,
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(
-            !sidecar.exists(),
-            "delete must remove the directory sidecar (no orphan)"
-        );
-
-        // Recreating the directory must not inherit orphaned metadata.
-        backend
-            .create_directory(
-                Request::new(CreateDirectoryRequest {
-                    address: dir.clone(),
-                    options: CreateDirectoryOptions::default(),
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-        let info = stat(&backend, &dir).await;
-        assert!(
-            info.user_metadata
-                .as_ref()
-                .map(|m| m.is_empty())
-                .unwrap_or(true),
-            "recreated directory must not inherit orphan metadata"
         );
     }
 
@@ -4568,48 +5166,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_directory_reports_metadata_change() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Url::from_directory_path(tmp.path()).unwrap();
-        let file = root.join("tagged.txt").unwrap();
-        let path = file.to_file_path().unwrap();
-        let backend = backend_over_tempdir(&tmp).await;
-
-        // The watcher is started with include_metadata_changes: true.
-        let stream = start_watch(&backend, &root, false, None).await;
-
-        // Create and settle the object so the next snapshot has it tracked with
-        // no sidecar yet (metadata_mtime == None).
-        std::fs::write(&path, b"body").unwrap();
-        let (event, stream) = next_change(stream).await;
-        assert_eq!(change_kind(&event), ChangeKind::Created);
-        assert_eq!(change_address(&event), &file);
-
-        // Touch only the sidecar via update_metadata; the object's bytes and
-        // mtime are unchanged, so the only observable difference between
-        // successive snapshots is the sidecar's mtime (None -> Some), which must
-        // surface as MetadataChanged rather than Modified.
-        backend
-            .update_metadata(
-                Request::new(UpdateMetadataRequest {
-                    address: file.clone(),
-                    options: set_one("color", "blue"),
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let (event, _stream) = next_change(stream).await;
-        assert_eq!(
-            change_kind(&event),
-            ChangeKind::MetadataChanged,
-            "a sidecar-only update must surface as MetadataChanged"
-        );
-        assert_eq!(change_address(&event), &file);
-    }
-
-    #[tokio::test]
     async fn watch_directory_on_missing_directory_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Url::from_directory_path(tmp.path()).unwrap();
@@ -4656,6 +5212,7 @@ mod tests {
     }
 
     /// Stat `address` requesting full metadata, so the owner-resolve path runs.
+    #[cfg(unix)]
     async fn stat_full(backend: &LayerHandle, address: &Url) -> ObjectInfo {
         backend
             .stat(
@@ -4663,6 +5220,7 @@ mod tests {
                     address: address.clone(),
                     options: StatOptions {
                         full_metadata: true,
+                        versioned_address: false,
                     },
                 }),
                 None,
@@ -5025,47 +5583,6 @@ mod tests {
             .expect("delete on a missing target must be idempotent success");
     }
 
-    // ----- internal-namespace addressability ---------------------------------
-
-    // The `.ovstorage-meta` sidecar namespace is backend-internal: a caller must
-    // not be able to address it directly to forge or corrupt another object's
-    // sidecar. checked_path_for rejects it for every op (stat shown here as the
-    // read side, write as the mutate side).
-    #[tokio::test]
-    async fn addressing_internal_sidecar_namespace_is_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Url::from_directory_path(tmp.path()).unwrap();
-        let backend = backend_over_tempdir(&tmp).await;
-        let sidecar = root.join(".ovstorage-meta/deadbeef.meta").unwrap();
-
-        let stat_err = backend
-            .stat(
-                Request::new(StatRequest {
-                    address: sidecar.clone(),
-                    options: StatOptions::default(),
-                }),
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(stat_err.code(), ErrorCode::InvalidArgument);
-
-        let write_err = backend
-            .write(
-                Request::new(WriteRequest {
-                    address: sidecar,
-                    body: Body::Bytes(b"forged".to_vec()),
-                    options: WriteOptions::default(),
-                }),
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(write_err.code(), ErrorCode::InvalidArgument);
-        // Nothing was written: the sidecar dir was never even created.
-        assert!(!tmp.path().join(".ovstorage-meta").exists());
-    }
-
     // ----- effective permissions ---------------------------------------------
 
     // stat reports the readonly approximation the descriptor advertises
@@ -5148,51 +5665,6 @@ mod tests {
     }
 
     // ----- precondition / lost-update locking --------------------------------
-
-    // Many concurrent `update_metadata` calls, each setting a distinct key with
-    // no if_match. Without the per-target lock the read→merge→write interleaves
-    // and silently drops keys (lost update); under the lock they serialize and
-    // every key survives.
-    #[tokio::test]
-    async fn concurrent_update_metadata_preserves_every_key() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Url::from_directory_path(tmp.path()).unwrap();
-        let file = root.join("meta-race.txt").unwrap();
-        let backend = backend_over_tempdir(&tmp).await;
-        write_file(&backend, &file, b"body").await;
-
-        const KEYS: u32 = 16;
-        let mut handles = Vec::new();
-        for i in 0..KEYS {
-            let backend = backend.clone();
-            let address = file.clone();
-            handles.push(tokio::spawn(async move {
-                backend
-                    .update_metadata(
-                        Request::new(UpdateMetadataRequest {
-                            address,
-                            options: set_one(&format!("k{i}"), "v"),
-                        }),
-                        None,
-                    )
-                    .await
-                    .unwrap();
-            }));
-        }
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        let info = stat(&backend, &file).await;
-        let user_metadata = info.user_metadata.expect("stat populates user_metadata");
-        for i in 0..KEYS {
-            assert_eq!(
-                user_metadata.get(&format!("k{i}")).map(String::as_str),
-                Some("v"),
-                "key k{i} was lost to a concurrent update_metadata race"
-            );
-        }
-    }
 
     // copy(a→b) and copy(b→a) issued concurrently take the source+destination
     // locks in opposite path orders. The canonical (path-sorted) ordering must
@@ -5350,77 +5822,6 @@ mod tests {
                     bytes, b"XXXX",
                     "round {round}: copy passed if_source=X but committed non-X bytes — the \
                      source lock didn't hold across the if_source check and the read"
-                );
-            }
-        }
-    }
-
-    // delete_directory shares the per-path lock with update_metadata, so a
-    // sidecar is never left orphaned for a directory being removed: either the
-    // patch lands and is then cleaned up with the directory, or the directory is
-    // gone and the patch fails NotFound. Without the directory lock, the patch
-    // can stat the live directory, the delete removes it, and the patch then
-    // (re)writes a sidecar for the now-absent directory. Verified to fail if the
-    // delete_directory lock is reverted.
-    #[tokio::test]
-    async fn update_metadata_racing_delete_directory_leaves_no_orphan_sidecar() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Url::from_directory_path(tmp.path()).unwrap();
-        let dir = root.join("subdir/").unwrap();
-        let dir_path = dir.to_file_path().unwrap();
-        let backend = backend_over_tempdir(&tmp).await;
-
-        for round in 0..100 {
-            backend
-                .create_directory(
-                    Request::new(CreateDirectoryRequest {
-                        address: dir.clone(),
-                        options: CreateDirectoryOptions::default(),
-                    }),
-                    None,
-                )
-                .await
-                .unwrap();
-
-            let patcher = {
-                let backend = backend.clone();
-                let address = dir.clone();
-                tokio::spawn(async move {
-                    backend
-                        .update_metadata(
-                            Request::new(UpdateMetadataRequest {
-                                address,
-                                options: set_one("k", "v"),
-                            }),
-                            None,
-                        )
-                        .await
-                })
-            };
-            let remover = {
-                let backend = backend.clone();
-                let address = dir.clone();
-                tokio::spawn(async move {
-                    backend
-                        .delete_directory(
-                            Request::new(DeleteDirectoryRequest {
-                                address,
-                                options: DeleteDirectoryOptions,
-                            }),
-                            None,
-                        )
-                        .await
-                })
-            };
-            let _ = patcher.await.unwrap();
-            let _ = remover.await.unwrap();
-
-            if !dir_path.exists() {
-                let sidecar = metadata::metadata_path(&dir_path).unwrap();
-                assert!(
-                    !sidecar.exists(),
-                    "round {round}: directory was removed but its metadata sidecar was left \
-                     orphaned — update_metadata wrote a sidecar for a directory being deleted"
                 );
             }
         }
@@ -5721,5 +6122,222 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(info.size, Some(5));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_backend_prefers_longest_overlapping_connection_root() {
+        for reverse_order in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let srv_dir = tmp.path().join("srv");
+            let outside = tmp.path().join("outside.txt");
+            std::fs::create_dir_all(&srv_dir).unwrap();
+            std::fs::write(srv_dir.join("inside.txt"), b"inside").unwrap();
+            std::fs::write(&outside, b"outside").unwrap();
+            std::os::unix::fs::symlink(&outside, srv_dir.join("escape")).unwrap();
+
+            let backend = FileBackendFactory
+                .create_backend("files", &LayerConfig::new(), None)
+                .await
+                .unwrap();
+            let mut broad_config = LayerConfig::new();
+            broad_config.insert("root".into(), ConfigValue::String("/".into()));
+            let mut narrow_config = LayerConfig::new();
+            narrow_config.insert(
+                "root".into(),
+                ConfigValue::String(srv_dir.to_string_lossy().into_owned()),
+            );
+            narrow_config.insert("confine_to_root".into(), ConfigValue::Bool(true));
+
+            let add_connection = |config| LayerConnectionRequest {
+                target: "files".into(),
+                connection: ConnectionRequest {
+                    backend_kind: FILE_BACKEND_KIND.into(),
+                    config,
+                    credentials: SecretBundle::default(),
+                    persist: false,
+                    display_name: None,
+                },
+            };
+            let narrow_connection = if reverse_order {
+                let narrow = backend
+                    .add_connection(Request::new(add_connection(narrow_config)), None)
+                    .await
+                    .unwrap();
+                backend
+                    .add_connection(Request::new(add_connection(broad_config)), None)
+                    .await
+                    .unwrap();
+                narrow
+            } else {
+                backend
+                    .add_connection(Request::new(add_connection(broad_config)), None)
+                    .await
+                    .unwrap();
+                backend
+                    .add_connection(Request::new(add_connection(narrow_config)), None)
+                    .await
+                    .unwrap()
+            };
+
+            let srv = Url::from_directory_path(&srv_dir).unwrap();
+            let inside = srv.join("inside.txt").unwrap();
+            let root_info = backend
+                .root_info_for(&inside, &Extensions::new(), None)
+                .await
+                .unwrap();
+            assert_eq!(root_info.root, srv, "reverse_order={reverse_order}");
+            assert_eq!(
+                root_info.connection_id,
+                Some(narrow_connection.id),
+                "reverse_order={reverse_order}"
+            );
+
+            let escape = Url::from_file_path(srv_dir.join("escape")).unwrap();
+            let err = backend
+                .stat(
+                    Request::new(StatRequest {
+                        address: escape,
+                        options: StatOptions::default(),
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("the narrow root's jail must deny its escaping symlink");
+            assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn enclosing_confining_root_is_not_disarmed_by_a_narrower_root() {
+        for reverse_order in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let broad_dir = tmp.path().join("broad");
+            let narrow_dir = broad_dir.join("narrow");
+            let outside = tmp.path().join("outside.txt");
+            std::fs::create_dir_all(&narrow_dir).unwrap();
+            std::fs::write(&outside, b"outside").unwrap();
+            std::os::unix::fs::symlink(&outside, narrow_dir.join("escape")).unwrap();
+
+            let backend = FileBackendFactory
+                .create_backend("files", &LayerConfig::new(), None)
+                .await
+                .unwrap();
+            let mut broad_config = LayerConfig::new();
+            broad_config.insert(
+                "root".into(),
+                ConfigValue::String(broad_dir.to_string_lossy().into_owned()),
+            );
+            broad_config.insert("confine_to_root".into(), ConfigValue::Bool(true));
+            let mut narrow_config = LayerConfig::new();
+            narrow_config.insert(
+                "root".into(),
+                ConfigValue::String(narrow_dir.to_string_lossy().into_owned()),
+            );
+            let request = |config| {
+                Request::new(LayerConnectionRequest {
+                    target: "files".into(),
+                    connection: ConnectionRequest {
+                        backend_kind: FILE_BACKEND_KIND.into(),
+                        config,
+                        credentials: SecretBundle::default(),
+                        persist: false,
+                        display_name: None,
+                    },
+                })
+            };
+            if reverse_order {
+                backend
+                    .add_connection(request(narrow_config), None)
+                    .await
+                    .unwrap();
+                backend
+                    .add_connection(request(broad_config), None)
+                    .await
+                    .unwrap();
+            } else {
+                backend
+                    .add_connection(request(broad_config), None)
+                    .await
+                    .unwrap();
+                backend
+                    .add_connection(request(narrow_config), None)
+                    .await
+                    .unwrap();
+            }
+
+            let escape = Url::from_file_path(narrow_dir.join("escape")).unwrap();
+            let err = backend
+                .stat(
+                    Request::new(StatRequest {
+                        address: escape,
+                        options: StatOptions::default(),
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("every containing confining root must retain its jail");
+            assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unconvertible_root_does_not_poison_a_valid_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("inside.txt");
+        std::fs::write(&file_path, b"inside").unwrap();
+        let mut config = LayerConfig::new();
+        config.insert(
+            "root".into(),
+            ConfigValue::String(tmp.path().to_string_lossy().into_owned()),
+        );
+        let backend = FileBackendFactory
+            .create_backend("files", &config, None)
+            .await
+            .unwrap();
+        let mut invalid = LayerConfig::new();
+        invalid.insert(
+            "root".into(),
+            ConfigValue::String("file://nas/share/".into()),
+        );
+        backend
+            .add_connection(
+                Request::new(LayerConnectionRequest {
+                    target: "files".into(),
+                    connection: ConnectionRequest {
+                        backend_kind: FILE_BACKEND_KIND.into(),
+                        config: invalid,
+                        credentials: SecretBundle::default(),
+                        persist: false,
+                        display_name: None,
+                    },
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let address = Url::from_file_path(&file_path).unwrap();
+        let info = backend
+            .stat(
+                Request::new(StatRequest {
+                    address: address.clone(),
+                    options: StatOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.size, Some(6));
+        assert_eq!(
+            backend
+                .root_info_for(&address, &Extensions::new(), None)
+                .await
+                .unwrap()
+                .root,
+            Url::from_directory_path(tmp.path()).unwrap()
+        );
     }
 }

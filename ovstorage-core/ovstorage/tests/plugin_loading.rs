@@ -329,6 +329,10 @@ async fn first_party_plugins_load_current_layer_abi() {
                     .map(str::to_string)
                     .collect()
             ),
+            "ovstorage_plugin_hub_cache" => assert_eq!(
+                kinds,
+                ["hub_cache"].into_iter().map(str::to_string).collect()
+            ),
             "ovstorage_plugin_http" => {
                 assert_eq!(
                     kinds,

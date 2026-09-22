@@ -127,6 +127,16 @@ async def test_export_import_capsule_round_trip(tmp_path: pathlib.Path) -> None:
         ovstorage.LayerBase.import_handle(capsule)
 
 
+async def test_transparent_python_adapters_preserve_native_list_stream() -> None:
+    probe = getattr(
+        _ovstorage_native, "_probe_transparent_list_stream_adapters", None
+    )
+    if probe is None:
+        pytest.skip("extension built without the test-probes feature")
+
+    await probe()
+
+
 async def test_unimported_capsule_destructor_releases_export(
     tmp_path: pathlib.Path,
 ) -> None:

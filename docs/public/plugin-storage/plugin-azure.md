@@ -84,6 +84,98 @@ vocabulary (`x-ms-version-id`, `x-ms-meta-*`, `x-ms-blob-content-md5`,
   runtime. Resolved auth is cached on the backend; OAuth bearer
   tokens refresh through an in-process `Mutex` 60 seconds before
   expiry.
+- **Anonymous-fallback layer keys** (set on `[ovstorage.layers.<name>]`,
+  never on a connection; see [Anonymous fallback](#anonymous-fallback)).
+  None of them appears in the kind descriptor's `config_schema`, so
+  `ovstorage connect` never prompts for one:
+  - `anonymous_fallback` (TOML array of scheme strings; the only scheme
+    this kind serves is `"azure"`; absent or `[]` is off, which is the
+    default).
+  - `anonymous_fallback_endpoint_suffix` (optional; default
+    `core.windows.net`; validated as a DNS suffix. The fallback derives
+    `<account>.blob.<suffix>` from it, so a sovereign cloud is one key
+    away.)
+  - `anonymous_fallback_max_backends` (optional int, default `64`; how
+    many per-container anonymous clients stay resident. Must be `1` or
+    more: `0` is refused at `create_backend`, as it is on `s3` and
+    `gcs`, and a value that does not fit is refused as too large.)
+  - `anonymous_fallback_mints_per_minute` (optional int, default `120`;
+    how many clients may be built per sliding minute. Must be `1` or
+    more: `0` is refused at `create_backend` rather than read as no
+    budget, and a value that does not fit is refused as too large.)
+
+### Anonymous fallback
+
+An `azure://<account>/<container>/<blob>` address that no connection
+serves has nowhere to go: the route scan misses and the caller sees
+`NoRoute`. The `anonymous_fallback` layer key is the opt-in answer, off
+by default:
+
+```toml
+[ovstorage.layers.azure]
+anonymous_fallback = ["azure"]
+```
+
+A granted layer publishes one extra address root beside its connection
+roots: the bare scheme `azure:///`, `Hidden`, with no connection id,
+read-only capabilities, the `Native` ranged-read strategy its connection
+roots advertise, and the marker
+`org.omniverse.ovstorage/scheme-fallback = "anonymous"` in its
+`user_metadata`. The shared route table consults that root only after
+every prefix has missed, so a configured container always outranks it
+for its own node, and only for an address whose query carries no
+credential. On a hit the layer reads the account and the container from
+the address, synthesizes the same per-container config a connection
+would carry — a flat namespace, no change feed, the blob tier at
+`<account>.blob.<anonymous_fallback_endpoint_suffix>` — and builds an
+`AzureBackend` from a literal empty `SecretBundle`; see [Auth](#auth).
+Building costs no request. Nothing is registered as a `Connection`:
+`list_connections` never lists the fallback, `ovstorage connect
+azure://account/container/` sees no incumbent, and adding a connection
+for a node the fallback has been serving is not a `RouteConflict`. The
+connection outranks the fallback the moment it installs, the cached
+anonymous client for that node is dropped, and removing the connection
+hands the node back to the fallback. `root_info_for` on a
+fallback-served address returns the `azure:///` root verbatim;
+`ovstorage list-routes` omits hidden roots, so the grant is visible
+through `ovstorage doctor`, which lists the root with its marker, and
+through the one `INFO` line the first build for a node logs at target
+`ovstorage.fallback`, naming the account origin and never a container or
+blob.
+
+The grant is layer configuration. A library, CLI or MCP host sets the
+key directly; the broker and the REST gateway set it from their
+top-level `anonymous_fallback_schemes` and refuse a hand-set layer key,
+so the deployment-wide policy has one spelling — see the
+`anonymous_fallback` section of
+[`../configuration.md`](../configuration.md) and the
+[broker operator guide](../broker-operator/README.md). Every
+`anonymous_fallback*` key is validated at `create_backend` whether or
+not the grant is on, so a mistake is refused where the operator wrote
+it rather than on the day the grant is added: a key this kind does not
+read answers `InvalidArgument` (`` unknown Azure layer key
+`anonymous_fallback_endpoint`; the anonymous fallback accepts
+anonymous_fallback, anonymous_fallback_endpoint_suffix,
+anonymous_fallback_max_backends, anonymous_fallback_mints_per_minute
+``), and a grant naming a scheme this kind does not serve answers
+`InvalidArgument` (`` `anonymous_fallback` on layer `azure` (kind
+azure) names scheme `s3`, which this kind does not serve; it serves
+azure ``). A connection request — `ovstorage connect`, an
+`[[ovstorage.connections]]` entry, or a probe — carrying any of these
+keys is refused with `` `anonymous_fallback` is a layer key, not
+connection config; set it on [ovstorage.layers.azure] ``, because a
+fallback key on a connection would otherwise be reported as an unknown
+field and send the operator to the wrong document.
+
+**A fallback grants routability, never authority.** Policy sees the
+caller's address, before routing and before alias resolution, so a
+caller the [authorization policy](../authz-policy/README.md) does not
+cover is denied before the fallback is consulted and no request leaves
+the process on their behalf. No grant is ever generated for the
+fallback — that would be automatic widening of a deny-by-default policy
+— and a container-scoped rule does not cover `azure:///`: a rule on the
+bare scheme (`prefix = "azure://"`) lists the hidden root and grants
+nothing on any account.
 
 ## Auth
 
@@ -153,6 +245,43 @@ container can arrive as `404` and reach the caller as
 `ErrorCode::NotFound` — indistinguishable on the status line from a
 container that is genuinely absent. The `x-ms-error-code` carried in the
 message is what separates them.
+
+A container reached through the [anonymous fallback](#anonymous-fallback)
+is served exactly as an anonymous connection is, and its anonymity is
+structural. The resolution order above runs on a connection's resolved
+`SecretBundle`, after the host has expanded the `${AZURE_*}`
+placeholders on that connection's credential fields; the fallback has no
+connection and no credential fields, and it resolves its auth source
+from a literal empty bundle. The resolver reads only the bundle, so it
+resolves to anonymous by construction rather than by the absence of an
+environment: no `AZURE_STORAGE_ACCOUNT_KEY`, no `AZURE_STORAGE_SAS_TOKEN`
+and no Entra secret can reach a fallback request however the process is
+configured. It signs nothing and appends nothing: `read` emits the bare
+blob URL as a redirect declared `none`, and `stat`, `list`,
+`list_stream`, `list_versions`, `get_latest_version` and `check_access`
+go to the store as they are, succeeding exactly as far as the
+container's public-access level allows — the same **blob** versus
+**container** distinction as above, with the same `404` for an
+enumeration the level does not permit.
+
+Read-only takes two shapes here, and they differ on purpose. A
+configured connection that resolves to anonymous keeps every capability
+bit a credentialed one advertises except `supports_write_redirect`,
+because every other operation is genuinely attempted and it is the
+service that decides. The fallback's `azure:///` root instead withholds
+every write, delete, copy, rename, directory-mutation, metadata-patch
+and watch bit, and the layer refuses those slots before any request is
+built: `Unsupported`, `this address is reached through the anonymous
+azure:// fallback, which is read-only`, with a `next_action` naming the
+node root (`add a connection for azure://account/container/ with
+credentials to modify it`) and never the blob. `copy` and `rename`
+check both ends and refuse when either is fallback-served, naming that
+end, so the refusal is the fallback's rather than the cross-connection
+`Unsupported`. `watch_directory` is refused the same way: the change
+feed is a standing registration the fallback has no identity to hold.
+An anonymous mutation is not something to attempt on an operator's
+behalf against a container the operator did not configure, whatever
+the container would accept.
 
 The Shared Key signer hand-rolls the canonical string-to-sign
 documented at Microsoft's Authorize-with-Shared-Key page: lowercased,
@@ -339,6 +468,83 @@ accounts have filesystem-like path rules and may reject names that
 flat Blob would accept; the plugin reports the provider's rejection
 as `InvalidArgument` rather than silently normalising.
 
+With `anonymous_fallback = ["azure"]` on the layer, an address naming
+an (account, container) pair that no connection pins is routed to the
+[fallback](#anonymous-fallback) rather than left at `NoRoute`. The
+account and the container come from the address, validated exactly as
+a connection's `account` and `container` are; the endpoint suffix comes
+from `anonymous_fallback_endpoint_suffix`; and the namespace is taken to
+be flat — there is no HNS probe an anonymous caller could run, so the
+`dfs` tier is never addressed and `has_real_directories` is false on the
+`azure:///` root. One client is built per (account, container), so
+`azure://account/alpha/one.usd` and `azure://account/beta/two.usd` are
+two nodes and two clients under one account. What the fallback does not
+extend to is deliberate. The scheme root and any hostless address —
+`azure:///`, `azure:///container/key` — name no account and answer
+`InvalidArgument` (`an azure:// address names no storage account`) on
+every slot, mutations included; `azure://account/` names no container
+and answers `InvalidArgument` (`azure address must include an account
+and container`). An address whose query carries anything outside the
+shared carried-query allowlist — the version selectors `versionid`,
+`versionId`, `generation` and `revision` — never reaches the fallback and
+answers the byte-identical `NoRoute` an ungranted layer gives: a SAS URL
+such as `azure://account/container/key?sig=abc` — or a `sv`, or a
+`snapshot` selector — authenticates itself, and re-serving it anonymously
+would silently discard the authority the caller presented, while
+`azure://account/container/key?versionid=7` (or `?versionId=7`) routes
+and is honoured on the wire; `generation` and `revision` route as well,
+and this plugin ignores them.
+
+### Generated URL spellings
+
+`azure://<account>/<container>/…` is the connection's only canonical
+address form; the ordinary HTTPS spellings of the same data are the
+**alias layer's** job. So that an operator does not have to author them,
+each connection advertises the URL prefixes it accepts as alternate
+spellings of its root (`org.omniverse.ovstorage/accepted-url-spellings` on
+its connection row), and an alias layer composed above installs one
+**hidden** alias rule per spelling at registration — addressable, never
+advertised, withdrawn with the connection. See "Generated aliases" in
+`docs/public/configuration.md` for the alias-layer and authorization
+semantics — including that a generated rule declines a SAS URL rather than
+re-serving it with this connection's credentials.
+
+The spellings are a property of a connection, so the
+[anonymous fallback](#anonymous-fallback) generates none:
+`https://account.blob.core.windows.net/container/key` for a container no
+connection pins is an ordinary HTTPS address and stays `NoRoute` under a
+granted layer, while `azure://account/container/key` routes.
+
+The set is derived from the same effective-endpoint resolution the request
+signer uses — never a host template — so every configured shape comes out
+right by construction:
+
+- the blob tier, always: `https://<account>.blob.<endpoint_suffix>/<container>/`
+  for a natural host (sovereign suffixes included), or the configured
+  `blob_endpoint` — including path-style Azurite,
+  `http://127.0.0.1:10000/devstoreaccount1/<container>/`, and privatelink
+  or custom hosts;
+- the DFS tier, exactly when `hierarchical_namespace` is set:
+  `https://<account>.dfs.<endpoint_suffix>/<container>/` (or the configured
+  `dfs_endpoint`). Under HNS the account answers on both hosts for the same
+  data; a flat-namespace connection never addresses the DFS tier, so no DFS
+  spelling is generated for it.
+
+**An endpoint carrying a path prefix generates no spelling unless it is
+loopback.** These prefixes are published in connection metadata, which
+`list_connections` and `list_address_roots` return to a principal holding
+only the addressless introspection operation — a weaker grant than reading
+the data — while connection configuration is otherwise never returned. An
+endpoint path can be a capability token
+(`https://gateway.example/<token>`), so a remote path-bearing
+`blob_endpoint` or `dfs_endpoint` is withheld rather than published; the
+two tiers are filtered independently, so a clean blob endpoint still
+generates while a path-bearing DFS endpoint does not. The loopback
+carve-out is what keeps path-style Azurite working: its path is the
+well-known `devstoreaccount1`, on an address that never leaves the host.
+Author the alias rule by hand to accept such a prefix — publishing it is
+then a decision rather than a default.
+
 Versioned URLs use Azure's opaque `versionid` pin (lowercased to
 match Azure's wire form, also accepted as `versionId`). `stat`,
 `read`, `delete`, and `copy(source)` append `versionid=<id>` to both
@@ -349,6 +555,15 @@ reject any pinned `?versionid=` with `InvalidArgument` (Azure's
 `Put Blob`, `Put Block List`, `Set Blob Metadata`, and the HNS rename
 surfaces all target the current version). `x-ms-version-id` from
 responses copies into `ObjectInfo.version`.
+
+It is also spelled into `ObjectInfo.versioned_address` as
+`azure://<account>/<container>/<blob>?versionid=<id>`: `stat` reports it
+for free from the `Get Blob Properties` response, echoing a caller's own
+`?versionid=` pin; `list` reports it only under
+`ListOptions::versioned_address`. HNS (`dfs`) stats and listings carry no
+version id and answer `None`, as do directory kinds and a container
+without versioning. Writing through a returned pin is refused exactly as
+above.
 
 ### Emulator and custom endpoints
 
@@ -447,23 +662,52 @@ The `http://azurite:10000` form is the same emulator over a container
 network — supported, and warned about, because the bytes do leave the
 host even when that network is trusted.
 
+### Instance-metadata endpoints
+
+A second advisory runs in the same spirit. A connection whose blob base
+— or, under `hierarchical_namespace`, its `dfs` base, or, under
+`change_feed_enabled`, its change-feed base — resolves to a cloud
+instance-metadata endpoint (`169.254.0.0/16`, `100.100.100.200`,
+`168.63.129.16`, `fe80::/10`, `fd00:ec2::254`, an IPv6 address
+embedding a refused IPv4 address, or the exact names
+`metadata.google.internal`, `metadata.goog` and `metadata`) is
+honoured, and logs one `warn` at construction: `Azure connection
+endpoint is a cloud instance-metadata host; it is honoured because an
+operator configured it, but every request this connection signs goes
+to that host`. An operator who wrote that endpoint chose it, and the
+request carries that operator's own credential.
+
+The [anonymous fallback](#anonymous-fallback) is the other case, and it
+is refused rather than warned about. Its blob host is derived from an
+account name a **caller** wrote, which is exactly the shape a
+server-side request forgery takes, so the derived host is judged by the
+same predicate before any client is built and an instance-metadata
+endpoint answers `PermissionDenied` (`refusing to contact <origin>: it
+is a cloud instance-metadata endpoint, and ovstorage never fetches from
+one on a caller's behalf`). In practice `<account>.blob.<suffix>` cannot
+spell one of those names, so the check is defence in depth on this
+plugin; it is the same predicate the http plugin applies to every
+redirect destination, where the destination is a server's choice. The
+predicate judges the host as written: a DNS name that resolves to a
+link-local address is not caught.
+
 ## Layer-to-API mapping
 
 | Layer method | Azure API |
 |---|---|
 | `add_connection` | Parses the connection config, resolves `AzureAuth` from the `SecretBundle`, and builds the `reqwest` (rustls) client. Bearer-token acquisition and the `hierarchical_namespace` round-trip check happen on the first data-path call. Capabilities are returned through `RootInfo`. |
-| `stat` (flat) | `HEAD Blob`. |
-| `stat` (HNS) | `HEAD ?action=getStatus` against the dfs endpoint. |
+| `stat` (flat) | `HEAD Blob`. A present `x-ms-version-id` is also spelled into `versioned_address` as `?versionid=…`, whatever `StatOptions::versioned_address` says; a caller's own pin is echoed; directory kinds and unversioned containers carry `None`. |
+| `stat` (HNS) | `HEAD ?action=getStatus` against the dfs endpoint. `getStatus` reports no version id, so `versioned_address` is `None`. |
 | `read` | Service SAS-signed GET URL (Shared Key auth), caller's SAS appended verbatim (SAS auth), or bearer-authenticated GET (OAuth). Returns `ReadResult::Redirect` with `ResponseParsing` pinning `etag`, `x-ms-version-id`, `content-length`, `last-modified`, plus the Azure system-metadata header set. On `hierarchical_namespace` connections — the only shape advertising `has_real_directories` — one `HEAD ?action=getStatus` precedes the signing: an `x-ms-resource-type: directory` verdict refuses the read with `InvalidArgument` and `list()` guidance, as `Layer::read` requires. Any other outcome (including a refused or failed probe) signs as usual, and flat namespaces issue no probe at all. |
 | `write` (Body::Bytes) | Direct `Put Blob` through the signed client (zero-byte payloads included). Preconditions inline. |
 | `write_redirect` (≤ 256 MiB) | Single `Put Blob` redirect with `RedirectBodySource::UserBytes { offset: 0, len }` and an empty `block_ids` continuation; `continue_write` rebuilds `ObjectInfo` from captured response headers (no second hop). Authorized per [Redirect credential scope](#redirect-credential-scope): a minted Service SAS under Shared Key, the caller's SAS verbatim under SAS auth, a bearer header under OAuth; refused under Anonymous. |
 | `write_redirect` (> 256 MiB) | Partitions into 4 MiB blocks (capped at Azure's 50 000-block limit; oversize bodies surface `Unsupported`). Emits one `?comp=block&blockid=<id>` redirect per block, authorized the same way as the single-shot form. Block IDs are deterministic: `base64(sha256(blob_key)[..12] \|\| u32::to_be_bytes(seq))`, uniformly 24 chars. |
 | `continue_write` | Refused with `Unsupported` on an anonymous connection, before the continuation is decoded — it is gated implicitly by `supports_write_redirect`, which that connection shape withholds. Otherwise a single `Put Block List` against `build_block_list_xml(block_ids)`. Re-applies `if_dest` (`If-Match: <etag>` for `MatchEtag`, `If-None-Match: *` for `Fail`) at commit time, not on each block. Non-2xx redirect outcomes route through `map_status_to_error` (401 → `AuthRequired`, 403 → `PermissionDenied`, 412 → `PreconditionFailed`, 409 → `AlreadyExists`, only 408/429/503/504 → `Transient`). |
 | `delete` | `DELETE Blob`; honours `?versionid=…`. |
-| `list` (flat) | `List Blobs` (`?restype=container&comp=list`) with `prefix`, optional `delimiter=/`, `marker`, `maxresults`. Loops on `NextMarker`. Zero-byte slash blobs return `DirectoryMarker`; `BlobPrefixes` return `DirectoryInferred`; an exact marker/prefix duplicate emits only the marker. |
-| `list` (HNS) | `Filesystem - List Paths` (`?resource=filesystem&recursive=<bool>&directory=<prefix>`) on the `dfs` endpoint; pages on `x-ms-continuation`. Directory paths return `Directory`. |
-| `list_versions` | `List Blobs` with `include=versions` constrained to the target blob's prefix; same `NextMarker` paging. Each version returns an `ObjectInfo` whose address carries `?versionid=…`. Oldest-first order (`version_list_order = Some(Oldest)`). |
-| `get_latest_version` | Stat on the pinned version, or the head's current version, returning a version-pinned `ObjectInfo.address`. Unversioned containers return `Unsupported`. |
+| `list` (flat) | `List Blobs` (`?restype=container&comp=list`) with `prefix`, optional `delimiter=/`, `marker`, `maxresults`. Loops on `NextMarker`. Zero-byte slash blobs return `DirectoryMarker`; `BlobPrefixes` return `DirectoryInferred`; an exact marker/prefix duplicate emits only the marker. With `ListOptions::versioned_address` set, a recursive listing adds `include=versions` and keeps only entries whose `IsCurrentVersion` is not `false`, pinning each `File` with `?versionid=…` (every version of every blob under the prefix travels in the response, so a page carries fewer items than `maxresults`); a non-recursive listing keeps its `delimiter` — the service refuses `include=versions` together with one — and issues one `Get Blob Properties` call per blob, whose answer supplies the pin from `x-ms-version-id` and replaces the listed entry's etag, size, mtime and metadata so they describe the version the pin names. `BlobPrefixes` and markers stay `None`. With the flag clear, `versioned_address` is `None`. |
+| `list` (HNS) | `Filesystem - List Paths` (`?resource=filesystem&recursive=<bool>&directory=<prefix>`) on the `dfs` endpoint; pages on `x-ms-continuation`. Directory paths return `Directory`. `List Paths` carries no version id, so `versioned_address` is `None`. |
+| `list_versions` | `List Blobs` with `include=versions` constrained to the target blob's prefix; same `NextMarker` paging. Each version returns an `ObjectInfo` whose address carries `?versionid=…`, and `versioned_address` equal to that address. Oldest-first order (`version_list_order = Some(Oldest)`). |
+| `get_latest_version` | Stat on the pinned version, or the head's current version, returning a version-pinned `ObjectInfo.address` and `versioned_address` equal to it. Unversioned containers return `Unsupported`. |
 | `create_directory` (HNS) | `PUT ?resource=directory`. |
 | `create_directory` (flat) | Zero-length marker blob at `<key>/`. |
 | `delete_directory` (HNS) | `DELETE` against an empty directory; non-empty surfaces `DirectoryNotEmpty`. |
@@ -480,6 +724,29 @@ Every backend method body is wrapped in
 so a `CancellationToken` cancelled before or during an in-flight HTTP
 exchange surfaces as `ErrorCode::Cancelled` rather than racing to
 completion.
+
+### Metadata keys
+
+The plugin formats every `user_metadata` key verbatim into an
+`x-ms-meta-<key>` header — on `Put Blob`, on the presigned PUT, at
+`Put Block List` and on `Set Blob Metadata` — and validates nothing
+before the wire. Azure requires a metadata name to be a C# identifier
+(a letter or underscore first, then letters, digits and underscores)
+and refuses any other name, a hyphen included, with
+`400 InvalidMetadata`, which fails the write. The service compares names
+case-insensitively, and the plugin reads them back from lowercased
+response headers, so a key round-trips in lowercase whatever case it
+was written in. The portable subset in
+[User-metadata keys](CONFORMANCE.md#user-metadata-keys) is the
+lowercase form of this rule, and the reserved `ovstorage_` names sit
+inside it. The per-operation `message` is stashed into the same map
+under `x_ov_message`, a name inside this rule, so a write or metadata
+patch that carries one stores the annotation beside the caller's keys;
+a message that is not a legal header value, one carrying a line break
+for instance, is dropped and the call proceeds without it.
+`copy` and `rename` issue Copy Blob without metadata headers, so the
+destination carries the source's metadata verbatim, annotation
+included, and the message they carry is not recorded.
 
 ## Streaming guarantees
 
@@ -530,6 +797,14 @@ in-place overwrite arrives as `BlobCreated`).
   accept an opaque etag string. Azure's wire carries it as
   `If-Match` / `x-ms-source-if-match`; `IfDestExists::Fail` maps to
   `If-None-Match: *`.
+- Raw HTTP `ETag` headers are normalized into opaque tokens with
+  `normalize_wire_etag`. A conformant nonempty quoted etag is declared
+  `Strong`; an explicit `W/` marker is preserved out of band as `Weak`; and a
+  bare or malformed unmarked header value is `Unspecified`. Azure serializes
+  the typed etag members in List Blobs XML and List Paths JSON without those
+  HTTP quotes; a nonempty bare value in either list payload is declared
+  `Strong` from the provider contract rather than inferred from its spelling,
+  while an explicit `W/` remains `Weak`.
 - Background OAuth refresh runs at ~90% of the access token's TTL with a
   30s retry floor on failure (Entra OAuth2 connections only; SharedKey
   and SAS connections don't refresh).
@@ -597,9 +872,38 @@ client secret or the signing key, so the residual exposure is low —
 but it is response text, and operators who forward `error.message` to
 a shared log sink should know it is there.
 
+The [anonymous fallback](#anonymous-fallback) holds no credential at
+all — no account key, no SAS, no bearer to cache — so there is nothing
+of its own in process memory to protect and nothing a redirect could
+carry: its `read` redirects are bare blob URLs declared `none`, and
+every mutation and `watch_directory` is refused before the wire. Its
+outbound host is judged by the instance-metadata predicate before any
+client is built (see [Instance-metadata
+endpoints](#instance-metadata-endpoints)). Its cost is bounded because
+account and container names are the caller's to invent: at most
+`anonymous_fallback_max_backends` clients stay resident, the least
+recently used evicted first; at most `anonymous_fallback_mints_per_minute`
+may be built per sliding minute, every attempt charged; and past the
+budget a cold node answers `ResourceExhausted` (`anonymous fallback mint
+budget exhausted; retry later`, retryable) while resident nodes keep
+answering. A build is single-flight per node. A SAS URL for an
+unconfigured container is never re-served anonymously: it falls through
+to `NoRoute` rather than reaching the fallback.
+
 ## Deferred capabilities
 
 - Managed Identity (IMDS), Azure CLI (`az login`), VS Code, and
   PowerShell credential sources from `DefaultAzureCredential`.
 - Event Grid push subscriptions for `watch_directory`.
 - Entra-only RBAC inference for fine-grained `EffectivePermissions`.
+- The HTTPS spellings of an unconfigured container reaching the
+  anonymous fallback; the fallback serves `azure://` alone.
+- Hierarchical-namespace accounts through the anonymous fallback; the
+  fallback assumes a flat namespace and never addresses the `dfs` tier.
+- A credentialed fallback tier — one that spends a configured identity
+  on a container nobody configured. The anonymous tier is the only one.
+- Refusing a configured `blob_endpoint` or `dfs_endpoint` at a cloud
+  instance-metadata host; the plugin warns instead. The unconditional
+  refusal covers the host the fallback derives and every redirect
+  destination the http plugin and the redirect follower are handed;
+  the redirects this plugin's own HTTP client follows are not judged.

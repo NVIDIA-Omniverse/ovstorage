@@ -198,7 +198,17 @@ impl LifecycleController {
         // at startup and absent from the broker a SIGHUP swaps in: a silent
         // security downgrade that validation cannot see, because validation runs
         // on the effective config.
-        let new_broker = crate::build_broker_from_config(&config).await?;
+        // Existing RPCs retain their old immutable Stack after the swap, so
+        // carry process-lifetime state into the replacement: old watch leases
+        // and newly admitted watches continue to share one daemon-wide budget,
+        // while continuations issued before the reload remain verifiable.
+        let running_broker = self.current_broker();
+        let watch_budget = running_broker.watch_budget();
+        let continuation_seal_key = running_broker.continuation_seal_key();
+        let context = crate::BrokerBuildContext::default()
+            .with_watch_budget(watch_budget)
+            .with_continuation_seal_key(continuation_seal_key);
+        let new_broker = crate::build_broker_with_context(&config, context).await?;
         self.broker_handle.store(Arc::new(new_broker));
         tracing::info!(
             target: "ovstorage.broker.lifecycle",
@@ -470,12 +480,31 @@ kind = "file"
             .with_config_path(cfg.clone())
             .unwrap();
         let before = controller.current_broker();
+        let address = ovstorage::Url::parse("s3://bucket/in-flight").unwrap();
+        let sealed_before_reload = crate::continuation_seal::seal_batch(
+            &before.continuation_seal_key(),
+            &address,
+            ovstorage::WriteRedirectBatch {
+                continuation: b"in-flight continuation".to_vec(),
+                redirects: Vec::new(),
+            },
+        );
         controller.reload().await.unwrap();
         let after = controller.current_broker();
         // Reload rebuilds and atomically swaps the live broker (no epoch counter;
         // the rebuilt auth layer evaluates the fresh policy).
         assert!(!Arc::ptr_eq(&before, &after));
         assert!(after.health().is_ok());
+        let unsealed_after_reload = crate::continuation_seal::unseal_batch(
+            &after.continuation_seal_key(),
+            &address,
+            sealed_before_reload,
+        )
+        .expect("SIGHUP rebuild carries the continuation-seal key");
+        assert_eq!(
+            unsealed_after_reload.continuation.as_slice(),
+            b"in-flight continuation"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -590,6 +619,94 @@ root = "{}"
 "#,
             root_literal(root)
         )
+    }
+
+    /// Anonymous file-backed broker with one live watch allowed. The explicit
+    /// watch-limit declaration makes a reset on reload immediately observable.
+    fn one_watch_config(root: &std::path::Path) -> String {
+        format!(
+            r#"
+[listener]
+bind = "127.0.0.1:0"
+auth = "anonymous"
+
+[ovstorage]
+root = "watch_limit"
+
+[ovstorage.layers.watch_limit]
+inner = "router"
+max_watches_per_principal = 1
+max_watches_total = 8
+
+[ovstorage.layers.router]
+children = ["file"]
+
+[ovstorage.layers.file]
+kind = "file"
+
+[[ovstorage.connections]]
+backend_kind = "file"
+
+[ovstorage.connections.config]
+root = "{}"
+"#,
+            root_literal(root)
+        )
+    }
+
+    #[tokio::test]
+    async fn reload_preserves_live_watch_admission_counts() {
+        crate::test_utils::ensure_test_plugin_env();
+        let dir = reload_e2e_temp_dir();
+        let watched = dir.join("watched");
+        std::fs::create_dir_all(&watched).unwrap();
+        let cfg = dir.join("broker.toml");
+        std::fs::write(&cfg, one_watch_config(&dir)).unwrap();
+
+        let broker = crate::build_broker_from_config_file(&cfg).await.unwrap();
+        let handle = broker_handle(broker);
+        let controller = LifecycleController::new(handle, Vec::new())
+            .with_config_path(cfg.clone())
+            .unwrap();
+        let prefix = ovstorage::Url::from_directory_path(&watched).unwrap();
+
+        let before = controller.current_broker();
+        let first = before
+            .watch_directory(
+                &crate::default_context(),
+                prefix.clone(),
+                ovstorage::WatchDirectoryOptions::default(),
+            )
+            .await
+            .expect("initial watch is admitted");
+
+        controller.reload().await.unwrap();
+        let after = controller.current_broker();
+        let error = match after
+            .watch_directory(
+                &crate::default_context(),
+                prefix.clone(),
+                ovstorage::WatchDirectoryOptions::default(),
+            )
+            .await
+        {
+            Ok(_) => panic!("reload must not reset live watch admission counts"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ovstorage::ErrorCode::ResourceExhausted);
+
+        drop(first);
+        let replacement = after
+            .watch_directory(
+                &crate::default_context(),
+                prefix,
+                ovstorage::WatchDirectoryOptions::default(),
+            )
+            .await
+            .expect("an old-generation lease releases into the shared budget");
+        drop(replacement);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Gated `builtin-auth` listener with an empty rule set (deny-all) over a

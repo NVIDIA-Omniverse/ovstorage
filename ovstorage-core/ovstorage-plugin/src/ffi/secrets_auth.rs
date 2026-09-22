@@ -510,7 +510,42 @@ pub struct Connection {
     pub auth_state: ConnectionAuthState,
     pub last_probed_unix_ms: Optional<i64>,
     pub user_metadata: KeyValueList,
+    /// The instance name of the Layer that owns this connection — the
+    /// `ConnectionKey.target` a connection op routes by, and the same fact
+    /// [`RootInfo::owning_target`](crate::ffi::v2::RootInfo) already reports for
+    /// a root. A plugin sets one of its own `owned_targets()` entries; a
+    /// composite sets the INTERNAL child's name, never its outer host name.
+    /// Absent means the plugin declines to attribute the row, and the host fills
+    /// it from the sole `owned_targets` entry where there is one.
+    ///
+    /// APPENDED AT THE TAIL, so every prior field keeps its offset. Unlike
+    /// `RootInfo`, this struct carries no `struct_size` prefix and no
+    /// `_reserved` tail, so the `Optional<Str>` GROWS it by 24 bytes — and it is
+    /// embedded BY VALUE in `Optional<Connection>`, `List<Connection>` and
+    /// `AuthEventSucceeded`, so the snapshot, the change stream and the
+    /// auth-event stream grow with it and a connection list's element stride
+    /// changes. No `struct_size` check anywhere covers that; the exact
+    /// `abi_version` match is what rejects a producer built against the earlier
+    /// layout. The `layout_is_frozen` assertion below pins the tail position.
+    pub owning_target: Optional<Str>,
 }
+
+/// Freeze the `#[repr(C)] Connection` binary layout: `owning_target` is the tail
+/// field, appended after `user_metadata`. There is no `_reserved` budget to
+/// spend here and no `struct_size` prefix to detect a mismatch, so the size is
+/// NOT invariant across this append and nothing but the exact `abi_version`
+/// match protects a mixed build. What this asserts is that the field stays at
+/// the tail: if a future edit shifts it or inserts ahead of it, this fails to
+/// compile — forcing a deliberate `OVSTORAGE_PLUGIN_ABI_V2_VERSION` decision.
+/// cbindgen:ignore
+const _: () = {
+    assert!(core::mem::size_of::<Optional<Str>>() == 24);
+    assert!(
+        core::mem::offset_of!(Connection, owning_target)
+            == core::mem::offset_of!(Connection, user_metadata)
+                + core::mem::size_of::<KeyValueList>()
+    );
+};
 
 unsafe impl Send for Connection {}
 

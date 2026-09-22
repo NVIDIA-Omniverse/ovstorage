@@ -31,7 +31,6 @@
 #include "../../../../ovstorage-c-source/src/temp_dir.h"
 
 #include "file_url.h"
-#include "sidecar_cleanup.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -375,6 +374,26 @@ static int handoff_handshake_negatives(void)
         goto cleanup;
     }
 
+    drop_calls = 0;
+    vtable = OVSTORAGE_UNSUPPORTED_VTABLE;
+    vtable.drop = handoff_stub_drop;
+    vtable.root_info_for = NULL;
+    handle.state = &drop_calls;
+    handle.vtable = &vtable;
+    if (!handoff_status_is(
+            "import without the root_info_for Layer slot",
+            ovstorage_import_handle(handle, &imported, &error),
+            OvStorage_Status_IncompatibleType)) {
+        goto cleanup;
+    }
+    if (drop_calls != 1) {
+        fprintf(stderr,
+                "a root_info_for-incomplete handle must be disposed exactly "
+                "once (drop ran %zu times)\n",
+                drop_calls);
+        goto cleanup;
+    }
+
     /* Export rejects NULL arguments without touching anything. */
     if (!handoff_status_is(
             "export from a NULL Stack handle",
@@ -662,9 +681,6 @@ cleanup:
     if (paths_initialized && unlink(native_second) != 0 && errno != ENOENT) {
         fprintf(stderr, "unlink failed: %s\n", strerror(errno));
         exit_code = EXIT_FAILURE;
-    }
-    if (directory != NULL) {
-        ovc_test_remove_metadata_sidecars(directory);
     }
     if (directory != NULL && rmdir(directory) != 0) {
         fprintf(stderr, "rmdir failed: %s\n", strerror(errno));

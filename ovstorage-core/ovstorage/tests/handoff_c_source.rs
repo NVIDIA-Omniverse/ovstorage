@@ -29,8 +29,8 @@ use std::os::raw::{c_char, c_ulong};
 use std::path::PathBuf;
 
 use ovstorage::{
-    Body, ListOptions, ListRequest, ReadOptions, ReadRequest, ReadResult, Request, StatOptions,
-    StatRequest, Url, WriteOptions, WriteRequest, import_handle,
+    Body, Extensions, Layer, ListOptions, ListRequest, ReadOptions, ReadRequest, ReadResult,
+    Request, StatOptions, StatRequest, Url, WriteOptions, WriteRequest, import_handle,
 };
 use ovstorage_plugin::ffi;
 
@@ -302,6 +302,32 @@ fn pure_c_producer_exports_a_layer_rust_imports_and_drives_ops() {
             2,
             "both the seeded and written objects list"
         );
+
+        // **The C backend attributes its own connection rows, and the value
+        // crosses the ABI.** The C reference backend is a producer like any
+        // plugin, so its rows have to name the layer instance a connection op
+        // routes by — `files`, deliberately different from its `file` KIND, so
+        // an assertion on it cannot pass by accidentally matching the kind.
+        //
+        // Asserted here rather than only in the backend's own
+        // `OVC_FILE_BACKEND_TEST_MAIN` self-test, which nothing in the repo
+        // builds automatically: this test runs in CI, and it reads the value
+        // from the far side of the boundary, so a C producer that stopped
+        // filling the field — or a marshalling that dropped it — fails here.
+        let (snapshot, _updates) = Layer::list_connections(&*imported, &Extensions::new(), None)
+            .await
+            .expect("list_connections across the pure-C -> Rust bridge");
+        assert!(
+            !snapshot.connections.is_empty(),
+            "the pure-C backend publishes the connection it was seeded with",
+        );
+        for connection in &snapshot.connections {
+            assert_eq!(
+                connection.owning_target.as_deref(),
+                Some("files"),
+                "every row the C backend lists names the layer that owns it",
+            );
+        }
     });
 
     drop(imported);

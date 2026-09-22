@@ -15,7 +15,8 @@ required) or the capability bits (those live in the same guide's
 "Capability vocabulary" section). You will need both open while
 reading this. The per-backend reference pages in this directory
 (`plugin-file.md`, `plugin-s3.md`, `plugin-gcs.md`, `plugin-azure.md`,
-`plugin-opendal.md`, `plugin-services-client.md`, `plugin-nucleus.md`,
+`plugin-huggingface.md`, `plugin-opendal.md`,
+`plugin-services-client.md`, `plugin-nucleus.md`,
 `plugin-broker.md`, `plugin-http.md`, `plugin-test.md`) each illustrate
 one valid branch of the contracts below.
 
@@ -25,14 +26,16 @@ backend; one branch is always correct.
 
 ## Which version this describes
 
-This document describes the conformance contract as of **ovstorage 0.2.1**,
-which is at Layer ABI 15. The loader requires an exact ABI match, so a plugin
-built against a different ABI version is refused rather than run against these
-rules.
+This document describes the conformance contract in the current source tree,
+which is at Layer ABI 19 (`OVSTORAGE_PLUGIN_ABI_V2_VERSION`, the canonical
+constant this restates). The ovstorage 0.2.1 artifacts use Layer ABI 15. The
+loader requires an exact ABI match, so a plugin built against a different ABI
+version is refused rather than run against these rules.
 
 One convention for reading the prose that follows: **"ABI-v2" is the plugin
-ABI family, not a release.** Its version number is 13 in 0.2.1 with a floor of
-5. Nothing here spelled `v2` refers to the ovstorage package version.
+ABI family, not a release.** Its version number is 19 in the current source
+tree and 15 in ovstorage 0.2.1, with a family floor of 5. Nothing here spelled
+`v2` refers to the ovstorage package version.
 
 ---
 
@@ -56,9 +59,9 @@ branch — your backend doesn't have to match.
 
 These apply to every slot. They are not repeated per-section.
 
-### Slot gating: baseline vs optional
+### Slot gating: baseline, optional, and host-owned
 
-The operational vtable slots split into two groups:
+The operational vtable slots split into three groups:
 
 - **Baseline required slots** have no default implementation; every
   plugin must implement them. The host calls them on every backend
@@ -71,12 +74,15 @@ The operational vtable slots split into two groups:
   are here?" (`read`). A backend that cannot serve one of these has
   no business being a backend.
 
-- **Optional slots** have a default `Unsupported` implementation;
-  plugins opt in by overriding the default. Each is paired with a
-  capability bit so the host fast-paths `Unsupported` without
-  invoking the slot:
+- **Optional slots** default to `Unsupported` unless noted below, and
+  plugins opt in by overriding that default. Each has a corresponding
+  capability bit. The `list_stream` default is the compatibility adapter
+  noted below rather than `Unsupported`:
   - `delete` — `supports_delete`
   - `list` — `supports_list`
+  - `list_stream` — `supports_list_stream` (a native-streaming hint;
+    the slot remains callable through its buffered compatibility adapter
+    when this bit is false)
   - `create_directory` — `supports_create_directory`
   - `delete_directory` — `supports_delete_directory`
   - `write` — `supports_write` (buffered single-shot path)
@@ -96,6 +102,17 @@ The operational vtable slots split into two groups:
   whose root set is static returns the snapshot with no stream and
   the host never polls; see the `list_address_roots` section below.
 
+- **Host-owned slots** have a default `Unsupported` implementation,
+  but a backend MUST leave that default in place. The host wrapper
+  that owns the behavior supplies it when the Stack is composed:
+  - `materialize` — `ByteCacheWrapper` and
+    `RedirectFollowerWrapper` produce local files; `FileBackend`
+    returns the path it already owns.
+
+  A backend MUST NOT implement `materialize`. Local availability is a
+  property of the composed Stack, not a backend capability, so there
+  is no capability bit for it.
+
 The three write bits are independent. A plugin that only supports
 streaming uploads sets `supports_write_stream = true` and leaves
 `supports_write` / `supports_write_redirect` false; the host's
@@ -105,8 +122,11 @@ dispatcher then picks `write_stream` regardless of `size_hint` or
 
 If you don't implement an optional op, leave the default impl in
 place and the bit false; the host returns `Unsupported` to callers
-without invoking the slot. If the bit is true the host expects
-the slot to behave per this contract — no half-implementations.
+without invoking the slot. `list_stream` is the exception: its Layer
+default adapts `list`, so a layer with `supports_list = true` remains
+correct but buffered when `supports_list_stream = false`. If an optional
+bit is true the host expects the slot to behave per this contract — no
+half-implementations.
 
 A plugin that exposes a single read-only resource per address (e.g.,
 the HTTP plugin) advertises `Capabilities::empty()` — every bit
@@ -125,6 +145,18 @@ owns its own connection routing, so it is the last line of defense for
 its own capability contract; the conformance registry's
 `capability-gate-<op>-unsupported` scenarios pin exactly this (typed
 `Unsupported`, nothing recorded, no side effects).
+
+An address a Layer reaches through its anonymous scheme fallback is
+served under exactly that contract, applied by the routing tier rather
+than by a connection's bits. The scheme root the Layer publishes for
+the fallback projects read-side bits only — list, stat, versions,
+access check — and the Layer refuses every mutating slot and
+`watch_directory` on such an address locally: typed `Unsupported`,
+nothing sent, before any request is built. That is the self-gate
+above with one more root to honour it, so a backend needs no
+fallback-specific behaviour and the registry needs no new scenario;
+the `capability-gate-<op>-unsupported` scenarios already pin the
+refusal shape the fallback produces.
 
 **Per-connection backend configuration.** Capabilities reflect the
 *specific connection* you're bound to, not the plugin's general
@@ -158,16 +190,23 @@ the call site, so callers see consistent behavior either way.
 
 **`wants_list_backed_stat` semantics.** When `wants_list_backed_stat =
 true` (and `supports_list = true`), the host may satisfy an
-unversioned, non-directory `stat` with `full_metadata = false` from a
-cached or freshly fetched one-level parent `list` entry, bypassing
-the backend's `stat` slot. `full_metadata = true`, directory-form
-addresses (trailing slash), and version-pinned URLs always dispatch
-to the backend's `stat`. Set the bit when your backend's `list`
-entries already carry the same metadata fields as `stat` (etag,
-version, size, mtime), so the parent-list shortcut is metadata-correct
-without an extra round trip. Leave it false if `list` returns thinner
-entries than `stat` does — the host won't synthesize the missing
-fields.
+unversioned, non-directory `stat` with both cost flags clear
+(`full_metadata = false`, `versioned_address = false`) from a cached
+or freshly fetched one-level parent `list` entry, bypassing the
+backend's `stat` slot. A `stat` with `versioned_address` set is answered
+from a cached parent listing only when that listing was itself asked
+for the pin; a `full_metadata` stat always reaches your `stat`, because
+no listing carries the per-object metadata that flag pays for, so a
+listing's rows never vouch for it. Neither buys a fresh listing of its
+own: the flag pays for this object, not for its directory.
+Directory-form addresses (trailing slash) and version-pinned URLs
+always dispatch to the backend's `stat`. Set the bit when your
+backend's `list` entries already carry the same metadata fields as
+`stat` (etag, version, size, mtime, and, where the listing carries a
+version id, the same `versioned_address`), so the parent-list shortcut
+is metadata-correct without an extra round trip. Leave it false if
+`list` returns thinner entries than `stat` does — the host won't
+synthesize the missing fields.
 
 ### Address inputs
 
@@ -194,6 +233,9 @@ Returned `ObjectInfo.address` values from `list`, `list_versions`,
 `get_latest_version`, and `watch_directory` use the same resolved
 address namespace and must stay inside the requested prefix or target
 scope. The host projects them back into the caller-facing namespace.
+`ObjectInfo.versioned_address`, when present, is projected the same
+way: it is a full resolved backend address whose route prefix the host
+rewrites and whose query — the pin — it leaves intact.
 If a returned address escapes that scope, treat it as a plugin bug:
 surface `Internal`, not a best-effort filtered child. Display labels
 are derived from the parent/child addresses; they are not returned as
@@ -252,6 +294,45 @@ supports cheapest. When both probes fail, prefer the file-shape error
 in the surfaced result (the file shape is the more common case and
 gives a clearer error class for callers); cache the last-known shape
 if your backend supports it.
+
+### User-metadata keys
+
+**Every backend that stores `user_metadata` MUST accept a key matching
+`[a-z_][a-z0-9_]*`** — lowercase ASCII letters, digits and underscores,
+with a letter or underscore first. That grammar is the intersection of
+what the shipped cloud backends take: Azure requires a C# identifier, S3
+takes any HTTP header token and lowercases it, and GCS preserves case.
+A plugin whose backend stores user metadata but refuses a name
+inside that subset is non-conformant. The rule is about names, not
+about whether metadata is stored at all: a backend with no
+user-metadata facet keeps rejecting a non-empty map with `Unsupported`,
+as the `write` contract says.
+
+A backend may accept more — uppercase, hyphens, dots — and a plugin
+passes such names through where its backend keeps them. Callers must
+not assume a wider name is portable across routes: the same `write`
+can succeed on one branch and be refused on another, or come back
+respelled. Per-key, per-value and per-object size and count limits
+stay backend-specific and belong on the backend page, not here.
+
+The `ovstorage_` prefix is reserved for host-attested keys —
+`ovstorage_modified_by`, stamped by the attribution overlay — and sits
+inside the portable subset so no backend refuses the stamp on name
+grounds. `is_reserved_metadata_key` matches
+the prefix case-insensitively because backends disagree on key case:
+S3 lowercases keys on the way in, Azure compares names
+case-insensitively, and GCS preserves case and stores `Author` and
+`author` as two distinct keys. An attributing host therefore strips a
+caller's `OVSTORAGE_Planted` exactly as it strips `ovstorage_planted`,
+so no case variant can pose as the host's stamp on a backend that
+would fold it into the reserved spelling. A plugin stores what it is
+handed; the stripping and the harvest are the host's. A plugin reads
+the namespace itself in two places only: the `continue_write`
+re-assertion under *`write`, `write_stream`, `write_redirect`,
+`continue_write`*, and — where a backend applies metadata in a stage
+after the object commits — to classify a failed reserved-key stash as
+the host's rather than the caller's, which the `omniverse-storage-service`
+page describes.
 
 ### Cancellation
 
@@ -332,25 +413,23 @@ When you do need them, two real cases from this codebase:
 
 - **Multi-stage durability** (bytes, then a separate metadata commit).
   When durability lands across multiple commit stages (e.g. a backend
-  commits bytes via `rename(2)`, then writes a user-metadata sidecar
-  in a second step), the durability contract still applies to the
-  final-stage commit. If the sidecar write fails after the bytes have
-  already landed, the right answer is to surface the error to the
-  caller — they will see the bytes as committed (`stat` returns the
-  new etag/version metadata) but their write call returned non-`Ok`, so they know
-  to re-issue the metadata patch. Do not retry the bytes commit; that
+  commits bytes, then records the caller's user metadata through a
+  separate service in a second step), the durability contract still
+  applies to the final-stage commit. If the metadata stage fails after
+  the bytes have already landed, the right answer is to surface the
+  error to the caller — they will see the bytes as committed (`stat`
+  returns the new etag/version metadata) but their write call returned
+  non-`Ok`, so they know to re-issue the metadata patch. Do not retry the bytes commit; that
   would change the etag/version again and break any concurrent `if_match`
   retry the caller is doing.
 
   **Report it as `ErrorCode::PartialCompletion`, carrying
-  `ErrorContext::Partial` where your host surface can.** (The C surface's
-  file backend reports the code and message only — it attaches no
-  `ErrorContext` to any error it mints. "Baseline" here means the reference
-  implementation.) The code exists so a caller can tell this
+  `ErrorContext::Partial` where your host surface can.** The code exists
+  so a caller can tell this
   apart from an operation that did not happen, and the context says which
   stage committed (`completed`), which one did not (`failed`), whether the
   failed stage is known not to have applied (`failed_outcome`), and what
-  undoing the committed stage would do (`rollback`). For bytes-then-sidecar
+  undoing the committed stage would do (`rollback`). For bytes-then-metadata
   that is `ObjectData` / `UserMetadata` / `DestroysRequestedWork`: rolling
   the write back would destroy the object the caller asked for, so the only
   correct remedy is to re-apply the metadata.
@@ -375,9 +454,12 @@ When you do need them, two real cases from this codebase:
   The shape that satisfies this: stage the second commit's payload BEFORE
   taking whatever lock guards the first, publish it after the first commits,
   and let the publish failure propagate rather than unwinding the bytes. The
-  built-in `file` backend does that in 0.2.1 with its user-metadata sidecar —
-  cited as an illustration of the shape, not as a promise that this backend
-  keeps a second stage.
+  in-tree example is the Omniverse storage-service client
+  (`plugin-services-client.md`): its write RPC carries no metadata, so the
+  object commits first and the caller's `user_metadata` lands through a
+  separate metadata-service stash afterwards; a stash failure surfaces as
+  `PartialCompletion` with `ObjectData` / `UserMetadata` /
+  `DestroysRequestedWork` rather than unwinding the bytes.
 
 The wrong shape, in either case, looks like:
 
@@ -410,15 +492,17 @@ which code you return. Some common confusions:
 | Caller has no permission                 | `PermissionDenied`    | Distinct from `AuthRequired` (no creds) / `AuthExpired` (creds need refresh). |
 | Network blip / 5xx / throttle            | `Transient`           | Host retries with backoff. |
 | Plugin bug / unhandled state             | `Internal`            | An unhandled state or a genuine bug; surfaces to operators as "plugin bug". |
-| Plugin's own fixed local bound hit        | `Internal`            | A deliberate cap on what one call may hold or do, such as a listing budget. Not `ResourceExhausted`: see below. |
+| Plugin's own fixed local bound hit        | `Internal`            | A deliberate cap on what one call may hold or do, such as a buffered `list` budget. Not `ResourceExhausted`: see below. |
 
 **A plugin's own fixed bound is `Internal`, not `ResourceExhausted`.** The
 names point the other way, so this is worth stating: `ResourceExhausted` is one
 of the two retryable buckets, and retryability here is exactly bucket
-membership. A bound the plugin sets itself — "this call may hold at most N
+membership. A bound the plugin sets itself — "this buffered `list` call may hold at most N
 entries" — is reached identically on every attempt, so a retryable code makes a
 host with `RetryWrapper` composed in repeat the whole operation to fail the same
-way, N times, paying the full cost each time. Reserve `ResourceExhausted` for
+way, N times, paying the full cost each time. Do not carry buffered `list` item
+or page budgets onto `list_stream`; that surface is bounded by resident state,
+not by refusing a large total traversal. Reserve `ResourceExhausted` for
 exhaustion outside this call that can clear on its own: a quota window, a rate
 limit, a concurrency slot, a store's own `429`. Use `Internal` for a limit that
 is a property of this build, and say in the message which limit was hit and what
@@ -517,13 +601,14 @@ retried once against a freshly minted redirect.)
 Implement the mapping unconditionally, and do not rely on a brokered caller
 observing your typed code for a non-2xx redirect.
 
-**Everything `continue_write` receives except the address is caller-supplied
-input.** The `RedirectResultBatch`, the `WriteRedirectBatch` echoed alongside
-it, and the opaque `continuation` blob inside that batch are all reported by
-whoever performed the redirect. The plugin observed none of them. That party is
-a follower inside a host stack on one route, and a remote client on the other —
-and on the route where it is a remote client, the values were decoded from that
-client's request.
+**At the Layer boundary, treat everything `continue_write` receives except the
+address as reported input.** The `RedirectResultBatch`, the
+`WriteRedirectBatch` echoed alongside it, and the opaque `continuation` blob
+inside that batch are all returned by whoever performed the redirect. The
+plugin observed none of them. That party is a follower inside a host stack on
+one route and a remote client on another. The broker authenticates the
+continuation on its client-driven route as described below, but that is a host
+boundary guarantee rather than part of the Layer SPI.
 
 Be precise about what is checked before it reaches you, because on the follower
 route the answer is *nothing*:
@@ -537,26 +622,51 @@ route the answer is *nothing*:
   caller's self-consistency. Every first-party plugin performs this check; a
   plugin that skips it and indexes results positionally against redirects will
   mis-handle a mismatched batch.
+  An in-process follower may deliberately hand `continue_write` the original
+  non-empty redirect batch with an empty result batch after redirect execution
+  fails and exhausts its retries. Treat that mismatch as a best-effort
+  abandonment notification: never finalize or report success, and release any
+  staged provider resources that can be identified safely before returning the
+  cardinality error. Backends without staged resources simply reject it like
+  any other mismatch. The follower ignores that cleanup result and returns the
+  original redirect-execution error to its caller.
 - **Status range** — the broker's `continue_write` RPC refuses a batch carrying
   any status outside 200..300. That is the only place it happens; on every
   follower route a non-2xx reaches your `continue_write`, as covered under
   *Post-redirect failure mapping* above.
 
-Both entries reduce to the same advice: neither check is performed for you on
-the route you are most likely to be running under. Nothing else is validated
-either — no signature binds the continuation to the operation you issued it for,
-and the host's obligation to echo it byte-for-byte is an obligation, not a proof
-that it did.
+The broker's client-driven route performs one additional check before either
+of those checks or any Stack dispatch. Every `WriteRedirectBatch` the broker
+hands to a remote client carries the plugin continuation inside an HMAC-SHA256
+envelope. The MAC binds the exact continuation bytes to the parsed request
+address. `continue_write` verifies the envelope against its request address and
+strips it before calling the Stack, so the plugin sees its original bytes. A
+malformed or edited envelope, a continuation issued by a broker with another
+key, and a genuine continuation presented for another address all fail closed
+as `InvalidArgument` before the plugin runs.
 
-**The address is the only authenticated thing in the call.** Authorization is
-decided on the request address; a key, path, upload id, or precondition read out
-of the continuation has been through no such check. So the resource your
-`continue_write` acts on must be **derived from** that address, and where the
-shape of the provider's handle makes derivation impossible, the gap must be
+That seal has deliberately narrow scope. It authenticates the continuation
+bytes and their address binding; it does not authenticate the redirect list,
+the result count, statuses, headers, or bodies. It does not prevent replay of a
+genuine continuation to its own address, and it does not bind a principal to
+the write. Follower routes — including the broker's own in-Stack follower — and
+non-broker hosts add no such seal. The Layer SPI neither supplies a seal nor
+tells a plugin that a host verified one. On those routes, no signature binds
+the continuation to the operation, and the host's byte-for-byte echo obligation
+is an obligation rather than proof. Plugin code must therefore remain correct
+for the unsealed routes.
+
+**The address is the only authenticated input available on every route.**
+Authorization is decided on the request address. A key, path, upload id, or
+precondition read out of the continuation has no SPI-level authentication; the
+broker seal is present only on the client-driven broker route. So the resource
+your `continue_write` acts on must be **derived from** that address, and where
+the shape of the provider's handle makes derivation impossible, the gap must be
 stated rather than presented as satisfied by a comparison — see *Derive, don't
 compare* below, and the paragraphs on resumable-session handles further down.
-A plugin that finalizes whatever object the continuation names is letting the
-caller choose the object, which is the caller choosing its own authorization.
+A plugin that finalizes whatever object the continuation names is letting an
+unsealed caller choose the object, which is the caller choosing its own
+authorization.
 
 The invariant is that what your call commits must not be steerable by
 caller-supplied data. The mechanism is yours, but be clear about what each one
@@ -573,15 +683,16 @@ build older than yours, whatever that is in your deployment — is a
 compatibility question, not a security one, as long as nothing reads it back.
 
 Comparing the continuation's object against the address and refusing a mismatch
-is weaker, and how much weaker depends on who produced the continuation. On a
-follower route the batch came from your own process and the comparison is a real
-assertion. On the client-driven `continue_write` RPC **both sides come from the
-same remote caller**: it presents an address it is authorized for, alongside a
-continuation whose recorded copy it has rewritten to match. Use comparison only
-where derivation is genuinely unavailable, and say in the code that it is
-defence in depth. If you do compare, compare in the namespace your backend
-resolves in rather than byte-for-byte — two spellings of one key must not read
-as two objects.
+is weaker, and how much weaker depends on the host boundary. On a follower
+route the batch came from the host process and the comparison is a real
+assertion about the unmodified batch. The broker's client-driven
+`continue_write` RPC authenticates the recorded bytes and their address binding,
+so a remote caller cannot rewrite that copy to match another address. A direct
+SPI caller or another client-driven host with no equivalent seal can do exactly
+that. Use comparison only where derivation is genuinely unavailable, and say in
+the code that it is defence in depth outside a sealed boundary. If you do
+compare, compare in the namespace your backend resolves in rather than
+byte-for-byte — two spellings of one key must not read as two objects.
 
 Making the continuation *unforgeable* does not settle it at all on its own. A
 continuation your backend minted, or one you could detect an edit to, stops a
@@ -590,8 +701,10 @@ untouched, perfectly valid continuation for another object is still a
 continuation the caller can hand you. Unforgeability only helps once it is
 paired with a binding to the address authorization was decided on, and that
 binding is checked here; without the check it moves the forgery out of reach and
-leaves the substitution exactly where it was. Note that nothing in the SPI makes
-the blob tamper-evident for you, so this is a property you would be adding.
+leaves the substitution exactly where it was. The broker seal pairs these
+properties for its client-driven RPC. Nothing in the SPI makes the blob
+tamper-evident for a plugin, so other hosts must add an equivalent boundary or
+plugin-owned mechanism to obtain that property.
 
 This page states the invariant and does not prescribe which mechanism you use.
 Object selection is the part these settle; the upload id and the preconditions
@@ -616,18 +729,22 @@ looks — but the two checks usually reached for are not equally weak, and sayin
 so matters, because a check described as worthless is a check the next reader
 deletes.
 
-Comparing the **session URL against the redirect batch** compares one
-caller-supplied value against another: both sides come out of the same batch, so
-on the client-driven route it establishes only that the caller was
-self-consistent.
+Comparing the **session URL against the redirect batch** compares two values
+from the echoed batch. On an unsealed client-driven route it establishes only
+that the caller was self-consistent. The broker seal authenticates a session
+URL stored inside the continuation, but not the separate redirect list; the
+comparison can then detect a changed list. That protection is still not an SPI
+property.
 
 Comparing a **recorded address field against the request address** is different.
 The request address is the authenticated side, so this does refuse a genuine,
 unmodified continuation minted for another object — substitution on its own does
-not get through it. What defeats it is *modification*: nothing in the SPI makes
-the blob tamper-evident, so a caller that rewrites the recorded field to the
-address it is authorized for passes the comparison. Keep it, and describe it as
-what it is — a check defeated by forgery, not a vacuous one.
+not get through it. On a route with no tamper-evident boundary, *modification*
+defeats it: the SPI does not protect the blob, so a caller that rewrites the
+recorded field to the address it is authorized for passes the comparison. The
+broker's client-driven RPC refuses that rewrite before dispatch. Keep the
+plugin check for every other route, and describe it as what it is — defence in
+depth outside the broker seal, not a vacuous comparison.
 
 The only anchors that are *not* caller-supplied are the request address and
 state your own backend holds. So resolve the session from one of those, or make
@@ -640,17 +757,19 @@ provider that issues a session handle naming the object, keeps no lookup from
 address to session, and returns nothing to resolve against leaves an adopter
 unable to *derive*. Such an adopter satisfies the rule only against an
 unmodified continuation, by the address comparison above, and not against a
-forged one — say that precisely rather than claiming either more or less. State
-in the code that the checks you keep are defence in depth on the client-driven
-route, pin both the case they catch and the case they cannot with tests, and
-raise the gap rather than absorbing it. What is *not* acceptable is an adopter
-that takes the object out of the continuation with no anchor and no statement.
+forged one on an unsealed route — say that precisely rather than claiming either
+more or less. State in the code that the checks you keep are defence in depth at
+the plugin boundary, pin both the case they catch and the direct-plugin case
+they cannot with tests, and raise the gap rather than absorbing it. The brokered
+client route closes that forgery case before the plugin runs. What is *not*
+acceptable is an adopter that takes the object out of the continuation with no
+anchor and no statement.
 
-**Spell out what the residual actually costs**, because it is wider than a wrong
-answer to the caller. Where the caller's own request was the commit, a forged
-continuation leaves the bytes on the object the *session* names while your
-`continue_write` reports the address the *request* names. Three consequences
-follow, and the second is the one people miss:
+**Spell out what the unsealed-route residual actually costs**, because it is
+wider than a wrong answer to the caller. Where the caller's own request was the
+commit, a forged continuation leaves the bytes on the object the *session*
+names while your `continue_write` reports the address the *request* names.
+Three consequences follow, and the second is the one people miss:
 
 - Anything the host derives from the reported address is wrong for that call.
 - **Cache invalidation lands on the reported address, and the object that
@@ -668,10 +787,11 @@ follow, and the second is the one people miss:
   report does not mention.
 
 None of this reaches an object the caller could not already write: obtaining the
-session required an authorized initiation on it. The residual is tamper-evidence
-and reporting, not privilege escalation — provided the provider's session handle
-is unguessable, which is a property of the provider and not something this
-contract can establish for you.
+session required an authorized initiation on it. On a route without the broker
+seal or an equivalent, the residual is tamper-evidence and reporting, not
+privilege escalation — provided the provider's session handle is unguessable,
+which is a property of the provider and not something this contract can
+establish for you.
 
 Re-validating the object that the finalize response reports is worth doing where
 the response carries it — the in-tree GCS backend re-checks the captured
@@ -679,16 +799,22 @@ object's name against the parsed target — but be precise about what it buys,
 because it varies by route and the weaker case is the one this passage is about.
 Where the captured body came from the provider, it is **detection after the
 commit, not prevention**: the object has already been written by the time you
-can look. Where the *caller* supplies the captured body, it is not even that — a
-caller who forges the continuation forges this check's input in the same breath,
-so against the forged case it establishes nothing. It is a backstop for the
-anchors above on follower routes, not a substitute anywhere, and on a backend
-whose finalize returns no object name it is not available at all.
+can look. Where the *caller* supplies the captured body, the body remains
+untrusted even on the sealed broker route because the seal does not cover
+results. On an unsealed route, a caller who also forges the continuation can
+forge this check's input in the same breath, so against that case it establishes
+nothing. It is a backstop for the anchors above on follower routes, not a
+substitute anywhere, and on a backend whose finalize returns no object name it
+is not available at all.
 
-And treat what you cannot validate as caller-chosen — ovstorage 0.2.1 has
-no mechanism that makes the blob tamper-evident, so a precondition arriving this way is the one the
-caller is willing to admit to, not provably the one the original write carried.
-Do not build a guarantee another principal depends on out of it.
+On the broker's client-driven RPC, a precondition inside the verified
+continuation is provably the one in the batch the broker issued for that
+address. It is not proof of freshness or of who presents it: the same genuine
+batch can be replayed to the same address, including by another authorized
+principal. On follower routes and non-broker hosts, no seal establishes even
+that much, so a precondition arriving in the blob is the one the caller is
+willing to admit to, not provably the one the original write carried. Do not
+build a guarantee another principal depends on out of an unsealed value.
 
 Beyond selecting the resource, these values must never be evidence for anything
 your plugin persists, shares, or grants: whether a connection is authenticated,
@@ -790,6 +916,11 @@ Per-op guidance:
   user-metadata patch; reject if the target address is pinned.
 - `delete_directory`, `create_directory` — reject if the address is
   pinned. Directories don't have version-modifier semantics.
+- `versioned_address` returned by `stat` / `list` is exactly such a
+  pinned address. A caller that turns around and mutates through it
+  hits the guards above; that refusal is the contract, not a defect.
+  `stat` on an address the caller already pinned echoes the caller's
+  pin as `versioned_address` regardless of `opts.versioned_address`.
 
 Meta-plugins (`ovstorage-plugin-broker-client`) forward the address
 verbatim to the broker; the downstream plugin applies its own
@@ -803,7 +934,7 @@ cross-cutting invariants *before* any backend round-trip. New backends
 should adopt the same pattern; the per-backend reference pages spell
 out the specific helpers each plugin uses.
 
-**Preconditions are opaque etag strings.** The precondition fields on
+**Preconditions use opaque etag strings.** The precondition fields on
 the options structs are:
 
 - `ReadOptions::if_match`, `DeleteOptions::if_match`,
@@ -814,20 +945,84 @@ the options structs are:
 - `CopyOptions::if_source`, `RenameOptions::if_source` —
   `Option<String>` etag constraining the source.
 
-The etag is opaque to the host; its internal structure is the
-plugin's choice. The built-in `file` backend synthesizes `"size:N,mtime:Tms"`;
-HTTP-derived backends use the wire `ETag` header value verbatim;
-GCS encodes the generation number; the Omniverse Storage Service uses
-`ResourceIdentity.encoded_identity`; the broker forwards whatever
-string the upstream backend supplied. A plugin that wants to encode
-multiple facts into a precondition can do so inside the opaque
-string. The host never parses or interprets it.
+The etag token is opaque to the host for comparison; its internal structure is
+the plugin's choice. The built-in `file` backend synthesizes
+`"size:N,mtime:T"`; GCS encodes the generation number; the Omniverse Storage
+Service uses `ResourceIdentity.encoded_identity`; and the broker forwards
+whatever string the upstream backend supplied. A plugin that wants to encode
+multiple facts into a precondition can do so inside the opaque string. The host
+never parses it to decide whether two tokens match. Validator trust is a
+separate backend promise carried out of band in `ObjectInfo::etag_strength`.
 
 Backends without an etag-conditional wire (most OpenDAL drivers)
 honor `ReadOptions::if_match` and `DeleteOptions::if_match` via
 post-stat compare. Backends without any precondition surface
 (Nucleus's `delete2` / `copy2` / `rename2`) return `Unsupported`
 when the preconditions are populated.
+
+**Etag strength is a declaration, not a computation.** The host cannot infer
+whether equal tokens guarantee byte-identical content from a token's spelling.
+Derive `ObjectInfo::etag_strength` from what the backend actually promises, not
+from a hash-like shape, length, or other string inspection. A weak declaration
+does not make the opaque token unusable as a backend precondition; it says only
+that consumers cannot use it as proof of byte identity.
+
+Producers receiving an HTTP-derived etag use the shared
+`normalize_wire_etag` helper. It removes surrounding quotes and the `W/` marker
+from the opaque token while preserving the marker's evidence out of band:
+`W/` declares `Weak`, and only a nonempty, syntactically valid quoted entity-tag
+declares `Strong`. A bare or malformed unmarked value declares `Unspecified`.
+The producer stores the normalized token and declaration together so stat,
+read, list, and client-side precondition comparisons use the same spelling.
+
+`Unspecified` is the undeclared zero value. Every consumer treats it as `Weak`
+for trust decisions, so omission fails safely. In particular, the byte cache
+keys content only on `Strong`; `Weak` and `Unspecified` validators take the
+untrusted path.
+
+| Backend | Etag strength declaration |
+|---|---|
+| `file` | `Weak`: size plus mtime can alias a same-size rewrite within the filesystem clock's granularity. |
+| S3 | Derived from the provider's object etag by `normalize_wire_etag`; conformant quoted S3 etags are `Strong`, an explicit `W/` marker is `Weak`, and a bare or malformed value is `Unspecified`. |
+| GCS | `Strong` for the numeric object generation used as the etag. |
+| Azure | Raw HTTP `ETag` headers use `normalize_wire_etag`: conformant quoted values are `Strong`, an explicit `W/` marker is `Weak`, and a bare or malformed value is `Unspecified`. A nonempty bare typed etag member in List Blobs XML or List Paths JSON is provider-declared `Strong`; an explicit `W/` remains `Weak`. |
+| Hugging Face Hub | `Strong` for the provider's content-addressed LFS SHA-256 and Git object IDs. Direct response `ETag` values use `normalize_wire_etag`, including the quoted/weak/bare rules above. |
+| Nucleus | `Unspecified`: omni1 exposes an opaque precondition token but does not declare that equality proves byte identity or that a token is never reissued for changed bytes. |
+| Omniverse Storage Service client | `Strong` for a present `ResourceIdentity.encoded_identity`: the Storage API contract explicitly marks the identity suitable as a cache key, so one encoded identity is not rebound to different bytes. Different identities may name the same bytes, which does not weaken the one-way strength promise. |
+| OpenDAL | Derived from the driver's wire etag by `normalize_wire_etag`, including the quoted/weak/bare rules above. |
+| HTTP(S) | Derived from the response `ETag` by `normalize_wire_etag`, including the quoted/weak/bare rules above. |
+| Broker client | Transparent: preserves the upstream declaration. |
+
+**A versioned address is a pin, not an identity.**
+`ObjectInfo::versioned_address` names *this* version of the object in the
+backend's own pin spelling. `None` means the backend does not version this
+object, or the caller did not ask and the answer was not free. It is not a
+capability (it grants nothing the unpinned address does not), not a durable
+key (retention and alias rules decide how long it resolves), and never a
+mutation target (see *Address-modifier rejection*). Every directory kind
+carries `None`, as do `write`, `update_metadata` and `create_directory`
+results. Populate it from what the backend returned for this object — a
+version id, a generation, a commit sha, a checkpoint, a server-supplied
+`resource_address` — never by deriving it from `etag`.
+
+`StatOptions::versioned_address` and `ListOptions::versioned_address` are
+cost knobs with the same shape as `full_metadata`: set, a versioning backend
+MUST populate the pin even when that costs a version lookup; clear, a backend
+MAY populate it when the answer is free. Over-delivery is allowed in both
+directions.
+
+| Backend | `versioned_address` spelling | `stat` cost | `list` cost | `None` cases |
+|---|---|---|---|---|
+| `file` | none | always `None` | always `None` | the filesystem has no versions |
+| S3 | `?versionId=<id>` | free: `x-amz-version-id` rides `HeadObject`. The literal `null` id of an unversioned or suspended bucket is not a pin. | flag set: `ListObjectsV2` becomes `ListObjectVersions` filtered to `IsLatest`; a key whose newest entry is a delete marker is omitted, as `ListObjectsV2` omits it. Each common prefix is verified with one `ListObjectsV2` probe and dropped when it holds no current object, so both listings agree on which directories exist. Needs `s3:ListBucketVersions` (and `s3:ListBucket` for the probes); a connection without them answers the wire's denial rather than falling back. `MaxKeys` counts every version, so pages may be short. Flag clear: `None`. | unversioned or suspended bucket; directories |
+| GCS | `?generation=<n>` | free: the generation is on every object resource | free: every list entry carries `generation`, so the pin is populated whether or not the flag is set | directories |
+| Azure | `?versionid=<id>` | free: `x-ms-version-id` rides `Get Blob Properties` | flag set: a recursive listing adds `include=versions` kept to the current version (`IsCurrentVersion`); a non-recursive listing keeps its delimiter and issues one `Get Blob Properties` call per blob, whose facts replace the listed entry's, because the service refuses `include=versions` together with a delimiter. Flag clear: `None`. | container versioning disabled; HNS (Data Lake) listings and stats; directories |
+| Hugging Face Hub | `?revision=<commit sha>` | flag set: the request carries `expand=true` (the same request `full_metadata` makes) and the pin is `?revision=<lastCommit.id>`. A 40-hex sha the caller already pinned is echoed for free; a ref such as `main` is not a pin and is not echoed. | same as `stat`, per file entry | repository root and directories |
+| Nucleus | `?<branch>&<checkpoint>` (native form, e.g. `?&3`) | flag set: one `get_checkpoints` plus one `stat2` at the chosen checkpoint, whose facts are reported; a `?branch&checkpoint` pin is echoed without either | flag set: one `get_checkpoints` plus one `stat2` per file entry | folders; files without checkpoints |
+| Omniverse Storage Service client | the server's `VersionInfo.resource_address` verbatim | flag set: one `EnumerateVersions` reports the newest `resource_address` and the entry's facts come from that version's `resource_info`; an address the service rejects as already a version address is echoed. Flag clear: `None`, because `Stat` carries no version. | flag set: one `EnumerateVersions` per file entry with the same fact rule, failing the page on error (the policy the `full_metadata` metadata fetch follows). Flag clear: `None`, because `ListStat` carries no version. | objects with no versions; subfolders |
+| OpenDAL | none | always `None` | always `None` | the adapter cannot serve a read at a pinned address |
+| HTTP(S) | none | always `None` | no `list` | every answer |
+| Broker client | forwarded | transparent: forwards the field and both cost flags untouched | transparent | whatever the downstream plugin answers |
 
 **Inverted byte ranges refused at the plugin boundary.** Every plugin
 that honors `ReadOptions::range` checks for `end_inclusive < start`
@@ -925,6 +1120,14 @@ known, system metadata, optionally `user_metadata` and
   much as you can, regardless of cost*. Callers asking for the cheap
   shape may still receive `user_metadata` / `system_metadata` if your
   backend hands those back for free.
+- `opts.versioned_address` is the second cost knob and has the same
+  shape: `false` means *return the pin if you already have it in hand*;
+  `true` means *I will pay — a versioning backend MUST return it for
+  every versioned object even if that costs a version lookup*.
+  Over-delivery is permitted: a backend that has the pin for free
+  returns it under either value. `None` under the flag means the
+  backend does not version this object. A `stat` on an address the
+  caller already pinned echoes that pin regardless of the flag.
 - `effective_permissions: None` means *"didn't compute"* (capability
   `populates_effective_permissions_on_stat = false`).
   `Some(EffectivePermissions::empty())` means *"explicitly denied
@@ -957,7 +1160,9 @@ known, system metadata, optionally `user_metadata` and
   through the host.
 - `ReadResult::Redirect(...)` — host fetches from a presigned URL.
 - `ReadResult::LocalDelegate(...)` — host reads from a local path under
-  lease.
+  lease. This is a valid `read` result for any Layer whose bytes already
+  sit on disk local to the current host; it does not authorize a backend
+  to implement the host-owned `materialize` slot.
 
 The byte sequence must match the object's current state at the moment of
 return (or at the version pinned by the address).
@@ -989,11 +1194,12 @@ return (or at the version pinned by the address).
   so bytes flow from the backend straight to the client without
   passing through the host. Set `expires_at` accurately; the host
   validates freshness.
-- *If your backend serves files from local disk under a lease:* you
-  MUST return `LocalDelegate` (not `Bytes`). Buffering an entire local
-  file into a `Vec<u8>` is the same memory-DoS vector as buffering a
-  write stream — unbounded by object size. Hold the lease for the
-  duration the delegate is alive.
+- *If your backend serves files from local disk under a lease:* `read`
+  MUST return `LocalDelegate` (not `Bytes`). This applies to the `read`
+  result shape only: a backend MUST still leave `materialize` at the
+  trait default. Buffering an entire local file into a `Vec<u8>` is the same
+  memory-DoS vector as buffering a write stream — unbounded by object
+  size. Hold the lease for the duration the delegate is alive.
 - *Otherwise:* `Stream`. Peak memory should be chunk size × channel
   capacity; never the full object size.
 
@@ -1033,6 +1239,10 @@ stores. Every other field of `result.info`, and every other verb's
 - `opts.if_dest = IfDestExists::Fail` — fail with `AlreadyExists` if
   the destination exists. Distinct from "create with default; fail if
   exists".
+- *Missing ancestors* — a write creates its path. A write to `/a/b/c`
+  succeeds when `/a/b/` does not exist; creating missing ancestors is
+  the backend's job, never the caller's. See **Branch points** below
+  for the real-directory versus flat split.
 - `opts.size_hint` — the host uses this to gate `redirect_size_threshold`
   and may help your multipart logic. Rely on it for *known* sizes;
   for `write_redirect`, decide explicitly whether your backend can
@@ -1046,17 +1256,21 @@ stores. Every other field of `result.info`, and every other verb's
 - `opts.user_metadata` — see `update_metadata` for the capability
   branching. `write` accepts metadata if your backend stores it; if
   not, reject non-empty `user_metadata` with `Unsupported` (don't
-  silently drop).
+  silently drop). Key names follow *User-metadata keys* under
+  Cross-cutting rules: every name in the portable subset must be
+  accepted, and the reserved `ovstorage_` namespace is the host's.
 
 **`continue_write` must re-assert the host's writer identity on anything it
 PERSISTS.** The `WriteRedirectBatch` and `RedirectResultBatch` a
-`continue_write` receives arrive from whoever drove the redirect, and under a
-broker that is a remote client reading them off the wire. So any
-`user_metadata` your plugin takes from the continuation and *writes* at the
-commit is a value the caller could have rewritten. A host that attributes
-writes puts its authenticated principal in the reserved key
-`ovstorage-modified-by` at mint, so a rewritten one is persisted as though the
-host vouched for it.
+`continue_write` receives arrive from whoever drove the redirect. On an
+unsealed route, any `user_metadata` your plugin takes from the continuation and
+*writes* at the commit is a value the caller could have rewritten. The broker's
+client-driven seal prevents that edit, but it deliberately does not bind a
+principal: another principal authorized for the same address can present the
+genuine continuation. A host that attributes writes puts its authenticated
+principal for the current call in the reserved key `ovstorage_modified_by`, so
+the plugin must not treat either an editable or a replayed prior value as the
+host's attestation for this finalize call.
 
 Take the value from the request instead:
 
@@ -1106,6 +1320,20 @@ which is what the paragraph above is about.
   S3 multipart (UploadPartNumber, CompleteMultipartUpload),
   Nucleus LFT (`Content-Start`, `Multipart-Chunk-Size`,
   finalize via `create_asset(content_id)`).
+- *If your backend has real directories (filesystem, Nucleus, ADLS
+  HNS):* create missing ancestors before the commit. Remember per
+  connection which directories you have already created so the
+  ancestor call is issued once per directory, not once per file. On
+  `NotFound` from the commit, forget the entry, re-create the
+  ancestors, and retry the commit once. The ancestor step is a
+  precursor, not a precondition: if it fails for a reason other than a
+  missing level, let the commit run and report the commit's own answer,
+  never the ancestor step's. For `copy` / `rename`
+  destinations, which carry no body, create the ancestors lazily after
+  a `NotFound`, once the source is known to exist, so a failure for
+  another reason leaves no folder behind.
+- *If your backend is flat (S3, flat Azure):* nothing to do; keys
+  create their own prefixes.
 - *If your backend supports versioning:* see **Versioning model
   decision tree**.
 - *If your backend can't truly stream `write_stream`:* return
@@ -1212,9 +1440,20 @@ moves the source to the destination atomically (when possible).
   different refusal.
 - `opts.message` — see **Versioning model decision tree**.
 
-### `list`
+### `list` and `list_stream`
 
-**Contract.** Return a stream of `ObjectInfo` values under the prefix.
+**Contract.** `list` is the buffered surface: return a `ListPage` of
+`ObjectInfo` values under the prefix. `list_stream` is the unpaged,
+pull-based surface: yield each `ObjectInfo` as it becomes available, retaining
+only bounded traversal, current-page, and folding state. A native-paginated
+backend drives its continuation pages internally and only when downstream
+demand advances the stream; a traversal backend advances its own iterator the
+same way. Neither streaming implementation materializes the whole prefix.
+
+The ABI-v17 slot uses the established pull-iterator stream shape. See the v17
+ABI changelog entry in the shipped `ovstorage_plugin.h` (generated from
+`ovstorage-core/ovstorage-plugin/src/ffi/v2/mod.rs`) for its layout and
+ownership mechanics rather than duplicating them here.
 
 **Edge cases.**
 
@@ -1222,6 +1461,14 @@ moves the source to the destination atomically (when possible).
   the requested prefix; the host projects it into the caller-facing
   namespace. Returning an address outside the prefix is an `Internal`
   contract violation.
+- `opts.versioned_address` follows the `stat` rule per entry. When
+  set, a versioning backend switches to whatever enumeration carries
+  version ids (S3 `ListObjectVersions` kept to `IsLatest`, Azure
+  `include=versions` kept to the current version) or makes one version
+  lookup per file entry where the listing itself carries none, and
+  returns the pinned address on every file entry; when clear it MAY
+  still populate the field where the listing already carries the id
+  (GCS generations). Directory-kind entries carry `None`.
 - `opts.recursive: false` → emit file `ObjectInfo` values and
   directory-kind `ObjectInfo` values for the immediate level. `true`
   → emit the entire subtree, including directory facts the backend
@@ -1232,8 +1479,34 @@ moves the source to the destination atomically (when possible).
   backend reports the same address as both a concrete directory fact
   (`Directory` or `DirectoryMarker`) and an inferred prefix, emit only
   the concrete fact.
-- `opts.max_results` / `opts.page_token` — pagination is host-driven.
-  Your stream yields items; the host stops at `max_results`.
+- `opts.max_results` / `opts.page_token` are buffered-`list` fields. The host's
+  `max_results` page window and continuation token apply only to `list`.
+  `list_stream` MUST refuse either populated field with `InvalidArgument`; it
+  never turns a page window into an early-stopped stream.
+- The cancellation token passed when `list_stream` is opened has a watch-style
+  lifetime: retain and observe that same token for the stream's entire
+  lifetime, including while waiting for the next backend page or traversal
+  entry. Cancellation terminates the stream with `Cancelled`; dropping the
+  stream releases its walk and all retained resources.
+- Pull demand is the backpressure boundary. Do not fetch arbitrarily ahead of
+  the consumer or accumulate previously yielded entries. Native pagination is
+  optional: a backend can implement bounded streaming from any incremental
+  traversal, with or without a resumable store cursor.
+- Stopping or dropping a stream promises no resumption. `list_stream` returns
+  no cursor, and a later call starts a new walk. A resumable streaming contract
+  would require a separate capability, analogous to
+  `watch_directory_resumable`; do not interpret `supports_list_stream` or
+  `supports_list` as such a promise.
+- Ordering is mode-conditional. A **recursive stream from a flat backend** MUST
+  yield backend entries in lexicographic byte order by decoded provider key,
+  not by the percent-encoded URL serialization; incremental inferred-ancestor
+  synthesis depends on that precondition, and a
+  regression terminates the stream with `Internal`. A non-recursive stream MAY
+  preserve the store's natural per-page emission order — for example, object
+  entries followed by inferred common prefixes — and need not be globally
+  sorted. In that mode, a flat backend MUST remove a marker/common-prefix
+  duplicate within the page that produced it before yielding the page. Native
+  real-directory streams have no additional ordering requirement.
 
 **Branch points.**
 
@@ -1245,7 +1518,8 @@ moves the source to the destination atomically (when possible).
 - *If your backend can't recursively list cheaply* (e.g. Nucleus's
   omni1 `list2` only returns one level per call): leave
   `supports_recursive_list = false`. If a caller invokes `list` with
-  `opts.recursive: true` anyway, return `Unsupported` — do **not**
+  `opts.recursive: true` anyway, or opens `list_stream` with that option,
+  return `Unsupported` — do **not**
   fan out internally into N one-level calls. That decision belongs to
   the caller (who can budget the round-trips); silently amplifying a
   single slot call into many backend calls is a cost-attribution
@@ -1262,16 +1536,28 @@ moves the source to the destination atomically (when possible).
 > `supports_recursive_list` decides whether the host can pass
 > `recursive: true` through.
 
+> **Note on `supports_list_stream`.** This bit says the layer implements the
+> bounded streaming path above rather than relying on the default adapter that
+> calls buffered `list`. It is an optimization/capability hint, not a gate on
+> calling `list_stream`, and it does not advertise pagination or resumption.
+> A backend does not need a native pagination API to set it: an incremental
+> filesystem or service traversal is sufficient.
+
 ### `list_versions`
 
 **Contract.** Return a stream of `ObjectInfo` values, each with a
-version-pinned `ObjectInfo.address`.
+version-pinned `ObjectInfo.address` and `versioned_address =
+Some(address)`.
 
 **Edge cases.**
 
 - `ObjectInfo.address` is the full backend address for that version,
   including whatever query/form the backend uses as the version pin.
   The host projects only the route prefix.
+- `versioned_address` equals `address` for every entry: the address is
+  already the pin. It is populated with no flag — `ListVersionsOptions`
+  has none. The one exception is a version id that selects mutable
+  content, S3's literal `null`: its entry carries `None`.
 - `list_versions` always returns the full version history. It does
   **not** filter to a single version when the input address carries a
   version-modifier query param — callers asking "does this version
@@ -1313,7 +1599,9 @@ backend's version-modifier query param (e.g.
 `?generation=12345` for GCS), return that pinned version's
 `ObjectInfo`. Otherwise return the current head's `ObjectInfo` with a
 version-pinned address — the same entry `list_versions` emits for the
-head.
+head. The returned `versioned_address` is `Some(address)`, except for a
+version id that selects mutable content (S3's literal `null`), which
+carries `None`.
 
 This is the read-shaped counterpart to `list_versions` for callers who
 only need "what version does this address point at right now?" It
@@ -1388,7 +1676,10 @@ last child does."
 ### `update_metadata`
 
 **Contract.** Apply additive `user_metadata_set` and removals
-`user_metadata_remove`. Return updated `BackendItemInfo`.
+`user_metadata_remove`. Return updated `BackendItemInfo`. Key names
+follow *User-metadata keys* under Cross-cutting rules: every name in
+the portable subset must be accepted, in the set and the removal list
+alike.
 
 **Edge cases.**
 
@@ -1512,7 +1803,8 @@ the bit reflects the instance, not the plugin's general capability.)
 1. **Does your backend record a new version on every write
    automatically (S3 versioning, GCS object generations)?**
    → Transparent. Enable versioning on the backend; `list_versions`
-   returns what the backend stored.
+   returns what the backend stored, and `versioned_address` is free on
+   `stat`: the id rides the HEAD response.
 
 2. **Does your backend have a per-call switch that gates whether a
    version is recorded?**
@@ -1523,19 +1815,38 @@ the bit reflects the instance, not the plugin's general capability.)
 
 3. **Does your backend have no versioning concept at all?**
    → Leave `supports_version_listing = false`. Don't implement
-   `list_versions`.
+   `list_versions`. Answer `versioned_address: None` on every slot.
 
 ### What about `opts.message`?
 
 `opts.message` is the version's **commit annotation**, supplied by the
 caller. It is *not* a versioning trigger: `message = None` means
 "create a version with no annotation", not "skip the version". Where
-the backend has a slot for the annotation (a commit-message field on
-the version, an "x-ov-message" user-metadata key, etc.), persist it
-on the version that gets created. Backends with no annotation slot at
-all should either stash it as user metadata or discard it explicitly
-with a code comment — see the "Dropping `opts.message` silently"
-anti-pattern below.
+the backend has a native slot for the annotation (a commit-message
+field on the version), persist it on the version that gets created.
+Backends without one stash it as user metadata under the shared
+`MESSAGE_METADATA_KEY`, spelled `x_ov_message`, beside the caller's
+keys, where they can keep user metadata at all, so the annotation reads
+back the same way on every route. A message the backend cannot store in
+that slot as it is, such as one that is not a legal HTTP header value
+where metadata travels in `x-amz-meta-*` or `x-ms-meta-*` headers, is
+dropped and the call proceeds; refusing the call would turn a droppable
+annotation into a hard failure. A caller-supplied entry under that
+key wins and the message is dropped: caller metadata is never silently
+dropped, while the annotation is droppable by contract. `message`
+fills the key only when the call's own map leaves it unset. On a patch
+a `user_metadata_set` entry under the key stands; otherwise the message
+replaces the object's earlier annotation, and a removal of the key in
+the same patch does not prevent that. Which of copy and rename record
+the annotation is per backend and stated on the backend page. The name
+sits inside the portable subset of
+[User-metadata keys](#user-metadata-keys), so every conformant backend
+accepts it, and outside the reserved `ovstorage_` namespace, so an
+attributing host neither strips it from the caller's map nor harvests
+it: the annotation stays visible as an ordinary user-metadata entry. A
+backend that can keep neither discards the message explicitly with a
+code comment — see the "Dropping `opts.message` silently" anti-pattern
+below.
 
 ---
 
@@ -1559,6 +1870,9 @@ present in any shipped ovstorage release.
   caller to write the same is-it-already-gone special-case.
 - **Acquiring locks across `.send()` / `.await`.** Publishes state to
   observers before durability is confirmed. Land durability first.
+- **Implementing a host-owned slot in a backend.** A backend MUST leave
+  `materialize` at the trait default; implementing it bypasses the
+  composed Stack's cache leasing and local-availability contract.
 - **Returning `Unsupported` to skip implementing a slot you've
   advertised.** If you don't intend to implement an op at all, that's
   what the capability bit is for — leave it false and the host won't
@@ -1567,9 +1881,9 @@ present in any shipped ovstorage release.
   `Unsupported`*); blanket-returning it from every call is a sign the
   capability bit is wrong.
 - **Dropping `opts.message` silently when your backend has no
-  per-operation annotation concept.** Either store it (probably as
-  `user_metadata`-ish) or discard it explicitly with a code comment so
-  the next reader knows.
+  per-operation annotation concept.** Either store it as user metadata
+  under `x_ov_message` (see *What about `opts.message`?*) or discard it
+  explicitly with a code comment so the next reader knows.
 - **Treating `INVALID_URI` / `INVALID_PATH` from a server as
   `InvalidArgument`.** Many backends conflate "malformed path" with
   "path doesn't exist" in their error codes. Map to `NotFound` for

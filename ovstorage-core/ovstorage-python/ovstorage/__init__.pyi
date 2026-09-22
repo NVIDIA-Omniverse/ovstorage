@@ -9,6 +9,7 @@ from . import alias as alias
 from . import byte_cache as byte_cache
 from . import copy_rename_fallback as copy_rename_fallback
 from . import file as file
+from . import hub_cache as hub_cache
 from . import metadata_cache as metadata_cache
 from . import plugin as plugin
 from . import redirect_follower as redirect_follower
@@ -215,6 +216,7 @@ __all__ = [
     "byte_cache",
     "copy_rename_fallback",
     "file",
+    "hub_cache",
     "init_auth_substrate",
     "metadata_cache",
     "plugin",

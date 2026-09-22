@@ -7,7 +7,7 @@
 
 #![cfg(test)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
@@ -28,6 +28,7 @@ use ovstorage_plugin_core::{
     RouterFactoryImpl,
 };
 use ovstorage_plugin_http::RedirectFollowerWrapperFactory;
+use ovstorage_plugin_test::{Recorder, TestLayerFactory};
 
 use crate::{
     Broker, BrokerGraphOptions, BrokerOAuthRouteBindings, BrokerStack, BrokerStackBuilder,
@@ -210,6 +211,9 @@ pub(crate) struct BrokerStackFixture {
     visibility: Vec<(Url, AddressVisibility)>,
     byte_cache: Option<Arc<Cache>>,
     metadata_cache: Option<Arc<MetadataCache>>,
+    /// Explicit plugin directory for fixtures that must control discovery.
+    /// `None` uses the staged workspace plugins.
+    plugin_dir: Option<PathBuf>,
     extra_factories: Vec<LoadedLayerFactory>,
     /// The daemon-wide follow cap threaded into the emitted graph's `byte_cache`
     /// (`max_object_bytes`) and `redirect_follower` (`follow_reads` +
@@ -245,9 +249,21 @@ pub(crate) struct BrokerStackFixture {
     /// are two enforcement points and a fixture that set only one would let a
     /// test pass through a path the other guards.
     disclose_redirect_credentials: bool,
+    /// The operator's anonymous fallback grant (`anonymous_fallback_schemes`
+    /// plus `http`/`https` when `anonymous_http_fallback` allows), stamped onto
+    /// the emitted graph the way production stamps it. Empty by default, so a
+    /// fixture grants nothing a shipped broker would not.
+    anonymous_fallback: BTreeSet<String>,
     /// Emit the graph without a `redirect_follower`, as an operator's own graph
     /// may. See `without_a_follower`.
     drop_follower: bool,
+    /// Optional small watch limits for daemon admission integration tests.
+    watch_limits: Option<(usize, usize)>,
+    /// Remove the declared guard so broker preparation has to inject it.
+    omit_watch_limit: bool,
+    /// Leave the declared guard orphaned below a different effective root so
+    /// startup-refusal tests can exercise the operator graph diagnostic.
+    misplace_watch_limit: bool,
 }
 
 impl BrokerStackFixture {
@@ -299,6 +315,11 @@ impl BrokerStackFixture {
         self
     }
 
+    pub(crate) fn plugin_dir(mut self, plugin_dir: impl Into<PathBuf>) -> Self {
+        self.plugin_dir = Some(plugin_dir.into());
+        self
+    }
+
     pub(crate) fn alias(mut self, from: Url, to: Url) -> Self {
         self.aliases.push((from, to));
         self
@@ -306,8 +327,8 @@ impl BrokerStackFixture {
 
     /// Register an address-visibility override, mirroring
     /// [`BrokerStackBuilder::visibility`]. Threaded into the composed Stack's
-    /// `alias` wrapper so a `Hidden`/`Suppressed` root is filtered from
-    /// `list_address_roots` (only `Visible` roots advertise).
+    /// `alias` wrapper so `Hidden` roots advertise with that marker while
+    /// `Suppressed` roots remain absent from `list_address_roots`.
     pub(crate) fn visibility(mut self, address: Url, visibility: AddressVisibility) -> Self {
         self.visibility.push((address, visibility));
         self
@@ -375,6 +396,15 @@ impl BrokerStackFixture {
         self
     }
 
+    /// Grant an anonymous fallback for `schemes`, as the operator's top-level
+    /// keys would. Stamped onto the emitted graph at build, so a grant whose
+    /// kind the graph lacks makes `try_build` refuse exactly as startup does.
+    pub(crate) fn anonymous_fallback(mut self, schemes: &[&str]) -> Self {
+        self.anonymous_fallback
+            .extend(schemes.iter().map(|scheme| (*scheme).to_string()));
+        self
+    }
+
     /// Emit the graph with **no** `redirect_follower` layer in it, the layer
     /// above it repointed at `retry`.
     ///
@@ -386,6 +416,26 @@ impl BrokerStackFixture {
     /// uncomposable-away.
     pub(crate) fn without_a_follower(mut self) -> Self {
         self.drop_follower = true;
+        self
+    }
+
+    /// Override the canonical graph's watch limits for integration tests.
+    pub(crate) fn watch_limits(mut self, per_principal: usize, total: usize) -> Self {
+        self.watch_limits = Some((per_principal, total));
+        self
+    }
+
+    /// Build from a declared graph with no `watch_limit` layer. Broker stack
+    /// preparation must inject the guard with its defaults.
+    pub(crate) fn omit_watch_limit(mut self) -> Self {
+        self.omit_watch_limit = true;
+        self
+    }
+
+    /// Move the declared guard off the effective root. Broker preparation must
+    /// refuse the graph rather than silently changing what the limits govern.
+    pub(crate) fn misplace_watch_limit(mut self) -> Self {
+        self.misplace_watch_limit = true;
         self
     }
 
@@ -425,7 +475,9 @@ impl BrokerStackFixture {
         ensure_test_plugin_env();
         // Assemble the auth-layer config before moving `self`'s other fields.
         let auth_config = self.auth_layer_config();
+        let plugin_dir = self.plugin_dir;
         let disclose = self.disclose_redirect_credentials;
+        let anonymous_fallback = self.anonymous_fallback;
         let drop_follower = self.drop_follower;
         // Emit the declarative graph — optional cache layers gated on the shared
         // instances the fixture holds; the concrete `Arc<Cache>` /
@@ -436,7 +488,7 @@ impl BrokerStackFixture {
             .into_iter()
             .map(ConnectionConfig::from_request)
             .collect();
-        let stack_config = broker_stack_config(
+        let mut stack_config = broker_stack_config(
             connections,
             BrokerGraphOptions {
                 byte_cache: self.byte_cache.is_some(),
@@ -445,6 +497,52 @@ impl BrokerStackFixture {
             },
             &ovstorage_authz::UserMetadataKinds::from_factories(&[]),
         );
+        if self.omit_watch_limit {
+            let removed = stack_config
+                .layers
+                .remove(crate::watch_limit::WATCH_LIMIT_KIND)
+                .expect("canonical broker test graph has watch_limit");
+            let inner = removed
+                .inner
+                .expect("canonical watch_limit wraps the data-plane root");
+            stack_config
+                .layers
+                .get_mut(crate::UPSTREAM_CREDENTIAL_KIND)
+                .expect("canonical broker test graph has upstream_credential")
+                .inner = Some(inner);
+        } else if let Some((per_principal, total)) = self.watch_limits {
+            let watch_limit = stack_config
+                .layers
+                .get_mut(crate::watch_limit::WATCH_LIMIT_KIND)
+                .expect("canonical broker test graph has watch_limit");
+            watch_limit.config.insert(
+                "max_watches_per_principal".into(),
+                toml::Value::Integer(per_principal as i64),
+            );
+            watch_limit.config.insert(
+                "max_watches_total".into(),
+                toml::Value::Integer(total as i64),
+            );
+        }
+        if self.misplace_watch_limit {
+            let watch_limit = stack_config
+                .layers
+                .remove(crate::watch_limit::WATCH_LIMIT_KIND)
+                .expect("canonical broker test graph has watch_limit");
+            let inner = watch_limit
+                .inner
+                .clone()
+                .expect("canonical watch_limit wraps the data-plane root");
+            stack_config
+                .layers
+                .insert("orphan_watch_limit".into(), watch_limit);
+            stack_config
+                .layers
+                .get_mut(crate::UPSTREAM_CREDENTIAL_KIND)
+                .expect("canonical broker test graph has upstream_credential")
+                .inner = Some(inner);
+        }
+
         let stack_config = if self.attribution_at_root {
             root_attribution_graph(stack_config)
         } else {
@@ -455,6 +553,8 @@ impl BrokerStackFixture {
         // Stamp the follower the way the operator-config path does, so a
         // fixture exercises the same two-point enforcement production has.
         let stack_config = ovstorage::host::stamp_redirect_disclosure(stack_config, disclose)?;
+        let stack_config =
+            ovstorage::host::stamp_anonymous_fallback(stack_config, &anonymous_fallback)?;
         let stack_config = if drop_follower {
             drop_follower_layer(stack_config)
         } else {
@@ -463,7 +563,11 @@ impl BrokerStackFixture {
         // Leave the auth substrate to `init_auth_substrate`'s default (`None`)
         // resolution: pinning a dir would make the process-global init reject a
         // later broker built under a different dir, and this suite builds many.
-        let mut builder = BrokerStackBuilder::new()
+        let builder = match plugin_dir {
+            Some(plugin_dir) => BrokerStackBuilder::new().plugin_dir(plugin_dir),
+            None => BrokerStackBuilder::new(),
+        };
+        let mut builder = builder
             .allow_test_plugins(true)
             .stack_config(stack_config)
             .attribution_strategy(self.attribution_strategy)
@@ -520,6 +624,32 @@ impl BrokerStackFixture {
         let disclose = self.disclose_redirect_credentials;
         Broker::from_composed(self.build().await).with_redirect_disclosure(disclose)
     }
+}
+
+/// Build the ordinary test-backend broker fixture while retaining its
+/// in-process call recorder.
+///
+/// Most broker tests intentionally exercise the staged test-plugin cdylib.
+/// Security-boundary tests additionally need to prove that a rejected request
+/// never reached the backend. This fixture scans an empty plugin directory and
+/// registers the equivalent factory in process, making that negative
+/// observation direct and race-free without a duplicate `test` kind.
+pub(crate) async fn recording_test_broker(
+    config: HashMap<String, ConfigValue>,
+) -> (Broker, Recorder) {
+    let empty_plugin_dir = tempfile::tempdir().expect("create empty plugin directory");
+    let factory = Arc::new(TestLayerFactory::default());
+    let broker = BrokerStackFixture::new()
+        .plugin_dir(empty_plugin_dir.path())
+        .test_backend(config)
+        .extra_factory(LoadedLayerFactory::Backend(factory.clone()))
+        .build_broker()
+        .await;
+    let root = Url::parse("test://demo/").expect("test backend root is a valid URL");
+    let recorder = factory
+        .recorder_for(&root)
+        .expect("building the test backend creates its recorder");
+    (broker, recorder)
 }
 
 /// A forward-class broker [`Stack`] with a single `file` connection at `root`.

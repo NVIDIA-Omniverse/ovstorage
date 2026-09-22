@@ -19,7 +19,11 @@ on the same machine.
 | GCS | Service-account JSON | Yes | `service_account_key` inline or `file_path` |
 | GCS | Authorized-user ADC JSON | Yes | `service_account_key` inline or `file_path`; the JSON `type` is `authorized_user` |
 | GCS | `GOOGLE_APPLICATION_CREDENTIALS` path selection | Host bridge | The host expands the environment variable into `file_path`; the plugin does not read it. |
-| GCS | Metadata server, workload identity, service-account impersonation | No representable token bridge | These flows produce bearer/provider state that the GCS bundle cannot accept. Use a supported JSON credential or a native client instead. |
+| GCS | Workload identity federation (`external_account` JSON) | Yes | `service_account_key` inline or `file_path`; file- and url-sourced subject tokens (re-fetched per exchange), optional impersonation hop. AWS and `executable` source flavors and workforce-pool configs are rejected; token/impersonation endpoints are pinned to https `*.googleapis.com` (or loopback) at parse. |
+| GCS | Service-account impersonation (`impersonated_service_account` JSON) | Yes | `service_account_key` inline or `file_path`; the source credential is parsed recursively (no nested impersonation). |
+| GCS | Metadata server | No representable token bridge | The metadata server produces ambient bearer state the GCS bundle cannot accept. Use a supported JSON credential or a native client instead. |
+| Hugging Face Hub | Static access token | Yes | `token` (descriptor default `${HF_TOKEN}`, resolved by the host); an empty bundle is anonymous |
+| Hugging Face Hub | Ambient `huggingface_hub` login cache | No | The plugin does not read `~/.cache/huggingface/token`; pass the token through the bundle. |
 | Azure | Shared Key or SAS | Yes | `account_key` or `sas_token` |
 | Azure | Entra service principal | Yes | `tenant_id`, `client_id`, and `client_secret` |
 | Azure | Federated workload-identity token file | Yes | `tenant_id`, `client_id`, and `federated_token_file` |
@@ -34,9 +38,17 @@ on the same machine.
 credential helper before constructing the ovstorage connection. It does not
 mean copying a long-lived secret to disk. For S3, every ambient chain resolves
 to the same temporary three-field credential shape the plugin already accepts.
-GCS workload identity and Azure Managed Identity resolve to bearer/provider
-objects that have no equivalent input field; serializing them into an
-invented bundle field does not work.
+GCS metadata-server identity and Azure Managed Identity resolve to
+bearer/provider objects that have no equivalent input field; serializing them
+into an invented bundle field does not work. GCS workload identity is
+different: its `external_account` JSON is static configuration (an audience,
+an STS endpoint, and where to fetch the rotating subject token), so the plugin
+runs that exchange in-process — the same posture as Azure's
+`federated_token_file` path — with subject-token freshness remaining the host
+platform's responsibility. "Configuration" does not mean "accept from
+anywhere": the plugin pins the exchange endpoints to Google (or loopback) at
+parse time, and the file still enters through the `SecretBundle` like every
+other credential.
 
 The `http` plugin has no ambient chain at all: its credential fields carry no
 environment-variable default, because no convention exists for “the token for
@@ -79,7 +91,8 @@ them.
 
 ## GCS host integration
 
-The plugin accepts only `service_account` and `authorized_user` JSON:
+The plugin accepts `service_account`, `authorized_user`,
+`external_account`, and `impersonated_service_account` JSON:
 
 ```python
 request.add_credential(
@@ -90,11 +103,14 @@ request.add_credential(
 )
 ```
 
-This recipe maps an environment-selected supported JSON file into the declared
-bundle field. It does not make `external_account` workload-identity or
-`impersonated_service_account` JSON supported. Hosts using those native ADC
-flows keep the native client on that path: the credential pipeline does not
-carry refreshable provider-backed credentials.
+This recipe maps an environment-selected JSON file into the declared bundle
+field; the plugin dispatches on the file's `type`. For `external_account`
+credentials the host platform owns subject-token freshness: the plugin
+re-fetches the token from the configured `file` or `url` on every exchange,
+so the file must keep being rotated (GKE projected volumes do this natively;
+a CI job points `url` at its identity endpoint instead). Only the metadata
+server remains native-client-only: it produces ambient bearer state with no
+representable bundle shape.
 
 ## Azure host integration
 

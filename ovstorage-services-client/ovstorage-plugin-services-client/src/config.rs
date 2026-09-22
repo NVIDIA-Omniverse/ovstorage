@@ -138,9 +138,24 @@ pub fn credential_methods() -> Vec<CredentialMethod> {
         CredentialMethod {
             key: "interactive".into(),
             display_name: "OIDC sign-in (browser / device flow)".into(),
+            fields: vec![],
+            help: Some(
+                "Recommended for a discovery URL. Nothing is entered now; after the connection \
+                 is added, sign-in runs in your browser with PKCE or by device code. A saved \
+                 sign-in for this service that is still valid is reused without a new flow; \
+                 run 'reauth <name>' to sign in again or as a different account."
+                    .into(),
+            ),
+            advanced: false,
+        },
+        CredentialMethod {
+            key: "token".into(),
+            display_name: "Pre-issued OIDC token bundle (direct gRPC only)".into(),
             fields: vec!["oauth".into()],
             help: Some(
-                "Recommended. Opens an OIDC sign-in flow in your browser or returns a device code."
+                "For a grpc:// or grpcs:// address only. Supplies an access token the host \
+                 already holds or mints; the direct endpoint has no sign-in flow. Discovery \
+                 URLs use 'OIDC sign-in (browser / device flow)' or client credentials."
                     .into(),
             ),
             advanced: false,
@@ -150,8 +165,8 @@ pub fn credential_methods() -> Vec<CredentialMethod> {
             display_name: "OIDC client credentials (machine-to-machine)".into(),
             fields: vec!["client_id".into(), "client_secret".into()],
             help: Some(
-                "For service identities: authenticates to the IDP with a client ID and secret \
-                 instead of a user sign-in."
+                "For service identities on a discovery URL: authenticates to the IDP with a \
+                 client ID and secret instead of a user sign-in."
                     .into(),
             ),
             advanced: false,
@@ -754,6 +769,54 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(ADDRESS_KEY.into(), ConfigValue::String(value.into()));
         map
+    }
+
+    /// Interactive authentication must not ask for the secret it exists to obtain.
+    ///
+    /// An empty bundle moves the connection to `AwaitingAuth`, after which the host
+    /// calls `authenticate_connection`; keeping the two credential paths distinct
+    /// prevents a UI from demanding an OIDC bundle before that flow runs.
+    #[test]
+    fn interactive_authentication_gathers_nothing_and_a_pre_issued_token_uses_oauth() {
+        let methods = credential_methods();
+        assert_eq!(
+            methods
+                .iter()
+                .map(|method| method.key.as_str())
+                .collect::<Vec<_>>(),
+            ["interactive", "token", "client_credentials"]
+        );
+        assert!(methods[0].fields.is_empty());
+        let interactive_help = methods[0].help.as_deref().expect("interactive help exists");
+        assert!(interactive_help.contains("reused without a new flow"));
+        assert!(interactive_help.contains("reauth <name>"));
+        assert_eq!(methods[1].fields, ["oauth"]);
+        assert!(methods[1].display_name.contains("direct gRPC only"));
+        assert!(
+            methods[1]
+                .help
+                .as_deref()
+                .is_some_and(|help| help.contains("grpc:// or grpcs://"))
+        );
+    }
+
+    /// Every method field must resolve through the descriptor's credential schema.
+    ///
+    /// The CLI treats a missing cross-reference as an `Internal` error while
+    /// populating a selected method, so a backend descriptor should make that path
+    /// unreachable rather than exposing a picker entry that cannot be gathered.
+    #[test]
+    fn every_credential_method_field_exists_in_the_credential_schema() {
+        let schema = credential_schema();
+        for method in credential_methods() {
+            for field in method.fields {
+                assert!(
+                    schema.iter().any(|schema_field| schema_field.key == field),
+                    "credential method {} references unknown field {field}",
+                    method.key,
+                );
+            }
+        }
     }
 
     /// Which addresses put a bearer token on a wire a third party could read.

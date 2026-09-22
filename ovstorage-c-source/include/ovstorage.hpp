@@ -118,14 +118,32 @@ public:
         : code_(error.code)
         , message_(error.message == nullptr ? "" : error.message)
     {
+        if (error.code_name != nullptr) {
+            code_name_ = error.code_name;
+        }
     }
 
     OvStorage_Status code() const noexcept { return code_; }
     const std::string& message() const noexcept { return message_; }
 
+    /// The code name supplied by the C API, unchanged: a finer plugin name
+    /// when supplied, otherwise the C host's coarse status name. Presence
+    /// does not imply a finer identity or establish object absence.
+    /// Returns `std::nullopt` when no name was supplied, including errors
+    /// constructed from a status/message by the wrapper's preflight guards.
+    /// Equivalent failures returned by the C ABI can carry a coarse name.
+    /// The returned optional owns its name and outlives this `Error`, matching
+    /// `AuthEvent::failed_error_code_name()`.
+    /// Copying the name may allocate and throw; this accessor is not noexcept.
+    std::optional<std::string> code_name() const
+    {
+        return code_name_;
+    }
+
 private:
     OvStorage_Status code_ = OvStorage_Status_Ok;
     std::string message_;
+    std::optional<std::string> code_name_;
 };
 
 template <class T>
@@ -148,7 +166,7 @@ private:
     {
     }
 
-    explicit Result(Error error)
+    explicit Result(Error&& error)
         : ok_(false)
         , error_(std::move(error))
     {
@@ -170,7 +188,7 @@ public:
     const Error& error() const& { return error_; }
 
 private:
-    Result(bool ok, Error error)
+    Result(bool ok, Error&& error)
         : ok_(ok)
         , error_(std::move(error))
     {
@@ -185,6 +203,39 @@ inline Error take_error(OvStorage_Error& error)
     Error out(error);
     ovstorage_error_clear(&error);
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// Plugin logging
+// ---------------------------------------------------------------------------
+
+struct PluginLogOptions {
+    OvStorage_PluginLogLevel level = OvStorage_PluginLogLevel_Warn;
+    OvStorage_PluginLogSink sink = nullptr;
+    void* sink_state = nullptr;
+};
+
+inline Result<void> set_plugin_log_options(const PluginLogOptions& options)
+{
+    OvStorage_PluginLogOptions raw{
+        options.level, options.sink, options.sink_state};
+    OvStorage_Error error{};
+    auto status = ovstorage_set_plugin_log_options(&raw, &error);
+    if (status != OvStorage_Status_Ok) {
+        return Result<void>::failure(take_error(error));
+    }
+    return Result<void>::success();
+}
+
+/// Restore and sample the OVSTORAGE_LOG, then RUST_LOG, then Warn fallback policy.
+inline Result<void> reset_plugin_log_options()
+{
+    OvStorage_Error error{};
+    auto status = ovstorage_set_plugin_log_options(nullptr, &error);
+    if (status != OvStorage_Status_Ok) {
+        return Result<void>::failure(take_error(error));
+    }
+    return Result<void>::success();
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +383,12 @@ public:
     {
         return string_or_empty(handle_ == nullptr ? nullptr : handle_->etag);
     }
+    OvStorage_EtagStrength etag_strength() const noexcept
+    {
+        return handle_ == nullptr
+            ? OVSTORAGE_ETAG_STRENGTH_UNSPECIFIED
+            : handle_->etag_strength;
+    }
     std::string version() const
     {
         return string_or_empty(handle_ == nullptr ? nullptr : handle_->version);
@@ -371,6 +428,23 @@ public:
             return std::nullopt;
         }
         return std::string(handle_->modified_by);
+    }
+
+    /// The address that names this version of the object; `std::nullopt`
+    /// when the backend does not version it or was not asked
+    /// (`OvStorage_StatOptions::versioned_address`). A pin, not an identity:
+    /// reads through it serve this version while the backend retains it,
+    /// and mutations through it are refused.
+    bool has_versioned_address() const noexcept
+    {
+        return handle_ != nullptr && handle_->versioned_address != nullptr;
+    }
+    std::optional<std::string> versioned_address() const
+    {
+        if (handle_ == nullptr || handle_->versioned_address == nullptr) {
+            return std::nullopt;
+        }
+        return std::string(handle_->versioned_address);
     }
 
     /// The caller's permissions on this object, reported only by backends
@@ -461,6 +535,10 @@ public:
     bool has_size() const noexcept { return view().has_size(); }
     std::uint64_t size() const noexcept { return view().size(); }
     std::string etag() const { return view().etag(); }
+    OvStorage_EtagStrength etag_strength() const noexcept
+    {
+        return view().etag_strength();
+    }
     std::string version() const { return view().version(); }
     bool has_mtime_unix_nanos() const noexcept { return view().has_mtime_unix_nanos(); }
     std::uint64_t mtime_unix_nanos() const noexcept { return view().mtime_unix_nanos(); }
@@ -473,6 +551,14 @@ public:
         return view().system_metadata();
     }
     std::optional<std::string> modified_by() const { return view().modified_by(); }
+    bool has_versioned_address() const noexcept
+    {
+        return view().has_versioned_address();
+    }
+    std::optional<std::string> versioned_address() const
+    {
+        return view().versioned_address();
+    }
     std::optional<OvStorage_AccessOps> effective_permissions() const noexcept
     {
         return view().effective_permissions();
@@ -659,6 +745,18 @@ struct ReadOptions {
     std::optional<std::uint64_t> range_end_inclusive;
 };
 
+/// Options shared by `LayerHandle::copy` and `rename`.
+///
+/// `no_overwrite` and `if_match_etag` are the two spellings of a
+/// destination precondition and are mutually exclusive, matching
+/// `WriteOptions` exactly: `no_overwrite` means "fail if anything is
+/// there", `if_match_etag` means "fail unless what is there is exactly
+/// this". Setting both is refused with `InvalidArgument`.
+struct CopyOptions {
+    bool no_overwrite = false;
+    std::optional<std::string> if_match_etag;
+};
+
 /// Options shared by `LayerHandle::write`, `write_stream` and
 /// `write_redirect`.
 ///
@@ -826,6 +924,18 @@ public:
         const char* p = ovstorage_local_delegate_path(handle_);
         return p == nullptr ? std::string{} : std::string(p);
     }
+
+    /// Metadata snapshot delivered with `path()`. The view remains valid while
+    /// the underlying handle is owned by a live `LocalDelegate`: moving the
+    /// delegate transfers that ownership, while destroying or move-assigning
+    /// over the current owner invalidates the view. Call `clone()` when the
+    /// metadata must outlive the local-file lease. Rvalue access is disabled
+    /// so a view cannot escape an unnamed delegate.
+    InfoView info() const & noexcept
+    {
+        return InfoView(ovstorage_local_delegate_info(handle_));
+    }
+    InfoView info() const && = delete;
 
 private:
     void reset()
@@ -1302,6 +1412,8 @@ private:
 class SecretBundle {
 public:
     SecretBundle() : handle_(ovstorage_secret_bundle_create()) {}
+    /// Wrap a raw, non-null handle. Takes ownership.
+    explicit SecretBundle(OvStorage_SecretBundle* handle) : handle_(handle) {}
     ~SecretBundle() { reset(); }
     SecretBundle(const SecretBundle&) = delete;
     SecretBundle& operator=(const SecretBundle&) = delete;
@@ -1522,6 +1634,20 @@ public:
                     i >= handle_->addresses_len
                 ? nullptr
                 : handle_->addresses[i]);
+    }
+
+    /// Instance name of the Layer that owns this connection — the `target`
+    /// that `authenticate_connection`, `update_connection_credentials` and
+    /// `remove_connection` route by, paired with `id()`. Reported on the row
+    /// so a connection that publishes no address (one parked in
+    /// `AwaitingAuth` or refused into `AuthFailed`) can still be addressed.
+    /// `std::nullopt` when the Layer reports none.
+    std::optional<std::string> owning_target() const
+    {
+        if (handle_ == nullptr || handle_->owning_target == nullptr) {
+            return std::nullopt;
+        }
+        return std::string(handle_->owning_target);
     }
 
     // Auth-state payloads. Each returns a value only for the variant
@@ -1770,6 +1896,19 @@ public:
             ? handle_->as.succeeded.connection
             : nullptr;
     }
+    /// Take ownership of a Succeeded event's plugin-reported credentials,
+    /// to push via `LayerHandle::update_connection_credentials` or persist
+    /// elsewhere. `std::nullopt` if this is not a Succeeded event, the
+    /// plugin reported none, or this has already been called on this
+    /// event -- safe to call at most once per event.
+    std::optional<SecretBundle> take_succeeded_credentials() noexcept
+    {
+        OvStorage_SecretBundle* taken =
+            ovstorage_auth_event_take_succeeded_credentials(handle_);
+        return taken == nullptr ? std::nullopt
+                                 : std::optional<SecretBundle>(
+                                       std::in_place, taken);
+    }
     std::optional<std::string> failed_error_message() const
     {
         const char* p =
@@ -1873,7 +2012,7 @@ public:
     }
 
     /// Instance name of the Layer that owns connections for this root — the
-    /// `target` that `authenticate`, `update_connection_credentials` and
+    /// `target` that `authenticate_connection`, `update_connection_credentials` and
     /// `remove_connection` route by. Not derivable from `root()`: a
     /// composite plugin's internal owning backend has a different name from
     /// the outer root. `std::nullopt` means there is no connection op to
@@ -3287,6 +3426,23 @@ struct root_info_list_awaiter : awaiter_base<RootInfoList> {
     }
 };
 
+struct root_info_awaiter : awaiter_base<RootInfo> {
+    static void on_complete(
+        OvStorage_Status /* status */,
+        OvStorage_RootInfo* root,
+        const OvStorage_Error* error,
+        void* user_data) noexcept
+    {
+        complete(user_data, [&](auto& state) {
+            if (error != nullptr) {
+                state.outcome = Result<RootInfo>::failure(Error(*error));
+            } else {
+                state.outcome = Result<RootInfo>::success(RootInfo(root));
+            }
+        });
+    }
+};
+
 /// Drain-to-vector for the multi-fire AuthEvent stream. Suitable for
 /// auth flows that terminate (succeed/fail/cancel); not appropriate
 /// for unbounded continuous streams.
@@ -3654,9 +3810,28 @@ public:
     // Object-I/O ops take a `const OvStorage_LayerHandle*`.
     // -----------------------------------------------------------------
 
+    // `stat` and `list` each come in two forms rather than one method with
+    // a defaulted options struct. `cancel` is positional, so an options
+    // parameter placed ahead of it would change what
+    // `stat(address, full_metadata, cancel)` and the six-positional `list`
+    // mean at every call site that already spells them that way. The
+    // options form takes the C struct by value, so every field the C header
+    // carries (`versioned_address` among them) is reachable without a
+    // wrapper change.
+
     task<Info> stat(
         std::string address,
         bool full_metadata = false,
+        const CancelToken* cancel = nullptr) const
+    {
+        OvStorage_StatOptions options{};
+        options.full_metadata = full_metadata;
+        return stat(std::move(address), options, cancel);
+    }
+
+    task<Info> stat(
+        std::string address,
+        OvStorage_StatOptions options,
         const CancelToken* cancel = nullptr) const
     {
         if (handle_ == nullptr) co_return detail::null_handle_result<Info>();
@@ -3679,8 +3854,7 @@ public:
         op a{};
         a.handle = handle_;
         a.addr = std::move(address);
-        a.opts = OvStorage_StatOptions{};
-        a.opts.full_metadata = full_metadata;
+        a.opts = options;
         a.cancel = CancelToken::as_ptr(cancel);
         co_return co_await a;
     }
@@ -4273,6 +4447,45 @@ public:
         co_return co_await a;
     }
 
+    task<List> list(
+        std::string prefix,
+        OvStorage_ListOptions options,
+        const CancelToken* cancel = nullptr) const
+    {
+        if (handle_ == nullptr) co_return detail::null_handle_result<List>();
+        // The task starts eagerly, so `options.page_token` is read here,
+        // before the first suspension, into a string the awaiter owns; the
+        // caller's pointer is not retained once this call returns.
+        std::string page_token = options.page_token == nullptr
+            ? std::string()
+            : std::string(options.page_token);
+        if (auto bad = detail::invalid_c_input({{"prefix", prefix}, {"page_token", page_token}})) {
+            co_return detail::invalid_c_input_result<List>(bad);
+        }
+        struct op : detail::list_awaiter {
+            const OvStorage_LayerHandle* handle;
+            std::string prefix;
+            std::string token;
+            OvStorage_ListOptions opts;
+            const OvStorage_CancelToken* cancel;
+            bool await_suspend(body_handle h)
+            {
+                s->continuation = h;
+                opts.page_token = token.empty() ? nullptr : token.c_str();
+                ovstorage_list(handle, prefix.c_str(), &opts, cancel,
+                    &list_awaiter::on_complete, release_user_data());
+                return commit_suspend(h);
+            }
+        };
+        op a{};
+        a.handle = handle_;
+        a.prefix = std::move(prefix);
+        a.token = std::move(page_token);
+        a.opts = options;
+        a.cancel = CancelToken::as_ptr(cancel);
+        co_return co_await a;
+    }
+
     task<VersionList> list_versions(
         std::string address,
         std::uint32_t max_results = 0,
@@ -4309,24 +4522,47 @@ public:
         co_return co_await a;
     }
 
+    // A `bool no_overwrite` convenience overload in this same slot would
+    // silently capture callers of the pre-`CopyOptions` three-argument form
+    // `copy(src, dest, &cancel)`: a `CancelToken*` converts to `bool`, so
+    // that call would resolve to the bool overload with `no_overwrite =
+    // true` and the cancel token dropped, rather than to a `CopyOptions`
+    // overload it cannot convert to. Defaulting `CopyOptions` here instead
+    // turns that stale call into a hard compile error (no conversion from
+    // `CancelToken*` to `CopyOptions`) rather than a silent behavior change.
     task<Info> copy(
         std::string src,
         std::string dest,
+        CopyOptions options = {},
         const CancelToken* cancel = nullptr) const
     {
         if (handle_ == nullptr) co_return detail::null_handle_result<Info>();
         if (auto bad = detail::invalid_c_input({{"src", src}, {"dest", dest}})) {
             co_return detail::invalid_c_input_result<Info>(bad);
         }
+        if (options.if_match_etag.has_value()) {
+            if (auto bad = detail::invalid_c_input(
+                    {{"if_match_etag", *options.if_match_etag}})) {
+                co_return detail::invalid_c_input_result<Info>(bad);
+            }
+        }
         struct op : detail::info_awaiter {
             const OvStorage_LayerHandle* handle;
             std::string src;
             std::string dest;
+            std::string etag;
+            bool has_etag;
+            OvStorage_CopyOptions opts;
             const OvStorage_CancelToken* cancel;
             bool await_suspend(body_handle h)
             {
                 s->continuation = h;
-                ovstorage_copy(handle, src.c_str(), dest.c_str(), cancel,
+                // Points into this awaiter's own `etag`, taken here alongside
+                // `src.c_str()`/`dest.c_str()` for the same reason: the C
+                // entry point borrows all three only for the duration of the
+                // call.
+                opts.if_match_etag = has_etag ? etag.c_str() : nullptr;
+                ovstorage_copy(handle, src.c_str(), dest.c_str(), &opts, cancel,
                     &info_awaiter::on_complete, release_user_data());
                 return commit_suspend(h);
             }
@@ -4335,28 +4571,45 @@ public:
         a.handle = handle_;
         a.src = std::move(src);
         a.dest = std::move(dest);
+        a.has_etag = options.if_match_etag.has_value();
+        a.etag = options.if_match_etag.value_or(std::string{});
+        a.opts = OvStorage_CopyOptions{};
+        a.opts.no_overwrite = options.no_overwrite;
         a.cancel = CancelToken::as_ptr(cancel);
         co_return co_await a;
     }
 
+    // See `copy` above for why this defaults `CopyOptions` rather than
+    // carrying a separate `bool no_overwrite` overload.
     task<void> rename(
         std::string src,
         std::string dest,
+        CopyOptions options = {},
         const CancelToken* cancel = nullptr) const
     {
         if (handle_ == nullptr) co_return detail::null_handle_result<void>();
         if (auto bad = detail::invalid_c_input({{"src", src}, {"dest", dest}})) {
             co_return detail::invalid_c_input_result<void>(bad);
         }
+        if (options.if_match_etag.has_value()) {
+            if (auto bad = detail::invalid_c_input(
+                    {{"if_match_etag", *options.if_match_etag}})) {
+                co_return detail::invalid_c_input_result<void>(bad);
+            }
+        }
         struct op : detail::status_awaiter {
             const OvStorage_LayerHandle* handle;
             std::string src;
             std::string dest;
+            std::string etag;
+            bool has_etag;
+            OvStorage_CopyOptions opts;
             const OvStorage_CancelToken* cancel;
             bool await_suspend(body_handle h)
             {
                 s->continuation = h;
-                ovstorage_rename(handle, src.c_str(), dest.c_str(), cancel,
+                opts.if_match_etag = has_etag ? etag.c_str() : nullptr;
+                ovstorage_rename(handle, src.c_str(), dest.c_str(), &opts, cancel,
                     &status_awaiter::on_complete, release_user_data());
                 return commit_suspend(h);
             }
@@ -4365,6 +4618,10 @@ public:
         a.handle = handle_;
         a.src = std::move(src);
         a.dest = std::move(dest);
+        a.has_etag = options.if_match_etag.has_value();
+        a.etag = options.if_match_etag.value_or(std::string{});
+        a.opts = OvStorage_CopyOptions{};
+        a.opts.no_overwrite = options.no_overwrite;
         a.cancel = CancelToken::as_ptr(cancel);
         co_return co_await a;
     }
@@ -4805,6 +5062,41 @@ public:
     // Address-root discovery (keyed on the built Stack root).
     // -----------------------------------------------------------------
 
+    /// Return the Stack route selected for `address`. Plugin-backed Layers
+    /// parse and canonicalize absolute URLs at the plugin ABI boundary;
+    /// native C Layers define their own accepted spelling and routing. Use
+    /// this operation for per-address ownership or capability decisions; raw
+    /// prefix matching against `list_address_roots()` is not
+    /// routing-equivalent. Invalid plugin-backed URLs fail with
+    /// `InvalidArgument`, and addresses without an owner fail with `NoRoute`.
+    task<RootInfo> root_info_for(
+        std::string address,
+        const CancelToken* cancel = nullptr) const
+    {
+        if (handle_ == nullptr) co_return detail::null_handle_result<RootInfo>();
+        if (auto bad = detail::invalid_c_input({{"address", address}})) {
+            co_return detail::invalid_c_input_result<RootInfo>(bad);
+        }
+        struct op : detail::root_info_awaiter {
+            const OvStorage_LayerHandle* handle;
+            std::string address;
+            const OvStorage_CancelToken* cancel;
+            bool await_suspend(body_handle h)
+            {
+                s->continuation = h;
+                ovstorage_root_info_for(
+                    handle, address.c_str(), cancel,
+                    &root_info_awaiter::on_complete, release_user_data());
+                return commit_suspend(h);
+            }
+        };
+        op a{};
+        a.handle = handle_;
+        a.address = std::move(address);
+        a.cancel = CancelToken::as_ptr(cancel);
+        co_return co_await a;
+    }
+
     task<RootInfoList> list_address_roots(const CancelToken* cancel = nullptr) const
     {
         if (handle_ == nullptr) co_return detail::null_handle_result<RootInfoList>();
@@ -5122,6 +5414,135 @@ private:
     }
 
     OvStorage_Stack* handle_ = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// StackConfig - immutable declarative [ovstorage] TOML plus build adapter.
+// ---------------------------------------------------------------------------
+
+class StackConfig {
+public:
+    explicit StackConfig(OvStorage_StackConfig* handle) : handle_(handle) {}
+
+    ~StackConfig() { reset(); }
+    StackConfig(const StackConfig&) = delete;
+    StackConfig& operator=(const StackConfig&) = delete;
+
+    StackConfig(StackConfig&& other) noexcept
+        : handle_(std::exchange(other.handle_, nullptr))
+    {
+    }
+    StackConfig& operator=(StackConfig&& other) noexcept
+    {
+        if (this != &other) {
+            reset();
+            handle_ = std::exchange(other.handle_, nullptr);
+        }
+        return *this;
+    }
+
+    /// Parse [ovstorage] from explicit TOML without reading the environment.
+    static Result<StackConfig> from_toml_str(std::string toml)
+    {
+        if (auto bad = detail::invalid_c_input({{"toml", toml}})) {
+            return detail::invalid_c_input_result<StackConfig>(bad);
+        }
+        OvStorage_StackConfig* handle = nullptr;
+        OvStorage_Error error{};
+        auto status = ovstorage_stack_config_from_toml_str(
+            toml.c_str(), &handle, &error);
+        if (status != OvStorage_Status_Ok) {
+            return Result<StackConfig>::failure(take_error(error));
+        }
+        return Result<StackConfig>::success(StackConfig(handle));
+    }
+
+    /// Load TOML from a path and merge the OVSTORAGE__ environment overlay.
+    static Result<StackConfig> from_toml_path(std::string path)
+    {
+        if (auto bad = detail::invalid_c_input({{"path", path}})) {
+            return detail::invalid_c_input_result<StackConfig>(bad);
+        }
+        OvStorage_StackConfig* handle = nullptr;
+        OvStorage_Error error{};
+        auto status = ovstorage_stack_config_from_toml_path(
+            path.c_str(), &handle, &error);
+        if (status != OvStorage_Status_Ok) {
+            return Result<StackConfig>::failure(take_error(error));
+        }
+        return Result<StackConfig>::success(StackConfig(handle));
+    }
+
+    /// Search the documented default paths. An empty optional means no
+    /// candidate file exists; a present config has already received the
+    /// OVSTORAGE__ environment overlay.
+    static Result<std::optional<StackConfig>> from_default_path()
+    {
+        OvStorage_StackConfig* handle = nullptr;
+        OvStorage_Error error{};
+        auto status =
+            ovstorage_stack_config_from_default_path(&handle, &error);
+        if (status != OvStorage_Status_Ok) {
+            return Result<std::optional<StackConfig>>::failure(
+                take_error(error));
+        }
+        if (handle == nullptr) {
+            return Result<std::optional<StackConfig>>::success(std::nullopt);
+        }
+        return Result<std::optional<StackConfig>>::success(
+            std::optional<StackConfig>(StackConfig(handle)));
+    }
+
+    /// Build through the registry without exposing an imperative Stack
+    /// builder. Config translation is complete before this call returns its
+    /// eager task, so this object and the registry need not outlive the await.
+    task<LayerHandle> build(
+        const Registry& registry,
+        const OvStorage_StackBuildOptions* options = nullptr,
+        const CancelToken* cancel = nullptr) const
+    {
+        struct op : detail::stack_build_awaiter {
+            const OvStorage_StackConfig* config;
+            const OvStorage_Registry* registry;
+            const OvStorage_StackBuildOptions* options;
+            const OvStorage_CancelToken* cancel;
+            bool await_suspend(body_handle h)
+            {
+                s->continuation = h;
+                ovstorage_stack_build_from_config_async(
+                    config, registry, options, cancel,
+                    &stack_build_awaiter::on_complete, release_user_data());
+                return commit_suspend(h);
+            }
+        };
+        op a{};
+        a.config = handle_;
+        a.registry = registry.get();
+        a.options = options;
+        a.cancel = CancelToken::as_ptr(cancel);
+        co_return co_await a;
+    }
+
+    const OvStorage_StackConfig* get() const noexcept { return handle_; }
+
+private:
+    // `Result<StackConfig>` needs a null failure slot, but an application must
+    // obtain a live config from one of the loaders above. Exposing this
+    // constructor would make `StackConfig{}` look like Rust's valid empty
+    // default while it actually carries no C handle.
+    template <class T>
+    friend class Result;
+    StackConfig() = default;
+
+    void reset()
+    {
+        if (handle_ != nullptr) {
+            ovstorage_stack_config_destroy(handle_);
+            handle_ = nullptr;
+        }
+    }
+
+    OvStorage_StackConfig* handle_ = nullptr;
 };
 
 } // namespace ovstorage

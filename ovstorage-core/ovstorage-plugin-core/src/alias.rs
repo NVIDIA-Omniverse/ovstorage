@@ -21,10 +21,10 @@
 //!   hop cap ([`MAX_ALIAS_HOPS`]) plus cycle
 //!   detection and validated eagerly at build/configuration time. Results
 //!   project back through the applied hops in reverse. Address-visibility is
-//!   enforced on the caller-supplied address (`Suppressed` ⇒ rejected;
-//!   `Hidden`/`Suppressed` ⇒ not advertised — only `Visible` roots/aliases are
-//!   listed), and a root is synthesized for every visible alias
-//!   (`RouteSource::Alias` + `AliasState::Live`/`Dangling`/`ChainTooLong`).
+//!   enforced on the caller-supplied address (`Suppressed` ⇒ rejected and
+//!   omitted; `Hidden` ⇒ retained in the root projection but marked
+//!   unlisted), and a root is synthesized for each non-suppressed alias with
+//!   a `Live` terminal state (`RouteSource::Alias` + `AliasState::Live`).
 //!   It is the connection owner (`accepts_connections = true`): its rule state
 //!   is a runtime-mutable set of credentialless alias connections managed
 //!   through the operational vtable (`add_connection`/`remove_connection`/
@@ -38,10 +38,13 @@
 //! requests back** (physical→caller) so no lower layer (which can't see the
 //! `from`→`to` rules) leaks a physical address: `stat`/`read`/
 //! `get_latest_version`/`materialize`/`write`/`write_stream`/`continue_write`/
-//! `copy` single addresses, every `list`/`list_versions` item,
-//! `watch_directory` change-event addresses, and `root_info_for`/
-//! `list_address_roots` root prefixes — matching host dispatch
-//! path's caller-space projection (`info.address = addr`). Projection replays
+//! `copy` single addresses, every `list`/`list_versions` item, the
+//! `versioned_address` pin on every one of those (a full backend address of
+//! its own, projected like `address`), the pin on the address-less
+//! `update_metadata`/`create_directory` results, `watch_directory`
+//! change-event addresses, and `root_info_for`/`list_address_roots` root
+//! prefixes — matching host dispatch path's caller-space projection
+//! (`info.address = addr`). Projection replays
 //! exactly the hops the request's forward resolution applied, in reverse — a
 //! request that was **not** rewritten is never projected, so a caller
 //! addressing a rule's target space directly gets results echoed in its own
@@ -89,6 +92,13 @@
 //!   rule (the RFC's canonical alias connection);
 //! - **visibility overrides** — config `{ address, visibility }`.
 //!
+//! A third population of alias rows is **derived**, not authored: when a
+//! delegated backend registration returns a row carrying
+//! accepted-URL-spellings metadata (the s3, azure and huggingface plugins
+//! stamp the ordinary URL prefixes of their data), the wrapper installs one
+//! hidden alias rule per spelling and withdraws them when that connection is
+//! removed. See the "Derived rules" section below for the ground rules.
+//!
 //! **Design decision (RFC left it open): visibility overrides are connections
 //! in their own right, not attributes on alias connections.** Rationale: a
 //! visibility override applies to an arbitrary address — including a real
@@ -123,12 +133,14 @@
 //! named differently from its kind is reached correctly). Visibility-override
 //! rows remain credentialless (`Unsupported`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use ovstorage_layer::ordered::{Deferred, Sequenced};
+use ovstorage_layer::origin_only;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
@@ -321,6 +333,18 @@ pub(crate) const MAX_ALIAS_HOPS: usize = 8;
 /// nudge.
 const INNER_ROOT_REQUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long derived-alias generation waits for the inner layer's
+/// `list_connections` before degrading to "no known inner owners".
+///
+/// Unlike [`INNER_ROOT_REQUERY_TIMEOUT`], a caller IS waiting on this one. The
+/// scan runs after a delegated registration has already committed, so an inner
+/// layer that never answers would hold a connection that exists hostage to an
+/// optional convenience — and return no result to a caller whose registration
+/// took effect, prompting a retry of an operation that succeeded. Tighter than
+/// the root re-query for exactly that reason: the cost of expiring is the same
+/// degradation an outright scan failure already takes.
+const INNER_CONNECTION_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How specific a scope is — the ONE currency the alias chain compares.
 ///
 /// A newtype with a single constructor, because selection and termination
@@ -408,6 +432,9 @@ fn walk_chain(
         // Filled by `AliasWrapper::resolve` from the same rule snapshot; the
         // shared walk works over bare `(from, to)` pairs and has no source.
         first_hop_source: None,
+        // Filled by `AliasWrapper::resolve` from the same rule snapshot. The
+        // shared synchronous walk has no visibility rules of its own.
+        visibility: Vec::new(),
     })
 }
 
@@ -693,6 +720,19 @@ fn project_back(chain: &[(Url, Url)], addr: &Url) -> Result<Url> {
 
 fn project_info(chain: &[(Url, Url)], mut info: ObjectInfo) -> Result<ObjectInfo> {
     info.address = project_back(chain, &info.address)?;
+    info.versioned_address = project_pin(chain, info.versioned_address.as_ref())?;
+    Ok(info)
+}
+
+/// A pin is a full backend address of its own and is projected like `address`.
+fn project_pin(chain: &[(Url, Url)], pin: Option<&Url>) -> Result<Option<Url>> {
+    pin.map(|pin| project_back(chain, pin)).transpose()
+}
+
+/// The address-less result of `update_metadata` / `create_directory`: only
+/// its pin can name a physical address, so only the pin is projected.
+fn project_item_info(chain: &[(Url, Url)], mut info: BackendItemInfo) -> Result<BackendItemInfo> {
+    info.versioned_address = project_pin(chain, info.versioned_address.as_ref())?;
     Ok(info)
 }
 
@@ -715,12 +755,12 @@ fn project_read_result(chain: &[(Url, Url)], result: ReadResult) -> Result<ReadR
 }
 
 fn project_delegate(chain: &[(Url, Url)], mut delegate: LocalDelegate) -> Result<LocalDelegate> {
-    delegate.info.address = project_back(chain, &delegate.info.address)?;
+    delegate.info = project_info(chain, delegate.info)?;
     Ok(delegate)
 }
 
 fn project_write_result(chain: &[(Url, Url)], mut result: WriteResult) -> Result<WriteResult> {
-    result.info.address = project_back(chain, &result.info.address)?;
+    result.info = project_info(chain, result.info)?;
     Ok(result)
 }
 
@@ -735,6 +775,7 @@ fn project_write_step(chain: &[(Url, Url)], step: WriteStep) -> Result<WriteStep
 fn project_items(chain: &[(Url, Url)], items: &mut [ObjectInfo]) -> Result<()> {
     for item in items.iter_mut() {
         item.address = project_back(chain, &item.address)?;
+        item.versioned_address = project_pin(chain, item.versioned_address.as_ref())?;
     }
     Ok(())
 }
@@ -761,11 +802,26 @@ fn visibility_of_in(visibility: &[(Url, AddressVisibility)], addr: &Url) -> Addr
         .unwrap_or(AddressVisibility::Visible)
 }
 
-/// A bare alias-facing root for a chain with no terminating real root —
-/// shared by the `list_address_roots` advertisement and `root_info_for` so
-/// the two introspection paths report the same dangling-alias metadata (the
-/// caller-facing fields — `source`/`alias_state`/visibility — are stamped by
-/// the caller).
+/// Return the more restrictive visibility (`Visible` < `Hidden` <
+/// `Suppressed`) without imposing ordering on the public enum.
+fn most_restrictive_visibility(
+    left: AddressVisibility,
+    right: AddressVisibility,
+) -> AddressVisibility {
+    match (left, right) {
+        (AddressVisibility::Suppressed, _) | (_, AddressVisibility::Suppressed) => {
+            AddressVisibility::Suppressed
+        }
+        (AddressVisibility::Hidden, _) | (_, AddressVisibility::Hidden) => {
+            AddressVisibility::Hidden
+        }
+        (AddressVisibility::Visible, AddressVisibility::Visible) => AddressVisibility::Visible,
+    }
+}
+
+/// A bare alias-facing root for direct alias introspection when a chain has no
+/// terminating real root. The caller stamps its `source`, `alias_state`, and
+/// visibility.
 fn bare_alias_root(from: &Url) -> RootInfo {
     RootInfo {
         root: from.clone(),
@@ -841,6 +897,7 @@ fn synthesize_alias_root(
     alias: &AliasProjection,
     terminal: Option<&RootInfo>,
     state: AliasState,
+    visibility: AddressVisibility,
 ) -> RootInfo {
     let mut root = match terminal {
         Some(target) => target.clone(),
@@ -856,10 +913,18 @@ fn synthesize_alias_root(
     // advertises the physical backend's routing target. Auth delegation walks
     // the chain to the physical terminal and reads ITS `owning_target`, so this
     // is informational only.
+    //
+    // This is about a SYNTHESIZED root, and it does not extend to the inner
+    // connection rows `list_connections` passes through. The value cleared here
+    // would be a fact about a terminal root the caller was never shown, attached
+    // to an object whose identity is the alias's. An inner connection row is the
+    // opposite: unprojected, carrying the backend's own id, kind and addresses,
+    // so its owning target is the truthful other half of its own key. See the
+    // union in `list_connections`.
     root.owning_target = None;
     root.alias_state = Some(state);
-    root.visibility = AddressVisibility::Visible;
-    root.visible = true;
+    root.visibility = visibility;
+    root.visible = visibility == AddressVisibility::Visible;
     // Thread the rule's presentation onto the projected root: an alias's own
     // `display_name` overrides the inherited target root's, and its
     // `user_metadata` is merged over any inherited from the terminal root.
@@ -872,12 +937,12 @@ fn synthesize_alias_root(
     root
 }
 
-/// Apply the advertised-root projection to a set of roots: drop non-`Visible`
-/// roots, force the survivors `Visible`, and synthesize a root for each
-/// visible alias — `Live` when its chain terminates at a present root
-/// (inheriting that root's advertisement), `Dangling`/`ChainTooLong`
-/// otherwise (a bare alias-facing root, so a misconfigured alias is visible
-/// in discovery instead of silently absent). Shared by the initial
+/// Apply the advertised-root projection to a set of roots: combine each inner
+/// root's visibility with its local rule using the most restrictive value,
+/// omit `Suppressed`, retain `Visible`/`Hidden` with their true marker, and
+/// synthesize a root for each non-suppressed alias whose chain terminates at a
+/// present root (`Live`). Dangling and overlong alias chains are omitted from
+/// discovery. Shared by the initial
 /// `list_address_roots` snapshot and every live root-update event so the two
 /// stay consistent.
 fn project_advertised_roots(
@@ -885,43 +950,61 @@ fn project_advertised_roots(
     visibility: &[(Url, AddressVisibility)],
     mut roots: Vec<RootInfo>,
 ) -> Vec<RootInfo> {
-    // Alias-root synthesis runs against the UNFILTERED roots: a visible alias
-    // whose target root is Hidden/Suppressed still advertises (the rewrite
-    // shape — the caller-facing mount is the advertised surface while its
-    // physical `rewrite_to` target is suppressed by construction).
+    // Alias-root synthesis runs against the UNFILTERED roots: a non-suppressed
+    // alias whose target root is Hidden/Suppressed retains the alias rule's own
+    // visibility (the caller-facing mount is distinct from its physical
+    // `rewrite_to` target).
     let pairs: Vec<(Url, Url)> = aliases
         .iter()
         .map(|alias| (alias.from.clone(), alias.to.clone()))
         .collect();
     let mut alias_roots = Vec::new();
     for alias in aliases {
-        if visibility_of_in(visibility, &alias.from) != AddressVisibility::Visible {
+        let alias_visibility = visibility_of_in(visibility, &alias.from);
+        if alias_visibility == AddressVisibility::Suppressed {
             continue;
         }
         let (terminal, state) = chain_terminal(&pairs, &roots, &alias.to);
-        alias_roots.push(synthesize_alias_root(alias, terminal, state));
+        if matches!(&state, AliasState::Live) {
+            alias_roots.push(synthesize_alias_root(
+                alias,
+                terminal,
+                state,
+                alias_visibility,
+            ));
+        }
     }
-    roots.retain(|root| visibility_of_in(visibility, &root.root) == AddressVisibility::Visible);
-    for root in roots.iter_mut() {
-        root.visibility = AddressVisibility::Visible;
-        root.visible = true;
-    }
+    roots.retain_mut(|root| {
+        let effective =
+            most_restrictive_visibility(root.visibility, visibility_of_in(visibility, &root.root));
+        if effective == AddressVisibility::Suppressed {
+            return false;
+        }
+        root.visibility = effective;
+        root.visible = effective == AddressVisibility::Visible;
+        true
+    });
     roots.extend(alias_roots);
     roots
 }
 
 /// Project a `Removed` delta. Unlike the other variants this must NOT re-run
 /// full alias-root synthesis: [`project_advertised_roots`] synthesizes a root
-/// for EVERY visible alias, so feeding it a `Removed` delta would spuriously
-/// report every alias root removed on any unrelated inner removal.
-/// Instead, emit removal only for (a) the removed inner roots that were
-/// themselves advertised (`Visible`), and (b) the alias roots whose backing
-/// chain terminated at one of the removed inner roots — those go `Dangling`
-/// and drop out of advertisement.
+/// for each non-suppressed alias with a `Live` terminal, so feeding it a `Removed`
+/// delta would spuriously report every live alias root removed on any unrelated inner
+/// removal.
+/// Instead, emit removal only for (a) removed inner roots whose effective
+/// visibility is not `Suppressed` and whose node no still-live local rule
+/// names, and (b) non-suppressed alias roots whose backing chain terminated at
+/// one of the removed inner roots. `surviving_roots` is the wrapper's current
+/// inner-root snapshot after applying the removal; it lets the same-node shield
+/// distinguish a live replacement alias from a dangling one that the next
+/// snapshot will omit.
 fn project_removed_roots(
     aliases: &[AliasProjection],
     visibility: &[(Url, AddressVisibility)],
     removed: Vec<RootInfo>,
+    surviving_roots: &[RootInfo],
 ) -> Vec<RootInfo> {
     let pairs: Vec<(Url, Url)> = aliases
         .iter()
@@ -929,55 +1012,386 @@ fn project_removed_roots(
         .collect();
     let mut out: Vec<RootInfo> = Vec::new();
     // Alias roots whose chain terminates at a removed inner root: resolve each
-    // visible alias against ONLY the removed roots — a `Live` terminal means
-    // the alias depended on a now-removed root and must be withdrawn too.
+    // non-suppressed alias against ONLY the removed roots — a `Live` terminal
+    // means the alias depended on a now-removed root and must be withdrawn too.
     for alias in aliases {
-        if visibility_of_in(visibility, &alias.from) != AddressVisibility::Visible {
+        let alias_visibility = visibility_of_in(visibility, &alias.from);
+        if alias_visibility == AddressVisibility::Suppressed {
             continue;
         }
         let (terminal, state) = chain_terminal(&pairs, &removed, &alias.to);
         if let Some(terminal) = terminal {
-            out.push(synthesize_alias_root(alias, Some(terminal), state));
+            out.push(synthesize_alias_root(
+                alias,
+                Some(terminal),
+                state,
+                alias_visibility,
+            ));
         }
     }
-    // The directly-removed inner roots that were advertised (`Visible`);
-    // non-visible roots were never advertised, so removing them is a no-op.
+    // Directly removed inner roots retain the most restrictive incoming/local
+    // visibility. Suppressed roots were never projected, so removing them is a
+    // no-op.
     for mut root in removed {
-        if visibility_of_in(visibility, &root.root) == AddressVisibility::Visible {
-            root.visibility = AddressVisibility::Visible;
-            root.visible = true;
-            out.push(root);
+        let effective =
+            most_restrictive_visibility(root.visibility, visibility_of_in(visibility, &root.root));
+        if effective == AddressVisibility::Suppressed {
+            continue;
         }
+        // An inner ALIAS root leaving an address one of THIS wrapper's LIVE
+        // rules still names does not withdraw the address: the next snapshot
+        // synthesizes the live replacement at the same node. A dangling local
+        // rule provides no such shield — dangling aliases are omitted — so its
+        // removal must propagate or a keyed delta consumer retains the stale
+        // inner root forever. Reachable when an explicit local rule takes a
+        // node over from an inner derived copy but resolves to no terminal.
+        //
+        // Two conditions, and BOTH are load-bearing.
+        // Synthesized-only: a REAL inner root disappearing from a node a local
+        // alias also names is a different event. The local alias root does not
+        // stand in for it — a keyed delta consumer holds one entry per
+        // address, so withholding the removal would leave it advertising the
+        // departed root's `Live` state and capabilities forever, which no
+        // later snapshot agrees with. The removal propagates, and the alias's
+        // own root returns on the next rule change or resync.
+        // Node-equal only: a removed root merely UNDER a local `from` is a
+        // distinct address whose removal must propagate. (A suppressed local
+        // alias synthesizes nothing, and never reaches this check — its
+        // suppression already caught the removal above.)
+        let shielded = root.alias_state.is_some()
+            && aliases.iter().any(|alias| {
+                ovstorage_layer::node_key(&alias.from) == ovstorage_layer::node_key(&root.root)
+                    && matches!(
+                        chain_terminal(&pairs, surviving_roots, &alias.to).1,
+                        AliasState::Live
+                    )
+            });
+        if shielded {
+            continue;
+        }
+        root.visibility = effective;
+        root.visible = effective == AddressVisibility::Visible;
+        out.push(root);
     }
     out
 }
 
 /// Project the roots carried by a live [`RootInfoChange`] the same way the
-/// snapshot is projected, so later updates can't leak non-visible roots or skip
+/// snapshot is projected, so later updates can't leak suppressed roots or skip
 /// alias-root synthesis. `Snapshot`/`Added`/`Updated` re-run the full
 /// filtering and synthesis; `Removed` uses [`project_removed_roots`] so it
 /// withdraws only the roots that went away (and the alias roots they backed),
 /// never the whole alias projection.
+///
+/// KNOWN LIMITATION: for a PARTIAL `Added`/`Updated` payload
+/// (an inner layer announcing one new root, as the conformance suite
+/// requires), projection considers only that payload, so an alias whose target
+/// is absent from it is not repeated in the delta. Address membership stays
+/// correct because a keyed consumer retains its existing row, but per-root
+/// metadata can lag a fresh snapshot. `inner_roots` deliberately tracks the
+/// complete set only to decide whether a same-node removal has a live local
+/// replacement; synthesizing every cached alias on each partial add/update
+/// would spuriously repeat unrelated roots in the delta.
 fn project_root_change(
     aliases: &[AliasProjection],
     visibility: &[(Url, AddressVisibility)],
     change: RootInfoChange,
+    inner_roots: &mut Vec<RootInfo>,
 ) -> RootInfoChange {
     match change {
         RootInfoChange::Snapshot(roots) => {
+            *inner_roots = roots.clone();
             RootInfoChange::Snapshot(project_advertised_roots(aliases, visibility, roots))
         }
         RootInfoChange::Added(roots) => {
+            upsert_inner_roots(inner_roots, &roots);
             RootInfoChange::Added(project_advertised_roots(aliases, visibility, roots))
         }
         RootInfoChange::Updated(roots) => {
+            upsert_inner_roots(inner_roots, &roots);
             RootInfoChange::Updated(project_advertised_roots(aliases, visibility, roots))
         }
         // A `Removed` delta must only withdraw the roots that actually went
         // away — never re-synthesize the whole alias projection.
         RootInfoChange::Removed(roots) => {
-            RootInfoChange::Removed(project_removed_roots(aliases, visibility, roots))
+            inner_roots.retain(|current| !roots.iter().any(|removed| removed.root == current.root));
+            RootInfoChange::Removed(project_removed_roots(
+                aliases,
+                visibility,
+                roots,
+                inner_roots,
+            ))
         }
+    }
+}
+
+fn upsert_inner_roots(current: &mut Vec<RootInfo>, changed: &[RootInfo]) {
+    for root in changed {
+        if let Some(existing) = current.iter_mut().find(|item| item.root == root.root) {
+            *existing = root.clone();
+        } else {
+            current.push(root.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+mod advertised_root_projection_tests {
+    use super::*;
+
+    fn url(value: &str) -> Url {
+        Url::parse(value).unwrap()
+    }
+
+    // Start with `visible = true` deliberately: the projection must restore
+    // the bool/enum invariant even for an inconsistent root received from an
+    // inner layer.
+    fn root(value: &str, visibility: AddressVisibility) -> RootInfo {
+        let mut root = bare_alias_root(&url(value));
+        root.visibility = visibility;
+        root.visible = true;
+        root
+    }
+
+    /// A root as an INNER alias wrapper would emit it: the same shape as
+    /// [`root`] plus the `alias_state` marker that says the row was
+    /// synthesized from a rule rather than advertised by a real backend.
+    fn alias_root(value: &str, visibility: AddressVisibility) -> RootInfo {
+        let mut root = root(value, visibility);
+        root.alias_state = Some(AliasState::Live);
+        root
+    }
+
+    fn alias(from: &str, to: &str) -> AliasProjection {
+        AliasProjection {
+            from: url(from),
+            to: url(to),
+            source: AliasSource::Static {
+                layer: ConfigLayer::Programmatic,
+            },
+            display_name: None,
+            user_metadata: UserMetadata::default(),
+        }
+    }
+
+    fn find<'a>(roots: &'a [RootInfo], value: &str) -> Option<&'a RootInfo> {
+        let address = url(value);
+        roots.iter().find(|root| root.root == address)
+    }
+
+    fn assert_visibility(root: &RootInfo, visibility: AddressVisibility) {
+        assert_eq!(root.visibility, visibility);
+        assert_eq!(root.visible, visibility == AddressVisibility::Visible);
+    }
+
+    #[test]
+    fn inner_roots_keep_the_most_restrictive_visibility() {
+        let roots = vec![
+            root("file:///configured-hidden/", AddressVisibility::Visible),
+            root("file:///already-hidden/", AddressVisibility::Hidden),
+            root("file:///configured-suppressed/", AddressVisibility::Visible),
+            root("file:///already-suppressed/", AddressVisibility::Suppressed),
+        ];
+        let visibility = vec![
+            (url("file:///configured-hidden/"), AddressVisibility::Hidden),
+            (
+                url("file:///configured-suppressed/"),
+                AddressVisibility::Suppressed,
+            ),
+        ];
+
+        let projected = project_advertised_roots(&[], &visibility, roots);
+
+        assert_eq!(projected.len(), 2);
+        assert_visibility(
+            find(&projected, "file:///configured-hidden/").unwrap(),
+            AddressVisibility::Hidden,
+        );
+        assert_visibility(
+            find(&projected, "file:///already-hidden/").unwrap(),
+            AddressVisibility::Hidden,
+        );
+        assert!(find(&projected, "file:///configured-suppressed/").is_none());
+        assert!(find(&projected, "file:///already-suppressed/").is_none());
+    }
+
+    #[test]
+    fn aliases_use_their_rule_visibility_independently_of_the_target() {
+        let aliases = vec![
+            alias("alias:///visible/", "file:///target/"),
+            alias("alias:///hidden/", "file:///target/"),
+            alias("alias:///suppressed/", "file:///target/"),
+        ];
+        let visibility = vec![
+            (url("alias:///hidden/"), AddressVisibility::Hidden),
+            (url("alias:///suppressed/"), AddressVisibility::Suppressed),
+        ];
+
+        let projected = project_advertised_roots(
+            &aliases,
+            &visibility,
+            vec![root("file:///target/", AddressVisibility::Hidden)],
+        );
+
+        assert_visibility(
+            find(&projected, "alias:///visible/").unwrap(),
+            AddressVisibility::Visible,
+        );
+        assert_visibility(
+            find(&projected, "alias:///hidden/").unwrap(),
+            AddressVisibility::Hidden,
+        );
+        assert!(find(&projected, "alias:///suppressed/").is_none());
+    }
+
+    /// An inner ALIAS root leaving a node a live local rule still names is not
+    /// forwarded as a removal: the wrapper synthesizes a root at that `from`
+    /// regardless of inner state, so a delta consumer that applied the
+    /// removal would drop an address the next snapshot still lists. This is
+    /// the notification half of derived-rule eviction — the inner wrapper's
+    /// evicted derived copy leaves exactly as the local explicit rule takes
+    /// the scope over.
+    #[test]
+    fn a_removal_at_a_live_local_alias_from_is_not_forwarded() {
+        let aliases = vec![alias("https://held.example/pub/", "target:///r/")];
+        let removed = vec![
+            // The evicted inner derived copy's synthesized (hidden) root, at
+            // the same node as the local rule's `from`.
+            alias_root("https://held.example/pub/", AddressVisibility::Hidden),
+            // A root merely UNDER the local `from` is a distinct address and
+            // its removal must still propagate.
+            root("https://held.example/pub/sub/", AddressVisibility::Visible),
+        ];
+
+        let projected = project_removed_roots(
+            &aliases,
+            &[],
+            removed,
+            &[root("target:///r/", AddressVisibility::Visible)],
+        );
+
+        assert!(
+            find(&projected, "https://held.example/pub/").is_none(),
+            "the locally-owned node is still advertised, so its removal is \
+             suppressed: {projected:?}"
+        );
+        assert!(
+            find(&projected, "https://held.example/pub/sub/").is_some(),
+            "a distinct address under the from still withdraws"
+        );
+    }
+
+    #[test]
+    fn a_dangling_local_takeover_does_not_shield_the_inner_alias_removal() {
+        let aliases = vec![alias("https://held.example/pub/", "missing:///target/")];
+        let stale = alias_root("https://held.example/pub/", AddressVisibility::Hidden);
+        let removed = vec![stale.clone()];
+
+        let projected = project_removed_roots(&aliases, &[], removed, &[]);
+        let fresh = project_advertised_roots(&aliases, &[], Vec::new());
+        let mut keyed = HashMap::from([(stale.root.clone(), stale)]);
+        for removal in &projected {
+            keyed.remove(&removal.root);
+        }
+
+        assert!(
+            find(&projected, "https://held.example/pub/").is_some(),
+            "the stale inner alias must be withdrawn"
+        );
+        assert_eq!(
+            keyed.keys().collect::<HashSet<_>>(),
+            fresh.iter().map(|root| &root.root).collect::<HashSet<_>>(),
+            "applying the removal must converge to the fresh snapshot"
+        );
+    }
+
+    /// The other half of that guard: a REAL inner root at a node a local alias
+    /// also names still withdraws. The local alias root is a different object
+    /// at the same address, so withholding this removal would strand a keyed
+    /// delta consumer advertising a departed root as live and capable.
+    #[test]
+    fn a_removal_of_a_real_root_under_a_local_alias_from_is_forwarded() {
+        let aliases = vec![alias("https://held.example/pub/", "target:///r/")];
+        let removed = vec![root(
+            "https://held.example/pub/",
+            AddressVisibility::Visible,
+        )];
+
+        let projected = project_removed_roots(&aliases, &[], removed, &[]);
+
+        assert!(
+            find(&projected, "https://held.example/pub/").is_some(),
+            "a real inner root's removal is a state change no local rule \
+             stands in for: {projected:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_aliases_are_not_advertised() {
+        let aliases = vec![
+            alias("alias:///dangling/", "missing:///target/"),
+            alias("alias:///cycle-a/", "alias:///cycle-b/"),
+            alias("alias:///cycle-b/", "alias:///cycle-a/"),
+        ];
+
+        let pairs: Vec<(Url, Url)> = aliases
+            .iter()
+            .map(|alias| (alias.from.clone(), alias.to.clone()))
+            .collect();
+        assert_eq!(
+            chain_terminal(&pairs, &[], &url("missing:///target/")).1,
+            AliasState::Dangling
+        );
+        assert!(matches!(
+            chain_terminal(&pairs, &[], &url("alias:///cycle-a/")).1,
+            AliasState::ChainTooLong { .. }
+        ));
+
+        let projected = project_advertised_roots(&aliases, &[], Vec::new());
+
+        assert!(find(&projected, "alias:///dangling/").is_none());
+        assert!(find(&projected, "alias:///cycle-a/").is_none());
+        assert!(find(&projected, "alias:///cycle-b/").is_none());
+    }
+
+    #[test]
+    fn removed_projection_withdraws_hidden_but_not_suppressed_roots() {
+        let aliases = vec![
+            alias("alias:///hidden/", "file:///configured-hidden/"),
+            alias("alias:///suppressed/", "file:///configured-hidden/"),
+        ];
+        let visibility = vec![
+            (url("file:///configured-hidden/"), AddressVisibility::Hidden),
+            (
+                url("file:///configured-suppressed/"),
+                AddressVisibility::Suppressed,
+            ),
+            (url("alias:///hidden/"), AddressVisibility::Hidden),
+            (url("alias:///suppressed/"), AddressVisibility::Suppressed),
+        ];
+        let removed = vec![
+            root("file:///configured-hidden/", AddressVisibility::Visible),
+            root("file:///already-hidden/", AddressVisibility::Hidden),
+            root("file:///configured-suppressed/", AddressVisibility::Visible),
+            root("file:///already-suppressed/", AddressVisibility::Suppressed),
+        ];
+
+        let projected = project_removed_roots(&aliases, &visibility, removed, &[]);
+
+        assert_eq!(projected.len(), 3);
+        for address in [
+            "alias:///hidden/",
+            "file:///configured-hidden/",
+            "file:///already-hidden/",
+        ] {
+            assert_visibility(
+                find(&projected, address).unwrap(),
+                AddressVisibility::Hidden,
+            );
+        }
+        assert!(find(&projected, "alias:///suppressed/").is_none());
+        assert!(find(&projected, "file:///configured-suppressed/").is_none());
+        assert!(find(&projected, "file:///already-suppressed/").is_none());
     }
 }
 
@@ -991,6 +1405,15 @@ fn project_root_change(
 // `ALIAS_KIND`; alias the exports here to keep the local call sites terse.
 use crate::layers::ALIAS_TO_METADATA_KEY as ALIAS_TO_KEY;
 use crate::layers::ALIAS_VISIBILITY_METADATA_KEY as ALIAS_VISIBILITY_KEY;
+// The derived-rule contract keys live in `ovstorage-layer` (the crate the
+// backend plugins that PRODUCE the spellings also share); aliased to the same
+// terse shape as the wrapper's own keys above.
+use ovstorage_plugin::ACCEPTED_URL_SPELLINGS_METADATA_KEY as ACCEPTED_URL_SPELLINGS_KEY;
+use ovstorage_plugin::ALIAS_DERIVED_FROM_METADATA_KEY as ALIAS_DERIVED_FROM_KEY;
+// The scheme-fallback marker is stamped only by a backend whose operator
+// granted the fallback; the wrapper refuses it on a patch so a projected root
+// cannot be forged into the catch-all for its scheme.
+use ovstorage_plugin::fallback::SCHEME_FALLBACK_METADATA_KEY as SCHEME_FALLBACK_KEY;
 
 /// One credentialless alias connection: a `(from → to)` URL-rewrite rule with a
 /// `(target, id)` identity for CRUD. Carries no visibility of its own — an
@@ -1011,6 +1434,15 @@ struct AliasRule {
     /// via the `{from, to, visibility}` add-connection shape and patchable
     /// through `update_connection_attributes`.
     visibility: Option<AddressVisibility>,
+    /// The backend connection this rule was derived from, when the rule was
+    /// auto-generated from that connection's accepted-URL-spellings metadata
+    /// ([`ACCEPTED_URL_SPELLINGS_METADATA_KEY`]) rather than authored.
+    /// `Some` keys the rule's withdrawal when the backend connection is
+    /// removed and marks the row ([`ALIAS_DERIVED_FROM_KEY`]) in
+    /// `list_connections` output; it also makes the rule evictable by an
+    /// explicit operator rule on the same scope. Never `Some` for a rule that
+    /// entered through config or the connection vtable.
+    derived_from: Option<ConnectionKey>,
 }
 
 /// One visibility-override connection: an `(address, visibility)` row with a
@@ -1046,6 +1478,32 @@ impl RuleSet {
             .collect()
     }
 
+    /// The alias pairs that may answer a CALLER's `addr`.
+    ///
+    /// Identical to [`Self::alias_pairs`] except that generated rules stand
+    /// aside for an address carrying a query they do not recognize — a
+    /// presigned or SAS URL, whose signature would stop meaning anything once
+    /// rewritten onto the canonical form and be replaced by the connection's
+    /// own credentials. See
+    /// [`ovstorage_layer::generated_rule_may_answer`] for why that is the one
+    /// class a generated rule declines, and why an authored rule still takes
+    /// it.
+    ///
+    /// Used by the walk that serves caller addresses. Advertisement and
+    /// validation keep [`Self::alias_pairs`]: a rule set's validity, and the
+    /// roots it projects, are properties of the rules rather than of any one
+    /// request.
+    fn alias_pairs_for(&self, addr: &Url) -> Vec<(Url, Url)> {
+        if ovstorage_layer::generated_rule_may_answer(addr) {
+            return self.alias_pairs();
+        }
+        self.aliases
+            .iter()
+            .filter(|rule| rule.derived_from.is_none())
+            .map(|rule| (rule.from.clone(), rule.to.clone()))
+            .collect()
+    }
+
     /// The alias projections, in registration order, for
     /// [`project_advertised_roots`]: each synthesized root's
     /// `RouteSource::Alias` carries the rule's real [`AliasSource`] so
@@ -1072,17 +1530,67 @@ impl RuleSet {
     /// load-bearing: [`visibility_of_in`] breaks an exact-prefix tie toward the
     /// last entry, so a later entry wins. Alias-intrinsic entries are listed
     /// FIRST so a standalone explicit override on the same prefix wins the tie.
+    ///
+    /// A DERIVED rule's intrinsic visibility is folded against the authored
+    /// answer at its own `from` before it is listed. [`visibility_of_in`]
+    /// selects the longest matching prefix, not the most restrictive value, so
+    /// an unfolded generated child rule would outrank a broader authored
+    /// `Suppressed` and re-open the exact subtree that override denies — a
+    /// generated rule silently undoing an operator's denial. Folding keeps the
+    /// ancestor restrictive while leaving an authored override ON that scope
+    /// free to win the tie, because the fold reads only authored entries and
+    /// the standalone overrides are still appended last.
     fn visibility_pairs(&self) -> Vec<(Url, AddressVisibility)> {
-        let mut pairs: Vec<(Url, AddressVisibility)> = self
+        let intrinsic = |rule: &AliasRule| rule.visibility.map(|vis| (rule.from.clone(), vis));
+        let authored_alias: Vec<(Url, AddressVisibility)> = self
             .aliases
             .iter()
-            .filter_map(|rule| rule.visibility.map(|vis| (rule.from.clone(), vis)))
+            .filter(|rule| rule.derived_from.is_none())
+            .filter_map(intrinsic)
             .collect();
-        pairs.extend(
-            self.visibility
-                .iter()
-                .map(|rule| (rule.address.clone(), rule.visibility)),
-        );
+        let standalone: Vec<(Url, AddressVisibility)> = self
+            .visibility
+            .iter()
+            .map(|rule| (rule.address.clone(), rule.visibility))
+            .collect();
+        let derived = self
+            .aliases
+            .iter()
+            .filter(|rule| rule.derived_from.is_some())
+            .filter_map(intrinsic);
+        // The most restrictive value anything authored carries. Folding a
+        // derived rule can only change it when something authored is more
+        // restrictive than that rule's own visibility — below that ceiling the
+        // fold returns the rule's own value whichever ancestor wins the
+        // longest-prefix selection. `resolve` rebuilds these pairs on every
+        // dispatch, so the ancestor scan is paid only by a configuration that
+        // has an authored denial to enforce, and a deployment with generated
+        // rules and no authored visibility rule pays one cheap pass.
+        let ceiling = authored_alias
+            .iter()
+            .chain(standalone.iter())
+            .map(|(_, vis)| *vis)
+            .fold(AddressVisibility::Visible, most_restrictive_visibility);
+        let needs_fold = self.aliases.iter().any(|rule| {
+            rule.derived_from.is_some()
+                && rule
+                    .visibility
+                    .is_some_and(|vis| most_restrictive_visibility(vis, ceiling) != vis)
+        });
+        let mut pairs = authored_alias.clone();
+        if needs_fold {
+            let authored: Vec<(Url, AddressVisibility)> = authored_alias
+                .into_iter()
+                .chain(standalone.iter().cloned())
+                .collect();
+            pairs.extend(derived.map(|(from, vis)| {
+                let folded = most_restrictive_visibility(vis, visibility_of_in(&authored, &from));
+                (from, folded)
+            }));
+        } else {
+            pairs.extend(derived);
+        }
+        pairs.extend(standalone);
         pairs
     }
 
@@ -1109,7 +1617,11 @@ fn connection_source(source: &AliasSource) -> ConnectionSource {
 /// The `Connection` view of an alias rule: credentialless (`Anonymous`), with
 /// the rewrite target and rule kind stamped into `user_metadata` for host
 /// reconstruction.
-fn alias_connection(rule: &AliasRule) -> Connection {
+/// `target` is the wrapper's own instance name: these rows are the wrapper's,
+/// so the `ConnectionKey` that reaches one names the wrapper and not the
+/// backend behind it. Taken as a parameter rather than stamped by the caller
+/// so the compiler refuses a construction site that forgot it.
+fn alias_connection(rule: &AliasRule, target: &str) -> Connection {
     let mut user_metadata = rule.user_metadata.clone();
     user_metadata.insert(ALIAS_TO_KEY.to_string(), rule.to.to_string());
     // An alias with an intrinsic visibility surfaces it so a host can round-trip
@@ -1118,6 +1630,15 @@ fn alias_connection(rule: &AliasRule) -> Connection {
         user_metadata.insert(
             ALIAS_VISIBILITY_KEY.to_string(),
             visibility_str(visibility).to_string(),
+        );
+    }
+    // A derived rule declares its provenance so a host reading
+    // `list_connections` can tell it from an operator-authored rule — and can
+    // see which backend connection re-registering would bring it back.
+    if let Some(owner) = &rule.derived_from {
+        user_metadata.insert(
+            ALIAS_DERIVED_FROM_KEY.to_string(),
+            format!("{}/{}", owner.target, owner.id.0),
         );
     }
     Connection {
@@ -1133,11 +1654,13 @@ fn alias_connection(rule: &AliasRule) -> Connection {
         auth_state: ConnectionAuthState::Anonymous,
         last_probed: None,
         user_metadata,
+        owning_target: Some(target.to_string()),
     }
 }
 
 /// The `Connection` view of a visibility-override rule.
-fn visibility_connection(rule: &VisibilityOverride) -> Connection {
+/// `target` is the wrapper's own instance name; see [`alias_connection`].
+fn visibility_connection(rule: &VisibilityOverride, target: &str) -> Connection {
     let mut user_metadata = rule.user_metadata.clone();
     user_metadata.insert(
         ALIAS_VISIBILITY_KEY.to_string(),
@@ -1156,6 +1679,7 @@ fn visibility_connection(rule: &VisibilityOverride) -> Connection {
         auth_state: ConnectionAuthState::Anonymous,
         last_probed: None,
         user_metadata,
+        owning_target: Some(target.to_string()),
     }
 }
 
@@ -1176,6 +1700,490 @@ fn parse_visibility_str(text: &str) -> Result<AddressVisibility> {
             ErrorCode::InvalidArgument,
             format!("invalid visibility `{other}` (want visible|hidden|suppressed)"),
         )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Derived rules — hidden aliases auto-generated from a backend connection's
+// accepted-URL-spellings metadata
+//
+// A backend that wants the ordinary URLs of its data to resolve stamps
+// `ACCEPTED_URL_SPELLINGS_KEY` onto its `Connection` rows (s3, azure and
+// huggingface do, next to their endpoint derivation). This wrapper is the
+// pass-through for every registration — build-time `[[connections]]` and
+// runtime adds both dispatch `add_connection` from the Stack root — so it
+// reads the key off the row a delegated registration returns (plus one
+// build-time scan for connections a backend factory seeded from its own layer
+// config, which never cross the vtable) and installs one HIDDEN rule per
+// spelling: addressable, never advertised, so listings keep showing the
+// canonical form only.
+//
+// Ground rules, each the resolution of a real hazard:
+//
+// - **Generation never fails a registration.** A colliding or
+//   chain-invalidating spelling is skipped with a warning; the backend
+//   connection the operator asked for is not held hostage by a convenience.
+// - **Explicit beats derived.** An operator rule on the same scope evicts the
+//   derived rule instead of being refused as a duplicate of a rule nobody
+//   wrote ([`evict_derived_duplicates`]); the reverse direction — a derived
+//   spelling colliding with any existing rule — skips the spelling.
+// - **No authz widening.** Nothing here touches authorization: policy
+//   evaluates the caller-supplied address BEFORE alias resolution and is
+//   deny-all when absent, so in a gated deployment a derived alias does
+//   nothing until the operator grants its `from` space. That is the settled
+//   model, stated in the operator docs, not a bug.
+// - **Never persisted.** A derived rule regenerates from whatever re-registers
+//   the backend connection (config replay on rebuild, a runtime re-add) and is
+//   withdrawn when the connection is removed. It carries its provenance in
+//   `ALIAS_DERIVED_FROM_KEY` so `list_connections` output distinguishes it.
+// - **Derivation runs at registration only.** A spellings key patched onto a
+//   row later via `update_connection_attributes` does nothing until the
+//   connection re-registers — no new capability, since anyone who can patch
+//   attributes could already add alias rules directly.
+// ---------------------------------------------------------------------------
+
+/// Evict derived rules scoping the same node as `from` (exact `node_key`
+/// match, the same identity [`validate_alias_rules`] dedups on), returning
+/// the evicted ids for `ConnectionChange::Removed` announcement. Only
+/// `derived_from: Some` rows are touched — two operator rules on one scope
+/// stay a load/add error.
+fn evict_derived_duplicates(rules: &mut RuleSet, from: &Url) -> Vec<ConnectionId> {
+    let key = ovstorage_layer::node_key(from);
+    let mut evicted = Vec::new();
+    rules.aliases.retain(|rule| {
+        if rule.derived_from.is_some() && ovstorage_layer::node_key(&rule.from) == key {
+            evicted.push(rule.id.clone());
+            false
+        } else {
+            true
+        }
+    });
+    evicted
+}
+
+/// Map a backend connection's [`ConnectionSource`] onto the [`AliasSource`] a
+/// rule derived from it carries: the rule's provenance IS the backend
+/// connection's registration (a static connection's derived rules regenerate
+/// from config on every rebuild, a runtime one's from re-adding it), so the
+/// mapping mirrors [`connection_source`] exactly — with `persisted` forced to
+/// `false`, because the RULE is never written anywhere: what persists is the
+/// backend connection it regenerates from.
+fn derived_alias_source(source: &ConnectionSource) -> AliasSource {
+    match source {
+        ConnectionSource::Static { layer } => AliasSource::Static { layer: *layer },
+        ConnectionSource::Runtime { .. } => AliasSource::Runtime { persisted: false },
+        ConnectionSource::BrokerDelivered { broker_principal } => AliasSource::BrokerDelivered {
+            broker_principal: broker_principal.clone(),
+        },
+    }
+}
+
+/// The derived-rule candidates for one backend connection: one **hidden**
+/// `from = spelling → to = advertised root` rule per entry of its
+/// accepted-URL-spellings metadata. Candidates only — installation
+/// ([`AliasWrapper::install_derived_rules`]) still checks each against the
+/// live rule set. Empty when the row carries no spellings, advertises no
+/// address to rewrite onto, or every entry is refused.
+///
+/// Each entry passes [`parse_url`] — the SAME boundary an operator-written
+/// rule crosses, so a foreign plugin stamping the key cannot smuggle in a
+/// query- or fragment-bearing prefix the TOML path refuses. A refused entry
+/// is skipped with a warning rather than poisoning its neighbours.
+fn derived_rules_from_connection(connection: &Connection, owner: &ConnectionKey) -> Vec<AliasRule> {
+    let Some(value) = connection.user_metadata.get(ACCEPTED_URL_SPELLINGS_KEY) else {
+        return Vec::new();
+    };
+    let Some(to) = connection.current_addresses.first() else {
+        tracing::warn!(
+            target = %owner.target,
+            id = %owner.id.0,
+            "connection advertises accepted URL spellings but no address; \
+             no alias rules derived"
+        );
+        return Vec::new();
+    };
+    decode_url_spellings(value)
+        .filter_map(|entry| match parse_url(entry, ACCEPTED_URL_SPELLINGS_KEY) {
+            Ok(from) => Some(AliasRule {
+                id: ConnectionId(fresh_id("alias")),
+                from,
+                to: to.clone(),
+                source: derived_alias_source(&connection.source),
+                display_name: None,
+                user_metadata: UserMetadata::new(),
+                // Hidden is the whole point: addressable, not advertised. A
+                // root is synthesized for every non-suppressed alias, so a
+                // Visible derived rule would multiply what
+                // `list_address_roots` shows per connection.
+                visibility: Some(AddressVisibility::Hidden),
+                derived_from: Some(owner.clone()),
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    target = %owner.target,
+                    id = %owner.id.0,
+                    error = %error.message(),
+                    "skipping an accepted-URL-spellings entry the alias rule \
+                     boundary refuses"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod derived_rule_tests {
+    use super::*;
+
+    fn owner() -> ConnectionKey {
+        ConnectionKey {
+            target: "s3".into(),
+            id: ConnectionId("s3-1".into()),
+        }
+    }
+
+    fn connection_with(spellings: Option<&str>, addresses: &[&str]) -> Connection {
+        let mut user_metadata = UserMetadata::new();
+        if let Some(value) = spellings {
+            user_metadata.insert(ACCEPTED_URL_SPELLINGS_KEY.to_string(), value.to_string());
+        }
+        Connection {
+            id: ConnectionId("s3-1".into()),
+            backend_kind: "s3".into(),
+            display_name: "S3 bucket".into(),
+            source: ConnectionSource::Runtime { persisted: true },
+            capabilities: Capabilities::empty(),
+            current_addresses: addresses.iter().map(|a| Url::parse(a).unwrap()).collect(),
+            auth_state: ConnectionAuthState::Anonymous,
+            last_probed: None,
+            user_metadata,
+            owning_target: Some("s3".into()),
+        }
+    }
+
+    #[test]
+    fn spellings_derive_hidden_rules_onto_the_advertised_root() {
+        let connection = connection_with(
+            Some(
+                "https://bucket.s3.us-west-2.amazonaws.com/\nhttps://s3.us-west-2.amazonaws.com/bucket/",
+            ),
+            &["s3://bucket/"],
+        );
+        let rules = derived_rules_from_connection(&connection, &owner());
+        assert_eq!(rules.len(), 2);
+        for rule in &rules {
+            assert_eq!(rule.to.as_str(), "s3://bucket/");
+            assert_eq!(
+                rule.visibility,
+                Some(AddressVisibility::Hidden),
+                "derived rules are addressable, never advertised"
+            );
+            assert_eq!(rule.derived_from.as_ref(), Some(&owner()));
+            // The rule regenerates from the backend connection; the ROW is
+            // never persisted.
+            assert_eq!(rule.source, AliasSource::Runtime { persisted: false });
+        }
+        assert_eq!(
+            rules[0].from.as_str(),
+            "https://bucket.s3.us-west-2.amazonaws.com/"
+        );
+        assert_eq!(
+            rules[1].from.as_str(),
+            "https://s3.us-west-2.amazonaws.com/bucket/"
+        );
+    }
+
+    /// The spellings value crosses the ABI as an opaque string a foreign
+    /// plugin is free to stamp, so each entry passes the SAME `parse_url`
+    /// boundary an operator-written rule does — and a refused entry is
+    /// skipped, not fatal to its neighbours.
+    #[test]
+    fn a_refused_entry_is_skipped_without_poisoning_its_neighbours() {
+        let connection = connection_with(
+            Some(
+                "https://ok.example/\nhttps://bad.example/?sig=secret\nnot a url\nhttps://also-ok.example/",
+            ),
+            &["s3://bucket/"],
+        );
+        let froms: Vec<String> = derived_rules_from_connection(&connection, &owner())
+            .iter()
+            .map(|rule| rule.from.to_string())
+            .collect();
+        assert_eq!(
+            froms,
+            vec!["https://ok.example/", "https://also-ok.example/"]
+        );
+    }
+
+    #[test]
+    fn no_spellings_or_no_address_derives_nothing() {
+        assert!(
+            derived_rules_from_connection(&connection_with(None, &["s3://bucket/"]), &owner())
+                .is_empty()
+        );
+        assert!(
+            derived_rules_from_connection(
+                &connection_with(Some("https://ok.example/"), &[]),
+                &owner()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn eviction_takes_derived_rules_only_and_matches_the_node() {
+        let derived = derived_rules_from_connection(
+            &connection_with(Some("https://held.example/pub/"), &["s3://bucket/"]),
+            &owner(),
+        );
+        let explicit = AliasRule {
+            id: ConnectionId("explicit".into()),
+            // The other slash spelling of the same node: eviction keys on
+            // `node_key`, exactly the identity the duplicate check uses.
+            from: Url::parse("https://held.example/pub").unwrap(),
+            to: Url::parse("s3://other/").unwrap(),
+            source: AliasSource::Runtime { persisted: false },
+            display_name: None,
+            user_metadata: UserMetadata::new(),
+            visibility: None,
+            derived_from: None,
+        };
+        let mut rules = RuleSet {
+            aliases: derived.clone(),
+            visibility: Vec::new(),
+        };
+        let evicted = evict_derived_duplicates(&mut rules, &explicit.from);
+        assert_eq!(evicted, vec![derived[0].id.clone()]);
+        assert!(rules.aliases.is_empty());
+
+        // An explicit rule is never evicted, whatever scope is asked for.
+        let mut rules = RuleSet {
+            aliases: vec![explicit.clone()],
+            visibility: Vec::new(),
+        };
+        assert!(evict_derived_duplicates(&mut rules, &explicit.from).is_empty());
+        assert_eq!(rules.aliases.len(), 1);
+    }
+
+    /// A derived scope is named in diagnostics by its ORIGIN alone. The scope
+    /// comes from a backend's advertised spellings, which for a custom
+    /// endpoint is the operator's endpoint URL — and an endpoint may carry a
+    /// capability token as a path prefix. `RedactedUrl` keeps the path
+    /// deliberately (it is how an operator identifies an address tree), so it
+    /// is the wrong renderer for this data; `origin_only` is the rule for any
+    /// message naming a route prefix, and `target`/`id` carry the diagnosis.
+    #[test]
+    fn a_derived_scope_is_named_by_origin_only_because_its_path_can_be_a_secret() {
+        let rules = derived_rules_from_connection(
+            &connection_with(
+                Some("https://gateway.example/sas-capability-token/container/"),
+                &["azure://account/container/"],
+            ),
+            &owner(),
+        );
+        let named = origin_only(&rules[0].from);
+        assert_eq!(named, "https://gateway.example");
+        assert!(
+            !named.contains("sas-capability-token"),
+            "a path-carried capability token must not reach a log line: {named}"
+        );
+        // Stated as a contrast, because the difference is the whole point: the
+        // renderer used everywhere else in this file would print it.
+        assert!(
+            RedactedUrl(&rules[0].from)
+                .to_string()
+                .contains("sas-capability-token"),
+            "if this stops being true, the reason this call site differs is gone"
+        );
+    }
+
+    /// A generated rule must not re-open a subtree an operator suppressed.
+    /// [`visibility_of_in`] selects the longest matching prefix, so a derived
+    /// child's intrinsic `Hidden` would outrank a broader `Suppressed` unless
+    /// [`RuleSet::visibility_pairs`] folds the authored answer into it first.
+    #[test]
+    fn a_derived_rule_never_relaxes_an_authored_ancestor_suppression() {
+        let derived = derived_rules_from_connection(
+            &connection_with(
+                Some("https://s3.us-west-2.amazonaws.com/bucket/"),
+                &["s3://bucket/"],
+            ),
+            &owner(),
+        );
+        let suppress_all = VisibilityOverride {
+            id: ConnectionId("suppress".into()),
+            address: Url::parse("https://s3.us-west-2.amazonaws.com/").unwrap(),
+            visibility: AddressVisibility::Suppressed,
+            source: AliasSource::Runtime { persisted: false },
+            display_name: None,
+            user_metadata: UserMetadata::new(),
+        };
+        let under = Url::parse("https://s3.us-west-2.amazonaws.com/bucket/key").unwrap();
+
+        let rules = RuleSet {
+            aliases: derived.clone(),
+            visibility: vec![suppress_all.clone()],
+        };
+        assert_eq!(
+            visibility_of_in(&rules.visibility_pairs(), &under),
+            AddressVisibility::Suppressed,
+            "an address under the generated child inherits the ancestor's denial"
+        );
+
+        // An authored override ON the generated scope still wins: the fold
+        // reads authored entries only, and those are appended after the
+        // derived ones, so the exact-prefix tie breaks toward the operator.
+        let reopen = VisibilityOverride {
+            id: ConnectionId("reopen".into()),
+            address: derived[0].from.clone(),
+            visibility: AddressVisibility::Visible,
+            ..suppress_all.clone()
+        };
+        let rules = RuleSet {
+            aliases: derived.clone(),
+            visibility: vec![suppress_all, reopen],
+        };
+        assert_eq!(
+            visibility_of_in(&rules.visibility_pairs(), &under),
+            AddressVisibility::Visible,
+            "an explicit override on the scope is still the operator's to make"
+        );
+
+        // Nothing authored: the derived rule keeps its own `Hidden`, which is
+        // what makes the generated address reachable but unadvertised.
+        let rules = RuleSet {
+            aliases: derived,
+            visibility: Vec::new(),
+        };
+        assert_eq!(
+            visibility_of_in(&rules.visibility_pairs(), &under),
+            AddressVisibility::Hidden
+        );
+    }
+
+    /// The same denial from an AUTHORED alias's intrinsic visibility rather
+    /// than a standalone override — the fold reads both.
+    #[test]
+    fn an_authored_alias_suppression_also_covers_a_derived_child() {
+        let derived = derived_rules_from_connection(
+            &connection_with(
+                Some("https://s3.us-west-2.amazonaws.com/bucket/"),
+                &["s3://bucket/"],
+            ),
+            &owner(),
+        );
+        let authored = AliasRule {
+            id: ConnectionId("authored".into()),
+            from: Url::parse("https://s3.us-west-2.amazonaws.com/").unwrap(),
+            to: Url::parse("s3://other/").unwrap(),
+            source: AliasSource::Runtime { persisted: false },
+            display_name: None,
+            user_metadata: UserMetadata::new(),
+            visibility: Some(AddressVisibility::Suppressed),
+            derived_from: None,
+        };
+        let rules = RuleSet {
+            aliases: derived.into_iter().chain([authored]).collect(),
+            visibility: Vec::new(),
+        };
+        assert_eq!(
+            visibility_of_in(
+                &rules.visibility_pairs(),
+                &Url::parse("https://s3.us-west-2.amazonaws.com/bucket/key").unwrap(),
+            ),
+            AddressVisibility::Suppressed
+        );
+    }
+
+    /// The derived-rule row carries its provenance for `list_connections`
+    /// readers, alongside the ordinary alias contract keys.
+    #[test]
+    fn the_connection_view_of_a_derived_rule_declares_its_provenance() {
+        let rules = derived_rules_from_connection(
+            &connection_with(Some("https://held.example/"), &["s3://bucket/"]),
+            &owner(),
+        );
+        let view = alias_connection(&rules[0], "alias");
+        assert_eq!(
+            view.user_metadata
+                .get(ALIAS_DERIVED_FROM_KEY)
+                .map(String::as_str),
+            Some("s3/s3-1")
+        );
+        assert_eq!(
+            view.user_metadata.get(ALIAS_TO_KEY).map(String::as_str),
+            Some("s3://bucket/")
+        );
+        assert_eq!(
+            view.user_metadata
+                .get(ALIAS_VISIBILITY_KEY)
+                .map(String::as_str),
+            Some("hidden")
+        );
+    }
+
+    /// The provenance key is as reserved as its two siblings: a patch writing
+    /// it is refused rather than either forging "generated" onto an authored
+    /// rule or returning `Ok` for a write projection silently overwrites.
+    #[test]
+    fn the_provenance_key_is_reserved_against_patching() {
+        for key in [ALIAS_TO_KEY, ALIAS_VISIBILITY_KEY, ALIAS_DERIVED_FROM_KEY] {
+            let mut patch = AttributePatch::default();
+            patch
+                .user_metadata
+                .insert(key.to_string(), Some("forged".into()));
+            let error = apply_presentation_patch(&mut None, &mut UserMetadata::new(), &patch)
+                .expect_err("a wrapper-managed key must not be patchable");
+            assert_eq!(error.code(), ErrorCode::InvalidArgument, "{key}");
+            assert!(error.message().contains(key), "{}", error.message());
+        }
+        // An ordinary key still patches, so the guard is about the contract
+        // keys and not about metadata patching in general.
+        let mut patch = AttributePatch::default();
+        patch
+            .user_metadata
+            .insert("note".to_string(), Some("mine".into()));
+        let mut metadata = UserMetadata::new();
+        apply_presentation_patch(&mut None, &mut metadata, &patch).unwrap();
+        assert_eq!(metadata.get("note").map(String::as_str), Some("mine"));
+    }
+
+    /// The scheme-fallback marker is reserved on a different ground from the
+    /// three wrapper keys: the shared route table treats a marked hostless
+    /// root as the catch-all for its scheme, so a patch able to write the
+    /// marker onto a projected root would turn an ordinary alias into a
+    /// scheme-wide fallback the operator never granted.
+    #[test]
+    fn a_presentation_patch_cannot_set_the_scheme_fallback_marker() {
+        let mut metadata = UserMetadata::new();
+        let mut patch = AttributePatch::default();
+        patch.user_metadata.insert(
+            SCHEME_FALLBACK_KEY.to_string(),
+            Some(ovstorage_plugin::fallback::SCHEME_FALLBACK_ANONYMOUS.into()),
+        );
+        let error = apply_presentation_patch(&mut Some("kept".into()), &mut metadata, &patch)
+            .expect_err("the scheme-fallback marker must not be patchable");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(
+            error.message().contains(SCHEME_FALLBACK_KEY),
+            "{}",
+            error.message()
+        );
+        assert!(metadata.is_empty(), "a refused patch writes nothing");
+
+        // The guard is on the key, not on the value: a removal of the marker
+        // is refused the same way, so a caller cannot probe for its presence.
+        let mut patch = AttributePatch::default();
+        patch
+            .user_metadata
+            .insert(SCHEME_FALLBACK_KEY.to_string(), None);
+        assert_eq!(
+            apply_presentation_patch(&mut None, &mut metadata, &patch)
+                .expect_err("removing the marker is refused too")
+                .code(),
+            ErrorCode::InvalidArgument
+        );
     }
 }
 
@@ -1328,7 +2336,7 @@ impl WrapperFactory for AliasWrapperFactory {
         name: &str,
         config: &LayerConfig,
         inner: LayerHandle,
-        _cancel: Option<CancellationToken>,
+        cancel: Option<CancellationToken>,
     ) -> Result<LayerHandle> {
         // Injected in-process rules win over the TOML config keys (the same
         // injected-beats-config precedence the cache wrappers use). The rules
@@ -1397,6 +2405,7 @@ impl WrapperFactory for AliasWrapperFactory {
                     // `visibility` overrides, so the
                     // rule itself carries no intrinsic visibility.
                     visibility: None,
+                    derived_from: None,
                 })
                 .collect(),
             visibility: visibility
@@ -1411,12 +2420,21 @@ impl WrapperFactory for AliasWrapperFactory {
                 })
                 .collect(),
         };
-        Ok(Arc::new(AliasWrapper::new(
+        let wrapper = Arc::new(AliasWrapper::new(
             name.to_string(),
             self.descriptor(),
             inner,
             rules,
-        )))
+        ));
+        // Adopt the backend connections that already exist below (a backend
+        // factory seeds a static connection from its own layer config before
+        // this wrapper wraps it), deriving hidden alias rules from any that
+        // advertise accepted URL spellings. Connections registered
+        // AFTER this point flow through the wrapper's own `add_connection`,
+        // which carries the matching hook — so each connection is derived
+        // from exactly once.
+        wrapper.adopt_preexisting_connections(cancel).await?;
+        Ok(wrapper)
     }
 }
 
@@ -1502,6 +2520,78 @@ struct AliasWrapper {
     /// wrapper spawns: cancelled on drop, so a task blocked on a stalled
     /// `inner.list_address_roots` cannot outlive the layer that owns it.
     shutdown: CancellationToken,
+    /// The backend connections whose derived rules are being generated right
+    /// now, each mapped to whether a removal of that same connection has since
+    /// committed.
+    ///
+    /// Derivation spans awaits: the delegated `add_connection` returns, then
+    /// the wrapper lists `inner`'s connections before committing the generated
+    /// rules. A `remove_connection` for that connection inside that window
+    /// runs its withdrawal against a rule set the derived rules are not in
+    /// yet, so it withdraws nothing — and the install behind it then commits
+    /// rules for a connection that no longer exists, dangling until the same
+    /// connection happens to re-register. The withdrawal marks the entry
+    /// instead, and the install re-reads the mark, both from inside their own
+    /// `rules.commit` closures: whichever order the rule-set guard grants,
+    /// the loser sees the winner's effect.
+    ///
+    /// An entry lives only for the span of one derivation, so this never
+    /// accumulates. Taken either while no rule-set guard is held or from
+    /// inside a commit closure, never the reverse, so the two locks have one
+    /// order and cannot deadlock.
+    derivations: Mutex<HashMap<String, bool>>,
+    /// Serializes this wrapper's own rule mutations end to end.
+    ///
+    /// [`Sequenced`] already makes each individual swap atomic, which is
+    /// enough while a mutation IS its commit. The explicit-alias add is not:
+    /// it prechecks, then evicts inner derived copies across an await, then
+    /// commits — and the commit re-runs the rejections authoritatively, so a
+    /// mutation landing in between can make it reject after the eviction has
+    /// already deleted rows. A derived copy regenerates only when its backend
+    /// connection re-registers, so that would leave a refused add having
+    /// permanently changed live routing. Holding this across the whole
+    /// sequence makes the precheck's answer still true at the commit.
+    ///
+    /// Async, because it is held across the eviction's inner calls — bounded
+    /// by [`INNER_CONNECTION_SCAN_TIMEOUT`]. Acquired only by this wrapper's
+    /// own mutation paths and never while a rule guard is held, and the
+    /// eviction it covers calls strictly downward into `inner`, so there is no
+    /// cycle to deadlock on.
+    mutations: tokio::sync::Mutex<()>,
+}
+
+/// The `ConnectionKey` a backend row's derived rules are owned by, and the
+/// key this wrapper's removals will arrive under. `owning_target` is the
+/// authoritative half when the row declares it; otherwise the target the
+/// registration was addressed to.
+fn derived_owner(connection: &Connection, requested_target: &str) -> ConnectionKey {
+    ConnectionKey {
+        target: connection
+            .owning_target
+            .clone()
+            .unwrap_or_else(|| requested_target.to_string()),
+        id: connection.id.clone(),
+    }
+}
+
+/// The in-flight-derivation table's key: the same `target/id` spelling the
+/// provenance metadata ([`ALIAS_DERIVED_FROM_KEY`]) uses.
+fn derivation_key(owner: &ConnectionKey) -> String {
+    format!("{}/{}", owner.target, owner.id.0)
+}
+
+/// Holds one derivation's entry in [`AliasWrapper::derivations`] open, and
+/// drops it however the derivation ends. Handed out by
+/// [`AliasWrapper::begin_derivation`].
+struct DerivationGuard<'a> {
+    wrapper: &'a AliasWrapper,
+    key: String,
+}
+
+impl Drop for DerivationGuard<'_> {
+    fn drop(&mut self) {
+        self.wrapper.derivations.lock().remove(&self.key);
+    }
 }
 
 impl Drop for AliasWrapper {
@@ -1524,6 +2614,12 @@ struct ResolvedAddress {
     /// replacement). `None` when no rewrite applied, or if the rule vanished
     /// between the walk and the source lookup within the same snapshot.
     first_hop_source: Option<AliasSource>,
+    /// Visibility rules captured by [`AliasWrapper::resolve`] from the same
+    /// atomic rule snapshot used for suppression and alias resolution. Keeping
+    /// the pairs here lets `root_info_for` evaluate the actual caller-facing
+    /// root after the inner lookup without re-locking and observing newer
+    /// rules than the dispatch used.
+    visibility: Vec<(Url, AddressVisibility)>,
 }
 
 impl AliasWrapper {
@@ -1541,7 +2637,20 @@ impl AliasWrapper {
             // deferred one; see the `rules` field.
             rules: Sequenced::broadcast(Arc::new(rules), 16, 16),
             shutdown: CancellationToken::new(),
+            derivations: Mutex::new(HashMap::new()),
+            mutations: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Open the in-flight window for `owner`'s derivation, before the first
+    /// await a concurrent removal could land in. The returned guard closes it
+    /// on drop — including on an unwind, so a panicking derivation cannot
+    /// strand an entry that a later removal would then mark. See the
+    /// `derivations` field.
+    fn begin_derivation(&self, owner: &ConnectionKey) -> DerivationGuard<'_> {
+        let key = derivation_key(owner);
+        self.derivations.lock().insert(key.clone(), false);
+        DerivationGuard { wrapper: self, key }
     }
 
     /// A consistent snapshot of the current rule set (a cheap `Arc` clone). The
@@ -1580,10 +2689,13 @@ impl AliasWrapper {
         // per dispatch. The rule set is atomically swapped under an `RwLock`, so
         // a cache would need its own invalidation keyed to the swap; deferred as
         // a straightforward-but-not-trivial follow-up (the clones are small).
-        if visibility_of_in(&rules.visibility_pairs(), addr) == AddressVisibility::Suppressed {
+        let visibility = rules.visibility_pairs();
+        if visibility_of_in(&visibility, addr) == AddressVisibility::Suppressed {
             return Err(Error::new(ErrorCode::NoRoute, "no route matches address"));
         }
-        self.walk_chain_async(&rules, addr, cancel).await
+        let mut resolved = self.walk_chain_async(&rules, addr, cancel).await?;
+        resolved.visibility = visibility;
+        Ok(resolved)
     }
 
     /// Async twin of the synchronous [`walk_chain`]: identical per-hop
@@ -1606,7 +2718,10 @@ impl AliasWrapper {
         addr: &Url,
         cancel: Option<CancellationToken>,
     ) -> Result<ResolvedAddress> {
-        let pairs = rules.alias_pairs();
+        // The caller's own address decides this, once: every hop carries the
+        // same query forward, so a rule that may not answer the address may
+        // not answer anything it rewrites to either.
+        let pairs = rules.alias_pairs_for(addr);
         let mut current = addr.clone();
         let mut hops: Vec<(Url, Url)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -1651,6 +2766,10 @@ impl AliasWrapper {
             address: current,
             hops,
             first_hop_source: None,
+            // `resolve` fills this from the same snapshot after the walk. The
+            // auth/ownership callers of this lower-level helper do not project
+            // caller-facing root metadata.
+            visibility: Vec::new(),
         };
         // Capture the first applied hop's source from the SAME snapshot
         // so `root_info_for` needn't re-lock and re-scan the rules.
@@ -1729,11 +2848,12 @@ impl AliasWrapper {
     /// root set (both projected against `inner`'s current roots via the same
     /// [`project_advertised_roots`] the snapshot uses) and broadcast the delta.
     /// Projecting through that helper is what keeps the emission leak-proof:
-    /// suppressed/hidden namespaces are already filtered out, so a `Removed`
-    /// event can only ever carry advertised (non-suppressed) roots. Re-querying
-    /// `inner` here (rather than tracking its roots) also folds in chain
-    /// interactions — a distant alias flipping Live↔Dangling shows up as an
-    /// `Updated`. Nothing is emitted when the projection is unchanged.
+    /// suppressed namespaces are already filtered out, so delta events can
+    /// only carry advertised (visible or marked-hidden) roots. Re-querying
+    /// `inner` here (rather than tracking its roots) also folds in visibility
+    /// flips and chain interactions — Visible↔Hidden and a distant alias
+    /// flipping Live↔Dangling show up as `Updated`. Nothing is emitted when
+    /// the projection is unchanged.
     ///
     /// Takes owned state rather than `&self` because it runs detached; see
     /// [`AliasWrapper::notify_root_change`].
@@ -1878,6 +2998,499 @@ impl AliasWrapper {
             .into_iter()
             .flatten(),
         );
+    }
+
+    /// One-shot adoption of the backend connections that already exist below
+    /// this wrapper when it is built — the config-as-Stack path, where a
+    /// backend factory seeds a static connection from its own layer config
+    /// and no `add_connection` ever crosses this wrapper for it. Runs once
+    /// from `create_wrapper`; everything registered later flows through the
+    /// delegated `add_connection` hook instead, so a connection is derived
+    /// from exactly once.
+    ///
+    /// Best-effort like the rest of derivation: an inner layer that cannot
+    /// list its connections costs the generated aliases, never the build.
+    /// `inner.list_connections` for the derived-alias paths: bounded by
+    /// [`INNER_CONNECTION_SCAN_TIMEOUT`] and scoped to a child token, so an
+    /// unresponsive inner layer costs a bounded wait rather than an unbounded
+    /// one. The child token is cancelled on expiry, so a cooperative layer
+    /// stops working on a request nobody is waiting for any more.
+    ///
+    /// The budget is dropped when there is no Tokio runtime — `Layer` does not
+    /// require one, and the plugin test harness drives these slots under
+    /// `futures::executor::block_on`, where `tokio::time::timeout` would panic.
+    /// A caller that supplied no runtime chose an unbounded wait, the same way
+    /// the root-change notification treats that case.
+    async fn scan_inner_connections(
+        &self,
+        cancel: Option<CancellationToken>,
+    ) -> Result<Vec<Connection>> {
+        let scan_cancel = match &cancel {
+            Some(token) => token.child_token(),
+            None => CancellationToken::new(),
+        };
+        let cx = Extensions::new();
+        let query = self.inner.list_connections(&cx, Some(scan_cancel.clone()));
+        let budget = tokio::runtime::Handle::try_current()
+            .is_ok()
+            .then_some(INNER_CONNECTION_SCAN_TIMEOUT);
+        let queried = match budget {
+            Some(budget) => match tokio::time::timeout(budget, query).await {
+                Ok(result) => result,
+                Err(_) => {
+                    scan_cancel.cancel();
+                    Err(Error::new(
+                        ErrorCode::DeadlineExceeded,
+                        format!(
+                            "the inner layer did not answer list_connections within {budget:?}"
+                        ),
+                    ))
+                }
+            },
+            None => query.await,
+        };
+        queried.map(|(snapshot, _updates)| snapshot.connections)
+    }
+
+    async fn adopt_preexisting_connections(&self, cancel: Option<CancellationToken>) -> Result<()> {
+        // The update stream is dropped: later registrations cross this
+        // wrapper's own vtable, which is the hook that covers them.
+        let connections = match self.scan_inner_connections(cancel.clone()).await {
+            Ok(connections) => connections,
+            // A cancelled BUILD is not a degraded build. Everything else here
+            // is best-effort — generation is a convenience and must never cost
+            // the wrapper — but returning `Ok` from a build whose token fired
+            // would hand back a partially-configured wrapper under the
+            // contract that says a cancelled build fails, and the caller has
+            // no way to tell the two apart. So this one error is propagated
+            // and the rest still degrade to "no rules derived".
+            Err(error) if error.code() == ErrorCode::Cancelled => return Err(error),
+            Err(error) => {
+                tracing::debug!(
+                    error = %error.message(),
+                    "alias wrapper could not scan inner connections for \
+                     accepted URL spellings; no alias rules derived for \
+                     pre-existing connections"
+                );
+                return Ok(());
+            }
+        };
+        for connection in &connections {
+            if !connection
+                .user_metadata
+                .contains_key(ACCEPTED_URL_SPELLINGS_KEY)
+            {
+                continue;
+            }
+            let Some(target) = connection.owning_target.as_deref() else {
+                // Without an owning target there is no `ConnectionKey` a
+                // removal could ever arrive under, so a rule derived here
+                // would be unwithdrawable.
+                tracing::warn!(
+                    id = %connection.id.0,
+                    "connection advertises accepted URL spellings but no \
+                     owning target; no alias rules derived"
+                );
+                continue;
+            };
+            let owner = derived_owner(connection, target);
+            let _derivation = self.begin_derivation(&owner);
+            self.install_derived_rules(connection, &owner, &connections, cancel.clone())
+                .await;
+            // Checked per adopted connection rather than once at the end: the
+            // installs above are awaits too, so a token that fires partway
+            // through leaves the wrapper half-adopted, which is the state the
+            // build contract says must not be handed back as success.
+            bail_if_cancelled(&cancel)?;
+        }
+        Ok(())
+    }
+
+    /// Install the hidden derived rules for a backend connection that just
+    /// registered through this wrapper (or was adopted by the build-time
+    /// scan). Infallible by design — generation is a convenience and must
+    /// never fail or unwind the registration it rides on — so every refused
+    /// spelling degrades to a warning: a scope some existing rule already
+    /// covers is skipped (explicit rules and first-registered connections
+    /// win), and a spelling that would break chain validity is skipped
+    /// individually rather than poisoning its siblings.
+    ///
+    /// **Stacked alias wrappers install each derived rule exactly once, at the
+    /// innermost wrapper.** A registration delegates through every wrapper on
+    /// the path (innermost hook first), and the build-time scan runs bottom-up,
+    /// so by the time an OUTER wrapper derives, any inner alias layer that owns
+    /// the scope already lists an alias-kind row on it — the `inner_rows`
+    /// pre-filter below skips those spellings. Without it every wrapper
+    /// installed its own copy: the extra copies could never fire (the inner
+    /// wrapper's synthesized alias root covers the scope at equal specificity,
+    /// which interrupts the outer chain), but they defeated eviction — an
+    /// explicit rule evicted only the local copy while the surviving inner copy
+    /// kept answering, routing past the operator's rewrite. The pre-filter keys
+    /// on inner alias-kind rows rather than `root_info_for` so an inner
+    /// visibility override on the scope (a suppression) also counts as
+    /// ownership rather than reading as "no route" and re-opening the scope one
+    /// layer up.
+    ///
+    /// **A local EXPLICIT rule on a candidate's scope evicts downstream too.**
+    /// The registration can arrive with the operator's rule already in place —
+    /// added at runtime before the backend connected, or seeded from this
+    /// wrapper's own `aliases` TOML (wrappers build bottom-up, so an inner
+    /// wrapper has already derived by the time this one adopts). In both
+    /// orderings the inner derived copy would cover the scope at equal
+    /// specificity and silently defeat the rule, exactly as an
+    /// after-the-fact copy would — so those scopes are not only skipped here,
+    /// they get the same post-commit [`Self::evict_downstream_derived`] the
+    /// explicit-rule-added-later path runs.
+    ///
+    /// `inner_rows` is a snapshot of the inner graph's connections, supplied by
+    /// the caller so the adoption scan's one listing serves both its own loop
+    /// and every pre-filter. An empty slice means "no inner alias layer owns
+    /// any of these scopes" — a real answer, and the correct one when the
+    /// inner graph genuinely has no alias rows.
+    ///
+    /// It does NOT mean "the scan failed". Both callers withhold derivation
+    /// entirely on a failed scan rather than passing an empty slice, because
+    /// the pre-filter below is what keeps this wrapper from re-deriving a
+    /// scope an inner wrapper owns — a suppression included — and an absent
+    /// answer is not evidence that nobody owns it.
+    async fn install_derived_rules(
+        &self,
+        connection: &Connection,
+        owner: &ConnectionKey,
+        inner_rows: &[Connection],
+        cancel: Option<CancellationToken>,
+    ) {
+        let mut candidates = derived_rules_from_connection(connection, owner);
+        if candidates.is_empty() {
+            return;
+        }
+        // Scopes one of THIS wrapper's explicit rules already owns: the
+        // operator's rewrite predates the registration, so nothing is derived
+        // for them anywhere — not here, and not at an inner wrapper that
+        // derived before this call (evicted below, after the commit).
+        let local = self.current_rules();
+        let mut takeover_scopes: Vec<Url> = Vec::new();
+        candidates.retain(|rule| {
+            let scope = ovstorage_layer::node_key(&rule.from);
+            let taken = local.aliases.iter().any(|existing| {
+                existing.derived_from.is_none()
+                    && ovstorage_layer::node_key(&existing.from) == scope
+            });
+            if taken {
+                tracing::debug!(
+                    scope = %origin_only(&rule.from),
+                    target = %owner.target,
+                    id = %owner.id.0,
+                    "an explicit rule here already owns this scope; not \
+                     deriving, and evicting any inner derived copy"
+                );
+                takeover_scopes.push(rule.from.clone());
+            }
+            !taken
+        });
+        // Scopes an inner alias layer already owns (any alias-kind row — an
+        // explicit or derived rule, or a visibility override).
+        let owned: Vec<&Url> = inner_rows
+            .iter()
+            .filter(|row| row.backend_kind == ALIAS_KIND)
+            .filter_map(|row| row.current_addresses.first())
+            .collect();
+        candidates.retain(|rule| {
+            let scope = ovstorage_layer::node_key(&rule.from);
+            let keep = !owned
+                .iter()
+                .any(|address| ovstorage_layer::node_key(address) == scope);
+            if !keep {
+                tracing::debug!(
+                    scope = %origin_only(&rule.from),
+                    target = %owner.target,
+                    id = %owner.id.0,
+                    "an inner alias layer already owns this scope; \
+                     not deriving a second copy"
+                );
+            }
+            keep
+        });
+        self.install_candidates(candidates, owner).await;
+        // Best-effort HERE, unlike the explicit-add path: derivation rides on a
+        // registration that already committed and has no caller of its own to
+        // report to, and the operator's rule is already winning locally. The
+        // warning inside names the scopes.
+        let _ = self
+            .evict_downstream_derived(&takeover_scopes, cancel)
+            .await;
+    }
+
+    /// The commit half of [`Self::install_derived_rules`]: same discipline as
+    /// `add_connection`'s local arm — dedup + validation + swap + sends are
+    /// one critical section, and the root delta is ticketed under the guard.
+    async fn install_candidates(&self, candidates: Vec<AliasRule>, owner: &ConnectionKey) {
+        if candidates.is_empty() {
+            return;
+        }
+        let key = derivation_key(owner);
+        // Derived installs take the same serialization: they are rule
+        // mutations too, and one landing inside an explicit add's sequence
+        // could invalidate the candidate it already evicted for.
+        let mutation = self.mutations.lock().await;
+        let committed = self.rules.commit(|rules, commit| {
+            // Read under the same guard that serializes the withdrawal's own
+            // commit: a removal of this connection that got there first has
+            // already set the mark, and these rules would be born orphaned.
+            if self.derivations.lock().get(&key).copied() == Some(true) {
+                tracing::debug!(
+                    target = %owner.target,
+                    id = %owner.id.0,
+                    "the connection was removed while its aliases were being \
+                     derived; installing none"
+                );
+                return None;
+            }
+            let old: Arc<RuleSet> = rules.clone();
+            let mut candidate = (*old).clone();
+            let mut installed: Vec<AliasRule> = Vec::new();
+            for rule in candidates {
+                let scope = ovstorage_layer::node_key(&rule.from);
+                if candidate
+                    .aliases
+                    .iter()
+                    .any(|existing| ovstorage_layer::node_key(&existing.from) == scope)
+                {
+                    tracing::warn!(
+                        scope = %origin_only(&rule.from),
+                        target = %owner.target,
+                        id = %owner.id.0,
+                        "skipping a derived alias whose scope an existing \
+                         rule already covers"
+                    );
+                    continue;
+                }
+                candidate.aliases.push(rule.clone());
+                if let Err(error) = validate_alias_rules(&candidate.alias_pairs()) {
+                    candidate.aliases.pop();
+                    tracing::warn!(
+                        scope = %origin_only(&rule.from),
+                        target = %owner.target,
+                        id = %owner.id.0,
+                        error = %error.message(),
+                        "skipping a derived alias the rule set refuses"
+                    );
+                    continue;
+                }
+                installed.push(rule);
+            }
+            if installed.is_empty() {
+                // Nothing changed: no swap, no events, no ticket.
+                return None;
+            }
+            let new = Arc::new(candidate);
+            *rules = Arc::clone(&new);
+            for rule in &installed {
+                commit.send(ConnectionChange::Added(alias_connection(rule, &self.name)));
+            }
+            Some((old, new, commit.defer()))
+        });
+        drop(mutation);
+        if let Some((old, new, deferred)) = committed {
+            self.notify_root_change(deferred, old, new).await;
+        }
+    }
+
+    /// Withdraw every derived rule keyed to `owner` — the inverse of
+    /// [`Self::install_derived_rules`], run after a delegated
+    /// `remove_connection` succeeds. Matching is on the full `(target, id)`
+    /// key: ids are unique only within an owner, so an id-only match could
+    /// withdraw rules derived from a different layer's connection.
+    async fn withdraw_derived_rules(&self, owner: &ConnectionKey) {
+        let key = derivation_key(owner);
+        let mutation = self.mutations.lock().await;
+        let committed = self.rules.commit(|rules, commit| {
+            // Marked under the guard, before anything is read: a derivation
+            // for this connection still in flight commits after this one and
+            // will see the mark, so the rules it would have installed for a
+            // connection that no longer exists are never installed. A
+            // derivation that already committed is withdrawn below instead —
+            // the two orderings are decided here, not by which task is faster.
+            if let Some(removed) = self.derivations.lock().get_mut(&key) {
+                *removed = true;
+            }
+            let old: Arc<RuleSet> = rules.clone();
+            let mut candidate = (*old).clone();
+            let mut removed: Vec<ConnectionId> = Vec::new();
+            candidate.aliases.retain(|rule| {
+                if rule.derived_from.as_ref() == Some(owner) {
+                    removed.push(rule.id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if removed.is_empty() {
+                return None;
+            }
+            // Mirrors `remove_connection`'s post-remove re-validation: removing
+            // a more-specific rule can unmask a cycle it shielded. Unlike
+            // there, a caller-facing refusal is not available — the backend
+            // connection is already gone — so the safe degradation is to KEEP
+            // the derived rules (they advertise as `Dangling`, which is a
+            // legal state) rather than commit an invalid set. That outcome is
+            // an operator-visible one, so it is named in the generated-alias
+            // section of `docs/public/configuration.md`: the rows stay listed
+            // against a connection that is gone, and removing one by its own
+            // id is the way out once the authored cycle is corrected.
+            if let Err(error) = validate_alias_rules(&candidate.alias_pairs()) {
+                tracing::warn!(
+                    target = %owner.target,
+                    id = %owner.id.0,
+                    error = %error.message(),
+                    "withdrawing this connection's derived aliases would \
+                     leave an invalid rule set; keeping them as dangling"
+                );
+                return None;
+            }
+            let new = Arc::new(candidate);
+            *rules = Arc::clone(&new);
+            for id in removed {
+                commit.send(ConnectionChange::Removed { id });
+            }
+            Some((old, new, commit.defer()))
+        });
+        drop(mutation);
+        if let Some((old, new, deferred)) = committed {
+            self.notify_root_change(deferred, old, new).await;
+        }
+    }
+
+    /// Evict every DERIVED rule an inner alias layer holds on any of
+    /// `scopes` — the cross-wrapper half of "explicit beats derived", run
+    /// after this wrapper commits an explicit rule on those scopes. The inner
+    /// rows are located by the provenance contract itself
+    /// ([`ALIAS_DERIVED_FROM_KEY`] plus the alias row's
+    /// `current_addresses[0] = from`) and removed through the ordinary
+    /// connection vtable, so intermediate wrappers route the removal by
+    /// target name exactly as an operator's own removal would. One inner
+    /// listing serves the whole scope set, so a registration that finds
+    /// several of its spellings taken over does not re-walk the inner graph
+    /// per scope.
+    ///
+    /// Best-effort, like every other derived-rule action: a failure leaves the
+    /// explicit rule installed but shadowed by the surviving inner copy, which
+    /// the warning names. Only rows carrying the derived marker are touched —
+    /// an inner EXPLICIT rule on the same scope is an operator's own and keeps
+    /// the standing stacked-alias semantics (the inner rule wins at equal
+    /// specificity).
+    async fn evict_downstream_derived(
+        &self,
+        scopes: &[Url],
+        cancel: Option<CancellationToken>,
+    ) -> Result<()> {
+        if scopes.is_empty() {
+            return Ok(());
+        }
+        let connections = match self.scan_inner_connections(cancel.clone()).await {
+            Ok(connections) => connections,
+            Err(error) => {
+                // Name the scopes: this warning is the only trace an operator
+                // gets that a specific rule of theirs may be silently
+                // shadowed by a surviving inner derived copy.
+                let named: Vec<String> = scopes.iter().map(origin_only).collect();
+                tracing::warn!(
+                    scopes = ?named,
+                    error = %error.message(),
+                    "could not scan inner connections for derived aliases on \
+                     these explicitly-owned scopes; an inner derived copy may \
+                     shadow the explicit rule"
+                );
+                // Warned, not failed. A scan failure says nothing about
+                // whether a derived copy exists to evict, and the overwhelming
+                // majority of stacks have no inner alias layer at all — so
+                // failing here would turn an unrelated inner hiccup into a
+                // refusal of a purely local address rewrite, and at build time
+                // into a failed build. The failure that IS diagnostic is a
+                // removal that could not be performed on a row this found:
+                // there the shadow is known to exist, and that one is fatal to
+                // the add below.
+                return Ok(());
+            }
+        };
+        let mut failures = 0usize;
+        for row in &connections {
+            if row.backend_kind != ALIAS_KIND
+                || !row.user_metadata.contains_key(ALIAS_DERIVED_FROM_KEY)
+            {
+                continue;
+            }
+            let Some(rule_from) = row.current_addresses.first() else {
+                continue;
+            };
+            let covers = scopes.iter().any(|scope| {
+                ovstorage_layer::node_key(scope) == ovstorage_layer::node_key(rule_from)
+            });
+            if !covers {
+                continue;
+            }
+            let Some(target) = row.owning_target.clone() else {
+                continue;
+            };
+            let key = ConnectionKey {
+                target,
+                id: row.id.clone(),
+            };
+            if let Err(error) = self
+                .inner
+                .remove_connection(Request::new(key.clone()), cancel.clone())
+                .await
+            {
+                failures += 1;
+                tracing::warn!(
+                    scope = %origin_only(rule_from),
+                    target = %key.target,
+                    id = %key.id.0,
+                    error = %error.message(),
+                    "could not evict an inner derived alias on this scope; it \
+                     shadows the explicit rule"
+                );
+            }
+        }
+        // The loop runs to completion before reporting: one unreachable inner
+        // layer must not leave the other scopes' derived copies in place too.
+        if failures > 0 {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                format!(
+                    "{failures} inner derived alias(es) on an explicitly-owned \
+                     scope could not be evicted"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The rejections the commit will apply, run against a snapshot before any
+    /// side effect leaves this wrapper.
+    ///
+    /// Advisory by construction: the commit re-runs them under the write
+    /// guard, which is where they are authoritative against a concurrent
+    /// mutation. This exists so a rule that is going to be refused does not
+    /// first evict an inner derived copy — which regenerates only when its
+    /// backend connection re-registers, so evicting for a rule that never
+    /// lands costs a spelling until then.
+    fn precheck_alias_candidate(&self, id: &ConnectionId, from: &Url, to: &Url) -> Result<()> {
+        let rules = self.current_rules();
+        if rules.contains_id(id) {
+            return Err(Error::new(
+                ErrorCode::AlreadyExists,
+                format!("connection id `{}` already exists", id.0),
+            ));
+        }
+        // Mirrors the commit's own candidate: the local derived copies this
+        // rule evicts are dropped first, so a scope a derived rule holds does
+        // not read as a duplicate `from`.
+        let mut candidate = (*rules).clone();
+        evict_derived_duplicates(&mut candidate, from);
+        let mut pairs = candidate.alias_pairs();
+        pairs.push((from.clone(), to.clone()));
+        validate_alias_rules(&pairs)
     }
 
     /// Preconditions shared by `probe` and `add_connection`, so a green probe
@@ -2063,8 +3676,13 @@ fn project_delegated_connection(
     rule: &AliasRule,
     hops: &[(Url, Url)],
     backend: Connection,
+    target: &str,
 ) -> Result<Connection> {
-    let mut projected = alias_connection(rule);
+    // The ALIAS name, never the backend's. This row keeps the alias identity
+    // throughout, so a caller building a `ConnectionKey` from it must reach the
+    // rule; inheriting the backend's target here would aim a removal at the
+    // physical connection the alias conceals.
+    let mut projected = alias_connection(rule, target);
     // A failure-bearing auth state carries an `ErrorContext::Auth
     // { connection_id }` (and physical-URL free text) naming the physical
     // backend; re-project every such error to the alias id so the connection
@@ -2129,13 +3747,19 @@ fn project_auth_events(
     rule: AliasRule,
     hops: Vec<(Url, Url)>,
     stream: AuthEventStream,
+    target: String,
 ) -> AuthEventStream {
     Box::new(stream.map(move |event| match event {
         Ok(AuthEvent::Succeeded {
             connection,
             credentials: _,
         }) => Ok(AuthEvent::Succeeded {
-            connection: Box::new(project_delegated_connection(&rule, &hops, *connection)?),
+            connection: Box::new(project_delegated_connection(
+                &rule,
+                &hops,
+                *connection,
+                &target,
+            )?),
             credentials: None,
         }),
         Ok(AuthEvent::Failed { error }) => Ok(AuthEvent::Failed {
@@ -2204,19 +3828,35 @@ impl Layer for AliasWrapper {
             .root_info_for(&resolved.address, cx, cancel)
             .await;
         // Not rewritten — no matching alias, or one outweighed by a more
-        // specific real route — the inner root is already
-        // caller-facing, so it passes through (errors included).
+        // specific real route. Combine the inner marker with the local rule at
+        // the root the child actually reports, matching the direct-root
+        // projection in `list_address_roots`. The most-restrictive combine
+        // prevents a local `Visible` rule from widening an incoming `Hidden`
+        // or `Suppressed` root.
         let Some((from, to)) = resolved.hops.first() else {
-            return inner_info;
+            return inner_info.map(|mut info| {
+                let visibility = most_restrictive_visibility(
+                    info.visibility,
+                    visibility_of_in(&resolved.visibility, &info.root),
+                );
+                info.visibility = visibility;
+                info.visible = visibility == AddressVisibility::Visible;
+                info
+            });
         };
         // Rewritten: present the caller-facing alias root of the FIRST hop +
-        // `Alias` source/state, mirroring the alias synthesis in
-        // `list_address_roots` — including for a dangling chain (`NoRoute`
-        // from the inner stack), which reports the same synthesized bare
-        // alias root the advertisement lists, so the two introspection paths
-        // agree.
+        // `Alias` source/state. `list_address_roots` advertises aliases only
+        // when their terminal is `Live`; a direct query still reports a bare,
+        // `Dangling` alias root for `NoRoute` from the inner stack so operators
+        // can diagnose an unresolved local alias.
         let (mut info, state) = match inner_info {
-            Ok(info) => (info, AliasState::Live),
+            Ok(info) => {
+                let state = match info.alias_state.as_ref() {
+                    Some(state) if !matches!(state, AliasState::Live) => state.clone(),
+                    _ => AliasState::Live,
+                };
+                (info, state)
+            }
             Err(error) if error.code() == ErrorCode::NoRoute => {
                 (bare_alias_root(from), AliasState::Dangling)
             }
@@ -2235,6 +3875,14 @@ impl Layer for AliasWrapper {
                 }),
         };
         info.alias_state = Some(state);
+        // Alias roots are caller-facing mounts distinct from their physical
+        // targets, so they carry the rule visibility for the first-hop root,
+        // exactly as the synthesized listing root does. In particular, a
+        // visible alias may encapsulate a hidden/suppressed target, while a
+        // hidden alias remains routable but unlisted by ordinary clients.
+        let visibility = visibility_of_in(&resolved.visibility, from);
+        info.visibility = visibility;
+        info.visible = visibility == AddressVisibility::Visible;
         Ok(info)
     }
 
@@ -2250,12 +3898,12 @@ impl Layer for AliasWrapper {
             .map(|item| item.map_err(|error| Error::new(ErrorCode::Internal, error.to_string())));
         let rules = self.current_rules();
         let (mut snapshot, inner_stream) = self.inner.list_address_roots(cx, cancel).await?;
-        // Advertise only `Visible` roots (drop `Hidden`/`Suppressed`) and
-        // synthesize a root for each live, visible alias whose target
-        // root exists — including Hidden/Suppressed targets, the rewrite shape:
-        // the caller-facing mount advertises while its physical `rewrite_to`
-        // target is suppressed by construction. Dangling/ChainTooLong aliases
-        // are not advertised.
+        // Retain `Visible` and marked-`Hidden` roots while omitting
+        // `Suppressed`, and synthesize a root for every non-suppressed alias
+        // with a Live terminal state — including aliases over Hidden/Suppressed
+        // targets. The caller-facing mount carries its own rule visibility,
+        // distinct from its physical `rewrite_to` target.
+        let mut inner_roots = snapshot.roots.clone();
         snapshot.roots = project_advertised_roots(
             &rules.alias_projection(),
             &rules.visibility_pairs(),
@@ -2283,6 +3931,7 @@ impl Layer for AliasWrapper {
                             &rules.alias_projection(),
                             &rules.visibility_pairs(),
                             change,
+                            &mut inner_roots,
                         )
                     })
                 });
@@ -2418,12 +4067,11 @@ impl Layer for AliasWrapper {
         mut request: Request<UpdateMetadataRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<BackendItemInfo> {
-        // `BackendItemInfo` carries no address — nothing to project back.
-        request.input.address = self
-            .resolve(&request.input.address, cancel.clone())
-            .await?
-            .address;
-        self.inner.update_metadata(request, cancel).await
+        let resolved = self.resolve(&request.input.address, cancel.clone()).await?;
+        request.input.address = resolved.address;
+        let chain = inverse_chain(&resolved.hops);
+        let info = self.inner.update_metadata(request, cancel).await?;
+        project_item_info(&chain, info)
     }
 
     async fn check_access(
@@ -2461,6 +4109,28 @@ impl Layer for AliasWrapper {
         let mut page = self.inner.list(request, cancel).await?;
         project_items(&chain, &mut page.items)?;
         Ok(page)
+    }
+
+    async fn list_stream(
+        &self,
+        mut request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        if request.input.options.max_results.is_some() || request.input.options.page_token.is_some()
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+
+        let resolved = self.resolve(&request.input.prefix, cancel.clone()).await?;
+        request.input.prefix = resolved.address;
+        let chain = inverse_chain(&resolved.hops);
+        let stream = self.inner.list_stream(request, cancel).await?;
+        Ok(Box::pin(stream.map(move |item| {
+            item.and_then(|info| project_info(&chain, info))
+        })))
     }
 
     async fn list_versions(
@@ -2505,11 +4175,11 @@ impl Layer for AliasWrapper {
         mut request: Request<CreateDirectoryRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<BackendItemInfo> {
-        request.input.address = self
-            .resolve(&request.input.address, cancel.clone())
-            .await?
-            .address;
-        self.inner.create_directory(request, cancel).await
+        let resolved = self.resolve(&request.input.address, cancel.clone()).await?;
+        request.input.address = resolved.address;
+        let chain = inverse_chain(&resolved.hops);
+        let info = self.inner.create_directory(request, cancel).await?;
+        project_item_info(&chain, info)
     }
 
     async fn delete_directory(
@@ -2537,15 +4207,34 @@ impl Layer for AliasWrapper {
             .map(|item| item.map_err(|error| Error::new(ErrorCode::Internal, error.to_string())));
         let rules = self.current_rules();
         let (inner_snapshot, inner_stream) = self.inner.list_connections(cx, cancel).await?;
-        let mut connections: Vec<Connection> = rules.aliases.iter().map(alias_connection).collect();
-        connections.extend(rules.visibility.iter().map(visibility_connection));
+        let mut connections: Vec<Connection> = rules
+            .aliases
+            .iter()
+            .map(|rule| alias_connection(rule, &self.name))
+            .collect();
+        connections.extend(
+            rules
+                .visibility
+                .iter()
+                .map(|rule| visibility_connection(rule, &self.name)),
+        );
         // Connection ids are unique only WITHIN an owner. This union places
         // alias-wrapper-owned ids and inner ids into one flat id-space, so a
         // collision between the two id-spaces is possible; a caller that needs
-        // to disambiguate uses each row's owning `target` (the wrapper name vs.
-        // the inner owner). Enforcing global uniqueness would require querying
-        // `inner` on every add (racy against inner's own mutations), so this is
-        // a documented constraint, not an enforced one.
+        // to disambiguate reads each row's `owning_target` — this wrapper's name
+        // on the rows above, the backend's on inner's. Enforcing global
+        // uniqueness would require querying `inner` on every add (racy against
+        // inner's own mutations), so this is a documented constraint, not an
+        // enforced one.
+        //
+        // **The alias projects addresses, not ownership.** Inner rows keep their
+        // own target rather than having it cleared the way a synthesized ROOT
+        // does (`synthesize_alias_root`): they pass through unprojected, so the
+        // target is a true fact about the row a caller is holding, and it is the
+        // very thing the paragraph above tells that caller to disambiguate by.
+        // There is nothing concealed by withholding it either — `owning_target_for`
+        // and `resolve_auth_delegation` both already resolve through to the
+        // physical terminal.
         let has_local_rows = !connections.is_empty();
         let inner_has_updates = inner_stream.is_some();
         connections.extend(inner_snapshot.connections);
@@ -2609,8 +4298,11 @@ impl Layer for AliasWrapper {
                 visibility,
             } => {
                 // Chain-validate the prospective rule set (current + candidate)
-                // exactly as `add_connection` would, but discard it.
+                // exactly as `add_connection` would, but discard it — including
+                // the derived-rule eviction, or a probe would report
+                // `AlreadyExists` for an add that succeeds.
                 let mut candidate = (*self.current_rules()).clone();
+                evict_derived_duplicates(&mut candidate, &from);
                 candidate.aliases.push(AliasRule {
                     id,
                     from,
@@ -2619,10 +4311,12 @@ impl Layer for AliasWrapper {
                     display_name: connection.display_name.clone(),
                     user_metadata: UserMetadata::new(),
                     visibility,
+                    derived_from: None,
                 });
                 validate_alias_rules(&candidate.alias_pairs())?;
                 Ok(alias_connection(
                     candidate.aliases.last().expect("just pushed"),
+                    &self.name,
                 ))
             }
             RuleFragment::Visibility {
@@ -2643,7 +4337,7 @@ impl Layer for AliasWrapper {
                 let mut candidate = (*self.current_rules()).clone();
                 candidate.visibility.push(rule.clone());
                 validate_visibility_rules(&standalone_visibility_pairs(&candidate.visibility))?;
-                Ok(visibility_connection(&rule))
+                Ok(visibility_connection(&rule, &self.name))
             }
         }
     }
@@ -2654,8 +4348,69 @@ impl Layer for AliasWrapper {
         cancel: Option<CancellationToken>,
     ) -> Result<Connection> {
         if request.input.target != self.name {
-            return self.inner.add_connection(request, cancel).await;
+            let requested_target = request.input.target.clone();
+            let connection = self.inner.add_connection(request, cancel.clone()).await?;
+            // A backend row advertising accepted URL spellings gets its
+            // hidden derived alias rules installed here, on the registration
+            // that produced it. After the delegate returned — the
+            // registration is committed and its row is the source of truth
+            // for the addresses the rules rewrite onto — and infallibly, so
+            // generation can never unwind a registration that succeeded.
+            // Skipped entirely (empty inner-rows degradation included) for a
+            // row that carries no spellings, so ordinary registrations pay no
+            // extra inner listing.
+            if connection
+                .user_metadata
+                .contains_key(ACCEPTED_URL_SPELLINGS_KEY)
+            {
+                // Opened BEFORE the inner listing, because that await is the
+                // window a `remove_connection` for this very connection can
+                // land in — and a removal there finds no derived rules to
+                // withdraw. See the `derivations` field.
+                let owner = derived_owner(&connection, &requested_target);
+                let _derivation = self.begin_derivation(&owner);
+                // Bounded: the registration below has already committed, so a
+                // scan that never answers must not hold this call — and the
+                // caller's committed connection — open indefinitely.
+                match self.scan_inner_connections(cancel.clone()).await {
+                    Ok(inner_rows) => {
+                        self.install_derived_rules(&connection, &owner, &inner_rows, cancel)
+                            .await;
+                    }
+                    // FAIL CLOSED. An empty row set means "no inner alias
+                    // layer owns any of these scopes", and derivation acts on
+                    // it — but a scan that could not RUN is not that answer,
+                    // it is the absence of one. Treating the two alike would
+                    // let a transient inner failure re-derive a scope an inner
+                    // wrapper owns, including one an operator suppressed
+                    // there: this wrapper's rule rewrites the address to the
+                    // canonical form before the request ever reaches that
+                    // suppression, so a deliberately unroutable spelling
+                    // silently becomes routable, and stays so until the
+                    // connection re-registers.
+                    //
+                    // The registration itself stands — generation never costs
+                    // a registration that succeeded — and a later
+                    // re-registration derives once the inner layer answers.
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error.message(),
+                            target = %owner.target,
+                            id = %owner.id.0,
+                            "alias wrapper could not scan inner connections \
+                             for already-owned scopes; deriving no aliases for \
+                             this registration"
+                        );
+                    }
+                }
+            }
+            return Ok(connection);
         }
+        // Held from here through the commit below: the precheck, the
+        // downstream eviction and the authoritative commit are one sequence,
+        // and a mutation landing between them could make the commit reject
+        // rows the eviction had already deleted. See the `mutations` field.
+        let mutation = self.mutations.lock().await;
         let connection = &request.input.connection;
         // Reject mis-kinded and persist-requesting requests up front.
         self.validate_connection_request(connection)?;
@@ -2665,6 +4420,41 @@ impl Layer for AliasWrapper {
             persisted: connection.persist,
         };
         let display_name = connection.display_name.clone();
+        // Captured before the fragment moves into the commit closure: an
+        // explicit alias rule must also evict derived copies an INNER alias
+        // wrapper holds on the same scope (see the pre-commit call below).
+        let explicit_rule = match &fragment {
+            RuleFragment::Alias { from, to, .. } => Some((from.clone(), to.clone())),
+            RuleFragment::Visibility { .. } => None,
+        };
+        // Explicit beats derived ACROSS stacked alias wrappers too: the local
+        // eviction inside the commit reaches only this wrapper's own rows, but
+        // a derived copy held by an inner alias layer covers the same scope at
+        // equal specificity — which interrupts this rule's chain at dispatch
+        // and keeps routing past the operator's rewrite.
+        //
+        // BEFORE the commit, because the commit is what makes the rule
+        // visible: it sends `Added` and tickets the root change under the
+        // guard. A subscriber acting on that announcement while an inner
+        // derived copy still covered the scope would dispatch through the
+        // copy — landing a request, possibly a write, on the very backend the
+        // operator's rule exists to replace. Taking the scope over first means
+        // the rule is never announced in a state where it does not yet apply,
+        // and an eviction that fails returns before anything is published, so
+        // there is no transient `Added` and nothing to roll back.
+        //
+        // A refused rule must still evict nothing, so the prospective set is
+        // pre-checked first; the commit re-runs those same rejections under
+        // the guard, where they are authoritative.
+        //
+        // A copy this FOUND and could not remove is fatal. A scan that could
+        // not run at all is warned about instead; see
+        // `evict_downstream_derived` for why the two differ.
+        if let Some((from, to)) = &explicit_rule {
+            self.precheck_alias_candidate(&id, from, to)?;
+            self.evict_downstream_derived(std::slice::from_ref(from), cancel.clone())
+                .await?;
+        }
         // Read-modify-write under the write guard so a duplicate-id check and
         // the swap are atomic against concurrent adds. `validate_alias_rules`
         // (the eager check) runs on the candidate before it is committed, so
@@ -2687,6 +4477,12 @@ impl Layer for AliasWrapper {
                     to,
                     visibility,
                 } => {
+                    // An explicit rule evicts derived rules on the same scope
+                    // (see [`evict_derived_duplicates`]): the operator's
+                    // authored `from`→`to` wins over the auto-generated one,
+                    // rather than being refused as a duplicate of a rule
+                    // nobody wrote.
+                    let evicted = evict_derived_duplicates(&mut candidate, &from);
                     let rule = AliasRule {
                         id,
                         from,
@@ -2695,10 +4491,19 @@ impl Layer for AliasWrapper {
                         display_name,
                         user_metadata: UserMetadata::new(),
                         visibility,
+                        derived_from: None,
                     };
                     candidate.aliases.push(rule.clone());
+                    // Validate BEFORE announcing the evictions: an `Err` here
+                    // means no swap, so an already-broadcast `Removed` would
+                    // strand delta consumers on a rule the set still has.
                     validate_alias_rules(&candidate.alias_pairs())?;
-                    alias_connection(&rule)
+                    // Evictions land before the add so a delta consumer never
+                    // holds two rules on one scope.
+                    for evicted in evicted {
+                        commit.send(ConnectionChange::Removed { id: evicted });
+                    }
+                    alias_connection(&rule, &self.name)
                 }
                 RuleFragment::Visibility {
                     address,
@@ -2719,7 +4524,7 @@ impl Layer for AliasWrapper {
                     // tie on rank — so the later `Visible` silently un-hides a
                     // subtree the operator hid, with no error surfaced.
                     validate_visibility_rules(&standalone_visibility_pairs(&candidate.visibility))?;
-                    visibility_connection(&rule)
+                    visibility_connection(&rule, &self.name)
                 }
             };
             let new = Arc::new(candidate);
@@ -2735,6 +4540,14 @@ impl Layer for AliasWrapper {
             commit.send(ConnectionChange::Added(new_connection.clone()));
             Ok((old, new, new_connection, commit.defer()))
         })?;
+        // Released before the notification. The lock exists to keep the
+        // precheck true at the commit, and the commit is done; the root-change
+        // delta is sequenced by its own ticket, and holding this across it
+        // would forbid the very add/remove interleaving that ordering exists
+        // to handle (with no runtime the notification runs INLINE, so a parked
+        // adder would block every other mutation for the length of an inner
+        // re-query).
+        drop(mutation);
         self.notify_root_change(deferred, old, new).await;
         Ok(new_connection)
     }
@@ -2745,8 +4558,17 @@ impl Layer for AliasWrapper {
         cancel: Option<CancellationToken>,
     ) -> Result<()> {
         if key.input.target != self.name {
-            return self.inner.remove_connection(key, cancel).await;
+            let owner = key.input.clone();
+            self.inner.remove_connection(key, cancel).await?;
+            // The backend connection is gone; its derived alias rules go with
+            // it. After the delegate returned, so a refused removal
+            // withdraws nothing.
+            self.withdraw_derived_rules(&owner).await;
+            return Ok(());
         }
+        // Serialized against the explicit-add sequence, whose precheck must
+        // still be true when it commits. See the `mutations` field.
+        let mutation = self.mutations.lock().await;
         let id = &key.input.id;
         // Every rejection returns `Err` from inside the commit closure, so a
         // rejected removal stamps no ticket.
@@ -2779,6 +4601,7 @@ impl Layer for AliasWrapper {
             commit.send(ConnectionChange::Removed { id: removed });
             Ok((old, new, commit.defer()))
         })?;
+        drop(mutation);
         // The synthesized root-change emission is projected through
         // `project_advertised_roots`, so a removed alias into a suppressed
         // namespace can only surface its (advertised) alias root, never the
@@ -2826,7 +4649,7 @@ impl Layer for AliasWrapper {
             .update_connection_credentials(forwarded, cancel)
             .await
             .map_err(|err| reproject_auth_error(&rule, err))?;
-        project_delegated_connection(&rule, &hops, backend)
+        project_delegated_connection(&rule, &hops, backend, &self.name)
     }
 
     async fn update_connection_attributes(
@@ -2840,6 +4663,9 @@ impl Layer for AliasWrapper {
                 .update_connection_attributes(request, cancel)
                 .await;
         }
+        // Serialized against the explicit-add sequence; see the `mutations`
+        // field.
+        let mutation = self.mutations.lock().await;
         let id = &request.input.key.id;
         let patch = &request.input.patch;
         // Every rejection returns `Err` from inside the commit closure, so a
@@ -2857,7 +4683,7 @@ impl Layer for AliasWrapper {
                 if let Some(visible) = patch.visible {
                     rule.visibility = Some(patched_visibility(rule.visibility, visible));
                 }
-                alias_connection(rule)
+                alias_connection(rule, &self.name)
             } else if let Some(rule) = candidate.visibility.iter_mut().find(|rule| &rule.id == id) {
                 apply_presentation_patch(&mut rule.display_name, &mut rule.user_metadata, patch)?;
                 // A visibility override's two-state `visible` maps onto its
@@ -2877,7 +4703,7 @@ impl Layer for AliasWrapper {
                     // door and unenforced at the other.
                     validate_visibility_rules(&[(rule.address.clone(), rule.visibility)])?;
                 }
-                visibility_connection(rule)
+                visibility_connection(rule, &self.name)
             } else {
                 return Err(Error::new(ErrorCode::NotFound, "connection does not exist"));
             };
@@ -2887,6 +4713,7 @@ impl Layer for AliasWrapper {
             commit.send(ConnectionChange::Updated(updated.clone()));
             Ok((old, new, updated, commit.defer()))
         })?;
+        drop(mutation);
         self.notify_root_change(deferred, old, new).await;
         Ok(updated)
     }
@@ -2927,7 +4754,7 @@ impl Layer for AliasWrapper {
             .authenticate_connection(forwarded, cancel)
             .await
             .map_err(|err| reproject_auth_error(&rule, err))?;
-        Ok(project_auth_events(rule, hops, stream))
+        Ok(project_auth_events(rule, hops, stream, self.name.clone()))
     }
 }
 
@@ -2949,17 +4776,28 @@ fn patched_visibility(current: Option<AddressVisibility>, visible: bool) -> Addr
 
 /// Apply an [`AttributePatch`]'s presentation fields (`display_name`,
 /// `user_metadata`) to a rule. `access_mode` is ignored — alias connections are
-/// credentialless and carry no access mode. Rejects a patch that writes the
-/// wrapper-managed discriminator keys (`ALIAS_TO_KEY`/`ALIAS_VISIBILITY_KEY`)
-/// into stored `user_metadata`: those are stamped on read from the rule's
-/// own fields, so accepting them verbatim would corrupt the round-trip.
+/// credentialless and carry no access mode. Rejects a patch that writes any of
+/// the wrapper-managed discriminator keys
+/// (`ALIAS_TO_KEY`/`ALIAS_VISIBILITY_KEY`/`ALIAS_DERIVED_FROM_KEY`)
+/// into stored `user_metadata`: those are stamped on read from the rule's own
+/// fields, so accepting them verbatim would either corrupt the round-trip (an
+/// authored rule forged as generated) or be silently overwritten at projection
+/// time (an `Ok` for a write with no effect). The scheme-fallback marker
+/// (`SCHEME_FALLBACK_KEY`) is refused on a different ground: the shared route
+/// table treats a marked hostless root as the catch-all for its scheme, so an
+/// attribute patch able to write the marker onto a projected root would turn
+/// an ordinary alias into a scheme-wide fallback the operator never granted.
 fn apply_presentation_patch(
     display_name: &mut Option<String>,
     user_metadata: &mut UserMetadata,
     patch: &AttributePatch,
 ) -> Result<()> {
     for key in patch.user_metadata.keys() {
-        if key == ALIAS_TO_KEY || key == ALIAS_VISIBILITY_KEY {
+        if key == ALIAS_TO_KEY
+            || key == ALIAS_VISIBILITY_KEY
+            || key == ALIAS_DERIVED_FROM_KEY
+            || key == SCHEME_FALLBACK_KEY
+        {
             return Err(Error::new(
                 ErrorCode::InvalidArgument,
                 format!("`{key}` is a reserved alias metadata key and cannot be patched"),
@@ -3711,4 +5549,164 @@ fn standalone_visibility_pairs(rules: &[VisibilityOverride]) -> Vec<(Url, Addres
         .iter()
         .map(|rule| (rule.address.clone(), rule.visibility))
         .collect()
+}
+
+#[cfg(test)]
+mod list_stream_tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::StreamExt as _;
+
+    use super::*;
+
+    struct ListingLayer {
+        items: Vec<ObjectInfo>,
+        buffered_prefix: Mutex<Option<Url>>,
+        streamed_prefix: Mutex<Option<Url>>,
+        stream_opens: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Layer for ListingLayer {
+        fn name(&self) -> &str {
+            "listing"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            descriptor("listing", LayerType::Backend, false)
+        }
+
+        async fn list(
+            &self,
+            request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ListPage> {
+            *self.buffered_prefix.lock().unwrap() = Some(request.input.prefix);
+            Ok(ListPage {
+                items: self.items.clone(),
+                next_page_token: None,
+            })
+        }
+
+        async fn list_stream(
+            &self,
+            request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ListStream> {
+            self.stream_opens.fetch_add(1, Ordering::SeqCst);
+            *self.streamed_prefix.lock().unwrap() = Some(request.input.prefix);
+            Ok(Box::pin(futures::stream::iter(
+                self.items.clone().into_iter().map(Ok),
+            )))
+        }
+    }
+
+    fn item(address: &str) -> ObjectInfo {
+        ObjectInfo::from((
+            Url::parse(address).unwrap(),
+            BackendItemInfo {
+                kind: ObjectKind::File,
+                ..BackendItemInfo::default()
+            },
+        ))
+    }
+
+    fn request(options: ListOptions) -> Request<ListRequest> {
+        Request::new(ListRequest {
+            prefix: Url::parse("alias:///public/").unwrap(),
+            options,
+        })
+    }
+
+    async fn wrapper(inner: LayerHandle) -> LayerHandle {
+        AliasWrapperFactory::with_rules(AliasRules {
+            aliases: vec![(
+                Url::parse("alias:///public/").unwrap(),
+                Url::parse("physical:///bucket/").unwrap(),
+            )],
+            visibility: Vec::new(),
+        })
+        .create_wrapper("alias", &LayerConfig::new(), inner, None)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn streaming_rewrites_the_prefix_and_projects_every_entry() {
+        let inner = Arc::new(ListingLayer {
+            items: vec![
+                item("physical:///bucket/a"),
+                item("physical:///bucket/sub/b"),
+            ],
+            buffered_prefix: Mutex::new(None),
+            streamed_prefix: Mutex::new(None),
+            stream_opens: AtomicUsize::new(0),
+        });
+        let alias = wrapper(inner.clone()).await;
+
+        let buffered = alias
+            .list(request(ListOptions::default()), None)
+            .await
+            .unwrap()
+            .items;
+        let streamed = alias
+            .list_stream(request(ListOptions::default()), None)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(streamed, buffered);
+        assert_eq!(
+            streamed
+                .iter()
+                .map(|info| info.address.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alias:///public/a", "alias:///public/sub/b"],
+            "streamed entries must never leak the physical namespace",
+        );
+        let physical_prefix = Url::parse("physical:///bucket/").unwrap();
+        assert_eq!(
+            *inner.buffered_prefix.lock().unwrap(),
+            Some(physical_prefix.clone()),
+        );
+        assert_eq!(
+            *inner.streamed_prefix.lock().unwrap(),
+            Some(physical_prefix),
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_page_windows_without_resolving_or_opening_inner() {
+        let inner = Arc::new(ListingLayer {
+            items: Vec::new(),
+            buffered_prefix: Mutex::new(None),
+            streamed_prefix: Mutex::new(None),
+            stream_opens: AtomicUsize::new(0),
+        });
+        let alias = wrapper(inner.clone()).await;
+
+        for options in [
+            ListOptions {
+                max_results: Some(1),
+                ..ListOptions::default()
+            },
+            ListOptions {
+                page_token: Some("next".to_string()),
+                ..ListOptions::default()
+            },
+        ] {
+            let error = match alias.list_stream(request(options), None).await {
+                Ok(_) => panic!("a page window must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        }
+        assert_eq!(inner.stream_opens.load(Ordering::SeqCst), 0);
+        assert_eq!(*inner.streamed_prefix.lock().unwrap(), None);
+    }
 }

@@ -1296,6 +1296,7 @@ impl CredentialRetainingLayer {
     }
 }
 
+#[async_trait::async_trait]
 impl ovs::Layer for CredentialRetainingLayer {
     fn name(&self) -> &str {
         self.inner.name()
@@ -1318,6 +1319,14 @@ impl ovs::Layer for CredentialRetainingLayer {
 
     fn list_kinds(&self, cx: &ovs::Extensions) -> ovs::Result<Vec<ovs::LayerKindDescriptor>> {
         self.inner.list_kinds(cx)
+    }
+
+    async fn list_stream(
+        &self,
+        request: ovs::Request<ovs::ListRequest>,
+        cancel: Option<ovs::CancellationToken>,
+    ) -> ovs::Result<ovs::ListStream> {
+        self.inner.list_stream(request, cancel).await
     }
 }
 
@@ -1503,6 +1512,7 @@ struct StackComposer {
     root: Option<String>,
     layers: Vec<ovs::LayerSpec>,
     connections: Vec<ovs::LayerConnectionRequest>,
+    config: Option<ovs::StackConfig>,
     registry: Option<PluginRegistry>,
     interactive_auth_capability: Option<i32>,
     credential_cache_durability: Option<i32>,
@@ -1532,6 +1542,10 @@ struct Info {
     mtime_unix_nanos: Option<u64>,
     #[pyo3(get)]
     etag: Option<String>,
+    #[pyo3(get)]
+    etag_strength: Option<String>,
+    #[pyo3(get)]
+    versioned_address: Option<String>,
     #[pyo3(get)]
     version: Option<String>,
     #[pyo3(get)]
@@ -2030,6 +2044,12 @@ wrapper_layer_class!(
     "ovstorage.copy_rename_fallback",
     ovs::layers::COPY_RENAME_FALLBACK_KIND
 );
+wrapper_layer_class!(
+    HubCache,
+    "HubCache",
+    "ovstorage.hub_cache",
+    ovs::layers::HUB_CACHE_KIND
+);
 
 #[pymethods]
 impl PluginRegistry {
@@ -2099,6 +2119,16 @@ fn ensure_layers_reachable(root: &str, layers: &[ovs::LayerSpec]) -> ovs::Result
 }
 
 impl StackComposer {
+    fn ensure_programmatic_composition_allowed(&self) -> PyResult<()> {
+        if self.config.is_some() {
+            return Err(py_error(OvError::new(
+                ErrorCode::InvalidArgument,
+                "Stack.from_config() declares the whole graph and cannot be mixed with programmatic composition in this version",
+            )));
+        }
+        Ok(())
+    }
+
     fn push_layer(&mut self, layer: &LayerBase) {
         if self.root.is_none() {
             self.root = Some(layer.spec.name.clone());
@@ -2244,12 +2274,17 @@ fn load_registry_directory(
 }
 
 /// Assemble the native `StackBuilder` from declared specs + loaded factories.
+/// Programmatic composers require every declaration to be reachable so a
+/// forgotten composition call is not silently dropped. Config files match the
+/// CLI/MCP host contract and may retain staged layer tables outside the live
+/// root graph.
 /// Non-blocking, so `Stack.build()` runs it inline after the blocking load.
 fn native_builder(
     root: Option<String>,
     layers: &[ovs::LayerSpec],
     factories: Vec<ovs::LoadedLayerFactory>,
     python_factories: Option<p2r_adapter::PyLayerFactories>,
+    require_all_layers_reachable: bool,
 ) -> ovs::Result<ovs::StackBuilder> {
     let root = root.ok_or_else(|| {
         OvError::new(
@@ -2257,7 +2292,9 @@ fn native_builder(
             "Stack has no root; pass root=... or add at least one layer",
         )
     })?;
-    ensure_layers_reachable(&root, layers)?;
+    if require_all_layers_reachable {
+        ensure_layers_reachable(&root, layers)?;
+    }
     for factory in &factories {
         let kind = factory.descriptor().kind;
         ensure_plugin_kind_is_not_reserved(&kind)?;
@@ -2651,6 +2688,152 @@ fn _probe_abandon_on_cancel(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
 #[pyfunction]
 fn _probe_abandon_completed() -> bool {
     ABANDON_PROBE_COMPLETED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// A native listing source whose buffered path is deliberately partial.
+/// Transparent wrappers must reach `list_stream`; falling back through `list`
+/// fails closed on the continuation token and makes the regression observable.
+#[cfg(feature = "test-probes")]
+struct TransparentListStreamProbe {
+    buffered_calls: std::sync::atomic::AtomicUsize,
+    stream_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "test-probes")]
+#[async_trait::async_trait]
+impl ovs::Layer for TransparentListStreamProbe {
+    fn name(&self) -> &str {
+        "python-transparent-list-stream-probe"
+    }
+
+    fn descriptor(&self) -> ovs::LayerKindDescriptor {
+        ovs::LayerKindDescriptor {
+            kind: "python-transparent-list-stream-probe".into(),
+            layer_type: ovs::LayerType::Backend,
+            display_name: "Python transparent list-stream probe".into(),
+            description: None,
+            config_schema: Vec::new(),
+            credential_schema: Vec::new(),
+            credential_methods: Vec::new(),
+            icon: None,
+            accepts_connections: false,
+            auth_capable: false,
+            supports_user_metadata: false,
+        }
+    }
+
+    async fn list(
+        &self,
+        _request: ovs::Request<ovs::ListRequest>,
+        _cancel: Option<ovs::CancellationToken>,
+    ) -> ovs::Result<ovs::ListPage> {
+        self.buffered_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ovs::ListPage {
+            items: Vec::new(),
+            next_page_token: Some("partial-buffered-page".into()),
+        })
+    }
+
+    async fn list_stream(
+        &self,
+        _request: ovs::Request<ovs::ListRequest>,
+        _cancel: Option<ovs::CancellationToken>,
+    ) -> ovs::Result<ovs::ListStream> {
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(futures::stream::empty()))
+    }
+}
+
+#[cfg(feature = "test-probes")]
+fn transparent_list_stream_probe() -> Arc<TransparentListStreamProbe> {
+    Arc::new(TransparentListStreamProbe {
+        buffered_calls: std::sync::atomic::AtomicUsize::new(0),
+        stream_calls: std::sync::atomic::AtomicUsize::new(0),
+    })
+}
+
+/// Verify the two Python-only transparent Layer adapters dispatch the native
+/// streaming slot rather than materializing their inner buffered listing.
+#[cfg(feature = "test-probes")]
+#[pyfunction]
+fn _probe_transparent_list_stream_adapters(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    let task_locals = pyo3_tokio::get_current_locals(py)?;
+    let adapter_probe = transparent_list_stream_probe();
+    let adapter_inner: ovs::LayerHandle = adapter_probe.clone();
+    let adapter_object = Py::new(py, LayerBase::from_handle(adapter_inner.clone()))?.into_any();
+    let adapter = p2r_adapter::PyLayerAdapter::new(
+        py,
+        "transparent-python-wrapper".into(),
+        ovs::LayerType::Wrapper,
+        adapter_object,
+        Some(adapter_inner),
+        task_locals,
+        Vec::new(),
+    )
+    .map_err(py_error)?;
+
+    coroutine_into_py(py, "_probe_transparent_list_stream_adapters", async move {
+        use futures::StreamExt as _;
+        use ovs::Layer as _;
+
+        let request = || {
+            ovs::Request::new(ovs::ListRequest {
+                prefix: ovs::Url::parse("test:///root/").expect("valid probe URL"),
+                options: ovs::ListOptions::default(),
+            })
+        };
+
+        let mut stream = adapter
+            .list_stream(request(), None)
+            .await
+            .map_err(py_error)?;
+        assert!(stream.next().await.is_none());
+        if adapter_probe.buffered_calls.load(Ordering::SeqCst) != 0
+            || adapter_probe.stream_calls.load(Ordering::SeqCst) != 1
+        {
+            return Err(py_error(OvError::new(
+                ErrorCode::Internal,
+                "transparent PyLayerAdapter did not forward list_stream",
+            )));
+        }
+
+        let retained_probe = transparent_list_stream_probe();
+        let retained_inner: ovs::LayerHandle = retained_probe.clone();
+        let stack = ovs::Stack::builder("probe")
+            .attach("probe", retained_inner)
+            .build()
+            .await
+            .map_err(py_error)?;
+        let credentials = CredentialResolver {
+            cache: Arc::new(ovs::auth::CredentialCache::new(
+                ovs::auth::CredentialCacheConfig::default(),
+            )),
+            providers: Vec::new(),
+            interactive_auth_capability: RustInteractiveAuthCapability::None,
+        };
+        let owner = StackOwner::from_parts(
+            stack,
+            credentials,
+            PrincipalView::new("transparent-list-stream-probe"),
+            Vec::new(),
+        );
+        let retained = CredentialRetainingLayer::new(owner);
+        let mut stream = retained
+            .list_stream(request(), None)
+            .await
+            .map_err(py_error)?;
+        assert!(stream.next().await.is_none());
+        if retained_probe.buffered_calls.load(Ordering::SeqCst) != 0
+            || retained_probe.stream_calls.load(Ordering::SeqCst) != 1
+        {
+            return Err(py_error(OvError::new(
+                ErrorCode::Internal,
+                "CredentialRetainingLayer did not forward list_stream",
+            )));
+        }
+
+        Ok(())
+    })
 }
 
 /// Fence the bridge against interpreter finalization.
@@ -3231,6 +3414,7 @@ impl StackComposer {
             root,
             layers: Vec::new(),
             connections: Vec::new(),
+            config: None,
             registry: None,
             interactive_auth_capability,
             credential_cache_durability,
@@ -3242,15 +3426,61 @@ impl StackComposer {
         }
     }
 
+    /// Load an opaque startup configuration using the same precedence as the
+    /// CLI and MCP hosts. The resulting composer declares the complete graph;
+    /// only a plugin registry may be attached before `build()`.
+    #[staticmethod]
+    #[pyo3(signature = (path=None, *, toml=None, allow_test_plugins=false))]
+    fn from_config(
+        path: Option<PathBuf>,
+        toml: Option<String>,
+        allow_test_plugins: bool,
+    ) -> PyResult<Self> {
+        if path.is_some() && toml.is_some() {
+            return Err(py_error(OvError::new(
+                ErrorCode::InvalidArgument,
+                "Stack.from_config() accepts either path or toml, not both",
+            )));
+        }
+
+        let config = if let Some(toml) = toml {
+            ovs::StackConfig::from_toml_str(&toml).map_err(py_error)?
+        } else if let Some(path) = path {
+            ovs::StackConfig::from_toml_path(&path).map_err(py_error)?
+        } else if let Some(path) = std::env::var_os("OVSTORAGE_CONFIG") {
+            ovs::StackConfig::from_toml_path(Path::new(&path)).map_err(py_error)?
+        } else {
+            ovs::StackConfig::from_default_path()
+                .map_err(py_error)?
+                .unwrap_or_default()
+        };
+
+        Ok(Self {
+            root: None,
+            layers: Vec::new(),
+            connections: Vec::new(),
+            config: Some(config),
+            registry: None,
+            interactive_auth_capability: None,
+            credential_cache_durability: None,
+            credential_callback: None,
+            credential_callback_name: None,
+            principal_id: String::new(),
+            allow_test_plugins,
+            declarations: Vec::new(),
+        })
+    }
+
     /// Add one exact `LayerSpec` declaration to the composition. The first
     /// declaration becomes the root when the constructor omitted `root`.
     fn layer<'py>(
         mut slf: PyRefMut<'py, Self>,
         layer: Bound<'py, LayerBase>,
-    ) -> PyRefMut<'py, Self> {
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.ensure_programmatic_composition_allowed()?;
         slf.push_layer(&layer.borrow());
         slf.retain_declaration(&layer);
-        slf
+        Ok(slf)
     }
 
     /// Typed convenience for a backend declaration. This still contributes
@@ -3260,6 +3490,7 @@ impl StackComposer {
         mut slf: PyRefMut<'py, Self>,
         layer: Bound<'py, LayerBase>,
     ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.ensure_programmatic_composition_allowed()?;
         slf.push_typed_layer(&layer.borrow(), ovs::LayerType::Backend)?;
         slf.retain_declaration(&layer);
         Ok(slf)
@@ -3271,6 +3502,7 @@ impl StackComposer {
         mut slf: PyRefMut<'py, Self>,
         layer: Bound<'py, LayerBase>,
     ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.ensure_programmatic_composition_allowed()?;
         slf.push_typed_layer(&layer.borrow(), ovs::LayerType::Wrapper)?;
         slf.retain_declaration(&layer);
         Ok(slf)
@@ -3282,6 +3514,7 @@ impl StackComposer {
         mut slf: PyRefMut<'py, Self>,
         layer: Bound<'py, LayerBase>,
     ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.ensure_programmatic_composition_allowed()?;
         slf.push_typed_layer(&layer.borrow(), ovs::LayerType::Router)?;
         slf.retain_declaration(&layer);
         Ok(slf)
@@ -3304,6 +3537,7 @@ impl StackComposer {
         target: String,
         request: &ConnectionRequest,
     ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.ensure_programmatic_composition_allowed()?;
         let connection = request
             .inner
             .lock()
@@ -3355,6 +3589,8 @@ impl StackComposer {
         );
         let registry = self.registry.clone();
         let allow_test_plugins = self.allow_test_plugins;
+        let config = self.config.clone();
+        let require_all_layers_reachable = config.is_none();
         let root = self.root.clone();
         let layers = self.layers.clone();
         let connections = self.connections.clone();
@@ -3418,11 +3654,63 @@ impl StackComposer {
                 // Plugin dlopen + auth-substrate init are blocking (flock/sqlite);
                 // run them on a blocking thread so neither the event loop nor the
                 // GIL is held across them while the async future is pending.
-                let factories = tokio::task::spawn_blocking(move || {
+                let mut factories = tokio::task::spawn_blocking(move || {
                     load_registry_factories(&registry, allow_test_plugins)
                 })
                 .await
                 .map_err(|error| py_error_msg(format!("plugin load task failed: {error}")))??;
+
+                let mut root = root;
+                let mut layers = layers;
+                let mut connections = connections;
+                if let Some(config) = config {
+                    let default_factories = ovs::layers::default_layer_factories();
+                    let factory_types: HashMap<String, ovs::LayerType> = default_factories
+                        .iter()
+                        .chain(factories.iter())
+                        .map(|factory| {
+                            let descriptor = factory.descriptor();
+                            (descriptor.kind, descriptor.layer_type)
+                        })
+                        .collect();
+
+                    match ovs::stack_config_to_spec(&config, &factory_types).map_err(py_error)? {
+                        Some(spec) => {
+                            root = Some(spec.root);
+                            layers = spec.layers;
+                            connections = config
+                                .connections
+                                .iter()
+                                .map(|connection| {
+                                    let target = connection
+                                        .target
+                                        .clone()
+                                        .unwrap_or_else(|| connection.backend_kind.clone());
+                                    connection.to_connection_request().map(|connection| {
+                                        ovs::LayerConnectionRequest { target, connection }
+                                    })
+                                })
+                                .collect::<ovs::Result<Vec<_>>>()
+                                .map_err(py_error)?;
+                        }
+                        None if !config.connections.is_empty() => {
+                            return Err(py_error(OvError::new(
+                                ErrorCode::InvalidArgument,
+                                "[[ovstorage.connections]] declared but no [ovstorage.layers] to attach them to",
+                            )));
+                        }
+                        None => {
+                            factories.push(ovs::LoadedLayerFactory::Backend(Arc::new(
+                                ovs::EmptyLayerFactory,
+                            )));
+                            root = Some(ovs::EMPTY_LAYER_KIND.to_owned());
+                            layers = vec![ovs::LayerSpec::backend(
+                                ovs::EMPTY_LAYER_KIND,
+                                ovs::EMPTY_LAYER_KIND,
+                            )];
+                        }
+                    }
+                }
 
                 // The credential resolver opens BEFORE the operational graph is
                 // built: the fill-if-empty resolution below consults its provider
@@ -3447,7 +3735,6 @@ impl StackComposer {
                 // credential-less exactly as before; a Backend error fails the
                 // build, matching the chain's own short-circuit contract.
                 let principal = PrincipalView::new(principal_id);
-                let mut connections = connections;
                 for connection in &mut connections {
                     if !connection.connection.credentials.fields.is_empty() {
                         continue;
@@ -3463,8 +3750,14 @@ impl StackComposer {
                 // StackBuilder owns all structural validation. Its InvalidArgument
                 // and NotConfigured codes are mapped by `py_error` to the public
                 // typed Python exception hierarchy without message inspection.
-                let builder =
-                    native_builder(root, &layers, factories, python_factories).map_err(py_error)?;
+                let builder = native_builder(
+                    root,
+                    &layers,
+                    factories,
+                    python_factories,
+                    require_all_layers_reachable,
+                )
+                .map_err(py_error)?;
                 let stack = builder.build().await.map_err(py_error)?;
 
                 // Apply the declared connections here instead of through the
@@ -3495,6 +3788,16 @@ impl StackComposer {
                         // — it has no id, and the credential fan-out keys on
                         // (target, id) — which is correct: nothing routes to it.
                         //
+                        // The refusal now also arrives from the Router, which
+                        // enforces prefix exclusivity ACROSS its children —
+                        // where no child can see the collision — by refusing a
+                        // sibling's same-node root and rolling the newcomer back
+                        // off its child (`Router::cross_child_conflict` in
+                        // ovstorage-plugin-core `router.rs`). Skipping is right
+                        // for that case too, and for the same reason: the
+                        // newcomer's addresses route to the incumbent sibling
+                        // regardless.
+                        //
                         // Keep this in step with `StackBuilder::build_with_cancel`
                         // in ovstorage-layer `traits.rs`, which carries the full
                         // reasoning and the caveat that `RouteConflict` is a
@@ -3507,6 +3810,47 @@ impl StackComposer {
                                 reason = %err.message(),
                                 "skipping a declared connection whose route is already served; \
                                  the rest of the stack is unaffected"
+                            );
+                            continue;
+                        }
+                        // Tolerated for the same reason as the Rust copy, and
+                        // narrowed the same way: ONLY a refusal whose rollback
+                        // failed. That connection is registered on its layer and
+                        // the refusing Layer withholds its roots, so it can never
+                        // route; aborting would take a Python host's whole stack
+                        // down over a leftover no host can repair.
+                        //
+                        // **It contributes no `ConnectionRecord`, and must not.**
+                        // Records are what `set_credential` and
+                        // `refresh_credentials` fan out over, and a record here
+                        // would aim a credential replacement at a connection this
+                        // graph refuses to route.
+                        //
+                        // The other `CommitAmbiguous` — a post-commit catch-up
+                        // that failed — is a connection that IS wanted and merely
+                        // unpublished, and it propagates. Returning a stack for
+                        // it would be worse than the abort: with no record, its
+                        // credentials could never be replaced afterwards
+                        // (`apply_credentials_locked` raises `NotFound` when no
+                        // record matches the kind, or silently skips it when a
+                        // same-kind record exists), and with an `updates: false`
+                        // child nothing would republish its routes either.
+                        //
+                        // The Rust copy also exempts a build whose token has
+                        // fired; this one needs no such guard, because the loop
+                        // applies each connection with `None` for cancellation.
+                        Err(err)
+                            if err.code() == ovs::ErrorCode::CommitAmbiguous
+                                && err.next_action() == Some(ovs::NEXT_ACTION_REFUSED_LEFTOVER) =>
+                        {
+                            tracing::warn!(
+                                target: "ovstorage.stack",
+                                layer = %connection.target,
+                                reason = %err.message(),
+                                "a declared connection was refused for another layer's address \
+                                 root and could not be removed; continuing so the rest of the \
+                                 stack starts. It is registered on that layer and this graph \
+                                 will not route it — remove it by hand"
                             );
                             continue;
                         }
@@ -4069,12 +4413,13 @@ impl LayerBase {
         )
     }
 
-    #[pyo3(signature = (address, full_metadata = false))]
+    #[pyo3(signature = (address, full_metadata = false, versioned_address = false))]
     fn stat<'py>(
         &self,
         py: Python<'py>,
         address: &str,
         full_metadata: bool,
+        versioned_address: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let address = address::parse(address).map_err(py_error)?;
         let layer = self.handle()?;
@@ -4085,7 +4430,10 @@ impl LayerBase {
                 .stat(
                     ovs::Request::new(ovs::StatRequest {
                         address,
-                        options: StatOptions { full_metadata },
+                        options: StatOptions {
+                            full_metadata,
+                            versioned_address,
+                        },
                     }),
                     Some(cancel),
                 )
@@ -4507,7 +4855,15 @@ impl LayerBase {
         )
     }
 
-    #[pyo3(signature = (prefix, recursive = false, max_results = None, page_token = None, full_metadata = false))]
+    #[pyo3(signature = (
+        prefix,
+        recursive = false,
+        max_results = None,
+        page_token = None,
+        full_metadata = false,
+        versioned_address = false,
+    ))]
+    #[allow(clippy::too_many_arguments)] // Matches the public Python signature table.
     fn list<'py>(
         &self,
         py: Python<'py>,
@@ -4516,6 +4872,7 @@ impl LayerBase {
         max_results: Option<u32>,
         page_token: Option<String>,
         full_metadata: bool,
+        versioned_address: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let prefix = address::parse(prefix).map_err(py_error)?;
         let options = ListOptions {
@@ -4523,6 +4880,7 @@ impl LayerBase {
             max_results,
             page_token,
             full_metadata,
+            versioned_address,
         };
         let layer = self.handle()?;
         let cancel = CancellationToken::new();
@@ -5487,6 +5845,12 @@ fn info_from_object(info: ObjectInfo) -> Info {
         size: info.size,
         mtime_unix_nanos: info.mtime.and_then(unix_nanos),
         etag: info.etag,
+        etag_strength: match info.etag_strength {
+            ovs::EtagStrength::Unspecified => None,
+            ovs::EtagStrength::Strong => Some("strong".into()),
+            ovs::EtagStrength::Weak => Some("weak".into()),
+        },
+        versioned_address: info.versioned_address.map(|url| url.to_string()),
         version: info.version,
         system_metadata: info.system_metadata.unwrap_or_default(),
         user_metadata: info.user_metadata.unwrap_or_default(),
@@ -6038,6 +6402,14 @@ impl SecretBundle {
 #[pymethods]
 impl Capabilities {
     #[getter]
+    fn supports_write(&self) -> bool {
+        self.inner.supports_write
+    }
+    #[getter]
+    fn supports_list(&self) -> bool {
+        self.inner.supports_list
+    }
+    #[getter]
     fn supports_if_match_write(&self) -> bool {
         self.inner.supports_if_match_write
     }
@@ -6099,6 +6471,13 @@ impl Connection {
     #[getter]
     fn display_name(&self) -> String {
         self.inner.display_name.clone()
+    }
+    /// The layer instance that owns this connection — the target half of the
+    /// key a connection op addresses. `None` where the row could not be
+    /// attributed, which is never the same as having no owner.
+    #[getter]
+    fn owning_target(&self) -> Option<String> {
+        self.inner.owning_target.clone()
     }
     #[getter]
     fn addresses(&self) -> Vec<String> {
@@ -6564,7 +6943,7 @@ fn ovstorage(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     builder.worker_threads(2).enable_all().thread_name("ovs-py");
     pyo3_tokio::init(builder);
 
-    module.add("__version__", "0.2.1")?;
+    module.add("__version__", "0.3.0")?;
     module.add("Error", py.get_type_bound::<Error>())?;
     // Bucket bases (one per `ErrorBucket`); registered before the per-code
     // exceptions that subclass them.
@@ -6807,6 +7186,11 @@ fn ovstorage(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
         "ovstorage.copy_rename_fallback",
         &copy_rename_fallback_module,
     )?;
+    let hub_cache_module = PyModule::new_bound(py, "hub_cache")?;
+    hub_cache_module.add_class::<HubCache>()?;
+    hub_cache_module.add("__all__", vec!["HubCache"])?;
+    module.add_submodule(&hub_cache_module)?;
+    modules.set_item("ovstorage.hub_cache", &hub_cache_module)?;
     // Free-function submodule (no layer class): the string-in/string-out
     // projection of the native `address` helpers.
     py_address::register(py, module)?;
@@ -6906,6 +7290,11 @@ fn ovstorage(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_probe_abandon_on_cancel, module)?)?;
     #[cfg(feature = "test-probes")]
     module.add_function(wrap_pyfunction!(_probe_abandon_completed, module)?)?;
+    #[cfg(feature = "test-probes")]
+    module.add_function(wrap_pyfunction!(
+        _probe_transparent_list_stream_adapters,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(_fence_bridge_gil, module)?)?;
     module.add_function(wrap_pyfunction!(_bridge_gil_drained, module)?)?;
     module.add_function(wrap_pyfunction!(_debug_assert_no_live_exports, module)?)?;
@@ -7570,6 +7959,7 @@ class ForwardingWrapper(LayerBase):
             root: Some(root.into()),
             layers,
             connections: Vec::new(),
+            config: None,
             registry: None,
             interactive_auth_capability: None,
             credential_cache_durability: Some(CredentialCacheDurability::IN_MEMORY_ONLY),
@@ -7710,6 +8100,7 @@ wrapper = Wrapper(name="python-wrapper", layer_type="wrapper", inner="python-bac
             &layers,
             Vec::new(),
             Some(factories),
+            true,
         )
         .unwrap();
         let stack = runtime.block_on(builder.build()).unwrap();
@@ -7796,6 +8187,7 @@ native_override = NativeOverride("native")
                 ovstorage_plugin_core::RouterFactoryImpl,
             ))],
             None,
+            true,
         )
         .unwrap();
         let stack = runtime.block_on(builder.build()).unwrap();
@@ -7879,8 +8271,14 @@ native_override = NativeOverride("native")
         ];
 
         for (expected_code, expected_message, composer) in cases {
-            let builder =
-                native_builder(composer.root.clone(), &composer.layers, Vec::new(), None).unwrap();
+            let builder = native_builder(
+                composer.root.clone(),
+                &composer.layers,
+                Vec::new(),
+                None,
+                true,
+            )
+            .unwrap();
             let error = runtime.block_on(builder.build()).err().unwrap();
             assert_eq!(error.code(), expected_code);
             assert!(

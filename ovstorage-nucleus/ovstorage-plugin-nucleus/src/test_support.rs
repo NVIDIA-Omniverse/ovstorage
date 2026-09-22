@@ -154,7 +154,7 @@ impl Transport for MockTransportHandle {
         interface: &str,
         method: &str,
         params: serde_json::Value,
-        binary: Option<Vec<u8>>,
+        binary: Option<&[u8]>,
     ) -> impl Future<Output = Result<Subscription>> + Send {
         self.inner.send(interface, method, params, binary)
     }
@@ -173,11 +173,12 @@ impl Transport for MockTransport {
         interface: &str,
         method: &str,
         params: serde_json::Value,
-        binary: Option<Vec<u8>>,
+        binary: Option<&[u8]>,
     ) -> impl Future<Output = Result<Subscription>> + Send {
         let inner = Arc::clone(&self.inner);
         let interface = interface.to_string();
         let method = method.to_string();
+        let binary = binary.map(<[u8]>::to_vec);
         async move {
             inner.requests.lock().unwrap().push(RecordedRequest {
                 interface: interface.clone(),

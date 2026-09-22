@@ -3,11 +3,11 @@
 
 //! The staged-block continuation must not choose the blob the commit lands on.
 //!
-//! Under the broker's client-driven `ContinueWrite` RPC the whole
-//! `WriteRedirectBatch` is echoed back by the remote caller, while the request
-//! address is the value authorization was decided on. So `continue_write`
-//! derives the blob key from the address; the continuation carries only the
-//! block count.
+//! This direct-plugin test represents a caller or host with no continuation
+//! seal. The broker's client-driven `ContinueWrite` RPC authenticates the
+//! continuation and address binding before plugin dispatch, but the Layer must
+//! remain safe on every route. So `continue_write` derives the blob key from the
+//! authorized address; the continuation carries only the block count.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -385,7 +385,10 @@ async fn layer_for(endpoint: &str) -> LayerHandle {
 /// can catch it is the commit-time re-assertion.
 async fn staged_batch_naming(layer: &LayerHandle, key: &str, planted: &str) -> WriteRedirectBatch {
     let mut user_metadata = HashMap::new();
-    user_metadata.insert("ovstorage-modified-by".to_string(), planted.to_string());
+    user_metadata.insert(
+        ovstorage_plugin::ATTRIBUTION_KEY_MODIFIED_BY.to_string(),
+        planted.to_string(),
+    );
     user_metadata.insert("author".to_string(), "unreserved".to_string());
     let batch = layer
         .write_redirect(
@@ -464,9 +467,15 @@ async fn staged_commit_records_the_asserted_writer_over_the_continuations() {
 
     let commit = commit_request(&capture);
     let lower = commit.to_lowercase();
+    // The header name is a literal rather than derived from
+    // `ATTRIBUTION_KEY_MODIFIED_BY`: Azure metadata names are C# identifiers,
+    // so a hyphen anywhere in the key fails the commit on the real service,
+    // while the capture server here accepts any header name. Only the exact
+    // wire spelling catches a constant drifting out of the portable
+    // `[a-z_][a-z0-9_]*` set.
     assert!(
         lower.contains(&format!(
-            "x-ms-meta-ovstorage-modified-by: {ATTESTED_WRITER}"
+            "x-ms-meta-ovstorage_modified_by: {ATTESTED_WRITER}"
         )),
         "the commit must carry the asserted writer; got:\n{commit}"
     );
@@ -511,9 +520,10 @@ async fn without_an_assertion_the_commit_carries_the_continuations_metadata() {
 
     let commit = commit_request(&capture);
     let lower = commit.to_lowercase();
+    // Literal for the same reason as above: the wire spelling is the pin.
     assert!(
         lower.contains(&format!(
-            "x-ms-meta-ovstorage-modified-by: {PLANTED_WRITER}"
+            "x-ms-meta-ovstorage_modified_by: {PLANTED_WRITER}"
         )),
         "with no host assertion the continuation's value stands; got:\n{commit}"
     );

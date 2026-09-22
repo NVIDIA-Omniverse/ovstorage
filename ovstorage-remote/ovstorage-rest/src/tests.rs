@@ -113,6 +113,204 @@ async fn object_routes_use_documented_paths_and_headers() {
 }
 
 #[tokio::test]
+async fn object_info_handlers_emit_only_declared_etag_strength() {
+    let root = "test://rest-etag-strength/";
+    let mut config = HashMap::new();
+    config.insert(
+        "test_root".into(),
+        ovstorage::ConfigValue::String(root.into()),
+    );
+    let gateway = crate::test_utils::test_gateway(vec![ovstorage::ConnectionRequest {
+        backend_kind: "test".into(),
+        config,
+        credentials: ovstorage::SecretBundle::default(),
+        persist: false,
+        display_name: None,
+    }])
+    .await;
+    let app = router(gateway);
+    let object = "test://rest-etag-strength/object.txt";
+
+    let put = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/v1/objects?dest={object}"))
+                .body(AxumBody::from("strong validator"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let stat = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/objects:stat?address={object}"))
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stat.status(), StatusCode::OK);
+    let stat_body = stat.into_body().collect().await.unwrap().to_bytes();
+    let stat_json: serde_json::Value = serde_json::from_slice(&stat_body).unwrap();
+    assert_eq!(stat_json["etag_strength"], "strong");
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/objects:list?prefix={root}"))
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = list.into_body().collect().await.unwrap().to_bytes();
+    let list_json: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+    assert_eq!(list_json["items"][0]["etag_strength"], "strong");
+
+    let directory = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/v1/directories?address=test://rest-etag-strength/empty/")
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(directory.status(), StatusCode::OK);
+    let directory_body = directory.into_body().collect().await.unwrap().to_bytes();
+    let directory_json: serde_json::Value = serde_json::from_slice(&directory_body).unwrap();
+    assert!(directory_json.get("etag_strength").is_none());
+}
+
+#[tokio::test]
+async fn file_object_info_handlers_emit_weak_etag_strength() {
+    let root = unique_temp_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let prefix = address_for_path(&root);
+    let object = address::join_relative(&prefix, "object.txt").unwrap();
+    let app = router(build_test_gateway_with_file_root(&root).await);
+
+    let put = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/v1/objects?dest={object}"))
+                .body(AxumBody::from("weak validator"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let stat = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/objects:stat?address={object}"))
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stat.status(), StatusCode::OK);
+    let stat_body = stat.into_body().collect().await.unwrap().to_bytes();
+    let stat_json: serde_json::Value = serde_json::from_slice(&stat_body).unwrap();
+    assert_eq!(stat_json["etag_strength"], "weak");
+
+    let list = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/objects:list?prefix={prefix}"))
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = list.into_body().collect().await.unwrap().to_bytes();
+    let list_json: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+    assert_eq!(list_json["items"][0]["etag_strength"], "weak");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn file_object_info_handlers_omit_absent_versioned_address() {
+    let root = unique_temp_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let prefix = address_for_path(&root);
+    let object = address::join_relative(&prefix, "object.txt").unwrap();
+    let app = router(build_test_gateway_with_file_root(&root).await);
+
+    let put = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/v1/objects?dest={object}"))
+                .body(AxumBody::from("unversioned"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+
+    // The file backend has no versions to pin, so paying for the lookup is
+    // honoured (200) and the field is omitted rather than serialized as null.
+    let stat = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/v1/objects:stat?address={object}&versioned_address=true"
+                ))
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stat.status(), StatusCode::OK);
+    let stat_body = stat.into_body().collect().await.unwrap().to_bytes();
+    let stat_json: serde_json::Value = serde_json::from_slice(&stat_body).unwrap();
+    assert_eq!(stat_json["kind"], "file");
+    assert!(stat_json.get("versioned_address").is_none());
+
+    let list = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/v1/objects:list?prefix={prefix}&versioned_address=true"
+                ))
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = list.into_body().collect().await.unwrap().to_bytes();
+    let list_json: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+    assert_eq!(list_json["items"][0]["kind"], "file");
+    assert!(list_json["items"][0].get("versioned_address").is_none());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn copy_rename_metadata_round_trip_through_router() {
     let root = unique_temp_dir();
     std::fs::create_dir_all(&root).unwrap();
@@ -168,6 +366,9 @@ async fn copy_rename_metadata_round_trip_through_router() {
         .unwrap();
     assert_eq!(rename.status(), StatusCode::NO_CONTENT);
 
+    // The `file` backend stores no user metadata and refuses a metadata patch
+    // with `Unsupported`; REST surfaces that refusal as 501 rather than
+    // pretending the write stuck.
     let metadata = app
         .clone()
         .oneshot(
@@ -180,12 +381,88 @@ async fn copy_rename_metadata_round_trip_through_router() {
         )
         .await
         .unwrap();
+    assert_eq!(metadata.status(), StatusCode::NOT_IMPLEMENTED);
+
+    let stat = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/objects:stat?address={renamed}"))
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stat.status(), StatusCode::OK);
+    let body = stat.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["user_metadata"]
+            .as_object()
+            .is_none_or(|metadata| metadata.is_empty()),
+        "a file object carries no user metadata: {json}"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// The positive metadata round-trip runs on a backend that stores user
+/// metadata: the `test` kind. PATCH sets a key, and the returned info carries
+/// it.
+#[tokio::test]
+async fn metadata_patch_round_trips_on_a_metadata_capable_backend() {
+    let root = "test://rest-metadata-patch/";
+    let mut config = HashMap::new();
+    config.insert(
+        "test_root".into(),
+        ovstorage::ConfigValue::String(root.into()),
+    );
+    // The `full` preset advertises a native metadata patch.
+    config.insert(
+        "test_caps".into(),
+        ovstorage::ConfigValue::String("full".into()),
+    );
+    let gateway = crate::test_utils::test_gateway(vec![ovstorage::ConnectionRequest {
+        backend_kind: "test".into(),
+        config,
+        credentials: ovstorage::SecretBundle::default(),
+        persist: false,
+        display_name: None,
+    }])
+    .await;
+    let app = router(gateway);
+    let object = "test://rest-metadata-patch/object.txt";
+
+    let put = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/v1/objects?dest={object}"))
+                .body(AxumBody::from("hello"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let metadata = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/v1/objects:metadata?address={object}"))
+                .header("content-type", "application/json")
+                .body(AxumBody::from(r#"{"set":{"author":"brian"}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(metadata.status(), StatusCode::OK);
     let body = metadata.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["user_metadata"]["author"], "brian");
-
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -1166,6 +1443,59 @@ async fn list_recursive_with_garbage_returns_400() {
             Request::builder()
                 .method(Method::GET)
                 .uri(format!("/v1/objects:list?prefix={prefix}&recursive=maybe"))
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"], "InvalidArgument");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn stat_versioned_address_with_garbage_returns_400() {
+    let root = unique_temp_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let gateway = build_test_gateway_with_file_root(&root).await;
+    let prefix = address_for_path(&root);
+    let object = address::join_relative(&prefix, "object.txt").unwrap();
+    let app = router(gateway);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/v1/objects:stat?address={object}&versioned_address=garbage"
+                ))
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"], "InvalidArgument");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn list_versioned_address_with_garbage_returns_400() {
+    let root = unique_temp_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let gateway = build_test_gateway_with_file_root(&root).await;
+    let prefix = address_for_path(&root);
+    let app = router(gateway);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/v1/objects:list?prefix={prefix}&versioned_address=garbage"
+                ))
                 .body(AxumBody::empty())
                 .unwrap(),
         )

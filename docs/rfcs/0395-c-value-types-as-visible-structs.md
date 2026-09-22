@@ -432,14 +432,16 @@ obligation, not a gated one.
 | `ovstorage-c-source/include/ovstorage.hpp` | 70 |
 | `ovstorage-core/ovstorage-c-source-cc-test` C TUs (`roundtrip_c.c` 6, `streams_c.c` 4, `stack_build_parked_c.c` 1) | 11 |
 | `ovstorage-c-source/examples/c_roundtrip.c` | 6 |
-| `ovstorage-c-source/src/dispatch.c` disabled self-test | 14 |
+| `ovstorage-c-source/src/dispatch.c` embedded self-test | 14 |
 | `completeness.c` table entries | 80 |
 | C producers (`ovstorage-core/ovstorage/tests/csrc`, `ovstorage-core/ovstorage-python/tests/csrc`) | 0 |
 
 The 14 `dispatch.c` sites are inside the `OVC_DISPATCH_TEST_MAIN` block
-(`dispatch.c:6112-7867`). No repository build defines that preprocessor symbol,
-so these calls are outside the compile-error safety net. The implementation
-must migrate them by inspection alongside the compiled consumers.
+(`dispatch.c:6112-7867`). `make c-source-examples` compiles every embedded
+`*_TEST_MAIN` suite with its symbol defined and runs it, on both CI platforms
+(`tools/ovtasks/_c_source_examples.py`, `build_and_run_embedded_suites`), so
+these calls sit inside the compile-error safety net alongside the compiled
+consumers.
 
 **Unaffected:** broker, REST, CLI, services and the Python binding have zero
 `ovstorage_*` C-symbol hits; Python is pyo3 over the Rust core and never
@@ -475,7 +477,7 @@ The premise was that the operations are declared twice — once as vtable slots,
 once as free functions — so source distribution makes the duplication
 unnecessary. The code refutes it. The free functions are not declarations; they
 are the host implementation: the first 6111 lines of `dispatch.c`, before its
-1756-line disabled self-test. Calling a slot directly means taking over:
+1756-line embedded self-test. Calling a slot directly means taking over:
 
 - **The quiesce.** `in_flight` is incremented only inside
   `ovc_dispatch_operation_create` (`dispatch.c:512-514`), and

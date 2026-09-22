@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Plugin-side bridge from `tracing` events to the host's logging
-//! pipeline. Each `tracing::Event` emitted inside a plugin gets its
-//! rendered fields shipped through `HostCallbacks::log` so the host's
-//! single `tracing-subscriber` can format and route it like any other
-//! event.
+//! pipeline. Events emitted inside a plugin have their rendered fields
+//! shipped through `HostCallbacks::log` so the host's single
+//! `tracing-subscriber` can format and route them like any other event,
+//! except that `TRACE` records from `tungstenite` are suppressed before
+//! rendering.
 //!
 //! The plugin and host each have their own `tracing` global subscriber
 //! (cdylibs don't share statics with the host binary), so plugin events
@@ -23,7 +24,7 @@ use tracing_subscriber::layer::Context;
 use crate::ffi;
 use crate::marshal;
 
-/// Subscriber layer that ships every event through the host's `log`
+/// Subscriber layer that ships eligible events through the host's `log`
 /// callback. Install once at plugin init via [`install`].
 pub struct HostLogLayer;
 
@@ -55,11 +56,24 @@ impl<S: Subscriber> Layer<S> for HostLogLayer {
         // directives like `tokio_tungstenite=warn` never match.
         let normalized = event.normalized_metadata();
         let metadata = normalized.as_ref().unwrap_or_else(|| event.metadata());
+        if suppressed_at_source(metadata.target(), *metadata.level()) {
+            return;
+        }
         let level = ffi_level(*metadata.level());
         let mut visitor = MessageVisitor::default();
         event.record(&mut visitor);
         host.log(level, metadata.target(), &visitor.rendered);
     }
+}
+
+/// Returns whether a record must be dropped at the plugin boundary.
+///
+/// `tungstenite` 0.24.0 renders the whole HTTP upgrade request, including
+/// its request target and `access_token` query, through `log::trace!` on every
+/// connection. Once that record crosses into the host, a host-side filter
+/// cannot redact it, so the bridge intercepts it before rendering or logging.
+fn suppressed_at_source(target: &str, level: Level) -> bool {
+    level == Level::TRACE && (target == "tungstenite" || target.starts_with("tungstenite::"))
 }
 
 fn ffi_level(level: Level) -> ffi::LogLevelV1 {
@@ -139,4 +153,29 @@ pub fn install() {
     use tracing_subscriber::util::SubscriberInitExt;
     let subscriber = tracing_subscriber::registry().with(HostLogLayer::new());
     let _ = subscriber.try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suppresses_only_tungstenite_trace_records() {
+        let cases = [
+            ("tungstenite", Level::TRACE, true),
+            ("tungstenite::handshake::client", Level::TRACE, true),
+            ("tungstenite::handshake::client", Level::DEBUG, false),
+            ("tokio_tungstenite", Level::TRACE, false),
+            ("tungstenite_extra", Level::TRACE, false),
+            ("ovstorage_plugin_nucleus", Level::TRACE, false),
+        ];
+
+        for (target, level, expected) in cases {
+            assert_eq!(
+                suppressed_at_source(target, level),
+                expected,
+                "unexpected suppression decision for {target} at {level}"
+            );
+        }
+    }
 }

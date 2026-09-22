@@ -10,7 +10,7 @@ use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 pub use ovstorage_layer::{
-    Extensions, REDACTED_QUERY_KEYS, canonicalize, canonicalize_preserves_node,
+    Extensions, REDACTED_QUERY_KEYS, canonicalize, canonicalize_preserves_node, origin_only,
     parsing_preserves_node, redact_message, redact_url,
 };
 pub use ovstorage_plugin::address;
@@ -562,12 +562,11 @@ pub mod wrappers;
 pub use format::*;
 /// The metadata cache lives in the shared `ovstorage-cache` crate. Re-export
 /// the module under its historical `metadata_cache` name so paths like
-/// `ovstorage::metadata_cache::hash_stat_options` keep resolving.
+/// `ovstorage::metadata_cache::MetadataCacheKey` keep resolving.
 pub use ovstorage_cache::metadata as metadata_cache;
 pub use ovstorage_cache::metadata::{
-    DisabledDispatcher, Invalidation, MetadataCache, MetadataCacheConfig, MetadataCacheKey,
-    MetadataCachePayload, MetadataKind, NotificationDispatcher, hash_list_options,
-    hash_list_versions_options, hash_stat_options,
+    CostFlags, DisabledDispatcher, Invalidation, MetadataCache, MetadataCacheConfig,
+    MetadataCacheKey, MetadataCachePayload, MetadataKind, MetadataLookup, NotificationDispatcher,
 };
 #[allow(unused_imports)]
 pub use routing::*;

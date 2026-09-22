@@ -15,10 +15,14 @@ use crate::ffi::abi_alloc::abi_buffer_free;
 // regardless of which allocator either binary installs.
 // ---------------------------------------------------------------------
 
-/// Owned UTF-8 string buffer. `ptr` is never null; `len` bounds the
-/// reads (the buffer is NOT NUL-terminated). UTF-8 validity is
-/// enforced at marshalling time. Empty strings carry `len == 0` and
-/// a one-byte sentinel allocation.
+/// Owned UTF-8 string buffer. A well-formed producer never leaves `ptr`
+/// null: empty strings carry `len == 0` and a one-byte sentinel
+/// allocation. `len` bounds the reads (the buffer is NOT NUL-terminated).
+/// UTF-8 validity is enforced at marshalling time. Inside a present
+/// `Optional`, a null `ptr` with a zero `len` is the bytes a zeroed struct
+/// already holds, not an empty string; a host may read that shape as absent,
+/// and both hosts do so for the root-info and operation-result strings
+/// (see `optional_str_unset_as_none` for the list).
 #[repr(C)]
 #[derive(Debug)]
 pub struct Str {

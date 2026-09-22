@@ -39,6 +39,11 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "jso
 url = "2.5.8"
 zeroize = "1.8.2"
 
+[dev-dependencies]
+# Pinned exactly: bench baselines and CI trend extraction read criterion's
+# on-disk output layout, which is stable in practice but undocumented.
+criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
 [features]
 # `test-codec` re-exports the crate-private `RootInfoChange` /
 # `ConnectionChange` FFI encoders (`thunks_v2`) as `*_for_test` hooks so the
@@ -57,7 +62,15 @@ test-credential-conformance = []
 cbindgen = "0.29.3"
 
 [lib]
+# `cargo bench` must not run the libtest lib harness: it rejects
+# criterion-only CLI flags such as `--quick` and `--save-baseline`.
+bench = false
 path = "src/lib.rs"
+
+# Criterion provides `main`; see the bench's module docs for what it prices.
+[[bench]]
+harness = false
+name = "routing"
 
 [lints]
 workspace = true

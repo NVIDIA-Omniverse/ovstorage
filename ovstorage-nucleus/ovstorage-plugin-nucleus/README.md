@@ -58,23 +58,17 @@ crates in this workspace plus the `omni1` IDL compiled by
   it; it is not something the plugin can suppress from its side, and the
   recorded token stops being useful when it expires. The transport redacts the
   parameter from the events it emits itself, so ovstorage's own logs do not
-  carry it at their usual levels. One path remains: the websocket library
-  renders the whole HTTP upgrade request, request target included, through the
-  `log` crate at TRACE, and the plugin's logging bridge forwards `log` records
-  to the host with no plugin-side filter, so that rendered request is built and
-  handed across the plugin boundary on every connect. Where it stops is the
-  host's business, and under ovstorage's own logging setup it is a matter of
-  spelling rather than of suppression. That setup appends `tungstenite=warn`
-  after the directives it read from the environment, and an appended directive
-  replaces an earlier one naming the same target, so neither
-  `OVSTORAGE_LOG=trace` nor `OVSTORAGE_LOG=tungstenite=trace` raises it. The
-  record's target is its module path, so a directive naming any target below
-  the crate root — `OVSTORAGE_LOG=tungstenite::handshake=trace` — is not
-  replaced, and the token then reaches ovstorage's own log sink. A host that
-  installs its own subscriber has no such directive at all. Operators should
-  scope retention and access on the proxy's access logs — and on any capture
-  that records the library's TRACE output — to match how they treat
-  short-lived credentials.
+  carry it at their usual levels. The websocket library still renders the whole
+  HTTP upgrade request, request target included, through the `log` crate at
+  TRACE inside the plugin. The plugin's logging bridge suppresses those TRACE
+  records at the plugin boundary for every host, so the rendered request is not
+  handed to a host log callback. In ovstorage's own logging setup, the noisy
+  crate filter honors an operator directive that explicitly names a silenced
+  crate root, such as `OVSTORAGE_LOG=tungstenite=trace`, while its crate-level
+  warning directives still override catch-alls such as `OVSTORAGE_LOG=trace`.
+  Operators should scope retention and access on the proxy's access logs — and
+  on any packet capture of the connection — to match how they treat short-lived
+  credentials.
 
 ## Test layout
 

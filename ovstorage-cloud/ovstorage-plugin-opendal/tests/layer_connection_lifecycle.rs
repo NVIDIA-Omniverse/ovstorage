@@ -23,10 +23,10 @@ use std::time::Duration;
 
 use futures::StreamExt as _;
 use ovstorage_plugin::{
-    AttributePatch, AuthenticateRequest, BackendFactory, Body, ConfigValue, ConnectionAuthState,
-    ConnectionKey, ConnectionRequest, ErrorCode, InteractiveAuthCapability, LayerConfig,
-    LayerConnectionRequest, LayerHandle, ListOptions, ListRequest, ObjectKind, ReadRequest,
-    Request, SecretBundle, SecretBytes, SecretValue, StatOptions, StatRequest,
+    AttributePatch, AuthenticateRequest, BackendFactory, Body, CancellationToken, ConfigValue,
+    ConnectionAuthState, ConnectionKey, ConnectionRequest, ErrorCode, InteractiveAuthCapability,
+    LayerConfig, LayerConnectionRequest, LayerHandle, ListOptions, ListRequest, ObjectKind,
+    ReadRequest, Request, SecretBundle, SecretBytes, SecretValue, StatOptions, StatRequest,
     UpdateConnectionAttributesRequest, UpdateConnectionCredentialsRequest, WriteOptions,
     WriteRequest, address,
 };
@@ -61,6 +61,35 @@ const EMPTY_S3_LIST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
     <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
     <Name>bkt</Name><Prefix></Prefix><KeyCount>0</KeyCount>\
     <MaxKeys>1</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>";
+
+const S3_LIST_STREAM_PAGE_ONE: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+    <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+    <Name>bkt</Name><Prefix></Prefix><KeyCount>2</KeyCount>\
+    <MaxKeys>2</MaxKeys><IsTruncated>true</IsTruncated>\
+    <NextContinuationToken>NEXT</NextContinuationToken>\
+    <Contents><Key>alpha/one.txt</Key><Size>1</Size><ETag>\"one\"</ETag>\
+    <LastModified>2026-01-01T00:00:00.000Z</LastModified></Contents>\
+    <Contents><Key>alpha/two.txt</Key><Size>2</Size><ETag>\"two\"</ETag>\
+    <LastModified>2026-01-01T00:00:00.000Z</LastModified></Contents>\
+    </ListBucketResult>";
+
+const S3_LIST_STREAM_PAGE_TWO: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+    <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+    <Name>bkt</Name><Prefix></Prefix><KeyCount>1</KeyCount>\
+    <MaxKeys>2</MaxKeys><IsTruncated>false</IsTruncated>\
+    <Contents><Key>beta/three.txt</Key><Size>3</Size><ETag>\"three\"</ETag>\
+    <LastModified>2026-01-01T00:00:00.000Z</LastModified></Contents>\
+    </ListBucketResult>";
+
+const UNSORTED_S3_LIST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+    <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+    <Name>bkt</Name><Prefix></Prefix><KeyCount>2</KeyCount>\
+    <MaxKeys>2</MaxKeys><IsTruncated>false</IsTruncated>\
+    <Contents><Key>beta/two.txt</Key><Size>2</Size><ETag>\"two\"</ETag>\
+    <LastModified>2026-01-01T00:00:00.000Z</LastModified></Contents>\
+    <Contents><Key>alpha/one.txt</Key><Size>1</Size><ETag>\"one\"</ETag>\
+    <LastModified>2026-01-01T00:00:00.000Z</LastModified></Contents>\
+    </ListBucketResult>";
 
 fn spawn_scripted_server(
     status_line: &'static str,
@@ -99,6 +128,64 @@ fn spawn_scripted_server(
         .expect("spawn scripted server");
     thread::sleep(Duration::from_millis(50));
     (endpoint, counter, requests)
+}
+
+struct PaginatedS3Server {
+    endpoint: String,
+    hits: Arc<AtomicUsize>,
+    second_page_hits: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+fn spawn_paginated_s3_server() -> PaginatedS3Server {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let counter = Arc::new(AtomicUsize::new(0));
+    let second_page_counter = Arc::new(AtomicUsize::new(0));
+    let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let counter_for_thread = counter.clone();
+    let second_page_counter_for_thread = second_page_counter.clone();
+    let requests_for_thread = requests.clone();
+    thread::Builder::new()
+        .name("ovs-test-opendal-paged-list".into())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Some(head) = read_http_head(&mut stream) else {
+                    continue;
+                };
+                let raw = String::from_utf8_lossy(&head).to_string();
+                let is_second_page = raw
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains("continuation-token=NEXT"));
+                let body = if is_second_page {
+                    second_page_counter_for_thread.fetch_add(1, Ordering::SeqCst);
+                    S3_LIST_STREAM_PAGE_TWO
+                } else {
+                    S3_LIST_STREAM_PAGE_ONE
+                };
+                requests_for_thread
+                    .lock()
+                    .expect("requests poisoned")
+                    .push(raw);
+                counter_for_thread.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        })
+        .expect("spawn paginated S3 server");
+    thread::sleep(Duration::from_millis(50));
+    PaginatedS3Server {
+        endpoint,
+        hits: counter,
+        second_page_hits: second_page_counter,
+        requests,
+    }
 }
 
 /// Every captured request head carries a SigV4 Authorization header signed
@@ -410,6 +497,161 @@ async fn add_s3_profile_connection_authenticates_via_verify_check() {
         .await
         .unwrap();
     assert!(!root.capabilities.has_real_directories);
+}
+
+#[tokio::test]
+async fn recursive_s3_list_stream_walks_native_pages_incrementally() {
+    let PaginatedS3Server {
+        endpoint,
+        hits,
+        second_page_hits,
+        requests,
+    } = spawn_paginated_s3_server();
+    let layer = empty_layer().await;
+    add(&layer, s3_profile_request(&endpoint, key_bundle())).await;
+    let hits_after_add = hits.load(Ordering::SeqCst);
+    let second_page_hits_after_add = second_page_hits.load(Ordering::SeqCst);
+    let requests_after_add = requests.lock().expect("requests poisoned").len();
+
+    let mut stream = layer
+        .list_stream(
+            Request::new(ListRequest {
+                prefix: address::parse("opendal://s3-bkt/").unwrap(),
+                options: ListOptions {
+                    recursive: true,
+                    ..ListOptions::default()
+                },
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let first = stream.next().await.unwrap().unwrap();
+    assert_eq!(first.address.as_str(), "opendal://s3-bkt/alpha/");
+    assert_eq!(first.kind, ObjectKind::DirectoryInferred);
+    assert_eq!(
+        second_page_hits.load(Ordering::SeqCst),
+        second_page_hits_after_add,
+        "the recursive stream yields from page one before requesting page two"
+    );
+
+    let mut items = vec![first];
+    while let Some(item) = stream.next().await {
+        items.push(item.unwrap());
+    }
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| (item.address.as_str(), item.kind))
+            .collect::<Vec<_>>(),
+        vec![
+            ("opendal://s3-bkt/alpha/", ObjectKind::DirectoryInferred),
+            ("opendal://s3-bkt/alpha/one.txt", ObjectKind::File),
+            ("opendal://s3-bkt/alpha/two.txt", ObjectKind::File),
+            ("opendal://s3-bkt/beta/", ObjectKind::DirectoryInferred),
+            ("opendal://s3-bkt/beta/three.txt", ObjectKind::File),
+        ]
+    );
+    assert!(
+        hits.load(Ordering::SeqCst) >= hits_after_add + 2,
+        "the native Lister fetched both provider pages"
+    );
+    assert!(
+        second_page_hits.load(Ordering::SeqCst) > second_page_hits_after_add,
+        "the continuation token reached the second provider page"
+    );
+    assert_sigv4_signed(&requests, "AKIATESTFIXTURE");
+    let requests = requests.lock().expect("requests poisoned");
+    let stream_requests = &requests[requests_after_add..];
+    assert_eq!(stream_requests.len(), 2, "one request per provider page");
+    for raw in stream_requests {
+        let request_line = raw.lines().next().unwrap_or_default();
+        assert!(
+            request_line.contains("list-type=2"),
+            "recursive stream must use ListObjectsV2: {request_line}"
+        );
+        assert!(
+            !request_line.contains("delimiter="),
+            "recursive flat listing must omit the delimiter: {request_line}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn recursive_s3_list_stream_cancels_before_the_next_page() {
+    let PaginatedS3Server {
+        endpoint,
+        hits,
+        second_page_hits,
+        requests: _,
+    } = spawn_paginated_s3_server();
+    let layer = empty_layer().await;
+    add(&layer, s3_profile_request(&endpoint, key_bundle())).await;
+    let hits_after_add = hits.load(Ordering::SeqCst);
+    let second_page_hits_after_add = second_page_hits.load(Ordering::SeqCst);
+    let cancel = CancellationToken::new();
+
+    let mut stream = layer
+        .list_stream(
+            Request::new(ListRequest {
+                prefix: address::parse("opendal://s3-bkt/").unwrap(),
+                options: ListOptions {
+                    recursive: true,
+                    ..ListOptions::default()
+                },
+            }),
+            Some(cancel.clone()),
+        )
+        .await
+        .unwrap();
+    assert!(stream.next().await.unwrap().is_ok());
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        hits_after_add + 1,
+        "only the first provider page is fetched before cancellation"
+    );
+
+    cancel.cancel();
+    let error = stream.next().await.unwrap().unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Cancelled);
+    assert!(stream.next().await.is_none());
+    assert_eq!(
+        second_page_hits.load(Ordering::SeqCst),
+        second_page_hits_after_add,
+        "cancellation prevents the continuation request"
+    );
+}
+
+#[tokio::test]
+async fn recursive_s3_list_stream_rejects_provider_order_regression() {
+    let (endpoint, _hits, _requests) = spawn_scripted_server("200 OK", UNSORTED_S3_LIST);
+    let layer = empty_layer().await;
+    add(&layer, s3_profile_request(&endpoint, key_bundle())).await;
+
+    let mut stream = layer
+        .list_stream(
+            Request::new(ListRequest {
+                prefix: address::parse("opendal://s3-bkt/").unwrap(),
+                options: ListOptions {
+                    recursive: true,
+                    ..ListOptions::default()
+                },
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    let error = loop {
+        match stream.next().await {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => break error,
+            None => panic!("unsorted recursive flat stream must fail loudly"),
+        }
+    };
+    assert_eq!(error.code(), ErrorCode::Internal);
+    assert_eq!(error.message(), "recursive flat listing is not byte-sorted");
+    assert!(stream.next().await.is_none());
 }
 
 /// The availability contract behind `BRIDGE_REPLAY_SAFE_KINDS`: a failing

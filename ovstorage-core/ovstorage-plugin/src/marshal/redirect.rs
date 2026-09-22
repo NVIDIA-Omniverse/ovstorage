@@ -75,6 +75,7 @@ pub fn response_parsing_to_ffi(value: ResponseParsing) -> ffi::ResponseParsing {
                 header: primitive::str_to_ffi(header),
             }
         }),
+        etag_strength: identity::etag_strength_to_ffi(value.etag_strength),
     }
 }
 
@@ -95,6 +96,7 @@ pub unsafe fn response_parsing_from_ffi(
         let content_checksum_header_ffi = value.content_checksum_header;
         let content_checksum_algorithm_ffi = value.content_checksum_algorithm;
         let checksum_headers_ffi = value.checksum_headers;
+        let etag_strength = identity::etag_strength_from_ffi(value.etag_strength);
 
         let etag = primitive::optional_from_ffi(etag_ffi, |s| primitive::str_from_ffi(s));
         let version = primitive::optional_from_ffi(version_ffi, |s| primitive::str_from_ffi(s));
@@ -126,6 +128,7 @@ pub unsafe fn response_parsing_from_ffi(
             content_checksum_header: content_checksum_header?,
             content_checksum_algorithm: content_checksum_algorithm?,
             checksum_headers: checksum_headers_pairs?.into_iter().collect(),
+            etag_strength,
         })
     }
 }

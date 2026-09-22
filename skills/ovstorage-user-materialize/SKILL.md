@@ -109,7 +109,7 @@ take a `path` (release) and the file itself both use the same string.
 |---|---|---|
 | `NotFound` | Address doesn't exist | Confirm with `ovstorage_stat` |
 | `NotConfigured` | No cache configured for this non-local backend | Local-file addresses materialize without a cache; remote backends need a cache configured on the host. See `next_action`. |
-| `Unsupported` | Backend has no local-materializable form | Use `ovstorage_read` with `max_bytes` instead. Some streaming-only backends can't pin a file. |
+| `Unsupported` | The composed Stack does not provide materialization for this request | Use `ovstorage_read` with `max_bytes`, or configure a redirect follower on the host, optionally with a cache above it. A cache alone serves only what it already holds. |
 | `InvalidArgument` | `ttl_seconds: 0` | Pass a positive number, or omit for the 1800s default |
 | `Transient` | Backend hiccup during fetch | `retryable: true` |
 

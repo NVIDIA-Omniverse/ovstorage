@@ -353,6 +353,7 @@ mod tests {
             auth_state: ConnectionAuthState::Anonymous,
             last_probed: None,
             user_metadata: UserMetadata::new(),
+            owning_target: None,
         };
         // Every capability, because the claim is that there is no flow under
         // any of them — not that the default happens to be refused.

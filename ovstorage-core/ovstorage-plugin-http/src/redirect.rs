@@ -167,9 +167,8 @@ async fn send_streaming_request(
 /// RFC 7232 requires the entity-tag to travel quoted, and strict origins
 /// (S3/GCS presigned URLs — the flagship mid-stream-resume scenario) compare `If-Match`
 /// against the literal quoted ETag, answering 412 on an unquoted value.
-/// Validators are stored quote-stripped (`redirect_info_from_result`), so
-/// re-quote at the wire; already-quoted and weak (`W/"..."`) forms pass
-/// through verbatim.
+/// Validators are stored quote-stripped, so re-quote at the wire;
+/// already-quoted and weak (`W/"..."`) forms pass through verbatim.
 fn quote_etag(value: &str) -> String {
     if value.starts_with('"') || value.starts_with("W/") {
         value.to_string()
@@ -228,11 +227,10 @@ pub(crate) struct StreamedReadRedirect {
 /// `reqwest::Response::bytes_stream()` without materializing the body.
 ///
 /// Transient-HTTP retry (the route's `RetryConfig`, honoring `Retry-After`)
-/// applies until response headers arrive. Once `bytes_stream()` is open,
-/// replay is impossible
-/// mid-stream, so a mid-body failure surfaces as a stream error. The
-/// redirect's freshness is checked once up front; an attempt that outlives
-/// `expires_at` surfaces the origin's non-retryable auth failure.
+/// applies until response headers arrive. An idempotent response that fails
+/// mid-body resumes from the delivered high-water mark when the configured
+/// validator header was present; otherwise the failure surfaces on the stream.
+/// Redirect freshness is checked before each header or resume attempt.
 pub(crate) async fn follow_read_redirect_streaming(
     address: Url,
     redirect: &ReadRedirect,
@@ -255,6 +253,10 @@ pub(crate) async fn follow_read_redirect_streaming(
         )
     })?;
     match url.scheme() {
+        // The instance-metadata refusal already ran on this URL inside
+        // `fresh_redirect` (through `ensure_read_redirect_valid`), and runs
+        // again on every redirect re-minted on expiry or 403, so nothing this
+        // function dispatches can reach such a host.
         "http" | "https" => {}
         // Local-path redirects are the broker-test / air-gapped stand-in for
         // presigned URLs; serve them straight off disk, mirroring the buffered
@@ -382,34 +384,40 @@ pub(crate) async fn follow_read_redirect_streaming(
     // moves into the resume engine — a size-gate decline surfaces this, not the
     // caller's possibly-stale original.
     let effective_redirect = shared_redirect.lock().await.0.clone();
+    let parsing = effective_redirect.response_parsing.clone();
     // Whether the origin honored Range with 206 or returned 200 with
     // the full body, we'll slice client-side below for the 200 case.
     let needs_client_side_range_filter = range.is_some() && status.as_u16() != 206;
     // Verifier travels into the streaming task without pinning the
     // response.
     let verifier = StreamingVerifier::for_streaming_response(
-        &redirect.response_parsing,
+        &parsing,
         &captured_headers,
         status.as_u16(),
         range,
     );
-    // The literal HTTP `ETag` header — a real RFC 7232 entity-tag for the
-    // resume `If-Match`, captured before `captured_headers` is consumed below.
-    // Stored quote-stripped so `quote_etag` re-quotes it uniformly at the wire.
-    let http_entity_tag = header_value(&captured_headers, Some("etag"))
-        .map(|value| value.trim_matches('"').to_string());
     // Size comes from Content-Length (or stays None for chunked).
     let mut header_only_result = RedirectResult {
         status_code: status.as_u16(),
         captured_headers,
         captured_body: Vec::new(),
     };
-    let info = redirect_info_from_result(
-        address,
-        &redirect.response_parsing,
-        &header_only_result,
-        false,
-    );
+    let info = redirect_info_from_result(address, &parsing, &header_only_result, false);
+    // Mid-stream resume uses the configured opaque validator as a textual
+    // version guard. Validator strength is separate metadata for consumers
+    // such as the byte cache and does not gate this resume path.
+    let validator = header_value(
+        &header_only_result.captured_headers,
+        parsing.etag_header.as_deref(),
+    )
+    .filter(|value| !value.is_empty())
+    .map(str::to_owned);
+    // The literal HTTP `ETag` header is an additional wire-level If-Match
+    // guard. Capture it independently from the configured validator and its
+    // strength; `quote_etag` preserves already-quoted and weak forms.
+    let http_entity_tag = header_value(&header_only_result.captured_headers, Some("etag"))
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     header_only_result.captured_headers.clear();
 
     // Mid-stream resume: the raw body stream reissues the redirected
@@ -425,8 +433,8 @@ pub(crate) async fn follow_read_redirect_streaming(
         redirect: shared_redirect,
         mint,
         retry_cfg: *retry_cfg,
-        parsing: redirect.response_parsing.clone(),
-        validator: info.etag.clone(),
+        parsing,
+        validator,
         http_entity_tag,
         requested_end: range.and_then(|r| r.end_inclusive),
         idempotent,
@@ -490,11 +498,12 @@ async fn follow_file_read_redirect_streaming(
     // it unset. Reconcile the two arms' gate input if that asymmetry bites.
     let content_length = Some(len);
     let info = ObjectInfo {
+        etag_strength: EtagStrength::Weak,
         address,
         kind: ObjectKind::File,
-        // The file backend's canonical validator, so a byte-cache fill from a
-        // followed file:// redirect is reachable by the validator a stat of
-        // the same file reports.
+        // Match the file backend's canonical validator and Weak declaration:
+        // size + mtime remains valid for preconditions but may alias a rewrite,
+        // so it cannot prove byte identity for cache admission.
         etag: Some(synthesize_file_etag(len, metadata.modified().ok())),
         version: None,
         size: Some(len),
@@ -504,6 +513,7 @@ async fn follow_file_read_redirect_streaming(
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     };
     let stream: ovstorage_plugin::ReadStream =
         Box::pin(tokio_util::io::ReaderStream::new(file).map(|chunk| chunk.map_err(io_error)));
@@ -541,18 +551,19 @@ struct ResumeContext {
     mint: Option<RedirectMint>,
     retry_cfg: retry::RetryConfig,
     parsing: ResponseParsing,
-    /// The backend's opaque SPI validator (`ObjectInfo.etag`, parsed via
-    /// `parsing.etag_header`). Used ONLY to guard against version splicing by
+    /// The backend's nonempty opaque resume validator, projected via
+    /// `parsing.etag_header`. Used ONLY to guard against version splicing by
     /// comparing the resumed response's `etag_header` — never sent as an HTTP
     /// `If-Match`, because on some backends it is not an RFC 7232 entity-tag
-    /// (GCS maps `x-goog-generation` here; `If-Match: "<generation>"` 412s even
-    /// for an unchanged object).
+    /// (GCS maps
+    /// `x-goog-generation` here; `If-Match: "<generation>"` 412s even for an
+    /// unchanged object).
     validator: Option<String>,
-    /// The first response's literal HTTP `ETag` header — a true RFC 7232
-    /// entity-tag suitable for the resume `If-Match`. Distinct from
-    /// `validator`: identical for S3 (`etag_header` == `ETag`), but different
-    /// for GCS. `None` when the origin sent no `ETag`; the resume then relies
-    /// on the `validator` comparison alone for its version guard.
+    /// The first response's literal HTTP `ETag` header, sent as the resume
+    /// `If-Match`. Distinct from `validator`: identical for S3 (`etag_header`
+    /// == `ETag`), but different for GCS. `None` when the origin sent no
+    /// `ETag`; the resume then relies on the `validator` comparison alone for
+    /// its version guard.
     http_entity_tag: Option<String>,
     requested_end: Option<u64>,
     idempotent: bool,
@@ -778,15 +789,15 @@ fn validate_single_range_206(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ParsedContentRange {
-    start: u64,
-    end: u64,
-    total: Option<u64>,
+pub(crate) struct ParsedContentRange {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) total: Option<u64>,
 }
 
 /// Parse a satisfiable RFC 7233 `Content-Range` value
 /// (`bytes <start>-<end>/<total>`; `<total>` may be `*`).
-fn parse_content_range(value: &str) -> Option<ParsedContentRange> {
+pub(crate) fn parse_content_range(value: &str) -> Option<ParsedContentRange> {
     let (unit, rest) = value.trim().split_once(char::is_whitespace)?;
     if !unit.eq_ignore_ascii_case("bytes") {
         return None;
@@ -926,9 +937,9 @@ fn resumable_body_stream(
                         return;
                     }
                     let Some(validator) = ctx.validator.clone() else {
-                        // Without a validator a resumed stream could splice
-                        // bytes from a different object version — surface the
-                        // failure instead.
+                        // Without a validator a resumed stream could
+                        // splice bytes from a different object version —
+                        // surface the failure instead.
                         yield Err(Error::new(
                             ErrorCode::Transient,
                             format!(
@@ -2001,6 +2012,13 @@ fn ensure_redirect_scope(
             format!("redirect URL is invalid: {error}"),
         )
     })?;
+    // The backend that minted this redirect also wrote its scope, so the
+    // scope comparison below can never catch a redirect the backend itself
+    // aimed at a cloud instance-metadata endpoint. Every executor — buffered
+    // and streaming, read and write, first attempt, re-mint and mid-stream
+    // resume — validates through here before a socket opens, which makes this
+    // the one place the destination host is refused for every connection.
+    ovstorage_plugin::instance_metadata::refuse_instance_metadata(&request)?;
     let mut prefix = url::Url::parse(&scope.physical_url_prefix).map_err(|error| {
         Error::new(
             ErrorCode::InvalidArgument,
@@ -2170,6 +2188,22 @@ pub(crate) fn redirect_info_from_result(
     result: &RedirectResult,
     captured_body_is_complete: bool,
 ) -> ObjectInfo {
+    let etag_header = parsing.etag_header.as_deref();
+    let (etag, etag_strength) = match header_value(&result.captured_headers, etag_header) {
+        Some(value) if etag_header.is_some_and(|name| name.eq_ignore_ascii_case("etag")) => {
+            let (etag, strength) = normalize_wire_etag(value);
+            (Some(etag), strength)
+        }
+        Some(value) => {
+            let strength = if value.is_empty() {
+                EtagStrength::Unspecified
+            } else {
+                parsing.etag_strength
+            };
+            (Some(value.to_string()), strength)
+        }
+        None => (None, EtagStrength::Unspecified),
+    };
     let size = if result.status_code == 206 {
         // Content-Length on a 206 is the selected span, not the object. The
         // validated Content-Range total is the only trustworthy object size.
@@ -2210,10 +2244,10 @@ pub(crate) fn redirect_info_from_result(
         }
     }
     ObjectInfo {
+        etag_strength,
         address,
         kind: ObjectKind::File,
-        etag: header_value(&result.captured_headers, parsing.etag_header.as_deref())
-            .map(|value| value.trim_matches('"').to_string()),
+        etag,
         version: header_value(&result.captured_headers, parsing.version_header.as_deref())
             .map(str::to_string),
         size,
@@ -2223,6 +2257,7 @@ pub(crate) fn redirect_info_from_result(
         system_metadata,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
@@ -2988,6 +3023,78 @@ mod content_checksum_tests {
     }
 
     #[test]
+    fn redirect_info_normalizes_etag_and_declares_strength() {
+        let parsing = ResponseParsing::default();
+        for (wire_etag, expected_etag, expected_strength) in [
+            (
+                Some("\"strong-v1\""),
+                Some("strong-v1"),
+                EtagStrength::Strong,
+            ),
+            (Some("W/\"weak-v1\""), Some("weak-v1"), EtagStrength::Weak),
+            (Some("bare-v1"), Some("bare-v1"), EtagStrength::Unspecified),
+            (None, None, EtagStrength::Unspecified),
+        ] {
+            let result = RedirectResult {
+                status_code: 200,
+                captured_headers: wire_etag
+                    .map(|etag| vec![("etag".into(), etag.into())])
+                    .unwrap_or_default(),
+                captured_body: Vec::new(),
+            };
+
+            let info = redirect_info_from_result(
+                Url::parse("mock://o").unwrap(),
+                &parsing,
+                &result,
+                false,
+            );
+
+            assert_eq!(info.etag.as_deref(), expected_etag);
+            assert_eq!(info.etag_strength, expected_strength);
+        }
+    }
+
+    #[test]
+    fn redirect_info_keeps_custom_validator_headers_untrusted_and_opaque() {
+        let parsing = ResponseParsing {
+            etag_header: Some("x-object-version".into()),
+            ..ResponseParsing::default()
+        };
+        let result = RedirectResult {
+            status_code: 200,
+            captured_headers: vec![("x-object-version".into(), "W/\"opaque-v1\"".into())],
+            captured_body: Vec::new(),
+        };
+
+        let info =
+            redirect_info_from_result(Url::parse("mock://o").unwrap(), &parsing, &result, false);
+
+        assert_eq!(info.etag.as_deref(), Some("W/\"opaque-v1\""));
+        assert_eq!(info.etag_strength, EtagStrength::Unspecified);
+    }
+
+    #[test]
+    fn redirect_info_preserves_declared_custom_validator_strength() {
+        let parsing = ResponseParsing {
+            etag_header: Some("x-goog-generation".into()),
+            etag_strength: EtagStrength::Strong,
+            ..ResponseParsing::default()
+        };
+        let result = RedirectResult {
+            status_code: 200,
+            captured_headers: vec![("x-goog-generation".into(), "1600000000000001".into())],
+            captured_body: Vec::new(),
+        };
+
+        let info =
+            redirect_info_from_result(Url::parse("mock://o").unwrap(), &parsing, &result, false);
+
+        assert_eq!(info.etag.as_deref(), Some("1600000000000001"));
+        assert_eq!(info.etag_strength, EtagStrength::Strong);
+    }
+
+    #[test]
     fn redirect_info_uses_content_range_total_for_partial_response_size() {
         let parsing = ResponseParsing {
             size_header: Some("content-length".into()),
@@ -3342,6 +3449,87 @@ mod range_injection_tests {
         assert_eq!(error.code(), ErrorCode::PermissionDenied);
     }
 
+    /// A backend-minted redirect aimed at a cloud instance-metadata endpoint
+    /// is refused before any request is sent. Nothing listens at these
+    /// addresses in the test, so a follower that dialed them would surface a
+    /// transport error (or hang on a link-local route) rather than this typed
+    /// refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_redirect_follower_refuses_a_backend_minted_instance_metadata_redirect() {
+        for target in [
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            "https://metadata.google.internal/computeMetadata/v1/instance/service-accounts/",
+            "http://[fd00:ec2::254]/latest/api/token",
+        ] {
+            let redirect = redirect_to(target.into());
+            let error = follow_read_redirect_streaming(
+                url::Url::parse("omni://server/object").unwrap(),
+                &redirect,
+                false,
+                None,
+                &retry::RetryConfig::default(),
+                None,
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{target} must be refused"));
+            assert_eq!(error.code(), ErrorCode::PermissionDenied, "case: {target}");
+            let text = error.to_string();
+            assert!(
+                text.contains("instance-metadata")
+                    && !text.contains("security-credentials")
+                    && !text.contains("service-accounts")
+                    && !text.contains("api/token"),
+                "the refusal names the origin only: {text}"
+            );
+        }
+    }
+
+    /// A redirect re-minted on expiry may point anywhere the backend chooses,
+    /// so the fresh redirect is judged on its own rather than trusted because
+    /// the stale one passed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_re_minted_redirect_to_an_instance_metadata_host_is_refused() {
+        let mut stale = redirect_to("http://127.0.0.1:1/stale".into());
+        stale.expires_at = std::time::UNIX_EPOCH;
+        stale.scope.expires_at = std::time::UNIX_EPOCH;
+        let fresh = redirect_to("http://169.254.169.254/latest/meta-data/".into());
+        let mint: RedirectMint = std::sync::Arc::new(move || {
+            let fresh = fresh.clone();
+            Box::pin(async move { Ok(fresh) })
+        });
+
+        let error = follow_read_redirect_streaming(
+            url::Url::parse("omni://server/object").unwrap(),
+            &stale,
+            false,
+            None,
+            &retry::RetryConfig::default(),
+            Some(mint),
+        )
+        .await
+        .err()
+        .expect("a re-minted redirect to an instance-metadata host must be refused");
+
+        assert_eq!(error.code(), ErrorCode::PermissionDenied);
+    }
+
+    /// The write executors validate through the same scope check as the read
+    /// follower, so both paths refuse an instance-metadata destination before
+    /// dispatch and neither depends on the other's guard.
+    #[test]
+    fn a_write_redirect_to_an_instance_metadata_host_is_refused_before_dispatch() {
+        let write = write_redirect_to("http://169.254.169.254/latest/api/token".into());
+        let error = ensure_write_redirect_valid(&write)
+            .expect_err("a write redirect to an instance-metadata host must be refused");
+        assert_eq!(error.code(), ErrorCode::PermissionDenied);
+
+        let read = redirect_to("https://metadata.google.internal/computeMetadata/v1/".into());
+        let error = ensure_read_redirect_valid(&read)
+            .expect_err("a read redirect to an instance-metadata host must be refused");
+        assert_eq!(error.code(), ErrorCode::PermissionDenied);
+    }
+
     #[test]
     fn redirect_methods_are_constrained_by_operation() {
         let mut read = redirect_to("https://storage.example/object".into());
@@ -3645,8 +3833,8 @@ mod range_injection_tests {
         assert!(result.captured_body.is_empty());
     }
 
-    // Retry transient HTTP failures during the header phase; mid-stream replay
-    // stays out of scope.
+    // This case isolates transient retry during the header phase; the
+    // mid-stream resume cases live in `resume_hardening_tests` below.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn follow_read_redirect_streaming_retries_transient_http_until_headers() {
         use futures::StreamExt;
@@ -3996,6 +4184,61 @@ mod resume_hardening_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn header_phase_uses_reminted_response_parsing() {
+        use futures::StreamExt;
+
+        let responses = vec![ScriptedResponse {
+            head: "HTTP/1.1 200 OK\r\nx-object-version: generation-2".into(),
+            body: b"fresh bytes".to_vec(),
+            content_length: 11,
+        }];
+        let (port, _captured) = spawn_scripted_server(responses).await;
+        let fresh_parsing = ResponseParsing {
+            etag_header: Some("x-object-version".into()),
+            ..ResponseParsing::default()
+        };
+        let fresh = redirect_with_parsing(
+            format!("http://127.0.0.1:{port}/fresh"),
+            fresh_parsing.clone(),
+        );
+        let mut stale = redirect_with_parsing(
+            "http://127.0.0.1:1/stale".into(),
+            ResponseParsing::default(),
+        );
+        stale.expires_at = std::time::UNIX_EPOCH;
+        stale.scope.expires_at = std::time::UNIX_EPOCH;
+        let mint: RedirectMint = Arc::new(move || {
+            let fresh = fresh.clone();
+            Box::pin(async move { Ok(fresh) })
+        });
+
+        let StreamedReadRedirect {
+            mut stream,
+            info,
+            effective_redirect,
+            ..
+        } = follow_read_redirect_streaming(
+            url::Url::parse("omni://server/object").unwrap(),
+            &stale,
+            false,
+            None,
+            &retry::RetryConfig::default(),
+            Some(mint),
+        )
+        .await
+        .expect("expired redirect is re-minted");
+        let mut body = Vec::new();
+        while let Some(frame) = stream.next().await {
+            body.extend_from_slice(&frame.expect("fresh body frame"));
+        }
+
+        assert_eq!(body, b"fresh bytes");
+        assert_eq!(info.etag.as_deref(), Some("generation-2"));
+        assert_eq!(info.etag_strength, EtagStrength::Unspecified);
+        assert_eq!(effective_redirect.response_parsing, fresh_parsing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn initial_206_requires_single_range_alignment() {
         let cases = [
             (
@@ -4266,6 +4509,102 @@ mod resume_hardening_tests {
         );
     }
 
+    /// Validator strength does not change the established textual resume
+    /// guard: a repeated weak or unspecified token still permits resume.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn weak_and_unspecified_validators_resume_with_textual_guard() {
+        use futures::StreamExt;
+
+        let cases = [
+            (
+                "weak standard etag",
+                ResponseParsing {
+                    etag_header: Some("etag".into()),
+                    ..ResponseParsing::default()
+                },
+                "ETag: W/\"v1\"",
+                EtagStrength::Weak,
+                Some("W/\"v1\""),
+            ),
+            (
+                "unspecified custom validator",
+                ResponseParsing {
+                    etag_header: Some("x-object-version".into()),
+                    ..ResponseParsing::default()
+                },
+                "x-object-version: v1",
+                EtagStrength::Unspecified,
+                None,
+            ),
+        ];
+
+        for (label, parsing, validator_header, expected_strength, expected_if_match) in cases {
+            let object: Vec<u8> = (0u16..100).map(|i| i as u8).collect();
+            let responses = vec![
+                ScriptedResponse {
+                    head: format!(
+                        "HTTP/1.1 206 Partial Content\r\n\
+                         Content-Range: bytes 0-99/100\r\n{validator_header}"
+                    ),
+                    body: object[..50].to_vec(),
+                    content_length: 100,
+                },
+                ScriptedResponse {
+                    head: format!(
+                        "HTTP/1.1 206 Partial Content\r\n\
+                         Content-Range: bytes 50-99/100\r\n{validator_header}"
+                    ),
+                    body: object[50..].to_vec(),
+                    content_length: 50,
+                },
+            ];
+            let (port, captured) = spawn_scripted_server(responses).await;
+            let redirect =
+                redirect_with_parsing(format!("http://127.0.0.1:{port}/object"), parsing);
+            let range = ByteRange {
+                start: 0,
+                end_inclusive: Some(99),
+            };
+            let retry_cfg = retry::RetryConfig {
+                initial_delay_ms: 1,
+                max_delay_ms: 5,
+                max_attempts: 3,
+            };
+            let StreamedReadRedirect {
+                mut stream, info, ..
+            } = follow_read_redirect_streaming(
+                url::Url::parse("omni://server/object").unwrap(),
+                &redirect,
+                false,
+                Some(&range),
+                &retry_cfg,
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{label}: initial response failed: {error}"));
+            assert_eq!(info.etag_strength, expected_strength, "case: {label}");
+
+            let mut bytes = Vec::new();
+            while let Some(frame) = stream.next().await {
+                bytes.extend_from_slice(
+                    &frame.unwrap_or_else(|error| panic!("{label}: resume failed: {error}")),
+                );
+            }
+            assert_eq!(bytes, object, "case: {label}");
+            let captured = captured.lock().unwrap();
+            assert_eq!(
+                captured.len(),
+                2,
+                "{label}: exactly one resume request is expected"
+            );
+            assert_eq!(
+                if_match_header(&captured[1]),
+                expected_if_match,
+                "case: {label}"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_missing_original_validator_is_rejected() {
         use futures::StreamExt;
@@ -4326,7 +4665,8 @@ mod resume_hardening_tests {
         );
     }
 
-    /// The resume `If-Match` must carry the response's real HTTP
+    /// An unspecified custom validator admits resume. The resume `If-Match`
+    /// must independently carry the response's real HTTP
     /// `ETag`, never the opaque SPI validator. A GCS-style backend maps
     /// `x-goog-generation` to `ObjectInfo.etag`; sending that as `If-Match`
     /// 412s every resume.
@@ -4369,7 +4709,9 @@ mod resume_hardening_tests {
             max_delay_ms: 5,
             max_attempts: 3,
         };
-        let StreamedReadRedirect { mut stream, .. } = follow_read_redirect_streaming(
+        let StreamedReadRedirect {
+            mut stream, info, ..
+        } = follow_read_redirect_streaming(
             url::Url::parse("omni://server/object").unwrap(),
             &redirect,
             false,
@@ -4379,6 +4721,8 @@ mod resume_hardening_tests {
         )
         .await
         .expect("header phase ok");
+        assert_eq!(info.etag.as_deref(), Some("1600000000000001"));
+        assert_eq!(info.etag_strength, EtagStrength::Unspecified);
         let mut bytes = Vec::new();
         while let Some(frame) = stream.next().await {
             bytes.extend_from_slice(&frame.expect("no error frame"));

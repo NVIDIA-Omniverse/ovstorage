@@ -100,6 +100,19 @@ pub enum ObjectKindV1 {
     DirectoryInferred = 3,
 }
 
+/// Strength declaration for an etag. Numeric values are the ABI contract.
+/// The zero value is deliberately `Unspecified`, so zero-initialized storage
+/// and producers that do not write the field receive the fail-safe,
+/// untrusted interpretation rather than promising a strong validator.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum EtagStrengthV1 {
+    #[default]
+    Unspecified = 0,
+    Strong = 1,
+    Weak = 2,
+}
+
 /// Object metadata: address, kind, identity, checksums, optional
 /// permissions / metadata. `mtime_unix_ms` is Unix milliseconds; ms
 /// precision is the FFI-boundary clock contract.
@@ -117,6 +130,11 @@ pub struct ObjectInfo {
     pub system_metadata: Optional<SystemMetadata>,
     pub user_metadata: Optional<UserMetadata>,
     pub modified_by: Optional<Str>,
+    pub etag_strength: EtagStrengthV1,
+    /// The address that names this version of the object; `present == false`
+    /// when the backend does not version it or was not asked. Tail-appended
+    /// in ABI v19.
+    pub versioned_address: Optional<Str>,
 }
 
 unsafe impl Send for ObjectInfo {}

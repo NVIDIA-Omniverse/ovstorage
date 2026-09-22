@@ -24,14 +24,25 @@ futures = "0.3.32"
 libloading = "0.8.9"
 log = "0.4.31"
 metrics = "0.24.6"
-opentelemetry = { version = "0.31.0", features = ["trace", "metrics"] }
-opentelemetry-otlp = { version = "0.31.1", default-features = false, features = [
+opentelemetry = { version = "0.32.0", features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = [
     "http-proto",
     "reqwest-blocking-client",
     "trace",
     "metrics",
 ] }
-opentelemetry_sdk = { version = "0.31.0", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["trace", "metrics"] }
+# opentelemetry-http 0.32 sends OTLP over reqwest 0.13, a second reqwest
+# package that this crate's reqwest 0.12 features cannot reach. The edge
+# below exists only to unify TLS onto that copy: `rustls-no-provider` links
+# rustls into it without adding a second crypto provider, and the exporter
+# builders install `ring` (the provider behind every other TLS client here)
+# as the process default before the exporter is built. Only the TLS
+# regression test in `tracing_init.rs` names this dependency directly.
+reqwest-otlp = { package = "reqwest", version = "0.13.5", default-features = false, features = [
+    "rustls-no-provider",
+] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 parking_lot = "0.12.5"
 rand = "0.8.6"
 reqwest = { version = "0.12.28", default-features = false, features = [
@@ -59,7 +70,7 @@ tokio-util = { version = "0.7.18", features = ["io", "rt"] }
 toml = "0.8.23"
 tracing = "0.1.44"
 tracing-log = "0.2.0"
-tracing-opentelemetry = "0.32.1"
+tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json", "tracing-log"] }
 url = "2.5.8"
 
@@ -78,12 +89,16 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security_Authorization",
     # `FILE_ALL_ACCESS`, the access mask in the auth directory's owner-only ACE.
     "Win32_Storage_FileSystem",
+    # `OVERLAPPED`, which carries the staging lock's byte offset to `LockFileEx`.
+    "Win32_System_IO",
 ] }
 
 [dev-dependencies]
 ovstorage-cache = { workspace = true, features = ["test-seams"] }
+ovstorage-hub-client = { workspace = true, features = ["fake-hub"] }
 ovstorage-plugin-cache = { workspace = true }
 ovstorage-plugin-core = { workspace = true }
+ovstorage-plugin-hub-cache = { workspace = true }
 ovstorage-plugin-http = { workspace = true }
 ovstorage-plugin-test = { workspace = true }
 # Enable the `test-codec` hooks so the `loaded_v2` round-trip tests can reach

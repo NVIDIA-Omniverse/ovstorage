@@ -171,6 +171,15 @@ example `foo.usd?&3` parses into
 The pin is preserved byte-for-byte through route translation,
 whether the caller typed it or got it back from `list_versions`.
 
+`ObjectInfo.versioned_address` uses the same form. A `stat` or `list` with
+`versioned_address` set costs one `get_checkpoints` plus one `stat2` at the
+newest checkpoint per file (per file entry, on `list`) and reports the file
+pinned at that checkpoint with that checkpoint's own facts, so a save landing
+between the two calls cannot leave the pin naming newer bytes than the etag
+and size describe; a `stat` of an address that already carries a
+`?branch&checkpoint` pin echoes it without either call. Folders, and files
+with no checkpoints, answer `None` and keep their head facts.
+
 Mutating ops — `write`, `write_stream`, `write_redirect`, `delete`,
 `copy(destination)`, `rename(both endpoints)`, `update_metadata`,
 `create_directory`, and `delete_directory` — refuse any URL that
@@ -200,6 +209,12 @@ The plugin maps the Layer precondition fields onto the wire:
   `RenameOptions::{if_source,if_dest}` → `Unsupported` (the
   underlying omni1 RPCs carry no conditional fields).
 
+omni1 etags remain `Unspecified` in object metadata. The wire exposes them as
+opaque precondition tokens but does not declare that equal values prove
+byte-identical content or are never reissued after copy, restore, or rollback.
+They remain usable for the precondition paths above, while trust-sensitive
+consumers such as the byte cache take the fail-safe path.
+
 A purged or older checkpoint surfaces as `NotFound`. A stale etag
 on `update_asset` returns Nucleus's `InvalidETag`, which the plugin
 maps to `PreconditionFailed`; `ObjectModified` remains reserved for
@@ -212,19 +227,19 @@ is preserved through the URL.
 | Layer method | omni1 RPC |
 |---|---|
 | `instantiate` | (no remote call; validates the connection config, deferred auth/authorize to first data-path call) |
-| `stat` | `Connection::stat2(PathAtVersion)` → `Stat2Result` (`size`, `etag`, `transaction_id`, `hash_*`, `acl`, lock state, checkpoint flag) |
+| `stat` | `Connection::stat2(PathAtVersion)` → `Stat2Result` (`size`, `etag`, `transaction_id`, `hash_*`, `acl`, lock state, checkpoint flag). With `StatOptions::versioned_address` set, one `get_checkpoints` plus one `stat2` at the newest checkpoint add `versioned_address` (`?<branch>&<newest checkpoint_id>`) for a file and report that checkpoint's facts; a `?branch&checkpoint` pin is echoed without either call; folders and files without checkpoints answer `None`. |
 | `read` (asset, inline) | `Connection::read_asset_version(PathAtVersion, etag?)` — inline `content` for sub-threshold payloads |
 | `read` (asset, LFT) | `Connection::read_asset_version` returns `uri_redirection` → `ReadResult::Redirect` carrying the LFT URL plus `LftClient::auth_headers()` |
-| `write` / `write_stream` (asset, inline) | `Connection::create_asset` / `update_asset(PathAtBranch, content?, content_id?, ...)` with bytes inline |
-| `write_redirect` + `continue_write` | LFT presigned-PUT: `LftClient::generate_upload` mints one `WriteRedirect` per call; `continue_write` finalises via `create_asset` / `update_asset` with `content_id` set |
+| `write` / `write_stream` (asset, inline) | `Connection::create_asset` / `update_asset(PathAtBranch, content?, content_id?, ...)` with bytes inline; a write without an etag precondition creates missing ancestors via `create_directory` first (tracked per connection) |
+| `write_redirect` + `continue_write` | LFT presigned-PUT: `LftClient::generate_upload` mints one `WriteRedirect` per call; `continue_write` finalises via `create_asset` / `update_asset` with `content_id` set; for a write without an etag precondition, both the mint and the finalize create missing ancestors via `create_directory` first (tracked per connection) |
 | `delete` | `Connection::delete2(PathAtVersion[])` — batched on the wire, single-path through the Layer; non-recursive |
-| `list` | `Connection::list2(path, branches?, path_types?, show_hidden?)` → `List2Response.entries[]`; one-level only |
-| `list_versions` | `Connection::get_checkpoints(PathAtBranch)` → `Checkpoint[]` (`checkpoint_id: uint64`, `message`); newest-first |
-| `get_latest_version` | `get_checkpoints` filtered to the requested checkpoint, or the most recent; `Unsupported` when no checkpoints |
-| `create_directory` | `Connection::create_directory(PathAtBranch)` (does not synthesise missing parents) |
+| `list` | `Connection::list2(path, branches?, path_types?, show_hidden?)` → `List2Response.entries[]`; one-level only. With `ListOptions::versioned_address` set, one `get_checkpoints` plus one `stat2` per file entry (2N round-trips) fill `versioned_address` and replace the entry's facts with the pinned checkpoint's; folders answer `None`. |
+| `list_versions` | `Connection::get_checkpoints(PathAtBranch)` → `Checkpoint[]` (`checkpoint_id: uint64`, `message`); newest-first; `versioned_address` equals each item's own address |
+| `get_latest_version` | `get_checkpoints` filtered to the requested checkpoint, or the most recent; `versioned_address` equals the returned address; `Unsupported` when no checkpoints |
+| `create_directory` | `Connection::create_directory(PathAtBranch)`, always issued for a requested target other than the root, which always exists; creates missing ancestors and is idempotent: the target's `ALREADY_EXISTS` is confirmed by one `stat2` and stays `AlreadyExists` when the node is a file |
 | `delete_directory` | `Connection::delete2` of an empty directory; non-recursive (recursive returns `Unsupported`; the host walks) |
-| `copy` | `Connection::copy2(PathsToCopy[])` — single-pair |
-| `rename` | `Connection::rename2(PathsToRename[])` — single-pair, atomic per pair |
+| `copy` | `Connection::copy2(PathsToCopy[])` — single-pair; on `NotFound`, confirms the source with `stat2`, then creates missing ancestors of the destination via `create_directory` and re-issues the pair once |
+| `rename` | `Connection::rename2(PathsToRename[])` — single-pair, atomic per pair; on `NotFound`, confirms the source with `stat2`, then creates missing ancestors of the destination via `create_directory` and re-issues the pair once |
 | `update_metadata` | `Unsupported` — omni1 has no caller-owned key/value metadata surface |
 | `check_access` | `Connection::get_acl_resolved` filtered to the authenticated principal captured from `Connection::authorize_token` |
 | `watch_directory` | `Connection::subscribe_list(PathAtBranch)` — one-level; iterator pumped on a dedicated OS thread |
@@ -244,6 +259,68 @@ Layer but not to omni1. Without it,
 `delete_directory("omniverse://srv/docs")` would target the **file**
 `/docs` rather than the folder `/docs/`, and a slashless `list` could
 return a sibling named `docsx` among its entries.
+
+### Missing ancestors
+
+A write creates its path. Before a write's `create_asset` — on the
+inline path, at the LFT mint in `write_redirect`, and at the finalize
+in `continue_write` — the plugin ensures the destination's parent
+folder exists with omni1 `create_directory`. It walks upward
+deepest-first only when the server answers `NOT_EXIST`, never above
+the connection's configured `prefix` and never to the root;
+`ALREADY_EXISTS` on an ancestor is treated as success. A
+per-connection fixed-capacity set (4096 entries, cleared wholesale
+when full; no LRU, no TTL) records the directories this connection
+knows to be folders, so the ancestor call is issued once per
+directory rather than once per file. A folder the walk created is
+remembered at once; a parent that answered `ALREADY_EXISTS` — a node
+of any type — is remembered only once a write beneath it succeeds, so
+a file-shaped path is asked about again rather than trusted. A folder
+this connection deletes or renames away is forgotten, together with
+everything beneath it. Concurrent writers into one
+fresh tree each issue the ancestor call; it is idempotent and there
+is no in-flight de-duplication. `IfDestExists::MatchEtag` writes skip
+ancestor handling on every write path, because the target must exist
+for the etag to match.
+
+The ancestor call is a precursor, not a precondition. If the server
+refuses it for any reason other than a missing level — a principal
+that may write assets but not create folders, a transport fault — the
+write proceeds, nothing is remembered, and the server's answer to the
+write itself is what the caller sees. A write therefore never requires
+folder-create rights on a parent that already exists. The one
+exception is a level the server reports missing that the walk cannot
+create, above the `prefix` or the root itself: the write would answer
+the same `NotFound`, so it surfaces before the body is sent.
+
+The set can go stale when another client removes a directory. If the
+commit answers `NotFound` and the parent had been answered from the
+set, the plugin forgets the entry, re-ensures the ancestors live, and
+retries the commit once: the folder exists after the re-ensure whether
+this writer created it or another writer racing on the same stale
+entry did, and the server does not say which. A `NotFound` unrelated to
+the ancestors therefore costs one re-send, on this path only. When the
+parent was confirmed live in the same call there is no retry. The
+re-ensure is a recovery attempt, not the operation the caller asked
+for: if it fails, the commit's own error is returned unchanged. The
+wire call borrows the body, so the retry holds no second copy of it.
+
+`copy2` and `rename2` carry no body, so their destination folder is
+created lazily: the pair is issued first, and only a `NotFound` answer
+triggers the same forget, re-ensure and single re-issue. Because omni1
+answers one `NotFound` for a missing source and a missing destination
+folder alike, the source is first probed with `stat2` in both
+spellings; a missing source surfaces as that `NotFound` with nothing
+created. A copy or rename that fails for any other reason leaves no
+folder behind.
+
+The public `create_directory` verb is recursive and idempotent: it
+always issues the RPC for the requested target and creates missing
+ancestors. An `ALREADY_EXISTS` answer for the target itself is
+confirmed with one `stat2` in the directory spelling; a folder is the
+idempotent success and is remembered, while a file at that path keeps
+the server's `AlreadyExists` and is never remembered as a folder. The
+root always exists, so `create_directory` on it succeeds with no RPC.
 
 ## Streaming guarantees
 

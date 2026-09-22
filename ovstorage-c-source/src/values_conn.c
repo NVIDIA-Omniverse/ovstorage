@@ -520,6 +520,7 @@ void ovc_connection_clear(OvStorage_Connection *connection)
     free((void *)connection->source_broker_principal);
     free((void *)connection->auth_failed_message);
     free((void *)connection->awaiting_auth_unknown_details);
+    free((void *)connection->owning_target);
     memset(connection, 0, sizeof(*connection));
 }
 
@@ -569,6 +570,7 @@ void ovstorage_auth_event_destroy(OvStorage_AuthEvent *event)
     case OvStorage_AuthEventKind_Succeeded:
         ovstorage_connection_destroy(
             (OvStorage_Connection *)(void *)event->as.succeeded.connection);
+        ovstorage_secret_bundle_destroy(event->as.succeeded.credentials);
         break;
     case OvStorage_AuthEventKind_Failed:
         free((void *)event->as.failed.message);
@@ -578,6 +580,19 @@ void ovstorage_auth_event_destroy(OvStorage_AuthEvent *event)
         break;
     }
     free(event);
+}
+
+OvStorage_SecretBundle *ovstorage_auth_event_take_succeeded_credentials(
+    OvStorage_AuthEvent *event)
+{
+    OvStorage_SecretBundle *taken;
+
+    if (event == NULL || event->kind != OvStorage_AuthEventKind_Succeeded) {
+        return NULL;
+    }
+    taken = event->as.succeeded.credentials;
+    event->as.succeeded.credentials = NULL;
+    return taken;
 }
 
 void ovc_root_info_clear(OvStorage_RootInfo *info)
@@ -732,6 +747,70 @@ static void ovc_values_conn_test_auth_event_variants(void)
     assert(connection->id != NULL);
     event->kind = OvStorage_AuthEventKind_Succeeded;
     event->as.succeeded.connection = connection;
+    ovstorage_auth_event_destroy(event);
+
+    /* Succeeded with credentials, never taken: ovstorage_auth_event_destroy
+     * must free the bundle itself, or the sanitizer leak check this suite
+     * runs under would catch it. */
+    {
+        OvStorage_SecretValue *value;
+        OvStorage_SecretBundle *taken;
+
+        event = (OvStorage_AuthEvent *)calloc(1, sizeof(*event));
+        connection = (OvStorage_Connection *)calloc(1, sizeof(*connection));
+        assert(event != NULL);
+        assert(connection != NULL);
+        connection->id = ovc_conn_string_duplicate("connection");
+        assert(connection->id != NULL);
+        event->kind = OvStorage_AuthEventKind_Succeeded;
+        event->as.succeeded.connection = connection;
+        event->as.succeeded.credentials = ovstorage_secret_bundle_create();
+        assert(event->as.succeeded.credentials != NULL);
+        value = ovstorage_secret_value_create_bytes(
+            (const uint8_t *)"token-bytes", 11);
+        assert(value != NULL);
+        assert(ovstorage_secret_bundle_add(
+            event->as.succeeded.credentials, "oauth", value));
+        ovstorage_auth_event_destroy(event);
+
+        /* Taken exactly once: the caller now owns it, and a second take on
+         * the same event answers NULL rather than double-handing it out. */
+        event = (OvStorage_AuthEvent *)calloc(1, sizeof(*event));
+        connection = (OvStorage_Connection *)calloc(1, sizeof(*connection));
+        assert(event != NULL);
+        assert(connection != NULL);
+        connection->id = ovc_conn_string_duplicate("connection");
+        assert(connection->id != NULL);
+        event->kind = OvStorage_AuthEventKind_Succeeded;
+        event->as.succeeded.connection = connection;
+        event->as.succeeded.credentials = ovstorage_secret_bundle_create();
+        assert(event->as.succeeded.credentials != NULL);
+        value = ovstorage_secret_value_create_bytes(
+            (const uint8_t *)"token-bytes", 11);
+        assert(value != NULL);
+        assert(ovstorage_secret_bundle_add(
+            event->as.succeeded.credentials, "oauth", value));
+
+        taken = ovstorage_auth_event_take_succeeded_credentials(event);
+        assert(taken != NULL);
+        assert(event->as.succeeded.credentials == NULL);
+        assert(ovstorage_auth_event_take_succeeded_credentials(event) ==
+               NULL);
+        /* Destroying the event now must not touch `taken`: ownership
+         * already left. Freeing `taken` separately is what proves it. */
+        ovstorage_auth_event_destroy(event);
+        ovstorage_secret_bundle_destroy(taken);
+    }
+
+    /* Take on the wrong event kind, and on NULL, both answer NULL rather
+     * than reading an inactive union member. */
+    event = (OvStorage_AuthEvent *)calloc(1, sizeof(*event));
+    assert(event != NULL);
+    event->kind = OvStorage_AuthEventKind_Progress;
+    event->as.progress.message = ovc_conn_string_duplicate("waiting");
+    assert(event->as.progress.message != NULL);
+    assert(ovstorage_auth_event_take_succeeded_credentials(event) == NULL);
+    assert(ovstorage_auth_event_take_succeeded_credentials(NULL) == NULL);
     ovstorage_auth_event_destroy(event);
 
     event = (OvStorage_AuthEvent *)calloc(1, sizeof(*event));

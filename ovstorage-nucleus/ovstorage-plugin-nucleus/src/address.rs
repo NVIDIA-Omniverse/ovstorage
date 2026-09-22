@@ -159,4 +159,24 @@ mod tests {
                 .unwrap();
         assert_eq!(target.checkpoint, Some(7));
     }
+
+    /// The spellings the backend emits for a pinned address (`?&N` on the
+    /// default branch, `?branch&N` otherwise) parse back to the same branch
+    /// and checkpoint, so a reported pin can be dereferenced as-is.
+    #[test]
+    fn checkpoint_selector_spellings_round_trip() {
+        let default_branch =
+            parse_nucleus_address(&address::parse("omniverse://server/p?&12").unwrap()).unwrap();
+        assert_eq!(
+            (default_branch.branch, default_branch.checkpoint),
+            (None, Some(12))
+        );
+
+        let named = parse_nucleus_address(&address::parse("omniverse://server/p?main&12").unwrap())
+            .unwrap();
+        assert_eq!(
+            (named.branch, named.checkpoint),
+            (Some("main".to_string()), Some(12))
+        );
+    }
 }

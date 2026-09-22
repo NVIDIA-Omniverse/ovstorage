@@ -443,6 +443,7 @@ pub(super) fn _verify_q7_snapshot_riders(py: Python<'_>) -> PyResult<()> {
             address: gate_address.clone(),
             options: ovs::StatOptions {
                 full_metadata: false,
+                versioned_address: false,
             },
         },
     };
@@ -459,6 +460,7 @@ pub(super) fn _verify_q7_snapshot_riders(py: Python<'_>) -> PyResult<()> {
                 address: gate_address.clone(),
                 options: ovs::StatOptions {
                     full_metadata: false,
+                    versioned_address: false,
                 },
             },
         },
@@ -478,6 +480,7 @@ pub(super) fn _verify_q7_snapshot_riders(py: Python<'_>) -> PyResult<()> {
         address: gate_address,
         options: ovs::StatOptions {
             full_metadata: false,
+            versioned_address: false,
         },
     });
 
@@ -2206,6 +2209,45 @@ impl ovs::Layer for PyLayerAdapter {
         .await
     }
 
+    async fn list_stream(
+        &self,
+        request: ovs::Request<ovs::ListRequest>,
+        cancel: Option<ovs::CancellationToken>,
+    ) -> ovs::Result<ovs::ListStream> {
+        if !self.is_overridden(OverrideSlot::List) {
+            return match &self.inner {
+                Some(inner) => inner.list_stream(request, cancel).await,
+                None => Err(ovs::Error::new(
+                    ovs::ErrorCode::Unsupported,
+                    "list is unsupported",
+                )),
+            };
+        }
+
+        // A Python `list` override may filter or transform the buffered page,
+        // so preserve the trait adapter's fail-closed semantics for that case.
+        // Only an unmodified wrapper is transparent enough to forward the
+        // native streaming slot above.
+        if request.input.options.max_results.is_some() || request.input.options.page_token.is_some()
+        {
+            return Err(ovs::Error::new(
+                ovs::ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+
+        let stream_cancel = cancel.clone();
+        let page = self.list(request, cancel).await?;
+        if page.next_page_token.is_some() {
+            return Err(ovs::Error::new(
+                ovs::ErrorCode::Internal,
+                "list returned a continuation token the buffered list_stream adapter cannot follow; implement list_stream natively",
+            ));
+        }
+        let stream = Box::pin(futures::stream::iter(page.items.into_iter().map(Ok)));
+        Ok(ovs::cancel_list_stream(stream, stream_cancel))
+    }
+
     async fn list_versions(
         &self,
         request: ovs::Request<ovs::ListVersionsRequest>,
@@ -2417,6 +2459,7 @@ fn decode_read_result(
 
 fn conservative_read_stream_info(address: ovs::Url) -> ovs::ObjectInfo {
     ovs::ObjectInfo {
+        etag_strength: Default::default(),
         address,
         kind: ovs::ObjectKind::File,
         size: None,
@@ -2428,6 +2471,7 @@ fn conservative_read_stream_info(address: ovs::Url) -> ovs::ObjectInfo {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 

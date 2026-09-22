@@ -44,11 +44,13 @@ async fn build_default_broker_for_test() -> Broker {
         .expect("build_default_broker")
 }
 
+mod anonymous_fallback;
 mod attribution;
 mod bespoke_stack;
 mod byte_cache_reuse;
 mod cache_redirect;
 mod config;
+mod continuation_seal;
 mod core;
 mod grpc;
 mod grpc_streaming_seam;
@@ -60,5 +62,6 @@ mod principal_isolation;
 mod redirect_disclosure;
 mod transport;
 mod watch;
+mod watch_limit;
 
 pub use helpers::*;

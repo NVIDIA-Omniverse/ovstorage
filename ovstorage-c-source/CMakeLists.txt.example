@@ -18,6 +18,7 @@ endif()
 set(OVSTORAGE_C_SOURCES
     src/auth_credential.c
     src/cancel.c
+    src/credential_store.c
     src/dispatch.c
     src/file_backend.c
     src/host_callbacks.c
@@ -26,6 +27,7 @@ set(OVSTORAGE_C_SOURCES
     src/registry.c
     src/runtime.c
     src/stack.c
+    src/stack_config.c
     src/streams.c
     src/temp_dir.c
     src/utf8.c

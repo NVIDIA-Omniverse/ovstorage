@@ -21,7 +21,8 @@ CXXFLAGS += -std=c++20 -Wall -Wextra
 LDLIBS += -lpthread -ldl
 
 C_SOURCES := $(wildcard src/*.c)
-C_HEADERS := $(wildcard include/*.h) src/internal.h src/temp_dir.h
+C_HEADERS := $(wildcard include/*.h) src/internal.h src/temp_dir.h \
+	src/vendor/tomlc17/tomlc17.c src/vendor/tomlc17/tomlc17.h
 
 # A BUILD_DIR containing a space needs two spellings. Make splits rule heads on
 # whitespace and honours a backslash escape there, so targets and prerequisites

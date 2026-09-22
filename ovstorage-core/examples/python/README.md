@@ -90,14 +90,38 @@ demonstrates that rule.
 - [`services_config_probe.py`](services_config_probe.py) and
   [`services_client_smoke.py`](services_client_smoke.py) exercise an
   Omniverse Storage Service connection supplied by the user. The probe loads
-  the plugin file kind `services_client`; its configuration uses backend kind
-  `omniverse-storage-service` and top-level connection entries:
+  the plugin file kind `services_client`. It accepts the same standard
+  `[ovstorage]` config file that the CLI reads and `ovstorage write-config`
+  emits. The graph needs a redirect follower because service reads can return
+  redirects for the HTTP plugin to follow:
 
   ```toml
-  [[connections]]
+  [ovstorage]
+  root = "redirects"
+
+  [ovstorage.layers.redirects]
+  kind = "redirect_follower"
+  inner = "routes"
+
+  [ovstorage.layers.routes]
+  kind = "router"
+  children = ["service"]
+
+  [ovstorage.layers.service]
+  kind = "omniverse-storage-service"
+
+  [[ovstorage.connections]]
   backend_kind = "omniverse-storage-service"
+  target = "service"
   display_name = "example-service"
 
-  [connections.config]
+  [ovstorage.connections.config]
   address = "https://storage.example.com"
+
+  [ovstorage.connections.credentials]
+  oauth = "${OVS_STORAGE_TOKEN}"
   ```
+
+  Credential references such as `${OVS_STORAGE_TOKEN}` resolve from the
+  environment when `Stack.build()` runs. Omit the credentials table for an
+  anonymous endpoint or an interactive-auth connection.

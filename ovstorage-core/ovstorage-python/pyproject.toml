@@ -7,7 +7,7 @@ build-backend = "maturin"
 
 [project]
 name = "ovstorage"
-version = "0.2.1"
+version = "0.3.0"
 requires-python = ">=3.10"
 description = "Python bindings for ovstorage"
 readme = { file = "PYPI_README.md", content-type = "text/markdown" }

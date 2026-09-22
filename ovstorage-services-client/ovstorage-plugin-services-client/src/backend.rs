@@ -3,6 +3,7 @@
 
 //! `Backend` impl: maps ovstorage SPI calls to Omniverse Storage Service gRPC RPCs.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 
 use bytes::Bytes;
@@ -12,13 +13,13 @@ use ovstorage_plugin::{
     BackendAddressRootsStream, BackendChangeEvent, BackendChangeStream, BackendItemInfo, Body,
     BodyStream, Capabilities, ChangeKind, ChecksumSet, ConnectionId, CopyOptions,
     CreateDirectoryOptions, DeleteDirectoryOptions, DeleteOptions, Error, ErrorCode, ErrorContext,
-    HttpRequest, IfDestExists, ListOptions, ListVersionsOptions, ObjectInfo, ObjectKind,
-    PartialStage, ReadOptions, ReadRedirect, ReadResult, RedirectBodySource, RedirectCredential,
-    RedirectResultBatch, RedirectScope, RenameOptions, ResolvedTarget, ResponseParsing, Result,
-    ResultCapture, RollbackEffect, RouteSource, StageOutcome, StatOptions, SystemMetadata,
-    UpdateMetadataOptions, UserMetadata, WatchDirectoryCursor, WatchDirectoryOptions, WriteOptions,
-    WriteRedirect, WriteRedirectBatch, WriteResult, WriteStep, race_cancel,
-    validate_redirect_results,
+    HttpRequest, IfDestExists, ListOptions, ListStream, ListVersionsOptions, MESSAGE_METADATA_KEY,
+    ObjectInfo, ObjectKind, PartialStage, ReadOptions, ReadRedirect, ReadResult,
+    RedirectBodySource, RedirectCredential, RedirectResultBatch, RedirectScope, RenameOptions,
+    ResolvedTarget, ResponseParsing, Result, ResultCapture, RollbackEffect, RouteSource,
+    StageOutcome, StatOptions, SystemMetadata, UpdateMetadataOptions, UserMetadata,
+    WatchDirectoryCursor, WatchDirectoryOptions, WriteOptions, WriteRedirect, WriteRedirectBatch,
+    WriteResult, WriteStep, race_cancel, validate_redirect_results,
 };
 use ovstorage_services_protos::nvidia::omniverse::notifications::consumer::v1beta as notif;
 use ovstorage_services_protos::nvidia::omniverse::storage::{
@@ -31,8 +32,8 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::convert::{
-    fields_from_metadata, map_status, object_info_from, require_etag_only_if_match, require_field,
-    resource_identity_from,
+    etag_strength, fields_from_metadata, map_status, object_info_from, require_etag_only_if_match,
+    require_field, resource_identity_from,
 };
 use crate::multipart::{Continuation, ContinuationKind};
 use crate::trace::RedactedUrl;
@@ -47,10 +48,6 @@ const WRITE_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 /// per-object access-control list. Matches the C++ provider's
 /// `kMetadataKeyAcl` at `StorageProvider.cpp:168`.
 const ACL_METADATA_KEY: &str = "acl";
-
-// SPI: opts.message stashed via the metadata service when the backend has
-// no per-operation annotation slot.
-const OV_MESSAGE_KEY: &str = "x-ov-message";
 
 /// The counts and flags one stash warning carries.
 ///
@@ -69,7 +66,7 @@ struct MetadataStashWarning<'a> {
     /// `PartialCompletion` reports on.
     ///
     /// "Caller" is shorthand: the test is the namespace, not provenance, so a
-    /// caller that sets its own `ovstorage-` key is counted with the host's.
+    /// caller that sets its own `ovstorage_` key is counted with the host's.
     /// A different denominator from `failed`, which counts the whole map —
     /// equal to it whenever no reserved key was involved, smaller when one was.
     caller_failed: usize,
@@ -78,7 +75,7 @@ struct MetadataStashWarning<'a> {
     /// Whichever key failed first, reserved or not. Meaningless when
     /// `service_unreachable` is set, since no key was individually refused.
     sample_key: &'a str,
-    /// Whether `ovstorage-modified-by` was among the failures. Called out
+    /// Whether `ovstorage_modified_by` was among the failures. Called out
     /// separately because the sample is whichever key iterated first, which
     /// for a `HashMap` is not a stable choice, so without the flag the one key
     /// an operator cares about could be masked by a neighbour.
@@ -101,7 +98,7 @@ struct MetadataStashWarning<'a> {
 
 /// Report post-commit metadata stashes that did not land. The object is already
 /// written when these run, so the keys keep whatever the object carried before,
-/// which for `ovstorage-modified-by` on an overwrite is the previous writer.
+/// which for `ovstorage_modified_by` on an overwrite is the previous writer.
 ///
 /// This warning is the operator's copy of the failure. When a CALLER key
 /// failed, the caller also gets `ErrorCode::PartialCompletion` carrying the
@@ -459,6 +456,251 @@ fn merge_standard_metadata_into_object(info: &mut ObjectInfo, extra: StandardMet
     }
 }
 
+/// One address decoded from a `ListStatResponse` frame. The lookup address is
+/// retained only while a caller-requested metadata fetch is pending; it is
+/// released before the entry is yielded.
+struct PendingListEntry {
+    info: ObjectInfo,
+    metadata_address: Option<String>,
+    /// The caller asked for the pin and this is a file entry, the only kind
+    /// that carries one.
+    pin_version: bool,
+}
+
+/// Decode one size-bounded `ListStatResponse` frame in service emission order.
+/// Invalid server addresses are omitted individually so one bad row cannot
+/// hide valid siblings in the same frame.
+fn decode_list_stat_frame(
+    frame: ff::ListStatResponse,
+    full_metadata: bool,
+    versioned_address: bool,
+) -> VecDeque<PendingListEntry> {
+    let mut pending =
+        VecDeque::with_capacity(frame.subfolder_addresses.len() + frame.entries.len());
+    for sub in frame.subfolder_addresses {
+        match parse_server_address(&sub.uri, "list subfolder address") {
+            Ok(address) => pending.push_back(PendingListEntry {
+                info: default_object_info(address, ObjectKind::Directory),
+                metadata_address: None,
+                pin_version: false,
+            }),
+            Err(error) => tracing::warn!(
+                target: "ovstorage::services_client",
+                address = %redacted_address(&sub.uri),
+                reason = %error.message(),
+                "omniverse-storage-service: subfolder address is not addressable; \
+                 omitted from the listing",
+            ),
+        }
+    }
+    for entry in frame.entries {
+        let address = match parse_server_address(&entry.resource_address, "list resource address") {
+            Ok(address) => address,
+            Err(error) => {
+                tracing::warn!(
+                    target: "ovstorage::services_client",
+                    address = %redacted_address(&entry.resource_address),
+                    reason = %error.message(),
+                    "omniverse-storage-service: list resource_address is not addressable; \
+                     omitted from the listing",
+                );
+                continue;
+            }
+        };
+        let info = entry
+            .resource_info
+            .as_ref()
+            .map(|info| object_info_from(address.clone(), info))
+            .unwrap_or_else(|| default_object_info(address, ObjectKind::File));
+        pending.push_back(PendingListEntry {
+            info,
+            metadata_address: full_metadata.then_some(entry.resource_address),
+            pin_version: versioned_address,
+        });
+    }
+    pending
+}
+
+struct ListStatStreamState {
+    server_stream: tonic::Streaming<ff::ListStatResponse>,
+    pending: VecDeque<PendingListEntry>,
+    transport: OmniverseStorageTransport,
+    cancel: Option<CancellationToken>,
+    full_metadata: bool,
+    versioned_address: bool,
+    finished: bool,
+}
+
+async fn next_list_stat_entry(
+    mut state: ListStatStreamState,
+) -> Option<(Result<ObjectInfo>, ListStatStreamState)> {
+    if state.finished {
+        return None;
+    }
+
+    loop {
+        // The open-time token governs the returned stream's whole lifetime,
+        // including entries already decoded from the current response frame.
+        if state
+            .cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            state.finished = true;
+            return Some((
+                Err(Error::new(ErrorCode::Cancelled, "cancelled by host")),
+                state,
+            ));
+        }
+
+        if let Some(mut entry) = state.pending.pop_front() {
+            // The pin rebuilds the entry's identity fields, so it lands before
+            // the metadata merge that layers onto them.
+            if entry.pin_version {
+                let pinned = race_cancel(
+                    state.cancel.as_ref(),
+                    pin_latest_version_with_transport(&state.transport, &mut entry.info),
+                )
+                .await;
+                if let Err(error) = pinned {
+                    state.finished = true;
+                    return Some((Err(error), state));
+                }
+            }
+            if let Some(address) = entry.metadata_address.take() {
+                let metadata = race_cancel(
+                    state.cancel.as_ref(),
+                    fetch_standard_metadata_with_transport(&state.transport, &address),
+                )
+                .await;
+                match metadata {
+                    Ok(Some(extra)) => merge_standard_metadata_into_object(&mut entry.info, extra),
+                    Ok(None) => {}
+                    Err(error) => {
+                        state.finished = true;
+                        return Some((Err(error), state));
+                    }
+                }
+            }
+            return Some((Ok(entry.info), state));
+        }
+
+        let next_frame = race_cancel(state.cancel.as_ref(), async {
+            state.server_stream.message().await.map_err(map_status)
+        })
+        .await;
+        match next_frame {
+            Ok(Some(frame)) => {
+                state.pending =
+                    decode_list_stat_frame(frame, state.full_metadata, state.versioned_address);
+            }
+            Ok(None) => return None,
+            Err(error) => {
+                state.finished = true;
+                return Some((Err(error), state));
+            }
+        }
+    }
+}
+
+async fn fetch_standard_metadata_with_transport(
+    transport: &OmniverseStorageTransport,
+    address: &str,
+) -> Result<Option<StandardMetadata>> {
+    let mut client = transport.metadata_client().await?;
+    let response = match client
+        .get_metadata(md::GetMetadataRequest {
+            uri: address.to_string(),
+            // Empty key list asks the service for all user metadata.
+            // `parse_standard_metadata` also promotes the known
+            // service-stamped keys into system_metadata/modified_by.
+            user_metadata_keys: Vec::new(),
+        })
+        .await
+    {
+        Ok(resp) => resp,
+        Err(status) if status.code() == tonic::Code::Unimplemented => {
+            // Server has no metadata service: silent no-op so stat/list
+            // don't fail just because the deployment skips notifications.
+            return Ok(None);
+        }
+        Err(status) => return Err(map_status(status)),
+    };
+    Ok(Some(parse_standard_metadata(response.into_inner())))
+}
+
+/// What `EnumerateVersions` reports as the newest version at one address.
+enum LatestVersion {
+    /// The newest version, at the service's own address for it.
+    Selected { pin: Url, item: ver::VersionInfo },
+    /// The service refuses to enumerate the address, its answer when the
+    /// address already names one version; the address is its own pin.
+    AddressIsVersion,
+    /// The object has no versions.
+    Unversioned,
+}
+
+/// The newest version the service reports at `address`.
+///
+/// The Omniverse Storage Service spells version addresses opaquely, so the pin
+/// is the `resource_address` `EnumerateVersions` returns, verbatim; nothing is
+/// synthesized from a query key. The service answers `InvalidArgument` when
+/// asked to enumerate a version address, the same reading `get_latest_version`
+/// applies to that refusal. Any other failure propagates: a caller who paid
+/// for the pin is told when it could not be produced.
+async fn latest_version_with_transport(
+    transport: &OmniverseStorageTransport,
+    address: &Url,
+) -> Result<LatestVersion> {
+    let mut client = transport.versioning_client().await?;
+    let enumerate = client
+        .enumerate_versions(ver::EnumerateVersionsRequest {
+            resource_address: address.to_string(),
+        })
+        .await
+        .map_err(map_status);
+    let mut stream = match enumerate {
+        Ok(response) => response.into_inner(),
+        Err(err) if err.code() == ErrorCode::InvalidArgument => {
+            return Ok(LatestVersion::AddressIsVersion);
+        }
+        Err(err) => return Err(err),
+    };
+    let mut picker = LatestVersionPicker::new();
+    while let Some(frame) = stream.message().await.map_err(map_status)? {
+        if picker.observe_frame(frame)? {
+            break;
+        }
+    }
+    match picker.into_selected() {
+        Ok((pin, item)) => Ok(LatestVersion::Selected { pin, item }),
+        // `parse_server_address` never answers `NotFound`, so this is the
+        // picker's own "no versions" rather than a refused address.
+        Err(err) if err.code() == ErrorCode::NotFound => Ok(LatestVersion::Unversioned),
+        Err(err) => Err(err),
+    }
+}
+
+/// Pin `info` to the newest version at its address.
+///
+/// `info` comes from `Stat` or `ListStat`, and a write can land between that
+/// call and the `EnumerateVersions` here; its etag, size and mtime would then
+/// describe an older head than the pin names. The selected entry carries its
+/// own `resource_info`, so the identity fields are rebuilt from it and the pin
+/// and the facts beside it describe one version. The refusal case has no entry
+/// to describe, so the facts `info` arrived with stand.
+async fn pin_latest_version_with_transport(
+    transport: &OmniverseStorageTransport,
+    info: &mut ObjectInfo,
+) -> Result<()> {
+    match latest_version_with_transport(transport, &info.address).await? {
+        LatestVersion::Selected { pin, item } => describe_pinned_version(info, pin, &item),
+        LatestVersion::AddressIsVersion => info.versioned_address = Some(info.address.clone()),
+        LatestVersion::Unversioned => info.versioned_address = None,
+    }
+    Ok(())
+}
+
 /// Translate a `google.protobuf.Value` ACL list into a granted-op set.
 /// Unknown permission tokens are ignored (logged at trace level by the
 /// C++ provider too). Bad shapes (not a list, or a list of non-strings)
@@ -633,6 +875,13 @@ impl OmniverseStorageBackend {
                 .map_err(map_status)?;
             let info = require_field(response.into_inner().resource_info, "stat.resource_info")?;
             let mut object_info = object_info_from(target.resolved_address.clone(), &info);
+            // `Stat` carries no version id, so the pin costs one
+            // `EnumerateVersions` stream and is fetched only when asked for.
+            // It rebuilds the identity fields, so it lands before the metadata
+            // merge that layers onto them.
+            if opts.versioned_address {
+                self.pin_latest_version(&mut object_info).await?;
+            }
             if opts.full_metadata
                 && let Some(extra) = self.fetch_standard_metadata(&target).await?
             {
@@ -939,6 +1188,7 @@ impl OmniverseStorageBackend {
                 .into_inner();
             let mut items = Vec::new();
             let mut metadata_targets: Vec<(usize, String)> = Vec::new();
+            let mut version_targets: Vec<usize> = Vec::new();
             while let Some(frame) = stream.message().await.map_err(map_status)? {
                 // An entry whose address does not survive canonicalization is
                 // dropped with a `warn!`, not propagated. That is a property of
@@ -988,8 +1238,20 @@ impl OmniverseStorageBackend {
                     if opts.full_metadata {
                         metadata_targets.push((items.len(), entry.resource_address.clone()));
                     }
+                    if opts.versioned_address {
+                        version_targets.push(items.len());
+                    }
                     items.push(info);
                 }
+            }
+            // `ListStat` entries carry no version id, so each file entry costs
+            // one `EnumerateVersions` stream when the caller asks for the pin.
+            // A failed lookup fails the page, the policy the metadata fetch
+            // below follows; subfolders are never looked up. The pin rebuilds
+            // an entry's identity fields, so it lands before the metadata merge
+            // that layers onto them.
+            for idx in version_targets {
+                self.pin_latest_version(&mut items[idx]).await?;
             }
             // Per-entry metadata fetch on `full_metadata`. Mirrors the C++
             // provider, which calls `_getMetadata` for each list entry
@@ -1004,6 +1266,67 @@ impl OmniverseStorageBackend {
                 }
             }
             Ok(items)
+        })
+        .await;
+        span.record("outcome", if result.is_ok() { "ok" } else { "err" });
+        result
+    }
+
+    /// Open the Storage API `ListStat` server stream and decode one response
+    /// frame at a time. Pulling an entry drains only the current frame; another
+    /// frame is requested only after its entries have been yielded.
+    pub async fn list_stream(
+        &self,
+        prefix: ResolvedTarget,
+        opts: ListOptions,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        let span = tracing::debug_span!(
+            "omniverse_storage_service.list_stream",
+            op = "list_stream",
+            plugin = "omniverse-storage-service",
+            "object.address" = %RedactedUrl(&prefix.resolved_address),
+            outcome = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        if opts.recursive {
+            return Err(Error::new(
+                ErrorCode::Unsupported,
+                "omniverse-storage-service: recursive list is not supported by this backend \
+                 (Capabilities.supports_recursive_list = false)",
+            ));
+        }
+        if opts.max_results.is_some() || opts.page_token.is_some() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+
+        let transport = self.transport.clone();
+        let stream_transport = transport.clone();
+        let stream_cancel = cancel.clone();
+        let result = race_cancel(cancel.as_ref(), async move {
+            let mut client = transport.filefolder_client().await?;
+            let server_stream = client
+                .list_stat(ff::ListStatRequest {
+                    folder: Some(ff::FolderAddress {
+                        uri: prefix.resolved_address.to_string(),
+                    }),
+                })
+                .await
+                .map_err(map_status)?
+                .into_inner();
+            let state = ListStatStreamState {
+                server_stream,
+                pending: VecDeque::new(),
+                transport: stream_transport,
+                cancel: stream_cancel,
+                full_metadata: opts.full_metadata,
+                versioned_address: opts.versioned_address,
+                finished: false,
+            };
+            Ok(Box::pin(futures::stream::unfold(state, next_list_stat_entry)) as ListStream)
         })
         .await;
         span.record("outcome", if result.is_ok() { "ok" } else { "err" });
@@ -1110,7 +1433,9 @@ impl OmniverseStorageBackend {
                         .map_err(map_status)?;
                     let info =
                         require_field(response.into_inner().resource_info, "stat.resource_info")?;
-                    return Ok(object_info_from(target.resolved_address.clone(), &info));
+                    let mut latest = object_info_from(target.resolved_address.clone(), &info);
+                    latest.versioned_address = Some(target.resolved_address.clone());
+                    return Ok(latest);
                 }
                 Err(err) => return Err(err),
             };
@@ -1281,11 +1606,13 @@ impl OmniverseStorageBackend {
             let etag = resource_identity
                 .map(|id| id.encoded_identity)
                 .filter(|s| !s.is_empty());
+            let etag_strength = etag_strength(etag.as_deref());
             let dest_address = dest.resolved_address.clone();
             self.stash_message(dest_address.as_str(), opts.message.as_deref())
                 .await;
             Ok(WriteStep::Done(WriteResult {
                 info: ObjectInfo {
+                    etag_strength,
                     address: dest_address,
                     kind: ObjectKind::File,
                     etag,
@@ -1297,6 +1624,7 @@ impl OmniverseStorageBackend {
                     system_metadata: None,
                     user_metadata: None,
                     modified_by: None,
+                    versioned_address: None,
                 },
             }))
         })
@@ -1386,6 +1714,9 @@ impl OmniverseStorageBackend {
                 ));
             }
             let mut client = self.transport.metadata_client().await?;
+            // The caller's value under the message key stands: the message is
+            // written only when `user_metadata_set` carries no entry under it.
+            let caller_sets_message_key = opts.user_metadata_set.contains_key(MESSAGE_METADATA_KEY);
             for (key, value) in opts.user_metadata_set {
                 client
                     .update_metadata(md::UpdateMetadataRequest {
@@ -1407,8 +1738,10 @@ impl OmniverseStorageBackend {
                     .await
                     .map_err(map_status)?;
             }
-            self.stash_message(target.resolved_address.as_str(), opts.message.as_deref())
-                .await;
+            if !caller_sets_message_key {
+                self.stash_message(target.resolved_address.as_str(), opts.message.as_deref())
+                    .await;
+            }
             let mut object_client = self.transport.fileobject_client().await?;
             let stat = object_client
                 .stat(fo::StatRequest {
@@ -1711,6 +2044,7 @@ fn object_info_from_read_metadata(
 ) -> ObjectInfo {
     let fields = fields_from_metadata(metadata, Some(etag.to_string()).filter(|s| !s.is_empty()));
     ObjectInfo {
+        etag_strength: fields.etag_strength,
         address,
         kind: ObjectKind::File,
         etag: fields.etag,
@@ -1722,11 +2056,13 @@ fn object_info_from_read_metadata(
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
 fn default_object_info(address: Url, kind: ObjectKind) -> ObjectInfo {
     ObjectInfo {
+        etag_strength: Default::default(),
         address,
         kind,
         etag: None,
@@ -1738,11 +2074,13 @@ fn default_object_info(address: Url, kind: ObjectKind) -> ObjectInfo {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
 fn backend_item_info_from_object(info: ObjectInfo) -> BackendItemInfo {
     BackendItemInfo {
+        etag_strength: info.etag_strength,
         kind: info.kind,
         etag: info.etag,
         version: info.version,
@@ -1753,6 +2091,7 @@ fn backend_item_info_from_object(info: ObjectInfo) -> BackendItemInfo {
         system_metadata: info.system_metadata,
         user_metadata: info.user_metadata,
         modified_by: info.modified_by,
+        versioned_address: None,
     }
 }
 
@@ -1870,12 +2209,34 @@ fn object_info_from_version_proto(v: ver::VersionInfo) -> Result<Option<ObjectIn
     let Some(address) = version_resource_address(&v)? else {
         return Ok(None);
     };
-    Ok(Some(
-        v.resource_info
-            .as_ref()
-            .map(|info| object_info_from(address.clone(), info))
-            .unwrap_or_else(|| default_object_info(address, ObjectKind::File)),
-    ))
+    Ok(Some(version_item_info(address, &v)))
+}
+
+/// The `ObjectInfo` for one `EnumerateVersions` item at its server address.
+///
+/// A version item's address already names exactly one version, so it is its
+/// own pin: `versioned_address` is that address verbatim, never a query the
+/// client synthesized, because the service's version spellings are opaque.
+fn version_item_info(address: Url, item: &ver::VersionInfo) -> ObjectInfo {
+    let mut info = default_object_info(address.clone(), ObjectKind::File);
+    describe_pinned_version(&mut info, address, item);
+    info
+}
+
+/// Make `info` describe the version `item`, pinned at `pin`.
+///
+/// The identity fields come from the item's own `resource_info`, so the etag,
+/// size and mtime describe the version the pin names; `address` and `kind`
+/// stay as they are, because the pin is the answer and not the question. An
+/// item without `resource_info` has nothing to describe itself with, so the
+/// facts already in `info` stand.
+fn describe_pinned_version(info: &mut ObjectInfo, pin: Url, item: &ver::VersionInfo) {
+    if let Some(resource_info) = item.resource_info.as_ref() {
+        let mut described = object_info_from(info.address.clone(), resource_info);
+        described.kind = info.kind;
+        *info = described;
+    }
+    info.versioned_address = Some(pin);
 }
 
 /// `None` when the server's `resource_address` is not one a caller could act on.
@@ -2010,15 +2371,18 @@ impl LatestVersionPicker {
         Ok(false)
     }
 
-    fn finish(self) -> Result<ObjectInfo> {
+    /// The winning entry and its parsed server address; `NotFound` when the
+    /// stream carried no versions.
+    ///
+    /// The winner's address is parsed here, and a failure is propagated rather
+    /// than skipped: there is no next-best answer to "which version is latest".
+    fn into_selected(self) -> Result<(Url, ver::VersionInfo)> {
         let selected = self.selected.ok_or_else(|| {
             Error::new(
                 ErrorCode::NotFound,
                 "omniverse-storage-service: EnumerateVersions returned no versions",
             )
         })?;
-        // The winner is converted here, and a failure is propagated rather
-        // than skipped: there is no next-best answer to `get_latest_version`.
         let raw = selected
             .item
             .resource_address
@@ -2031,12 +2395,12 @@ impl LatestVersionPicker {
                 )
             })?;
         let address = parse_server_address(raw, "latest version resource_address")?;
-        Ok(selected
-            .item
-            .resource_info
-            .as_ref()
-            .map(|info| object_info_from(address.clone(), info))
-            .unwrap_or_else(|| default_object_info(address, ObjectKind::File)))
+        Ok((address, selected.item))
+    }
+
+    fn finish(self) -> Result<ObjectInfo> {
+        let (address, item) = self.into_selected()?;
+        Ok(version_item_info(address, &item))
     }
 }
 
@@ -2313,10 +2677,12 @@ impl OmniverseStorageBackend {
         })?;
         let address = target.resolved_address.clone();
         let address_str = address.as_str().to_string();
-        self.stash_message(&address_str, opts.message.as_deref())
-            .await;
-        self.stash_user_metadata(&address_str, opts.user_metadata.as_ref())
-            .await?;
+        self.stash_write_annotations(
+            &address_str,
+            opts.user_metadata.as_ref(),
+            opts.message.as_deref(),
+        )
+        .await?;
         Ok(WriteResult {
             info: object_info_from(address, &info),
         })
@@ -2428,8 +2794,33 @@ impl OmniverseStorageBackend {
         }
     }
 
-    // Stash opts.message under user_metadata key `x-ov-message` after a
-    // successful mutating write.
+    /// Stash a committed write's `message` and then its `user_metadata`.
+    ///
+    /// Each stash is one `UpdateMetadata` RPC per key. A caller-supplied entry
+    /// under [`MESSAGE_METADATA_KEY`] stands and the message is not sent at
+    /// all, as on every other backend: `user_metadata` must be persisted while
+    /// the message is droppable by contract, so the message never overwrites
+    /// it. Otherwise the message stash is best-effort and runs whether or not
+    /// a caller key fails; a caller-key failure is what propagates.
+    async fn stash_write_annotations(
+        &self,
+        address: &str,
+        user_metadata: Option<&ovstorage_plugin::UserMetadata>,
+        message: Option<&str>,
+    ) -> Result<()> {
+        let caller_carries_key =
+            user_metadata.is_some_and(|map| map.contains_key(MESSAGE_METADATA_KEY));
+        if !caller_carries_key {
+            self.stash_message(address, message).await;
+        }
+        self.stash_user_metadata(address, user_metadata).await
+    }
+
+    // Stash opts.message under user_metadata key `x_ov_message` after a
+    // successful mutating write. The caller's metadata is never overwritten by
+    // the message: `stash_write_annotations` skips this when the caller's map
+    // carries that key, and `update_metadata` skips it when
+    // `user_metadata_set` carries the key.
     //
     // Best-effort, and unlike `stash_user_metadata` it stays that way: EVERY
     // failure is discarded — a metadata client that cannot be built and any
@@ -2448,7 +2839,7 @@ impl OmniverseStorageBackend {
         let _ = client
             .update_metadata(md::UpdateMetadataRequest {
                 uri: address.to_string(),
-                user_metadata_key: OV_MESSAGE_KEY.to_string(),
+                user_metadata_key: MESSAGE_METADATA_KEY.to_string(),
                 user_metadata: Some(md_value_string(value.to_string())),
                 expected_etag: None,
             })
@@ -2459,7 +2850,7 @@ impl OmniverseStorageBackend {
     /// object bytes have committed.
     ///
     /// Returns `ErrorCode::PartialCompletion` when a key **outside the reserved
-    /// `ovstorage-` namespace** fails. The object is durable at that point and must not be re-written,
+    /// `ovstorage_` namespace** fails. The object is durable at that point and must not be re-written,
     /// so the error names the object data as committed and the user metadata as
     /// the stage that did not apply. The remedy depends on why the stash failed
     /// and is carried in `next_action` — see [`MetadataStashFailure`]; it is
@@ -2467,15 +2858,15 @@ impl OmniverseStorageBackend {
     ///
     /// # Why the host's own reserved keys are exempt
     ///
-    /// A failure confined to the `ovstorage-` reserved namespace warns and
+    /// A failure confined to the `ovstorage_` reserved namespace warns and
     /// returns `Ok`. That looks like it contradicts the multi-stage durability
     /// rule, which says a metadata failure after a commit must surface — so
     /// the reasoning belongs here rather than in a merge commit nobody reads.
     ///
-    /// **The `ovstorage-` namespace is the host's**, and on the deployments
+    /// **The `ovstorage_` namespace is the host's**, and on the deployments
     /// this matters for the keys in it are the host's too. A broker or REST
     /// branch running the default `UserMetadata` attribution strategy stamps
-    /// `ovstorage-modified-by` into `user_metadata` on every mutating write —
+    /// `ovstorage_modified_by` into `user_metadata` on every mutating write —
     /// whether or not the caller asked for any metadata, since the stamp
     /// creates the map when there is none. If that stamp failing were to fail
     /// the write, then against a deployment whose metadata service is absent,
@@ -2507,12 +2898,12 @@ impl OmniverseStorageBackend {
     ///
     /// # The consequence a caller can hit, stated
     ///
-    /// The test is the `ovstorage-` **namespace**, not the one key the host
+    /// The test is the `ovstorage_` **namespace**, not the one key the host
     /// actually plants, and the host strips that namespace out of
     /// client-supplied metadata only where an attribution layer is composed and
     /// stamping (`ovstorage-authz`'s `stamp_write` / `stamp_update_metadata`).
     /// A direct, unbrokered caller — or one on a `Passthrough` branch — can
-    /// therefore reach this backend with an `ovstorage-`-prefixed key of their
+    /// therefore reach this backend with an `ovstorage_`-prefixed key of their
     /// own, and it will be treated as the host's: warned about and not
     /// surfaced.
     ///
@@ -2687,26 +3078,11 @@ impl OmniverseStorageBackend {
         &self,
         address: &str,
     ) -> Result<Option<StandardMetadata>> {
-        let mut client = self.transport.metadata_client().await?;
-        let response = match client
-            .get_metadata(md::GetMetadataRequest {
-                uri: address.to_string(),
-                // Empty key list asks the service for all user metadata.
-                // `parse_standard_metadata` also promotes the known
-                // service-stamped keys into system_metadata/modified_by.
-                user_metadata_keys: Vec::new(),
-            })
-            .await
-        {
-            Ok(resp) => resp,
-            Err(status) if status.code() == tonic::Code::Unimplemented => {
-                // Server has no metadata service: silent no-op so stat/list
-                // don't fail just because the deployment skips notifications.
-                return Ok(None);
-            }
-            Err(status) => return Err(map_status(status)),
-        };
-        Ok(Some(parse_standard_metadata(response.into_inner())))
+        fetch_standard_metadata_with_transport(&self.transport, address).await
+    }
+
+    async fn pin_latest_version(&self, info: &mut ObjectInfo) -> Result<()> {
+        pin_latest_version_with_transport(&self.transport, info).await
     }
 
     /// Fetch the per-object `acl` user metadata key and translate it to the
@@ -2768,9 +3144,11 @@ impl OmniverseStorageBackend {
             &mut continuation.user_metadata,
         );
         // Derive the destination from the authorized request address rather
-        // than reading it back out of a blob the remote caller echoes. The
-        // metadata stash below already keys off this value, so the commit, the
-        // abort and the stash now all name one object.
+        // than reading it back out of the blob. The broker's client-driven RPC
+        // authenticates the blob and address binding, but direct SPI callers,
+        // follower routes, and unsealed hosts have no equivalent Layer
+        // guarantee. The metadata stash below already keys off the derived
+        // value, so the commit, the abort and the stash all name one object.
         let destination = target.resolved_address.to_string();
         let pending_message = continuation.message.clone();
         let pending_user_metadata = continuation.user_metadata.clone();
@@ -2802,10 +3180,12 @@ impl OmniverseStorageBackend {
                     "complete_redirect_upload.resource_info",
                 )?;
                 let address_str = target.resolved_address.as_str().to_string();
-                self.stash_message(&address_str, pending_message.as_deref())
-                    .await;
-                self.stash_user_metadata(&address_str, pending_user_metadata.as_ref())
-                    .await?;
+                self.stash_write_annotations(
+                    &address_str,
+                    pending_user_metadata.as_ref(),
+                    pending_message.as_deref(),
+                )
+                .await?;
                 Ok(WriteStep::Done(WriteResult {
                     info: object_info_from(target.resolved_address, &info),
                 }))
@@ -2865,10 +3245,12 @@ impl OmniverseStorageBackend {
                     "complete_multipart_upload.resource_info",
                 )?;
                 let address_str = target.resolved_address.as_str().to_string();
-                self.stash_message(&address_str, pending_message.as_deref())
-                    .await;
-                self.stash_user_metadata(&address_str, pending_user_metadata.as_ref())
-                    .await?;
+                self.stash_write_annotations(
+                    &address_str,
+                    pending_user_metadata.as_ref(),
+                    pending_message.as_deref(),
+                )
+                .await?;
                 Ok(WriteStep::Done(WriteResult {
                     info: object_info_from(target.resolved_address, &info),
                 }))
@@ -3550,6 +3932,42 @@ mod latest_version_tests {
             .expect("the authority-bearing spelling is an ordinary address");
     }
 
+    /// The facts beside a pin are the pinned version's own, the address and
+    /// kind are the caller's, and an entry with nothing to say leaves the facts
+    /// it found in place.
+    #[test]
+    fn a_pinned_object_describes_the_version_it_is_pinned_to() {
+        let address = Url::parse(GOOD).unwrap();
+        let pin = Url::parse(OTHER).unwrap();
+        let mut head = default_object_info(address.clone(), ObjectKind::Directory);
+        head.etag = Some("head-etag".into());
+        head.size = Some(1);
+
+        let mut described = head.clone();
+        let mut item = version(OTHER, None);
+        item.resource_info = Some(fo::ResourceInfo {
+            resource_identity: Some(fo::ResourceIdentity {
+                encoded_identity: "version-etag".into(),
+            }),
+            metadata: Some(fo::Metadata {
+                data_object_size: Some(2),
+                last_modified_timestamp: None,
+            }),
+        });
+        describe_pinned_version(&mut described, pin.clone(), &item);
+        assert_eq!(described.address, address);
+        assert_eq!(described.kind, ObjectKind::Directory);
+        assert_eq!(described.etag.as_deref(), Some("version-etag"));
+        assert_eq!(described.size, Some(2));
+        assert_eq!(described.versioned_address.as_ref(), Some(&pin));
+
+        let mut kept = head;
+        describe_pinned_version(&mut kept, pin.clone(), &version(OTHER, None));
+        assert_eq!(kept.etag.as_deref(), Some("head-etag"));
+        assert_eq!(kept.size, Some(1));
+        assert_eq!(kept.versioned_address.as_ref(), Some(&pin));
+    }
+
     /// The honest cases, because a refusal that also refuses ordinary answers
     /// is worse than the substitution it replaces.
     #[test]
@@ -3580,6 +3998,12 @@ mod latest_version_tests {
                 .finish()
                 .unwrap_or_else(|e| panic!("{order:?} must answer: {}", e.message()));
             assert_eq!(info.address.as_str(), expected, "{order:?}");
+            // The winner's address names one version, so it is also the pin.
+            assert_eq!(
+                info.versioned_address.as_ref(),
+                Some(&info.address),
+                "{order:?}"
+            );
         }
     }
 }
@@ -3999,13 +4423,14 @@ impl MultipartAborter {
     }
 }
 
-/// Bounds a caller-supplied upload id before it reaches a log field. On the
-/// broker's client-driven route the id comes out of the echoed continuation,
-/// whose only integrity check is a plugin-kind tag, so an unbounded copy would
-/// let a caller choose how *large* a WARN record it can trigger. A prefix is
-/// enough to correlate with the service's own records. Note what this does not
-/// do: the retained prefix is still caller-chosen, so treat it as untrusted
-/// text in any log consumer that interprets escape sequences.
+/// Bounds an upload id before it reaches a log field. The broker's client-driven
+/// RPC authenticates the continuation, but the Layer SPI does not: a direct SPI
+/// caller or an unsealed host can choose the id because its only plugin-level
+/// integrity check is a kind tag. An unbounded copy would let that caller choose
+/// how *large* a WARN record it can trigger. A prefix is enough to correlate
+/// with the service's own records. On an unsealed route the retained prefix is
+/// still caller-chosen, so treat it as untrusted text in any log consumer that
+/// interprets escape sequences.
 struct UploadIdPrefix<'a>(&'a str);
 
 impl std::fmt::Display for UploadIdPrefix<'_> {

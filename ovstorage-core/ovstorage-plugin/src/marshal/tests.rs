@@ -595,29 +595,75 @@ fn object_info_round_trip_preserves_full_payload() {
     let mut user_meta: HashMap<String, String> = HashMap::new();
     user_meta.insert("x-app-tag".to_string(), "v1".to_string());
 
-    let original = ObjectInfo {
-        address: crate::address::parse("s3://b/k").unwrap(),
-        kind: ObjectKind::DirectoryMarker,
-        etag: Some("\"abc\"".to_string()),
-        version: None,
-        size: Some(7),
-        mtime: Some(primitive::system_time_from_unix_ms(42)),
-        checksums,
-        effective_permissions: Some(EffectivePermissions::READ | EffectivePermissions::DELETE),
-        system_metadata: Some(HashMap::new()),
-        user_metadata: Some(user_meta),
-        modified_by: Some("alice@example.com".to_string()),
-    };
+    for etag_strength in [
+        crate::EtagStrength::Unspecified,
+        crate::EtagStrength::Strong,
+        crate::EtagStrength::Weak,
+    ] {
+        let original = ObjectInfo {
+            etag_strength,
+            address: crate::address::parse("s3://b/k").unwrap(),
+            kind: ObjectKind::DirectoryMarker,
+            etag: Some("\"abc\"".to_string()),
+            version: None,
+            size: Some(7),
+            mtime: Some(primitive::system_time_from_unix_ms(42)),
+            checksums: checksums.clone(),
+            effective_permissions: Some(EffectivePermissions::READ | EffectivePermissions::DELETE),
+            system_metadata: Some(HashMap::new()),
+            user_metadata: Some(user_meta.clone()),
+            modified_by: Some("alice@example.com".to_string()),
+            versioned_address: Some(
+                crate::address::parse(
+                    "s3://b/k?versionId=3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY+MTRCxf3vjVBH40Nr8X8gdRQBpUMLUo",
+                )
+                .unwrap(),
+            ),
+        };
 
-    let ffi_value = metadata::object_info_to_ffi(original.clone());
-    // SAFETY: just constructed.
-    let back = unsafe { metadata::object_info_from_ffi(ffi_value).unwrap() };
-    assert_eq!(original, back);
+        let ffi_value = metadata::object_info_to_ffi(original.clone());
+        assert_eq!(ffi_value.etag_strength as u8, etag_strength as u8);
+        assert!(ffi_value.versioned_address.present);
+        // SAFETY: just constructed.
+        let back = unsafe { metadata::object_info_from_ffi(ffi_value).unwrap() };
+        assert_eq!(original, back);
+    }
+}
+
+#[test]
+fn backend_item_info_round_trip_preserves_each_etag_strength() {
+    for etag_strength in [
+        crate::EtagStrength::Unspecified,
+        crate::EtagStrength::Strong,
+        crate::EtagStrength::Weak,
+    ] {
+        let original = BackendItemInfo {
+            kind: ObjectKind::File,
+            etag: Some("\"abc\"".to_string()),
+            etag_strength,
+            version: Some("v1".to_string()),
+            size: Some(7),
+            mtime: Some(primitive::system_time_from_unix_ms(42)),
+            checksums: ChecksumSet::new(),
+            effective_permissions: Some(EffectivePermissions::READ),
+            system_metadata: Some(HashMap::new()),
+            user_metadata: Some(HashMap::new()),
+            modified_by: Some("alice@example.com".to_string()),
+            versioned_address: Some(crate::address::parse("s3://b/k?versionId=v1").unwrap()),
+        };
+
+        let ffi_value = payload::backend_item_info_to_ffi(original.clone());
+        assert_eq!(ffi_value.etag_strength as u8, etag_strength as u8);
+        // SAFETY: just constructed.
+        let back = unsafe { payload::backend_item_info_from_ffi(ffi_value).unwrap() };
+        assert_eq!(original, back);
+    }
 }
 
 #[test]
 fn object_info_round_trip_with_all_optionals_absent() {
     let original = ObjectInfo {
+        etag_strength: Default::default(),
         address: crate::address::parse("file:///tmp/x").unwrap(),
         kind: ObjectKind::File,
         etag: None,
@@ -629,6 +675,7 @@ fn object_info_round_trip_with_all_optionals_absent() {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     };
     let ffi_value = metadata::object_info_to_ffi(original.clone());
     // SAFETY: just constructed.
@@ -636,15 +683,187 @@ fn object_info_round_trip_with_all_optionals_absent() {
     assert_eq!(original, back);
 }
 
+/// The present-but-unwritten shape a C producer reaches by `calloc`: the
+/// encoder cannot produce it, so these tests overwrite an absent field with it.
+fn unset_str() -> ffi::Optional<ffi::Str> {
+    ffi::Optional::some(ffi::Str {
+        ptr: std::ptr::null_mut(),
+        len: 0,
+    })
+}
+
+fn object_info_with_no_strings() -> ObjectInfo {
+    ObjectInfo {
+        etag_strength: Default::default(),
+        address: crate::address::parse("file:///tmp/x").unwrap(),
+        kind: ObjectKind::File,
+        etag: None,
+        version: None,
+        size: None,
+        mtime: None,
+        checksums: ChecksumSet::new(),
+        effective_permissions: None,
+        system_metadata: None,
+        user_metadata: None,
+        modified_by: None,
+        versioned_address: None,
+    }
+}
+
+fn backend_item_info_with_no_strings() -> BackendItemInfo {
+    BackendItemInfo {
+        kind: ObjectKind::File,
+        etag: None,
+        etag_strength: Default::default(),
+        version: None,
+        size: None,
+        mtime: None,
+        checksums: ChecksumSet::new(),
+        effective_permissions: None,
+        system_metadata: None,
+        user_metadata: None,
+        modified_by: None,
+        versioned_address: None,
+    }
+}
+
+/// Every optional string a plugin returns through an operation result decodes
+/// the unset shape as `None`, the way the C host delivers NULL for the same
+/// bytes: `etag`, `version` and `modified_by` on both info structs, the access
+/// reason, and the two change-event strings.
+#[test]
+fn unset_result_string_payloads_decode_as_absent() {
+    let mut info = metadata::object_info_to_ffi(object_info_with_no_strings());
+    assert!(!info.etag.present && !info.version.present && !info.modified_by.present);
+    info.etag = unset_str();
+    info.version = unset_str();
+    info.modified_by = unset_str();
+    // SAFETY: a freshly encoded value with three fields overwritten in place.
+    let back = unsafe { metadata::object_info_from_ffi(info).unwrap() };
+    assert_eq!(back, object_info_with_no_strings());
+
+    let mut item = payload::backend_item_info_to_ffi(backend_item_info_with_no_strings());
+    assert!(!item.etag.present && !item.version.present && !item.modified_by.present);
+    item.etag = unset_str();
+    item.version = unset_str();
+    item.modified_by = unset_str();
+    // SAFETY: as above.
+    let back = unsafe { payload::backend_item_info_from_ffi(item).unwrap() };
+    assert_eq!(back, backend_item_info_with_no_strings());
+
+    let decision = AccessDecision {
+        allowed: true,
+        denied_ops: AccessOps::default(),
+        reason: None,
+    };
+    let mut access = payload::access_decision_to_ffi(decision.clone());
+    assert!(!access.reason.present);
+    access.reason = unset_str();
+    // SAFETY: as above.
+    let back = unsafe { payload::access_decision_from_ffi(access).unwrap() };
+    assert_eq!(back, decision);
+
+    let event = BackendChangeEvent::Object {
+        address: Url::parse("test://root/foo/bar.bin").unwrap(),
+        kind: ChangeKind::Created,
+        etag: None,
+        version: None,
+        size: None,
+        mtime: None,
+        at: primitive::system_time_from_unix_ms(1_700_000_000_000),
+        cursor: WatchDirectoryCursor(vec![1, 2, 3]),
+    };
+    let mut change = change::backend_change_event_to_ffi(event.clone());
+    assert!(matches!(change.tag, ffi::BackendChangeEventTag::Object));
+    // SAFETY: the tag was just asserted, so the object payload is initialized.
+    unsafe {
+        let object = &mut *change.object.as_mut_ptr();
+        assert!(!object.etag.present && !object.version.present);
+        object.etag = unset_str();
+        object.version = unset_str();
+    }
+    // SAFETY: as above.
+    let back = unsafe { change::backend_change_event_from_ffi(change).unwrap() };
+    assert_eq!(back, event);
+}
+
+/// The deliberately-empty shape — a sentinel allocation of zero length, which
+/// is what the encoder emits for `Some("")` — still decodes as `Some("")`, so
+/// the rule above is a discrimination on the encoding and not a length test.
+#[test]
+fn deliberately_empty_result_strings_survive_the_round_trip() {
+    let info = ObjectInfo {
+        etag: Some(String::new()),
+        modified_by: Some(String::new()),
+        ..object_info_with_no_strings()
+    };
+    let encoded = metadata::object_info_to_ffi(info.clone());
+    assert!(encoded.etag.present);
+    // SAFETY: `present` was just asserted, so the payload is initialized.
+    let payload = unsafe { &*encoded.etag.value.as_ptr() };
+    assert!(
+        !payload.ptr.is_null() && payload.len == 0,
+        "the encoder mints the sentinel"
+    );
+    // SAFETY: just constructed.
+    let back = unsafe { metadata::object_info_from_ffi(encoded).unwrap() };
+    assert_eq!(back, info);
+
+    let decision = AccessDecision {
+        allowed: false,
+        denied_ops: AccessOps::default(),
+        reason: Some(String::new()),
+    };
+    let encoded = payload::access_decision_to_ffi(decision.clone());
+    // SAFETY: just constructed.
+    let back = unsafe { payload::access_decision_from_ffi(encoded).unwrap() };
+    assert_eq!(back, decision);
+}
+
 #[test]
 fn stat_options_round_trip() {
     for full in [false, true] {
-        let original = StatOptions {
-            full_metadata: full,
-        };
-        let back =
-            options::stat_options_from_ffi(options::stat_options_to_ffi(original.clone())).unwrap();
-        assert_eq!(original, back);
+        for pinned in [false, true] {
+            let original = StatOptions {
+                full_metadata: full,
+                versioned_address: pinned,
+            };
+            let back =
+                options::stat_options_from_ffi(options::stat_options_to_ffi(original.clone()))
+                    .unwrap();
+            assert_eq!(original, back);
+        }
+    }
+}
+
+/// The trailing `versioned_address` bool sits in padding the struct already
+/// carried, so `struct_size` is the same before and after the ABI bump that
+/// added it; the v19 note in `ffi::v2` relies on this.
+#[test]
+fn stat_options_versioned_address_fits_in_existing_padding() {
+    assert_eq!(
+        std::mem::size_of::<ffi::StatOptions>(),
+        2 * std::mem::size_of::<usize>()
+    );
+}
+
+/// Every in-tree pin spelling crosses the FFI byte-for-byte: the answer-side
+/// validator normalizes host and path only and leaves the query — where the
+/// version lives — untouched.
+#[test]
+fn versioned_address_pins_survive_the_ffi_round_trip() {
+    for pin in [
+        "s3://bucket/key?versionId=3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY+MTRCxf3vjVBH40Nr8X8gdRQBpUMLUo",
+        "azure://account/container/blob?versionid=2024-05-01T12:34:56.7890123Z",
+        "gs://bucket/obj?generation=1712345678901234",
+        "omniverse://server/Projects/scene.usd?main&3",
+        "hf://org/repo/model.bin?revision=0123456789abcdef0123456789abcdef01234567",
+    ] {
+        let ffi_value = address::object_address_to_ffi(crate::Url::parse(pin).unwrap());
+        // SAFETY: just constructed.
+        let back = unsafe { address::object_address_from_ffi(ffi_value) }
+            .unwrap_or_else(|error| panic!("{pin} must be accepted: {error:?}"));
+        assert_eq!(back.as_str(), pin, "the pin must cross byte-for-byte");
     }
 }
 
@@ -742,6 +961,7 @@ fn list_options_round_trip_carries_paging_fields() {
         max_results: Some(50),
         page_token: Some("opaque-cursor".into()),
         full_metadata: true,
+        versioned_address: true,
     };
     let ffi_value = options::list_options_to_ffi(original.clone());
     // SAFETY: just constructed.
@@ -907,7 +1127,10 @@ fn read_redirect_round_trip_preserves_every_field() {
             url: "https://b.example.com/k".into(),
             headers: Vec::new(),
         },
-        response_parsing: ResponseParsing::default(),
+        response_parsing: ResponseParsing {
+            etag_strength: crate::EtagStrength::Strong,
+            ..ResponseParsing::default()
+        },
         expires_at: primitive::system_time_from_unix_ms(1_700_000_000_000),
         scope: RedirectScope {
             physical_url_prefix: "https://b.example.com/".into(),
@@ -1156,6 +1379,7 @@ fn body_stream_plugin_side_latches_natural_end() {
 fn write_result_round_trip_preserves_info() {
     let original = WriteResult {
         info: ObjectInfo {
+            etag_strength: Default::default(),
             address: crate::address::parse("s3://b/k").unwrap(),
             kind: ObjectKind::File,
             etag: Some("\"abc\"".into()),
@@ -1167,6 +1391,7 @@ fn write_result_round_trip_preserves_info() {
             system_metadata: None,
             user_metadata: None,
             modified_by: None,
+            versioned_address: None,
         },
     };
     let ffi_value = payload::write_result_to_ffi(original.clone());
@@ -1180,6 +1405,7 @@ fn local_delegate_round_trip_preserves_path_and_info() {
     let original = LocalDelegate {
         path: PathBuf::from("/var/cache/ov/abc"),
         info: ObjectInfo {
+            etag_strength: Default::default(),
             address: crate::address::parse("file:///x").unwrap(),
             kind: ObjectKind::File,
             etag: None,
@@ -1191,6 +1417,7 @@ fn local_delegate_round_trip_preserves_path_and_info() {
             system_metadata: None,
             user_metadata: None,
             modified_by: None,
+            versioned_address: None,
         },
         guard: None,
     };
@@ -1203,6 +1430,7 @@ fn local_delegate_round_trip_preserves_path_and_info() {
 #[test]
 fn read_result_round_trips_each_variant() {
     let info = ObjectInfo {
+        etag_strength: Default::default(),
         address: crate::address::parse("s3://b/k").unwrap(),
         kind: ObjectKind::File,
         etag: None,
@@ -1214,6 +1442,7 @@ fn read_result_round_trips_each_variant() {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     };
 
     let bytes_variant = ReadResult::Bytes {
@@ -1255,6 +1484,7 @@ fn read_result_round_trips_each_variant() {
 async fn read_result_stream_round_trips_chunks_through_ffi() {
     use futures::StreamExt;
     let info = ObjectInfo {
+        etag_strength: Default::default(),
         address: crate::address::parse("s3://b/k").unwrap(),
         kind: ObjectKind::File,
         etag: None,
@@ -1266,6 +1496,7 @@ async fn read_result_stream_round_trips_chunks_through_ffi() {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     };
     let chunks: Vec<Result<bytes::Bytes, Error>> = vec![
         Ok(bytes::Bytes::from_static(&[1, 2, 3])),
@@ -1297,6 +1528,7 @@ async fn read_result_stream_round_trips_chunks_through_ffi() {
 #[test]
 fn write_step_round_trips_each_variant() {
     let info = ObjectInfo {
+        etag_strength: Default::default(),
         address: crate::address::parse("s3://b/k").unwrap(),
         kind: ObjectKind::File,
         etag: None,
@@ -1308,6 +1540,7 @@ fn write_step_round_trips_each_variant() {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     };
     let result = WriteResult { info };
 
@@ -1359,6 +1592,7 @@ fn capabilities_round_trip_preserves_every_field() {
         supports_atomic_rename: false,
         has_real_directories: true,
         supports_list: true,
+        supports_list_stream: true,
         wants_list_backed_stat: false,
         supports_recursive_list: true,
         populates_subdirectory_metadata: false,
@@ -1384,9 +1618,29 @@ fn capabilities_round_trip_preserves_every_field() {
         supports_delete_directory: false,
     };
     let ffi_value = capabilities::capabilities_to_ffi(original.clone());
+    assert!(ffi_value.supports_list_stream);
     // SAFETY: just constructed.
     let back = unsafe { capabilities::capabilities_from_ffi(ffi_value).unwrap() };
     assert_eq!(original, back);
+}
+
+#[test]
+fn capabilities_list_stream_defaults_false_and_marshals_from_ffi() {
+    let empty = Capabilities::empty();
+    assert!(!empty.supports_list_stream);
+
+    let mut ffi_value = capabilities::capabilities_to_ffi(empty);
+    assert!(!ffi_value.supports_list_stream);
+    ffi_value.supports_list_stream = true;
+
+    // SAFETY: `ffi_value` was constructed by the Rust marshal and only a bool
+    // capability field was changed to model a foreign plugin advertising it.
+    let from_ffi = unsafe { capabilities::capabilities_from_ffi(ffi_value).unwrap() };
+    assert!(from_ffi.supports_list_stream);
+    assert!(
+        capabilities::capabilities_to_ffi(from_ffi).supports_list_stream,
+        "the foreign capability must survive a marshal back to the ABI"
+    );
 }
 
 #[test]
@@ -1629,10 +1883,130 @@ fn connection_round_trip_preserves_full_payload() {
         auth_state: ConnectionAuthState::Anonymous,
         last_probed: Some(primitive::system_time_from_unix_ms(1_700_000_001_000)),
         user_metadata: HashMap::new(),
+        owning_target: Some("s3_prod".into()),
     };
     let back =
         unsafe { auth::connection_from_ffi(auth::connection_to_ffi(original.clone())).unwrap() };
     assert_eq!(original, back);
+
+    // The absent case is not the same code path: an `Optional` that is not
+    // present carries unspecified bytes, and the decoder must answer `None`
+    // rather than reading them.
+    let unattributed = Connection {
+        owning_target: None,
+        ..original
+    };
+    let back = unsafe {
+        auth::connection_from_ffi(auth::connection_to_ffi(unattributed.clone())).unwrap()
+    };
+    assert_eq!(unattributed, back);
+}
+
+fn connection_fixture(owning_target: Option<String>) -> Connection {
+    Connection {
+        id: ConnectionId("c-1".into()),
+        backend_kind: "s3".into(),
+        display_name: "Prod S3".into(),
+        source: ConnectionSource::Runtime { persisted: false },
+        capabilities: Capabilities::empty(),
+        current_addresses: vec![],
+        auth_state: ConnectionAuthState::Anonymous,
+        last_probed: None,
+        user_metadata: HashMap::new(),
+        owning_target,
+    }
+}
+
+/// An UNSET `owning_target` payload on a `Connection` decodes to `None`.
+///
+/// `present == true` with `ptr == NULL, len == 0` is the shape a C plugin
+/// reaches by omission rather than by mistake: `calloc` gives exactly that,
+/// so setting `present` on a zero-initialised struct produces it. The
+/// producer never wrote the field, so there is no attribution to carry, and
+/// `None` is what the row means. Without the guard the row would arrive
+/// attributed to a name no layer answers to, and every consumer downstream
+/// would decline to act for a locally correct reason, leaving the connection
+/// unaddressable where an unattributed row still has its fallbacks.
+///
+/// The premise is asserted first, because a test that silently stopped
+/// building the unset case would keep passing while proving nothing.
+#[test]
+fn an_unset_connection_owning_target_payload_decodes_as_absent() {
+    let mut encoded = auth::connection_to_ffi(connection_fixture(None));
+
+    // The fixture must arrive UNATTRIBUTED, or the overwrite below would not
+    // be what makes the payload unset and the test would be proving something
+    // about the encoder instead.
+    assert!(
+        !encoded.owning_target.present,
+        "an unattributed fixture must encode to an absent Optional",
+    );
+
+    // Overwrite it with the zeroed-but-present shape. The encoder cannot
+    // produce this; a C producer does, which is the point.
+    encoded.owning_target = ffi::Optional::some(ffi::Str {
+        ptr: std::ptr::null_mut(),
+        len: 0,
+    });
+
+    let decoded = unsafe { auth::connection_from_ffi(encoded).unwrap() };
+    assert_eq!(
+        decoded.owning_target, None,
+        "a payload the producer never wrote is not an attribution",
+    );
+}
+
+/// A DELIBERATELY empty `owning_target` on a `Connection` survives the ROUND
+/// TRIP as `Some("")`, through the real encoder rather than a hand-built `Str`.
+///
+/// This is the half that distinguishes discriminating on the encoding from
+/// testing the decoded length. `str_to_ffi` routes the empty string through
+/// `abi_capacity`, which returns a one-element sentinel for a zero length, so
+/// `Some(String::new())` on a plugin's `Connection` encodes to
+/// `ptr != NULL, len == 0` every time. The encoded assertions below pin that,
+/// so the claim rests on this test rather than on a comment elsewhere.
+///
+/// Losing it would matter: an empty layer instance name is legal at the graph
+/// level (neither stack builder nor the TOML config path rejects one) and a
+/// Router routes target `""` like any other key, so a decode that read the
+/// empty string as absent would discard an attribution the producer made.
+#[test]
+fn a_deliberately_empty_connection_owning_target_survives_the_round_trip() {
+    let encoded = auth::connection_to_ffi(connection_fixture(Some(String::new())));
+
+    // The encoder's own output is the premise: `present`, a non-NULL pointer,
+    // and a zero length. If this ever became the calloc shape the decode below
+    // would be reading the OTHER case and would pass for the wrong reason.
+    assert!(
+        encoded.owning_target.present,
+        "an attributed fixture must encode to a present Optional",
+    );
+    // SAFETY: `present` was just asserted, so the payload is initialized.
+    let payload = unsafe { &*encoded.owning_target.value.as_ptr() };
+    assert!(
+        !payload.ptr.is_null(),
+        "str_to_ffi must mint the sentinel allocation for an empty string",
+    );
+    assert_eq!(payload.len, 0, "an empty target encodes to a zero length");
+
+    let decoded = unsafe { auth::connection_from_ffi(encoded).unwrap() };
+    assert_eq!(
+        decoded.owning_target,
+        Some(String::new()),
+        "an empty target the producer encoded on purpose must survive",
+    );
+}
+
+/// `connection_from_ffi` partial-moves its argument field by field, so a field
+/// nobody reads is dropped at end of scope: freed correctly, no leak, no double
+/// free -- and silently gone, with nothing on the FFI side failing to compile.
+/// The whole-value equality above would catch that for `owning_target`; this
+/// pins it on its own so the failure names the field rather than the struct.
+#[test]
+fn connection_owning_target_is_not_dropped_by_the_decoder() {
+    let original = connection_fixture(Some("s3_prod".into()));
+    let back = unsafe { auth::connection_from_ffi(auth::connection_to_ffi(original)).unwrap() };
+    assert_eq!(back.owning_target.as_deref(), Some("s3_prod"));
 }
 
 #[test]
@@ -1652,6 +2026,7 @@ fn auth_event_round_trips_each_variant() {
         },
         last_probed: None,
         user_metadata: HashMap::new(),
+        owning_target: None,
     };
     let cases = [
         AuthEvent::OpenBrowser {
@@ -2195,6 +2570,7 @@ fn list_options_undersized_struct_size_is_rejected() {
         max_results: None,
         page_token: None,
         full_metadata: false,
+        versioned_address: false,
     };
     let mut ffi_value = options::list_options_to_ffi(original);
     ffi_value.struct_size = 0x10;
@@ -2238,6 +2614,7 @@ fn watch_directory_options_undersized_struct_size_is_rejected() {
 fn stat_options_undersized_struct_size_is_rejected() {
     let mut ffi_value = options::stat_options_to_ffi(StatOptions {
         full_metadata: false,
+        versioned_address: false,
     });
     ffi_value.struct_size = 0x4;
     let err = options::stat_options_from_ffi(ffi_value).unwrap_err();

@@ -10,7 +10,13 @@
 //! NOT retried, see the note on the `401` arm below. [`map_sdk_error`]
 //! classifies a typed `SdkError`:
 //! modeled error code first (S3 can return HTTP 200 with an embedded `<Error>`
-//! body), then raw HTTP status, then the non-HTTP transport variants.
+//! body), then raw HTTP status, then the non-HTTP transport variants. A 301 or
+//! a 400 whose response carries `x-amz-bucket-region` also earns a
+//! `next_action` naming the region to configure, because those two answers are
+//! how S3 says the request reached a region that does not serve the bucket.
+//! Where the operator sets that region depends on how the backend came to
+//! be: [`map_sdk_error_for`] words the remedy by [`AnonymousShape`], since
+//! the anonymous `s3://` fallback has no connection to set `region` on.
 //!
 //! Provider response bodies never reach an error message. Both entry points
 //! reduce a body to its `<Code>` token — allowlisted to ASCII alphanumerics
@@ -20,8 +26,9 @@
 //! exception would put credential-derived material into every log that renders
 //! it.
 
+use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
-use ovstorage_plugin::{ConnectionId, Error, ErrorCode, ErrorContext};
+use ovstorage_plugin::{ConnectionId, Error, ErrorCode, ErrorContext, Url};
 
 /// Map an AWS HTTP status to a typed `ErrorCode`.
 ///
@@ -207,6 +214,30 @@ fn map_error_status_detail(status: u16, detail: &Detail) -> Error {
             ErrorCode::Transient,
             format!("S3 returned transient HTTP {status}{trail}"),
         ),
+        // A 301 is a configuration answer, not a transient fault; retrying it
+        // cannot succeed. S3 answers `PermanentRedirect` when a request reaches
+        // an endpoint that does not serve the bucket, which for a connection
+        // with a fixed `region` means that region is wrong. Left to the
+        // catch-all it would map `Transient`, and the host's `RetryWrapper`
+        // replays a `Transient` — every replay reaches the same endpoint and
+        // earns the same 301. `InvalidArgument` names the configuration and is
+        // surfaced at once; `map_sdk_error` adds the region to set when the
+        // response says which one.
+        301 => Error::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "S3 answered HTTP 301 (PermanentRedirect): the bucket is not \
+                 served from the configured region{trail}"
+            ),
+        ),
+        // A 307 is the opposite case: S3 answers `TemporaryRedirect` for a
+        // bucket in the minutes after its creation, while the bucket's DNS name
+        // still resolves to another region. It clears on its own, so a retry is
+        // the right response.
+        307 => Error::new(
+            ErrorCode::Transient,
+            format!("S3 answered HTTP 307 (TemporaryRedirect){trail}"),
+        ),
         status => Error::new(
             ErrorCode::Transient,
             format!("S3 returned unexpected HTTP {status}{trail}"),
@@ -219,7 +250,101 @@ fn map_error_status_detail(status: u16, detail: &Detail) -> Error {
 /// When the SDK captured a raw HTTP response, the status drives the mapping
 /// through [`map_error_status`]. Otherwise the failure was local (timeout,
 /// connect/TLS, request construction) and is classified by variant.
+///
+/// A 301, or a 400 carrying `x-amz-bucket-region`, is S3 saying which region
+/// does serve the bucket, so the mapped error gains a `next_action` naming it.
+/// Only those two statuses are read: the header also rides on ordinary
+/// successful responses and on refusals that have nothing to do with region,
+/// where advising a region change would send the operator after the wrong
+/// setting.
+///
+/// The remedy is worded for a connection backend, whose `region` is a
+/// connection setting. A backend that may be the anonymous fallback's takes
+/// [`map_sdk_error_for`] so the remedy names a setting that exists for it.
 pub(crate) fn map_sdk_error<E>(context: &str, err: SdkError<E>) -> Error
+where
+    E: std::fmt::Debug + ProvideErrorMetadata,
+{
+    map_sdk_error_for(context, err, None)
+}
+
+/// [`map_sdk_error`] for a backend of known `shape`: the region remedy names
+/// the setting an operator can actually reach. A connection backend, signed
+/// or anonymous, has `region` on the connection; the fallback's backend has
+/// no connection at all, so its remedy names the layer's
+/// `anonymous_fallback_region`, or a connection to add for the bucket root.
+pub(crate) fn map_sdk_error_for<E>(
+    context: &str,
+    err: SdkError<E>,
+    shape: Option<&AnonymousShape>,
+) -> Error
+where
+    E: std::fmt::Debug + ProvideErrorMetadata,
+{
+    let region_hint = match err.raw_response().map(|raw| raw.status().as_u16()) {
+        Some(301 | 400) => bucket_region_from_error(&err),
+        _ => None,
+    };
+    let mapped = classify_sdk_error(context, err);
+    match region_hint {
+        Some(region) => mapped.with_next_action(region_remedy(&region, shape)),
+        None => mapped,
+    }
+}
+
+/// Where an operator sets the region a 301 or 400 named, by the shape of the
+/// backend that received the answer.
+///
+/// The fallback offers two settings because they repair different scopes:
+/// `anonymous_fallback_region` moves every cold bucket's probe, which is the
+/// fix when the store has one region for everything (an S3-compatible
+/// endpoint, say); a connection for the bucket root pins this bucket alone,
+/// and outranks the fallback the moment it installs.
+fn region_remedy(region: &str, shape: Option<&AnonymousShape>) -> String {
+    match shape {
+        Some(AnonymousShape::Fallback { root }) => format!(
+            "set anonymous_fallback_region = \"{region}\" on the layer, or add a \
+             connection for {root} with region = \"{region}\""
+        ),
+        Some(AnonymousShape::Connection) | None => {
+            format!("set region = \"{region}\" on this connection")
+        }
+    }
+}
+
+/// What a `301` told the backend that received it: its bucket lives in a
+/// region other than the one it is built for, either named by the answer's
+/// `x-amz-bucket-region` or not.
+///
+/// Recorded on the backend by `S3Backend::map_store_error` and read by the
+/// anonymous `s3://` fallback, which is the one owner that can act on it: a
+/// connection's region is the operator's to change, but the fallback learned
+/// its bucket's region itself and can unlearn it. A `307` is not a mismatch —
+/// S3 answers it while a fresh bucket's DNS settles, and it clears on its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RegionMismatch {
+    /// The answer named the bucket's region.
+    Named(String),
+    /// The answer named no region, or one that fails [`is_valid_region_token`].
+    Unnamed,
+}
+
+/// The region verdict a `301` carries, or `None` for any other answer.
+pub(crate) fn region_mismatch_from_error<E>(
+    err: &SdkError<E, HttpResponse>,
+) -> Option<RegionMismatch> {
+    if err.raw_response()?.status().as_u16() != 301 {
+        return None;
+    }
+    Some(match bucket_region_from_error(err) {
+        Some(region) => RegionMismatch::Named(region),
+        None => RegionMismatch::Unnamed,
+    })
+}
+
+/// The classification behind [`map_sdk_error`]: modeled code, then HTTP
+/// status, then transport variant.
+fn classify_sdk_error<E>(context: &str, err: SdkError<E>) -> Error
 where
     E: std::fmt::Debug + ProvideErrorMetadata,
 {
@@ -243,6 +368,20 @@ where
             }
             "InvalidPart" | "InvalidPartOrder" | "EntityTooSmall" => {
                 return Error::new(ErrorCode::ObjectModified, format!("{context}: {code}"));
+            }
+            // S3 answers HTTP 400 with this code when a SigV4 signature names a
+            // region other than the one serving the bucket. The status alone
+            // would fall to the catch-all as `Transient`, and a replay signed
+            // for the same region is refused the same way; the connection's
+            // `region` is what has to change.
+            "AuthorizationHeaderMalformed" => {
+                return Error::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "{context}: {code}: the request is signed for a region that \
+                         does not serve this bucket"
+                    ),
+                );
             }
             _ => {}
         }
@@ -313,21 +452,63 @@ where
     }
 }
 
+/// The region S3 names in `x-amz-bucket-region`, if the response carries one
+/// that passes [`is_valid_region_token`].
+///
+/// S3 sets the header on `HeadBucket` answers — including the 301 and 400 it
+/// gives a request that reached the wrong region — so a caller can learn where
+/// a bucket lives from the refusal itself. The value is provider-controlled
+/// text that ends up in an error message and, for a cold bucket, in an
+/// endpoint hostname, so it is admitted only when it has the shape of a region
+/// identifier; anything else is treated as absent rather than quoted.
+pub(crate) fn bucket_region_from_error<E>(err: &SdkError<E, HttpResponse>) -> Option<String> {
+    let region = err.raw_response()?.headers().get("x-amz-bucket-region")?;
+    is_valid_region_token(region).then(|| region.to_string())
+}
+
+/// Whether `token` has the shape of an AWS region identifier: one to
+/// thirty-two characters, each a lowercase ASCII letter, a digit or a hyphen.
+///
+/// Every real identifier (`us-east-1`, `eu-central-2`, `us-gov-west-1`) fits.
+/// What the rule refuses is a value that could steer a hostname somewhere else
+/// (`.`, `/`, `@`) or that is merely an odd spelling of one (`EU-WEST-1`,
+/// which S3 never emits). The byte-class scan is written out because it is the
+/// only pattern this crate matches and does not justify a regex dependency.
+pub(crate) fn is_valid_region_token(token: &str) -> bool {
+    (1..=32).contains(&token.len())
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// The two ways a request comes to be unsigned. They differ in what an
+/// operator can do about a refusal of it, which is why a refusal is restated
+/// by shape — see [`map_anonymous_refusal`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AnonymousShape {
+    /// A connection the operator added without credentials.
+    Connection,
+    /// The anonymous scheme fallback's backend for a bucket no connection
+    /// serves. `root` is the bucket root a connection would be added for
+    /// (`s3://bucket/`); it is never the caller's full address.
+    Fallback { root: Url },
+}
+
 /// Restate a store refusal of an UNSIGNED request in terms an operator can act
 /// on.
 ///
 /// Applied by `S3Backend::map_store_error`, which covers the operations an
-/// anonymous connection sends through the SDK: `list`, `list_versions`, and
+/// anonymous backend sends through the SDK: `list`, `list_versions`, and
 /// the `HeadObject` and directory probe behind `stat` and
 /// `get_latest_version`. It does not cover `read`, which mints a redirect and
 /// issues nothing. `check_access` reaches it only through that same directory
 /// probe, and only to classify: its own output is a verdict rather than an
 /// error, so what the restatement changes there is which status the verdict's
 /// reason names — an anonymous `401` is restated as `PermissionDenied` and so
-/// reads as `403`, deliberately, since there is no credential to fix. It is a
-/// no-op on a credentialed connection.
+/// reads as `403`, deliberately, since there is no credential to fix. A
+/// credentialed backend never calls it.
 ///
-/// An anonymous connection sends no signature, so S3 evaluates the request as
+/// An anonymous backend sends no signature, so S3 evaluates the request as
 /// the anonymous principal. A `401` or `403` back therefore says the store
 /// refused THIS request from an anonymous caller — a different fact from either
 /// reading the caller would otherwise take:
@@ -358,15 +539,21 @@ where
 /// connection whose credential is in question, and there is none.
 ///
 /// The remedy is a `next_action` rather than more message, because the repairs
-/// are the operator's and they are alternatives. Two things about its wording
-/// are deliberate:
+/// are the operator's and they are alternatives. Three things about its
+/// wording are deliberate:
 ///
-/// - it says **remove and re-add** the connection, not "add credentials to it".
-///   `S3Layer::update_connection_credentials` refuses an
-///   anonymous-to-credentialed update outright — the backend was built without
-///   a signing client and the live credential cell would not reshape it — so
-///   "configure credentials on this connection" is advice that cannot be
-///   followed;
+/// - on an anonymous connection it says **remove and re-add** the connection,
+///   not "add credentials to it". `S3Layer::update_connection_credentials`
+///   refuses an anonymous-to-credentialed update outright — the backend was
+///   built without a signing client and the live credential cell would not
+///   reshape it — so "configure credentials on this connection" is advice
+///   that cannot be followed;
+/// - on the fallback it says **add a connection for** the bucket root. There
+///   is no connection to remove: the fallback reaches the bucket precisely
+///   because none is configured, and a connection for that root outranks the
+///   fallback the moment it installs. The wording matches the fallback's own
+///   mutation refusal, so the two remedies an operator meets on one bucket
+///   read as one instruction;
 /// - it says **public-access controls**, not "the bucket policy". S3 Block
 ///   Public Access, an access point policy, an SCP, or an S3-compatible
 ///   gateway's own rules produce the same refusal, and the message must not
@@ -374,37 +561,44 @@ where
 ///
 /// Every other code passes through untouched — a `404` for a missing bucket, a
 /// `503`, a timeout — because none of them is about the request being unsigned.
-pub(crate) fn map_anonymous_refusal(err: Error) -> Error {
+pub(crate) fn map_anonymous_refusal(err: Error, shape: &AnonymousShape) -> Error {
     if !matches!(
         err.code(),
         ErrorCode::AuthRequired | ErrorCode::PermissionDenied
     ) {
         return err;
     }
+    let (why_unsigned, repair) = match shape {
+        AnonymousShape::Connection => (
+            "this S3 connection is anonymous".to_string(),
+            "remove and re-add this connection with credentials".to_string(),
+        ),
+        AnonymousShape::Fallback { root } => (
+            "this bucket is reached through the anonymous s3:// fallback".to_string(),
+            format!("add a connection for {root} with credentials to read it"),
+        ),
+    };
     // `err.message()` is already sanitized: everything reaching here was built
     // by `map_error_status_detail` out of this module's literals plus a
     // validated provider code token.
     Error::new(
         ErrorCode::PermissionDenied,
         format!(
-            "{}; the request was unsigned because this S3 connection is \
-             anonymous, and the store refused it. Note a bucket that does not \
-             grant s3:ListBucket to anonymous callers also answers 403 for an \
-             object that does not exist",
+            "{}; the request was unsigned because {why_unsigned}, and the store \
+             refused it. Note a bucket that does not grant s3:ListBucket to \
+             anonymous callers also answers 403 for an object that does not exist",
             err.message()
         ),
     )
-    .with_next_action(
-        "confirm the object exists, then remove and re-add this connection with \
-         credentials, or grant the action to anonymous callers in the \
-         public-access controls covering this bucket",
-    )
+    .with_next_action(format!(
+        "confirm the object exists, then {repair}, or grant the action to \
+         anonymous callers in the public-access controls covering this bucket"
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_sdk_s3::config::http::HttpResponse;
     use aws_sdk_s3::error::ErrorMetadata;
     use aws_sdk_s3::primitives::SdkBody;
 
@@ -464,14 +658,30 @@ mod tests {
         code: Option<&str>,
         body: &'static str,
     ) -> SdkError<FakeServiceError> {
+        service_error_with_region(status, code, body, None)
+    }
+
+    /// [`service_error`] whose response also carries `x-amz-bucket-region`,
+    /// the way S3 answers a request that reached a region other than the
+    /// bucket's. `None` leaves the header off.
+    fn service_error_with_region(
+        status: u16,
+        code: Option<&str>,
+        body: &'static str,
+        region: Option<&str>,
+    ) -> SdkError<FakeServiceError> {
         let mut meta = ErrorMetadata::builder();
         if let Some(code) = code {
             meta = meta.code(code);
         }
-        let raw = HttpResponse::new(
+        let mut raw = HttpResponse::new(
             status.try_into().expect("valid status"),
             SdkBody::from(body),
         );
+        if let Some(region) = region {
+            raw.headers_mut()
+                .insert("x-amz-bucket-region", region.to_string());
+        }
         SdkError::service_error(FakeServiceError(meta.build()), raw)
     }
 
@@ -553,6 +763,201 @@ mod tests {
     #[test]
     fn map_error_status_unknown_is_transient() {
         assert_eq!(map_error_status(418, b"").code(), ErrorCode::Transient);
+    }
+
+    /// A 301 is a configuration answer: the request reached a region that does
+    /// not serve the bucket. Filed as `Transient` it would go to the host's
+    /// `RetryWrapper`, whose every replay reaches the same endpoint and earns
+    /// the same 301, so it is `InvalidArgument` and surfaces at once.
+    #[test]
+    fn a_301_maps_to_a_non_retryable_region_mismatch() {
+        let err = map_error_status(301, b"<Error><Code>PermanentRedirect</Code></Error>");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "S3 answered HTTP 301 (PermanentRedirect): the bucket is not served \
+             from the configured region: PermanentRedirect"
+        );
+        assert!(
+            err.next_action().is_none(),
+            "a bare status names no region to set"
+        );
+
+        // Through the SDK path the response's own region hint is the remedy.
+        let err = service_error_with_region(301, Some("PermanentRedirect"), "", Some("eu-west-1"));
+        let mapped = map_sdk_error("s3 head_bucket", err);
+        assert_eq!(mapped.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            mapped.message(),
+            "S3 answered HTTP 301 (PermanentRedirect): the bucket is not served \
+             from the configured region: s3 head_bucket: PermanentRedirect"
+        );
+        assert_eq!(
+            mapped.next_action(),
+            Some("set region = \"eu-west-1\" on this connection")
+        );
+
+        // Without the header there is no region to name, and the error says
+        // nothing rather than guessing one.
+        let mapped = map_sdk_error(
+            "s3 head_bucket",
+            service_error(301, Some("PermanentRedirect"), ""),
+        );
+        assert_eq!(mapped.code(), ErrorCode::InvalidArgument);
+        assert!(mapped.next_action().is_none());
+    }
+
+    /// A 307 (`TemporaryRedirect`) clears by itself once a fresh bucket's DNS
+    /// settles, so it stays retryable — the opposite verdict from a 301.
+    #[test]
+    fn a_307_is_transient() {
+        let err = map_error_status(307, b"<Error><Code>TemporaryRedirect</Code></Error>");
+        assert_eq!(err.code(), ErrorCode::Transient);
+        assert_eq!(
+            err.message(),
+            "S3 answered HTTP 307 (TemporaryRedirect): TemporaryRedirect"
+        );
+        assert!(err.next_action().is_none());
+    }
+
+    /// `x-amz-bucket-region` is provider text that ends up in a message and, for
+    /// a cold bucket, in a hostname, so only a value shaped like a region
+    /// identifier is read; anything else is treated as absent.
+    #[test]
+    fn the_bucket_region_header_is_read_and_validated() {
+        for accepted in ["eu-west-1", "us-gov-west-1", "a", &"a".repeat(32)] {
+            assert!(is_valid_region_token(accepted), "{accepted:?}");
+        }
+        for rejected in [
+            "evil.example/",
+            "",
+            "EU-WEST-1",
+            "us_east_1",
+            "us east 1",
+            "eu-west-1@",
+            &"a".repeat(33),
+        ] {
+            assert!(!is_valid_region_token(rejected), "{rejected:?}");
+        }
+
+        let read = |region: &str| {
+            bucket_region_from_error(&service_error_with_region(301, None, "", Some(region)))
+        };
+        assert_eq!(read("eu-west-1"), Some("eu-west-1".to_string()));
+        for rejected in ["evil.example/", "", "EU-WEST-1", &"a".repeat(33)] {
+            assert_eq!(read(rejected), None, "{rejected:?}");
+        }
+        // No header at all is the ordinary case and reads as absent.
+        assert_eq!(
+            bucket_region_from_error(&service_error(301, None, "")),
+            None
+        );
+        // A failure with no response has nothing to read.
+        let no_response: SdkError<FakeServiceError> = SdkError::timeout_error("timed out");
+        assert_eq!(bucket_region_from_error(&no_response), None);
+    }
+
+    /// The SigV4 region-mismatch answer: HTTP 400 with a modeled code, which
+    /// the status alone would file as `Transient`. The response also carries
+    /// the bucket's region, and that becomes the remedy; the same header on a
+    /// status that is not about region attaches nothing.
+    #[test]
+    fn an_authorization_header_malformed_code_is_invalid_argument() {
+        let mapped = map_sdk_error(
+            "s3 list_objects_v2",
+            service_error(400, Some("AuthorizationHeaderMalformed"), ""),
+        );
+        assert_eq!(mapped.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            mapped.message(),
+            "s3 list_objects_v2: AuthorizationHeaderMalformed: the request is signed \
+             for a region that does not serve this bucket"
+        );
+        assert!(mapped.next_action().is_none());
+
+        let mapped = map_sdk_error(
+            "s3 list_objects_v2",
+            service_error_with_region(
+                400,
+                Some("AuthorizationHeaderMalformed"),
+                "",
+                Some("eu-west-1"),
+            ),
+        );
+        assert_eq!(mapped.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            mapped.next_action(),
+            Some("set region = \"eu-west-1\" on this connection")
+        );
+
+        // The hint is bounded to the two region-mismatch statuses: on a 403 the
+        // header says nothing about why the request was refused.
+        let mapped = map_sdk_error(
+            "s3 head_object",
+            service_error_with_region(403, Some("AccessDenied"), "", Some("eu-west-1")),
+        );
+        assert_eq!(mapped.code(), ErrorCode::PermissionDenied);
+        assert!(mapped.next_action().is_none());
+    }
+
+    /// The fallback's backend has no connection, so its region remedy names
+    /// the layer key and a connection to add for the bucket root; an anonymous
+    /// connection keeps the connection wording, because `region` is its own.
+    #[test]
+    fn a_fallback_backend_is_sent_to_the_layer_key_rather_than_a_connection() {
+        let redirect =
+            || service_error_with_region(301, Some("PermanentRedirect"), "", Some("eu-west-1"));
+        let root = Url::parse("s3://bkt/").unwrap();
+
+        let mapped = map_sdk_error_for(
+            "s3 head_object",
+            redirect(),
+            Some(&AnonymousShape::Fallback { root }),
+        );
+        assert_eq!(mapped.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            mapped.next_action(),
+            Some(
+                "set anonymous_fallback_region = \"eu-west-1\" on the layer, or add a \
+                 connection for s3://bkt/ with region = \"eu-west-1\""
+            )
+        );
+
+        for shape in [Some(&AnonymousShape::Connection), None] {
+            let mapped = map_sdk_error_for("s3 head_object", redirect(), shape);
+            assert_eq!(
+                mapped.next_action(),
+                Some("set region = \"eu-west-1\" on this connection"),
+                "{shape:?}"
+            );
+        }
+    }
+
+    /// Only a 301 is a region verdict; whether it names the region decides
+    /// what the fallback can relearn from it.
+    #[test]
+    fn a_301_is_a_region_mismatch_whether_or_not_it_names_the_region() {
+        let verdict = |status, region| {
+            region_mismatch_from_error(&service_error_with_region(status, None, "", region))
+        };
+        assert_eq!(
+            verdict(301, Some("eu-west-1")),
+            Some(RegionMismatch::Named("eu-west-1".to_string()))
+        );
+        assert_eq!(verdict(301, None), Some(RegionMismatch::Unnamed));
+        assert_eq!(
+            verdict(301, Some("evil.example/")),
+            Some(RegionMismatch::Unnamed),
+            "an invalid token is not a region to relearn"
+        );
+        assert_eq!(
+            verdict(307, Some("eu-west-1")),
+            None,
+            "a 307 clears by itself"
+        );
+        assert_eq!(verdict(403, Some("eu-west-1")), None);
+        let no_response: SdkError<FakeServiceError> = SdkError::timeout_error("timed out");
+        assert_eq!(region_mismatch_from_error(&no_response), None);
     }
 
     /// The whole point of the sanitizer: a `SignatureDoesNotMatch` body hands

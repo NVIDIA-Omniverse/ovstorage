@@ -591,19 +591,210 @@ ovc_ssize_t ovc_pwrite(ovc_file file,
                        size_t byte_count,
                        uint64_t offset);
 
+/* Owner-only files for the credential store.
+ *
+ * These files are never shared with another OS user.  Callers must securely
+ * zero every buffer that held file contents before releasing that buffer. */
+typedef enum ovc_private_open_mode {
+    OVC_PRIVATE_OPEN_CREATE_NEW,
+    OVC_PRIVATE_OPEN_ALWAYS,
+    OVC_PRIVATE_OPEN_EXISTING
+} ovc_private_open_mode;
+
+/**
+ * Open a regular owner-only file, or return OVC_INVALID_FILE with errno set.
+ * A pre-existing Win32 file must be owned by either the process token's user
+ * or its default owner. The latter can be the built-in Administrators group
+ * for an elevated administrator token.
+ */
+ovc_file ovc_private_file_open(const char *path,
+                               ovc_private_open_mode mode);
+
+/** Close a file without retrying an interrupted POSIX close. */
+int ovc_file_close(ovc_file file);
+
+/** Flush file contents and metadata to stable storage. */
+int ovc_file_sync(ovc_file file);
+
+/** Return the current file length in bytes through out. */
+int ovc_file_size(ovc_file file, uint64_t *out);
+
+/**
+ * Read exactly the file's current contents, refusing lengths above max_len.
+ *
+ * The caller owns the malloc'd result and must securely zero it before
+ * calling free().  Returns 0 on success or -1 with errno set; an oversized
+ * file reports EFBIG.
+ */
+int ovc_file_read_all(ovc_file file,
+                      size_t max_len,
+                      uint8_t **out_bytes,
+                      size_t *out_len);
+
+/** Write every byte starting at offset zero, handling short writes. */
+int ovc_file_write_all_from_start(ovc_file file,
+                                  const void *bytes,
+                                  size_t len);
+
+/** Atomically rename source over destination where the platform permits. */
+int ovc_file_rename_replace(const char *source, const char *destination);
+
+/** Remove one file path. */
+int ovc_file_unlink(const char *path);
+
+/**
+ * Bound the Win32 transient-sharing retries of every file primitive this
+ * thread calls, until ovc_transient_retry_end(), to one deadline `budget_ns`
+ * from now instead of one budget per primitive. A no-op on POSIX, where an
+ * open handle in another process does not refuse rename or unlink. Ending a
+ * scope that was never begun is harmless.
+ */
+void ovc_transient_retry_begin(uint64_t budget_ns);
+void ovc_transient_retry_end(void);
+
+/** Commit directory-entry changes to stable storage where required. */
+int ovc_dir_sync(const char *dir);
+
+typedef struct ovc_lockfile {
+    ovc_file file;
+} ovc_lockfile;
+
+/**
+ * Acquire an exclusive cross-process lock, bounded by timeout_ns.
+ *
+ * POSIX record locks are per-process and closing ANY descriptor open on the
+ * same lock file drops this process's locks.  The caller must therefore
+ * serialize its threads with a process mutex before acquiring this lock and
+ * must never hold another descriptor to the lock file.  This primitive
+ * serializes processes only; it does not serialize threads within a process.
+ */
+int ovc_lockfile_acquire(const char *path,
+                         uint64_t timeout_ns,
+                         ovc_lockfile *out);
+
+/** Unlock and close a lock acquired by ovc_lockfile_acquire. */
+void ovc_lockfile_release(ovc_lockfile *lock);
+
+/* Durable credential store. */
+typedef enum ovc_cred_status {
+    OVC_CRED_OK,
+    OVC_CRED_INVALID,
+    OVC_CRED_CORRUPT,
+    OVC_CRED_NEWER_FORMAT,
+    OVC_CRED_UNAVAILABLE,
+    OVC_CRED_LOCKED,
+    OVC_CRED_NOMEM
+} ovc_cred_status;
+
+typedef struct ovc_cred_error {
+    ovc_cred_status status;
+    char message[320];
+} ovc_cred_error;
+
+typedef struct ovc_cred_record {
+    uint8_t *backend_kind;
+    size_t backend_kind_len;
+    uint8_t *connection_id;
+    size_t connection_id_len;
+    uint8_t *field;
+    size_t field_len;
+    uint8_t *value;
+    size_t value_len;
+} ovc_cred_record;
+
+typedef struct ovc_cred_records {
+    ovc_cred_record *items;
+    size_t count;
+} ovc_cred_records;
+
+typedef struct ovc_cred_store ovc_cred_store;
+
+#define OVC_CRED_FORMAT_VERSION 1
+#define OVC_CRED_MAX_FILE_BYTES (64u << 20)
+#define OVC_CRED_MAX_FIELD_BYTES (16u << 20)
+#define OVC_CRED_NAMESPACE_MAX 64
+#define OVC_CRED_LOCK_TIMEOUT_NS (UINT64_C(10) * UINT64_C(1000000000))
+/* One store operation's whole budget for Win32 transient sharing retries,
+ * shared by every primitive it calls while it holds the namespace lock. */
+#define OVC_CRED_TRANSIENT_RETRY_NS (UINT64_C(2) * UINT64_C(1000000000))
+
+int ovc_cred_namespace_valid(const char *ns);
+char *ovc_cred_namespace_file_stem(const char *ns);
+int ovc_cred_encode(const ovc_cred_records *records,
+                    uint8_t **out,
+                    size_t *out_len,
+                    ovc_cred_error *err);
+int ovc_cred_decode(const uint8_t *bytes,
+                    size_t len,
+                    ovc_cred_records *out,
+                    ovc_cred_error *err);
+ovc_cred_record *ovc_cred_records_find(ovc_cred_records *records,
+                                       const uint8_t *backend_kind,
+                                       size_t backend_kind_len,
+                                       const uint8_t *connection_id,
+                                       size_t connection_id_len,
+                                       const uint8_t *field,
+                                       size_t field_len);
+int ovc_cred_records_upsert(ovc_cred_records *records,
+                            const uint8_t *backend_kind,
+                            size_t backend_kind_len,
+                            const uint8_t *connection_id,
+                            size_t connection_id_len,
+                            const uint8_t *field,
+                            size_t field_len,
+                            const uint8_t *value,
+                            size_t value_len,
+                            ovc_cred_error *err);
+int ovc_cred_records_remove(ovc_cred_records *records,
+                            const uint8_t *backend_kind,
+                            size_t backend_kind_len,
+                            const uint8_t *connection_id,
+                            size_t connection_id_len,
+                            const uint8_t *field,
+                            size_t field_len);
+void ovc_cred_records_clear(ovc_cred_records *records);
+
+/*
+ * Store calls have no in-process lock of their own.  The standalone host
+ * holds g_ovc_host_secret_mutex across every call.  That serialization is
+ * required before acquiring the cross-process lock because POSIX record
+ * locks are per-process rather than per-thread.
+ */
+int ovc_cred_store_open(const char *auth_dir,
+                        const char *credential_namespace,
+                        ovc_cred_store **out,
+                        ovc_cred_error *err);
+int ovc_cred_store_get(ovc_cred_store *store,
+                       const ovc_cred_record *key,
+                       uint8_t **out_copy,
+                       size_t *out_len,
+                       int *out_found,
+                       ovc_cred_error *err);
+int ovc_cred_store_put(ovc_cred_store *store,
+                       const ovc_cred_record *record,
+                       ovc_cred_error *err);
+int ovc_cred_store_delete(ovc_cred_store *store,
+                          const ovc_cred_record *key,
+                          ovc_cred_error *err);
+void ovc_cred_store_close(ovc_cred_store *store);
+
+#if defined(OVC_CREDENTIAL_STORE_TEST_MAIN) || \
+    defined(OVC_HOST_CALLBACKS_TEST_MAIN)
+void ovc_cred_test_set_release_observer(
+    void (*observer)(const uint8_t *, size_t));
+#endif
+
 /** Irrecoverably overwrite byte_count bytes at data. */
 void ovc_secure_zero(void *data, size_t byte_count);
 
-/* Read an environment variable as an OWNED string on every platform, or NULL
- * when unset or on failure (errno set).
+/* Read an environment variable as an OWNED UTF-8 string on every platform, or
+ * NULL when unset or on failure (errno set). An unset variable leaves errno 0.
  *
  * The ownership is uniform on purpose. Win32 has no thread-safe borrowing
  * form -- `getenv` there returns a pointer into a snapshot that
- * `_putenv`/`_wputenv` can invalidate -- so without this helper each caller needs
- * `_dupenv_s` under `#if defined(_WIN32)` and plain `getenv` otherwise,
- * carrying its own conditional declarations, free and error path. Every
- * environment-backed option repeats that bookkeeping. Always-owned costs one
- * `strdup` on POSIX and removes the conditional from the callers. */
+ * `_putenv`/`_wputenv` can invalidate -- so the implementation reads the wide
+ * Win32 environment and converts it to UTF-8. POSIX duplicates `getenv`.
+ * Always-owned storage removes platform conditionals from callers. */
 char *ovc_env_dup(const char *name);
 
 #if defined(_WIN32)
@@ -629,10 +820,34 @@ char *ovc_wide_to_utf8(const wchar_t *wide);
  * table covers only the codes its author happened to need, and the same
  * failure then reports a specific errno on one path and EIO on another. */
 void ovc_win32_set_errno(DWORD error);
+
+/**
+ * Build a protected DACL granting FILE_ALL_ACCESS only to the process user.
+ *
+ * The returned security descriptor, ACL, and token-user allocation must stay
+ * alive together until the descriptor or ACL is no longer in use.  Release
+ * all three with `ovc_win32_owner_only_sd_free`.  Returns NULL on failure.
+ */
+PSECURITY_DESCRIPTOR ovc_win32_owner_only_sd_create(
+    PACL *out_acl,
+    PTOKEN_USER *out_user);
+
+/** Release allocations returned by `ovc_win32_owner_only_sd_create`. */
+void ovc_win32_owner_only_sd_free(PSECURITY_DESCRIPTOR descriptor,
+                                  PACL acl,
+                                  PTOKEN_USER user);
+
+/** Verify that a filesystem handle is owned by either accepted SID. */
+int ovc_win32_handle_owner_is(HANDLE handle,
+                              PSID token_user,
+                              PSID token_default_owner);
 #endif
 
 /** Return monotonic nanoseconds, or zero with errno set if the clock fails. */
 uint64_t ovc_monotonic_ns(void);
+
+/** Sleep for at least nanoseconds unless the platform reports an error. */
+void ovc_sleep_ns(uint64_t nanoseconds);
 
 /** Return the number of online logical processors, falling back to one. */
 unsigned int ovc_cpu_count(void);
@@ -844,6 +1059,38 @@ int ovc_path_is_absolute(const char *utf8_path);
  * returned allocation.  NULL is returned with errno set on failure.
  */
 char *ovc_path_join(const char *base, const char *child);
+
+/**
+ * Return an owned copy of the parent portion of `path`.
+ *
+ * The native root separator is retained, including the separator after a
+ * Win32 drive designator.  A path with no separator has the empty string as
+ * its parent.  NULL is returned with errno set on failure.
+ */
+char *ovc_path_parent_dup(const char *path);
+
+/**
+ * Create or harden `path` as an owner-only directory.
+ *
+ * Missing parents retain ordinary platform defaults: on POSIX they are
+ * created with mode 0777 subject to the process umask, rather than narrowing
+ * unrelated data directories such as a fresh ~/.local.  The leaf is created
+ * with mode 0700 instead of being created and then chmod'd; the latter leaves
+ * a traversable window in which another process can open a handle that
+ * survives the chmod.  Win32 follows the same policy by using a NULL security
+ * descriptor for missing parents and a protected owner-only DACL for the
+ * leaf.
+ *
+ * A pre-existing POSIX leaf must be a non-symlink directory owned by getuid();
+ * otherwise this fails with ELOOP, ENOTDIR, or EACCES respectively.  Existing
+ * directories are narrowed to mode 0700.  A pre-existing Win32 leaf must be
+ * owned by either the process token's user or its default owner (which can be
+ * the built-in Administrators group for an elevated administrator token);
+ * Win32 rejects other owners, reparse points, and non-directories before
+ * applying a protected owner-only DACL. Returns 0 on success or -1 with errno
+ * set.
+ */
+int ovc_private_dir_ensure(const char *path);
 
 #ifdef __cplusplus
 } /* extern "C" */

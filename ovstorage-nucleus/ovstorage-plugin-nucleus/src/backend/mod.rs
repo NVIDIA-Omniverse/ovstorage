@@ -9,7 +9,10 @@
 //!   the ABI-v2 port; the `Layer` slots delegate here)
 //! - `convert` — pure-data conversions between omni1 wire types and SPI types
 //! - `watch` — sync `Iterator` adapter over the async `subscribe_list` pump
+//! - `ancestors` — missing-ancestor creation and the per-connection set of
+//!   directories already created
 
+mod ancestors;
 mod convert;
 pub(crate) mod session;
 pub(crate) mod spi;
@@ -73,6 +76,7 @@ mod tests {
             auth_state: ConnectionAuthState::Anonymous,
             last_probed: None,
             user_metadata: UserMetadata::new(),
+            owning_target: None,
         }
     }
 
@@ -382,6 +386,14 @@ mod spi_tests {
     async fn factory_with_mock() -> (Arc<NucleusShared>, Arc<NucleusBackend>, Arc<MockTransport>) {
         let mut config = HashMap::new();
         config.insert("server".into(), ConfigValue::String("srv".into()));
+        factory_with_mock_config(config).await
+    }
+
+    /// Same as [`factory_with_mock`] with a caller-supplied connection config
+    /// (`prefix`, and so on).
+    async fn factory_with_mock_config(
+        config: HashMap<String, ConfigValue>,
+    ) -> (Arc<NucleusShared>, Arc<NucleusBackend>, Arc<MockTransport>) {
         let request = ConnectionRequest {
             backend_kind: NUCLEUS_KIND.into(),
             config,
@@ -447,6 +459,10 @@ mod spi_tests {
             .unwrap();
 
         assert_eq!(info.etag.as_deref(), Some("etag-1"));
+        assert_eq!(
+            info.etag_strength,
+            ovstorage_plugin::EtagStrength::Unspecified
+        );
         assert_eq!(info.size, Some(1024));
         assert_eq!(info.version.as_deref(), Some("tx-9"));
 
@@ -596,12 +612,831 @@ mod spi_tests {
         }
     }
 
+    /// The ancestor call every `PathAtBranch`-typed create issues first on a
+    /// fresh connection.
+    fn ancestor_ok() -> CannedResponse {
+        ancestor_status("OK")
+    }
+
+    fn ancestor_status(status: &str) -> CannedResponse {
+        CannedResponse {
+            interface: "Connection".into(),
+            method: "create_directory".into(),
+            frames: vec![RawFrame::from_json(&json!({"status": status, "ts": {}}))],
+        }
+    }
+
+    fn asset_status(status: &str) -> CannedResponse {
+        CannedResponse {
+            interface: "Connection".into(),
+            method: "create_asset".into(),
+            frames: vec![RawFrame::from_json(&json!({
+                "status": status,
+                "etag": "e",
+                "transaction_id": 1,
+            }))],
+        }
+    }
+
+    fn stat2_status(status: &str, path_type: Option<&str>) -> CannedResponse {
+        let mut frame = json!({"status": status});
+        if let Some(path_type) = path_type {
+            frame["type"] = json!(path_type);
+        }
+        CannedResponse {
+            interface: "Connection".into(),
+            method: "stat2".into(),
+            frames: vec![RawFrame::from_json(&frame)],
+        }
+    }
+
+    fn recorded_methods(mock: &MockTransport) -> Vec<String> {
+        mock.requests().into_iter().map(|r| r.method).collect()
+    }
+
+    fn recorded_paths(mock: &MockTransport, method: &str) -> Vec<String> {
+        mock.requests()
+            .into_iter()
+            .filter(|r| r.method == method)
+            .map(|r| r.params["path"]["path"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    async fn write_default(
+        backend: &NucleusBackend,
+        address: &str,
+        body: &[u8],
+    ) -> ovstorage_plugin::Result<()> {
+        backend
+            .write(
+                target(address),
+                body.to_vec(),
+                WriteOptions::default(),
+                None,
+            )
+            .await
+            .map(|_| ())
+    }
+
+    /// A write creates its path: the parent folder is created ahead of the
+    /// body, and a second write into the same folder finds it in the set.
+    #[tokio::test]
+    async fn write_creates_the_parent_folder_once_per_connection() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_ok());
+        mock.enqueue(asset_status("OK"));
+        write_default(
+            &backend,
+            "omniverse://srv/Users/alice/new/tree/leaf.usd",
+            b"one",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded_methods(&mock),
+            ["create_directory", "create_asset"]
+        );
+        assert_eq!(
+            recorded_paths(&mock, "create_directory"),
+            ["/Users/alice/new/tree/"]
+        );
+
+        mock.enqueue(asset_status("OK"));
+        write_default(
+            &backend,
+            "omniverse://srv/Users/alice/new/tree/other.usd",
+            b"two",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded_methods(&mock),
+            ["create_directory", "create_asset", "create_asset"]
+        );
+    }
+
+    /// Deepest-first: the walk climbs only while the server says the level
+    /// below is missing, then descends creating each level once.
+    #[tokio::test]
+    async fn write_climbs_to_the_first_existing_ancestor_then_creates_downward() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue_for_path(ancestor_status("NOT_EXIST"), "/Users/alice/a/b/");
+        mock.enqueue_for_path(ancestor_status("NOT_EXIST"), "/Users/alice/a/");
+        mock.enqueue_for_path(ancestor_status("OK"), "/Users/alice/");
+        mock.enqueue_for_path(ancestor_status("OK"), "/Users/alice/a/");
+        mock.enqueue_for_path(ancestor_status("OK"), "/Users/alice/a/b/");
+        mock.enqueue(asset_status("OK"));
+        write_default(&backend, "omniverse://srv/Users/alice/a/b/leaf.usd", b"x")
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_paths(&mock, "create_directory"),
+            [
+                "/Users/alice/a/b/",
+                "/Users/alice/a/",
+                "/Users/alice/",
+                "/Users/alice/a/",
+                "/Users/alice/a/b/",
+            ]
+        );
+        assert_eq!(recorded_methods(&mock).last().unwrap(), "create_asset");
+
+        // Every level the walk created is remembered.
+        mock.enqueue(asset_status("OK"));
+        write_default(&backend, "omniverse://srv/Users/alice/a/sibling.usd", b"y")
+            .await
+            .unwrap();
+        assert_eq!(recorded_paths(&mock, "create_directory").len(), 5);
+    }
+
+    /// A folder removed by another client makes the remembered parent stale:
+    /// the commit's `NotFound` forgets it, re-creates, and re-sends the body once.
+    #[tokio::test]
+    async fn write_retries_once_when_a_remembered_folder_is_gone() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_ok());
+        mock.enqueue(asset_status("OK"));
+        write_default(
+            &backend,
+            "omniverse://srv/Users/alice/tree/first.usd",
+            b"first",
+        )
+        .await
+        .unwrap();
+
+        mock.enqueue(asset_status("NOT_EXIST"));
+        mock.enqueue(ancestor_ok());
+        mock.enqueue(asset_status("OK"));
+        write_default(
+            &backend,
+            "omniverse://srv/Users/alice/tree/second.usd",
+            b"second",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded_methods(&mock),
+            [
+                "create_directory",
+                "create_asset",
+                "create_asset",
+                "create_directory",
+                "create_asset",
+            ]
+        );
+        let recorded = mock.requests();
+        assert_eq!(recorded[4].blob.as_deref(), Some(b"second".as_slice()));
+        assert_eq!(recorded[4].params["overwrite"], json!(true));
+    }
+
+    /// Ancestors confirmed live this call cannot be stale, so a `NotFound`
+    /// right after them is the server's answer and earns no retry.
+    #[tokio::test]
+    async fn write_does_not_retry_when_the_parent_was_just_created() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_ok());
+        mock.enqueue(asset_status("NOT_EXIST"));
+        let err = write_default(&backend, "omniverse://srv/Users/alice/tree/leaf.usd", b"x")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(
+            recorded_methods(&mock),
+            ["create_directory", "create_asset"]
+        );
+    }
+
+    #[tokio::test]
+    async fn write_retry_that_still_fails_surfaces_not_found() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_ok());
+        mock.enqueue(asset_status("OK"));
+        write_default(&backend, "omniverse://srv/Users/alice/tree/first.usd", b"x")
+            .await
+            .unwrap();
+        mock.enqueue(asset_status("NOT_EXIST"));
+        mock.enqueue(ancestor_ok());
+        mock.enqueue(asset_status("NOT_EXIST"));
+        let err = write_default(
+            &backend,
+            "omniverse://srv/Users/alice/tree/second.usd",
+            b"y",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(mock.requests().len(), 5);
+    }
+
+    /// The walk never climbs above the connection's `prefix`: a missing
+    /// folder above the route is the server's `NotFound`, not ours to create.
+    #[tokio::test]
+    async fn ancestor_walk_stops_at_the_connection_prefix() {
+        let mut config = HashMap::new();
+        config.insert("server".into(), ConfigValue::String("srv".into()));
+        config.insert("prefix".into(), ConfigValue::String("/Users/alice".into()));
+        let (_shared, backend, mock) = factory_with_mock_config(config).await;
+        mock.enqueue_for_path(ancestor_status("NOT_EXIST"), "/Users/alice/deep/");
+        mock.enqueue_for_path(ancestor_status("NOT_EXIST"), "/Users/alice/");
+        let err = write_default(&backend, "omniverse://srv/Users/alice/deep/leaf.usd", b"x")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(
+            recorded_paths(&mock, "create_directory"),
+            ["/Users/alice/deep/", "/Users/alice/"]
+        );
+    }
+
+    /// `create_directory` is recursive and idempotent, and always sends the
+    /// requested target even when the set remembers it.
+    /// An ancestor's `ALREADY_EXISTS` is taken as is; the target's is
+    /// confirmed by one stat2.
+    #[tokio::test]
+    async fn create_directory_creates_missing_ancestors_and_absorbs_already_exists() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue_for_path(ancestor_status("NOT_EXIST"), "/Users/alice/x/y/");
+        mock.enqueue_for_path(ancestor_status("ALREADY_EXISTS"), "/Users/alice/x/");
+        mock.enqueue_for_path(ancestor_status("OK"), "/Users/alice/x/y/");
+        backend
+            .create_directory(
+                target("omniverse://srv/Users/alice/x/y"),
+                CreateDirectoryOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_paths(&mock, "create_directory"),
+            ["/Users/alice/x/y/", "/Users/alice/x/", "/Users/alice/x/y/"]
+        );
+
+        mock.enqueue_for_path(ancestor_status("ALREADY_EXISTS"), "/Users/alice/x/y/");
+        mock.enqueue_for_path(stat2_status("OK", Some("folder")), "/Users/alice/x/y/");
+        backend
+            .create_directory(
+                target("omniverse://srv/Users/alice/x/y/"),
+                CreateDirectoryOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recorded_paths(&mock, "create_directory").len(), 4);
+        assert_eq!(recorded_paths(&mock, "stat2"), ["/Users/alice/x/y/"]);
+    }
+
+    fn batch_status(method: &str, status: &str, per_path: &str) -> CannedResponse {
+        CannedResponse {
+            interface: "Connection".into(),
+            method: method.into(),
+            frames: vec![RawFrame::from_json(
+                &json!({"status": status, "ts": {}, "responses": [per_path]}),
+            )],
+        }
+    }
+
+    /// No body travels with copy2/rename2, so the destination folder is
+    /// created only after the server reports something missing and one stat2
+    /// shows the source is there; the retry re-issues the pair once.
+    #[tokio::test]
+    async fn copy_and_rename_create_the_destination_parent_only_after_not_found() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(batch_status("copy2", "OK", "NOT_EXIST"));
+        mock.enqueue_for_path(stat2_status("OK", Some("asset")), "/Users/alice/src/a.usd");
+        mock.enqueue(ancestor_ok());
+        mock.enqueue(batch_status("copy2", "OK", "OK"));
+        backend
+            .copy(
+                target("omniverse://srv/Users/alice/src/a.usd"),
+                target("omniverse://srv/Users/bob/dst/b.usd"),
+                CopyOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_methods(&mock),
+            ["copy2", "stat2", "create_directory", "copy2"]
+        );
+        assert_eq!(
+            recorded_paths(&mock, "create_directory"),
+            ["/Users/bob/dst/"]
+        );
+
+        mock.enqueue(batch_status("rename2", "NOT_EXIST", "OK"));
+        mock.enqueue_for_path(stat2_status("OK", Some("asset")), "/Users/alice/src/a.usd");
+        mock.enqueue(ancestor_ok());
+        mock.enqueue(batch_status("rename2", "OK", "OK"));
+        backend
+            .rename(
+                target("omniverse://srv/Users/alice/src/a.usd"),
+                target("omniverse://srv/Users/bob/moved/a.usd"),
+                RenameOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_paths(&mock, "create_directory"),
+            ["/Users/bob/dst/", "/Users/bob/moved/"]
+        );
+    }
+
+    /// A copy whose SOURCE is missing must not leave a destination folder
+    /// behind even when that folder is missing too: the source is probed in
+    /// both spellings first, and the server's `NotFound` is the answer with
+    /// no `create_directory` issued and no second copy2.
+    #[tokio::test]
+    async fn copy_with_a_missing_source_leaves_no_folder_and_is_not_retried() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(batch_status("copy2", "OK", "NOT_EXIST"));
+        mock.enqueue_for_path(
+            stat2_status("NOT_EXIST", None),
+            "/Users/alice/does-not-exist.usd",
+        );
+        mock.enqueue_for_path(
+            stat2_status("INVALID_URI", None),
+            "/Users/alice/does-not-exist.usd/",
+        );
+        let err = backend
+            .copy(
+                target("omniverse://srv/Users/alice/does-not-exist.usd"),
+                target("omniverse://srv/Users/bob/brand/new/b.usd"),
+                CopyOptions::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(recorded_methods(&mock), ["copy2", "stat2", "stat2"]);
+    }
+
+    /// A folder source is spelled with a trailing `/` on the wire, so the
+    /// second probe finds it and the destination ensure proceeds.
+    #[tokio::test]
+    async fn copy_of_a_folder_source_probes_the_directory_spelling() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(batch_status("copy2", "OK", "NOT_EXIST"));
+        mock.enqueue_for_path(stat2_status("INVALID_URI", None), "/Users/alice/folder");
+        mock.enqueue_for_path(stat2_status("OK", Some("folder")), "/Users/alice/folder/");
+        mock.enqueue(ancestor_ok());
+        mock.enqueue(batch_status("copy2", "OK", "OK"));
+        backend
+            .copy(
+                target("omniverse://srv/Users/alice/folder"),
+                target("omniverse://srv/Users/bob/fresh/folder"),
+                CopyOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_methods(&mock),
+            ["copy2", "stat2", "stat2", "create_directory", "copy2"]
+        );
+    }
+
+    /// A stale parent that another writer re-created in between still earns
+    /// the one retry: after the re-ensure the folder exists, and the server
+    /// cannot say who put it back. The body is re-sent exactly once.
+    #[tokio::test]
+    async fn write_retries_once_when_the_stale_folder_is_already_back() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_ok());
+        mock.enqueue(asset_status("OK"));
+        write_default(&backend, "omniverse://srv/Users/alice/tree/first.usd", b"x")
+            .await
+            .unwrap();
+        mock.enqueue(asset_status("NOT_EXIST"));
+        mock.enqueue(ancestor_status("ALREADY_EXISTS"));
+        mock.enqueue(asset_status("OK"));
+        write_default(
+            &backend,
+            "omniverse://srv/Users/alice/tree/second.usd",
+            b"y",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded_methods(&mock),
+            [
+                "create_directory",
+                "create_asset",
+                "create_asset",
+                "create_directory",
+                "create_asset",
+            ]
+        );
+    }
+
+    /// A walk that saw the target missing reports it created even when the
+    /// target answers `ALREADY_EXISTS` on the way back down (another writer
+    /// filled it in): the verb needs no stat2, because the tree was
+    /// incomplete at this call and a folder is what was created.
+    #[tokio::test]
+    async fn create_directory_raced_on_the_way_down_needs_no_confirmation() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue_for_path(ancestor_status("NOT_EXIST"), "/Users/alice/x/y/");
+        mock.enqueue_for_path(ancestor_status("OK"), "/Users/alice/x/");
+        mock.enqueue_for_path(ancestor_status("ALREADY_EXISTS"), "/Users/alice/x/y/");
+        backend
+            .create_directory(
+                target("omniverse://srv/Users/alice/x/y"),
+                CreateDirectoryOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_methods(&mock),
+            ["create_directory", "create_directory", "create_directory"]
+        );
+    }
+
+    /// One climb per level: a parent that answers OK while the level below
+    /// keeps answering NOT_EXIST is a server-side fact to surface, not a
+    /// reason to loop.
+    #[tokio::test]
+    async fn ancestor_walk_climbs_each_level_at_most_once() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue_for_path(ancestor_status("NOT_EXIST"), "/Users/alice/a/b/");
+        mock.enqueue_for_path(ancestor_status("OK"), "/Users/alice/a/");
+        mock.enqueue_for_path(ancestor_status("NOT_EXIST"), "/Users/alice/a/b/");
+        let err = write_default(&backend, "omniverse://srv/Users/alice/a/b/leaf.usd", b"x")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(
+            recorded_paths(&mock, "create_directory"),
+            ["/Users/alice/a/b/", "/Users/alice/a/", "/Users/alice/a/b/"]
+        );
+    }
+
+    /// The root is never created: a top-level folder the server reports
+    /// missing surfaces as that `NotFound`, with no `create_directory("/")`.
+    #[tokio::test]
+    async fn ancestor_walk_never_creates_the_root() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue_for_path(ancestor_status("NOT_EXIST"), "/Users/");
+        let err = write_default(&backend, "omniverse://srv/Users/leaf.usd", b"x")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(recorded_paths(&mock, "create_directory"), ["/Users/"]);
+    }
+
+    /// `ALREADY_EXISTS` over a FILE is not the idempotent directory success:
+    /// the verb keeps the server's `AlreadyExists`, and the set does not
+    /// remember the path as a folder.
+    #[tokio::test]
+    async fn create_directory_over_an_existing_file_keeps_already_exists() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue_for_path(ancestor_status("ALREADY_EXISTS"), "/Users/alice/file.usd/");
+        mock.enqueue_for_path(stat2_status("INVALID_URI", None), "/Users/alice/file.usd/");
+        let err = backend
+            .create_directory(
+                target("omniverse://srv/Users/alice/file.usd"),
+                CreateDirectoryOptions::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::AlreadyExists);
+        assert_eq!(recorded_methods(&mock), ["create_directory", "stat2"]);
+
+        // A stat2 that answers with a non-folder type is the same verdict.
+        mock.enqueue_for_path(ancestor_status("ALREADY_EXISTS"), "/Users/alice/other.usd/");
+        mock.enqueue_for_path(stat2_status("OK", Some("asset")), "/Users/alice/other.usd/");
+        let err = backend
+            .create_directory(
+                target("omniverse://srv/Users/alice/other.usd"),
+                CreateDirectoryOptions::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::AlreadyExists);
+
+        // Nothing was remembered: a write under the file's name asks again.
+        mock.enqueue_for_path(ancestor_status("ALREADY_EXISTS"), "/Users/alice/file.usd/");
+        mock.enqueue(asset_status("OK"));
+        write_default(
+            &backend,
+            "omniverse://srv/Users/alice/file.usd/child.usd",
+            b"x",
+        )
+        .await
+        .unwrap();
+        assert_eq!(recorded_paths(&mock, "create_directory").len(), 3);
+    }
+
+    /// An etag precondition on the redirect slot skips the ancestor call
+    /// exactly as the inline slot does; the mint runs against the path as is.
+    #[tokio::test]
+    async fn write_redirect_with_if_match_skips_ancestor_handling() {
+        let (shared, backend, mock) = factory_with_mock().await;
+        *shared.lft_client.lock().unwrap() = Some(lft_with_threshold(1024));
+        mock.enqueue(ancestor_status("DENIED"));
+        // The mint against the unreachable test LFT address fails on its own;
+        // the assertion is that no ancestor RPC preceded it.
+        let _ = backend
+            .write_redirect(
+                target("omniverse://srv/Users/alice/tree/big.bin"),
+                WriteOptions {
+                    if_dest: IfDestExists::MatchEtag("e1".into()),
+                    size_hint: Some(4096),
+                    ..WriteOptions::default()
+                },
+                None,
+            )
+            .await;
+        assert!(recorded_methods(&mock).is_empty());
+    }
+
+    /// The ancestor call before the LFT mint is a precursor, not a
+    /// precondition: a refusal there does not stop the mint, and no folder
+    /// is remembered.
+    #[tokio::test]
+    async fn write_redirect_ancestor_refusal_does_not_block_the_mint() {
+        let (shared, backend, mock) = factory_with_mock().await;
+        *shared.lft_client.lock().unwrap() = Some(lft_with_threshold(1024));
+        mock.enqueue(ancestor_status("DENIED"));
+        // The mint against the unreachable test LFT address fails on its own;
+        // the assertions are that the refusal was not the answer and that the
+        // ancestor call was the only omni1 RPC.
+        let err = backend
+            .write_redirect(
+                target("omniverse://srv/Users/alice/tree/big.bin"),
+                WriteOptions {
+                    size_hint: Some(4096),
+                    ..WriteOptions::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_ne!(err.code(), ErrorCode::PermissionDenied);
+        assert_eq!(recorded_methods(&mock), ["create_directory"]);
+    }
+
+    /// A principal that may write assets but not create folders: the
+    /// ancestor call is refused, the write proceeds and the server answers
+    /// the write. A refused parent is not remembered, so the next write asks
+    /// again.
+    #[tokio::test]
+    async fn write_proceeds_when_the_ancestor_call_is_refused() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_status("DENIED"));
+        mock.enqueue(asset_status("OK"));
+        write_default(&backend, "omniverse://srv/Users/alice/tree/first.usd", b"x")
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_methods(&mock),
+            ["create_directory", "create_asset"]
+        );
+    }
+
+    /// A failed recovery attempt never replaces the commit's own answer: the
+    /// caller asked for a write and is told why the write failed.
+    #[tokio::test]
+    async fn stale_retry_reports_the_commit_error_when_the_re_ensure_fails() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_ok());
+        mock.enqueue(asset_status("OK"));
+        write_default(&backend, "omniverse://srv/Users/alice/tree/first.usd", b"x")
+            .await
+            .unwrap();
+        mock.enqueue(asset_status("NOT_EXIST"));
+        mock.enqueue(ancestor_status("DENIED"));
+        let err = write_default(
+            &backend,
+            "omniverse://srv/Users/alice/tree/second.usd",
+            b"y",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(
+            recorded_methods(&mock),
+            [
+                "create_directory",
+                "create_asset",
+                "create_asset",
+                "create_directory",
+            ]
+        );
+    }
+
+    /// Same rule on the lazy copy path: the destination re-ensure failing
+    /// keeps copy2's `NotFound`, and the pair is not re-issued.
+    #[tokio::test]
+    async fn copy_reports_not_found_when_the_destination_re_ensure_fails() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(batch_status("copy2", "OK", "NOT_EXIST"));
+        mock.enqueue_for_path(stat2_status("OK", Some("asset")), "/Users/alice/src/a.usd");
+        mock.enqueue(ancestor_status("DENIED"));
+        let err = backend
+            .copy(
+                target("omniverse://srv/Users/alice/src/a.usd"),
+                target("omniverse://srv/Users/bob/dst/b.usd"),
+                CopyOptions::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(
+            recorded_methods(&mock),
+            ["copy2", "stat2", "create_directory"]
+        );
+    }
+
+    /// `ALREADY_EXISTS` names a node of any type, so an existing parent is
+    /// remembered only once a commit beneath it succeeds; a file-shaped
+    /// parent is asked about again on every write and never doubles bytes.
+    #[tokio::test]
+    async fn existing_parent_is_remembered_only_after_a_successful_commit() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_status("ALREADY_EXISTS"));
+        mock.enqueue(asset_status("OK"));
+        write_default(&backend, "omniverse://srv/Users/alice/tree/first.usd", b"x")
+            .await
+            .unwrap();
+        mock.enqueue(asset_status("OK"));
+        write_default(
+            &backend,
+            "omniverse://srv/Users/alice/tree/second.usd",
+            b"y",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded_methods(&mock),
+            ["create_directory", "create_asset", "create_asset"]
+        );
+
+        // A file where the parent should be: the write fails once, with the
+        // body sent once, and nothing is remembered.
+        for _ in 0..2 {
+            mock.enqueue(ancestor_status("ALREADY_EXISTS"));
+            mock.enqueue(asset_status("NOT_EXIST"));
+            let err = write_default(&backend, "omniverse://srv/Users/alice/file.usd/child", b"z")
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), ErrorCode::NotFound);
+        }
+        assert_eq!(recorded_methods(&mock).len(), 7);
+    }
+
+    /// A folder this connection deletes is forgotten, so the next write
+    /// beneath that name asks the server again instead of trusting the set.
+    #[tokio::test]
+    async fn delete_directory_forgets_the_folder() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_ok());
+        mock.enqueue(asset_status("OK"));
+        write_default(&backend, "omniverse://srv/Users/alice/tree/leaf.usd", b"x")
+            .await
+            .unwrap();
+        mock.enqueue(CannedResponse {
+            interface: "Connection".into(),
+            method: "delete2".into(),
+            frames: vec![RawFrame::from_json(
+                &json!({"status": "OK", "responses": ["OK"]}),
+            )],
+        });
+        backend
+            .delete_directory(
+                target("omniverse://srv/Users/alice/tree/"),
+                ovstorage_plugin::DeleteDirectoryOptions,
+                None,
+            )
+            .await
+            .unwrap();
+        mock.enqueue(ancestor_ok());
+        mock.enqueue(asset_status("OK"));
+        write_default(&backend, "omniverse://srv/Users/alice/tree/again.usd", b"y")
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_methods(&mock),
+            [
+                "create_directory",
+                "create_asset",
+                "delete2",
+                "create_directory",
+                "create_asset",
+            ]
+        );
+    }
+
+    /// Renaming a folder away forgets it and everything beneath it.
+    #[tokio::test]
+    async fn rename_forgets_the_source_subtree() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_ok());
+        mock.enqueue(asset_status("OK"));
+        write_default(
+            &backend,
+            "omniverse://srv/Users/alice/src/sub/leaf.usd",
+            b"x",
+        )
+        .await
+        .unwrap();
+        mock.enqueue(batch_status("rename2", "OK", "OK"));
+        backend
+            .rename(
+                target("omniverse://srv/Users/alice/src"),
+                target("omniverse://srv/Users/alice/moved"),
+                RenameOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        mock.enqueue(ancestor_ok());
+        mock.enqueue(asset_status("OK"));
+        write_default(
+            &backend,
+            "omniverse://srv/Users/alice/src/sub/again.usd",
+            b"y",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded_paths(&mock, "create_directory"),
+            ["/Users/alice/src/sub/", "/Users/alice/src/sub/"]
+        );
+    }
+
+    /// A source already in directory spelling is probed once, not twice.
+    #[tokio::test]
+    async fn source_probe_does_not_repeat_a_directory_spelling() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(batch_status("copy2", "OK", "NOT_EXIST"));
+        mock.enqueue_for_path(stat2_status("NOT_EXIST", None), "/Users/alice/folder/");
+        let err = backend
+            .copy(
+                target("omniverse://srv/Users/alice/folder/"),
+                target("omniverse://srv/Users/bob/fresh/folder/"),
+                CopyOptions::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(recorded_paths(&mock, "stat2"), ["/Users/alice/folder/"]);
+    }
+
+    /// The root always exists: `create_directory` on it is a local success
+    /// with no RPC of any kind.
+    #[tokio::test]
+    async fn create_directory_on_the_root_issues_no_rpc() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        backend
+            .create_directory(
+                target("omniverse://srv/"),
+                CreateDirectoryOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(mock.requests().is_empty());
+    }
+
+    /// An etag precondition asserts the target exists, so its folder exists
+    /// too: no ancestor call, and `NotFound` stays the precondition answer.
+    #[tokio::test]
+    async fn write_with_if_match_skips_ancestor_handling() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(CannedResponse {
+            interface: "Connection".into(),
+            method: "update_asset".into(),
+            frames: vec![RawFrame::from_json(&json!({"status": "NOT_EXIST"}))],
+        });
+        let err = backend
+            .write(
+                target("omniverse://srv/Users/alice/tree/leaf.usd"),
+                b"x".to_vec(),
+                WriteOptions {
+                    if_dest: IfDestExists::MatchEtag("e1".into()),
+                    ..WriteOptions::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(recorded_methods(&mock), ["update_asset"]);
+    }
+
     #[tokio::test]
     async fn write_passes_message_through_to_create_asset() {
         // `--message "first cut"` ⇒ omni1 create_asset request carries the
         // user-supplied message verbatim. Without this, Nucleus drops the
         // checkpoint message entirely.
         let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_ok());
         mock.enqueue(CannedResponse {
             interface: "Connection".into(),
             method: "create_asset".into(),
@@ -624,8 +1459,8 @@ mod spi_tests {
             .await
             .unwrap();
         let recorded = mock.requests();
-        assert_eq!(recorded[0].method, "create_asset");
-        assert_eq!(recorded[0].params["message"], json!("first cut"));
+        assert_eq!(recorded[1].method, "create_asset");
+        assert_eq!(recorded[1].params["message"], json!("first cut"));
     }
 
     #[tokio::test]
@@ -634,6 +1469,7 @@ mod spi_tests {
         // creates a checkpoint with an empty annotation. This is the
         // behaviour Bug C established.
         let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_ok());
         mock.enqueue(CannedResponse {
             interface: "Connection".into(),
             method: "create_asset".into(),
@@ -653,7 +1489,7 @@ mod spi_tests {
             .await
             .unwrap();
         let recorded = mock.requests();
-        assert_eq!(recorded[0].params["message"], json!(""));
+        assert_eq!(recorded[1].params["message"], json!(""));
     }
 
     #[tokio::test]
@@ -721,6 +1557,7 @@ mod spi_tests {
     #[tokio::test]
     async fn write_creates_asset_with_overwrite_when_no_if_match() {
         let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_ok());
         mock.enqueue(CannedResponse {
             interface: "Connection".into(),
             method: "create_asset".into(),
@@ -742,13 +1579,13 @@ mod spi_tests {
             .unwrap();
 
         let recorded = mock.requests();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].method, "create_asset");
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[1].method, "create_asset");
         assert_eq!(
-            recorded[0].params["path"],
+            recorded[1].params["path"],
             json!({"path": "/Users/alice/foo.usd"})
         );
-        assert_eq!(recorded[0].params["overwrite"], json!(true));
+        assert_eq!(recorded[1].params["overwrite"], json!(true));
         assert_eq!(result.info.etag.as_deref(), Some("new-etag"));
         assert_eq!(result.info.version.as_deref(), Some("7"));
     }
@@ -801,6 +1638,7 @@ mod spi_tests {
     #[tokio::test]
     async fn continue_write_completes_via_create_asset() {
         let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_ok());
         mock.enqueue(CannedResponse {
             interface: "Connection".into(),
             method: "create_asset".into(),
@@ -833,16 +1671,16 @@ mod spi_tests {
             .unwrap();
 
         let recorded = mock.requests();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].method, "create_asset");
-        assert_eq!(recorded[0].params["content_id"], json!(12345));
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[1].method, "create_asset");
+        assert_eq!(recorded[1].params["content_id"], json!(12345));
         assert!(
-            recorded[0]
+            recorded[1]
                 .params
                 .get("content")
                 .is_none_or(|v| v.is_null()),
             "create_asset should not carry inline content; got {}",
-            recorded[0].params
+            recorded[1].params
         );
         match step {
             WriteStep::Done(result) => {
@@ -859,6 +1697,7 @@ mod spi_tests {
     #[tokio::test]
     async fn continue_write_commits_to_the_authorized_path_not_the_continuations() {
         let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_ok());
         mock.enqueue(CannedResponse {
             interface: "Connection".into(),
             method: "create_asset".into(),
@@ -891,9 +1730,12 @@ mod spi_tests {
             .unwrap();
 
         let recorded = mock.requests();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].method, "create_asset");
-        let params = recorded[0].params.to_string();
+        assert_eq!(recorded.len(), 2);
+        // The ancestor call derives from the authorized address too.
+        assert_eq!(recorded[0].method, "create_directory");
+        assert_eq!(recorded[0].params["path"], json!({"path": "/Users/bob/"}));
+        assert_eq!(recorded[1].method, "create_asset");
+        let params = recorded[1].params.to_string();
         assert!(
             params.contains("/Users/bob/victim.bin"),
             "create_asset must name the authorized path; got {params}"
@@ -1272,6 +2114,7 @@ mod spi_tests {
     #[tokio::test]
     async fn continue_write_validates_every_part_status() {
         let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_ok());
         // Three parts all 200; finalization should fire exactly once.
         mock.enqueue(CannedResponse {
             interface: "Connection".into(),
@@ -1314,8 +2157,8 @@ mod spi_tests {
             )
             .await
             .unwrap();
-        assert_eq!(mock.requests().len(), 1);
-        assert_eq!(mock.requests()[0].method, "create_asset");
+        assert_eq!(mock.requests().len(), 2);
+        assert_eq!(mock.requests()[1].method, "create_asset");
     }
 
     #[tokio::test]
@@ -1549,6 +2392,479 @@ mod spi_tests {
             "omniverse://srv/Users/alice/foo.usd?&3"
         );
         assert_eq!(versions[0].version.as_deref(), Some("3"));
+        for version in &versions {
+            assert_eq!(
+                version.versioned_address.as_ref(),
+                Some(&version.address),
+                "a version's own address is already the pin"
+            );
+        }
+    }
+
+    fn checkpoints_response(ids: &[u64]) -> CannedResponse {
+        let checkpoints: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| json!({"status": "OK", "checkpoint_id": id}))
+            .collect();
+        CannedResponse {
+            interface: "Connection".into(),
+            method: "get_checkpoints".into(),
+            frames: vec![RawFrame::from_json(&json!({
+                "status": "OK",
+                "checkpoints": checkpoints,
+            }))],
+        }
+    }
+
+    fn file_stat2_ok(path: &str) -> CannedResponse {
+        CannedResponse {
+            interface: "Connection".into(),
+            method: "stat2".into(),
+            frames: vec![RawFrame::from_json(&json!({
+                "status": "OK",
+                "type": "asset",
+                "uri": path,
+                "etag": "e1",
+                "size": 3,
+            }))],
+        }
+    }
+
+    fn versioned_stat() -> StatOptions {
+        StatOptions {
+            versioned_address: true,
+            ..StatOptions::default()
+        }
+    }
+
+    fn versioned_list() -> ListOptions {
+        ListOptions {
+            versioned_address: true,
+            ..ListOptions::default()
+        }
+    }
+
+    fn get_checkpoints_calls(mock: &MockTransport) -> Vec<serde_json::Value> {
+        mock.requests()
+            .into_iter()
+            .filter(|request| request.method == "get_checkpoints")
+            .map(|request| request.params)
+            .collect()
+    }
+
+    fn stat2_calls(mock: &MockTransport) -> Vec<serde_json::Value> {
+        mock.requests()
+            .into_iter()
+            .filter(|request| request.method == "stat2")
+            .map(|request| request.params)
+            .collect()
+    }
+
+    fn rpc_sequence(mock: &MockTransport) -> Vec<String> {
+        mock.requests()
+            .into_iter()
+            .map(|request| request.method)
+            .collect()
+    }
+
+    /// A `stat2` answer for `path` at `checkpoint` whose etag and size differ
+    /// from `file_stat2_ok`, so a test can tell which answer a result reports.
+    fn file_stat2_at_checkpoint(path: &str, checkpoint: u64) -> CannedResponse {
+        CannedResponse {
+            interface: "Connection".into(),
+            method: "stat2".into(),
+            frames: vec![RawFrame::from_json(&json!({
+                "status": "OK",
+                "type": "asset",
+                "uri": path,
+                "etag": format!("cp{checkpoint}"),
+                "size": 100 + checkpoint,
+            }))],
+        }
+    }
+
+    /// Queue the answer for the `stat2` that reads `path` at `checkpoint`.
+    /// The head probes for the same path carry no checkpoint and never
+    /// consume it, so the test proves which stat2 the reported facts come
+    /// from.
+    fn enqueue_stat2_at_checkpoint(mock: &MockTransport, path: &str, checkpoint: u64) {
+        let want = path.to_string();
+        mock.enqueue_filtered(file_stat2_at_checkpoint(path, checkpoint), move |params| {
+            params["path"]["path"] == want.as_str() && params["path"]["checkpoint"] == checkpoint
+        });
+    }
+
+    /// The flag costs one get_checkpoints plus one stat2 at the chosen
+    /// checkpoint on top of the head probes, reports the newest checkpoint
+    /// whatever order the server lists them in, and describes that
+    /// checkpoint's own facts beside the pin. The head and pinned stat2
+    /// answers differ in etag and size, so the assertion tells them apart: a
+    /// save landing between the lookup and the pinned stat2 cannot make the
+    /// pin name newer bytes than the reported etag and size describe.
+    #[tokio::test]
+    async fn stat_with_versioned_address_reports_the_newest_checkpoint_and_its_facts() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(file_stat2_ok("/Users/alice/a.usd"));
+        mock.enqueue(folder_probe_invalid_uri());
+        mock.enqueue(checkpoints_response(&[3, 7, 5]));
+        enqueue_stat2_at_checkpoint(&mock, "/Users/alice/a.usd", 7);
+
+        let info = backend
+            .stat(
+                target("omniverse://srv/Users/alice/a.usd"),
+                versioned_stat(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            info.versioned_address.as_ref().map(Url::as_str),
+            Some("omniverse://srv/Users/alice/a.usd?&7")
+        );
+        assert_eq!(
+            info.address.as_str(),
+            "omniverse://srv/Users/alice/a.usd",
+            "the address itself is untouched"
+        );
+        assert_eq!(info.kind, ObjectKind::File);
+        assert_eq!(
+            (info.etag.as_deref(), info.size),
+            (Some("cp7"), Some(107)),
+            "the facts are the pinned checkpoint's, not the head's"
+        );
+        assert_eq!(
+            get_checkpoints_calls(&mock),
+            vec![json!({"path": {"path": "/Users/alice/a.usd"}})]
+        );
+        assert_eq!(
+            rpc_sequence(&mock),
+            vec!["stat2", "stat2", "get_checkpoints", "stat2"],
+            "two head probes, the lookup, then the pinned stat2"
+        );
+        assert_eq!(
+            stat2_calls(&mock).last(),
+            Some(&json!({"path": {"path": "/Users/alice/a.usd", "checkpoint": 7}})),
+            "the closing stat2 reads the file at the chosen checkpoint"
+        );
+    }
+
+    /// A file with no checkpoints has nothing to pin and nothing to read at a
+    /// checkpoint: it keeps its head facts, carries no pin, and spends no
+    /// extra stat2.
+    #[tokio::test]
+    async fn stat_with_versioned_address_on_a_file_without_checkpoints_keeps_head_facts() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(file_stat2_ok("/Users/alice/a.usd"));
+        mock.enqueue(folder_probe_invalid_uri());
+        mock.enqueue(checkpoints_response(&[]));
+
+        let info = backend
+            .stat(
+                target("omniverse://srv/Users/alice/a.usd"),
+                versioned_stat(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(info.versioned_address, None);
+        assert_eq!(
+            (info.etag.as_deref(), info.size),
+            (Some("e1"), Some(3)),
+            "the head facts stand when there is no checkpoint to describe"
+        );
+        assert_eq!(
+            rpc_sequence(&mock),
+            vec!["stat2", "stat2", "get_checkpoints"]
+        );
+    }
+
+    /// Without the flag no checkpoint lookup is made and nothing is reported.
+    #[tokio::test]
+    async fn stat_without_the_flag_makes_no_get_checkpoints_call() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(file_stat2_ok("/Users/alice/a.usd"));
+        mock.enqueue(folder_probe_invalid_uri());
+
+        let info = backend
+            .stat(
+                target("omniverse://srv/Users/alice/a.usd"),
+                StatOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(info.versioned_address, None);
+        assert!(get_checkpoints_calls(&mock).is_empty());
+    }
+
+    /// A caller-supplied checkpoint pin already names one checkpoint, so it
+    /// is echoed in the canonical spelling without a lookup, flag or not.
+    #[tokio::test]
+    async fn stat_on_a_pinned_address_echoes_the_checkpoint_without_a_lookup() {
+        for (spelling, expected) in [
+            (
+                "omniverse://srv/Users/alice/a.usd?&5",
+                "omniverse://srv/Users/alice/a.usd?&5",
+            ),
+            (
+                "omniverse://srv/Users/alice/a.usd?main&5",
+                "omniverse://srv/Users/alice/a.usd?main&5",
+            ),
+            (
+                "omniverse://srv/Users/alice/a.usd?checkpoint=5",
+                "omniverse://srv/Users/alice/a.usd?&5",
+            ),
+        ] {
+            for opts in [StatOptions::default(), versioned_stat()] {
+                let (_shared, backend, mock) = factory_with_mock().await;
+                mock.enqueue(file_stat2_ok("/Users/alice/a.usd"));
+                mock.enqueue(folder_probe_invalid_uri());
+
+                let info = backend.stat(target(spelling), opts, None).await.unwrap();
+
+                assert_eq!(
+                    info.versioned_address.as_ref().map(Url::as_str),
+                    Some(expected),
+                    "{spelling}"
+                );
+                assert!(get_checkpoints_calls(&mock).is_empty(), "{spelling}");
+                assert_eq!(
+                    stat2_calls(&mock).len(),
+                    2,
+                    "{spelling}: only the two head probes, no pinned re-read"
+                );
+            }
+        }
+    }
+
+    /// Folders have no checkpoints; the flag never triggers a lookup for one.
+    #[tokio::test]
+    async fn stat_on_a_folder_reports_no_versioned_address() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(folder_probe_invalid_uri());
+        mock.enqueue(CannedResponse {
+            interface: "Connection".into(),
+            method: "stat2".into(),
+            frames: vec![RawFrame::from_json(&json!({
+                "status": "OK",
+                "type": "folder",
+                "uri": "/Users/alice/Library",
+            }))],
+        });
+
+        let info = backend
+            .stat(
+                target("omniverse://srv/Users/alice/Library"),
+                versioned_stat(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(info.kind, ObjectKind::Directory);
+        assert_eq!(info.versioned_address, None);
+        assert!(get_checkpoints_calls(&mock).is_empty());
+    }
+
+    /// A flagged listing costs one get_checkpoints plus one stat2 per file
+    /// entry with a checkpoint and reports each pinned entry with that
+    /// checkpoint's own etag and size, which differ from the list2 entry's so
+    /// the assertion tells them apart. Folders and files without checkpoints
+    /// carry no pin, keep their list2 facts, and cost no stat2.
+    #[tokio::test]
+    async fn list_with_versioned_address_pins_files_with_their_checkpoint_facts() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(CannedResponse {
+            interface: "Connection".into(),
+            method: "list2".into(),
+            frames: vec![RawFrame::from_json(&json!({
+                "status": "DONE",
+                "entries": [
+                    {"path": "/Users/alice/sub", "path_type": "folder"},
+                    {"path": "/Users/alice/foo.usd", "path_type": "asset", "size": 17},
+                    {"path": "/Users/alice/bar.usd", "path_type": "asset", "size": 4},
+                    {"path": "/Users/alice/new.usd", "path_type": "asset", "size": 1},
+                ],
+            }))],
+        });
+        mock.enqueue_for_path(checkpoints_response(&[1, 4]), "/Users/alice/foo.usd");
+        mock.enqueue_for_path(checkpoints_response(&[9]), "/Users/alice/bar.usd");
+        mock.enqueue_for_path(checkpoints_response(&[]), "/Users/alice/new.usd");
+        enqueue_stat2_at_checkpoint(&mock, "/Users/alice/foo.usd", 4);
+        enqueue_stat2_at_checkpoint(&mock, "/Users/alice/bar.usd", 9);
+
+        let items = backend
+            .list(
+                target("omniverse://srv/Users/alice/"),
+                versioned_list(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let reported: Vec<(Option<&str>, Option<&str>, Option<u64>)> = items
+            .iter()
+            .map(|item| {
+                (
+                    item.versioned_address.as_ref().map(Url::as_str),
+                    item.etag.as_deref(),
+                    item.size,
+                )
+            })
+            .collect();
+        assert_eq!(
+            reported,
+            vec![
+                (None, None, None),
+                (
+                    Some("omniverse://srv/Users/alice/foo.usd?&4"),
+                    Some("cp4"),
+                    Some(104)
+                ),
+                (
+                    Some("omniverse://srv/Users/alice/bar.usd?&9"),
+                    Some("cp9"),
+                    Some(109)
+                ),
+                (None, None, Some(1)),
+            ],
+            "pinned entries carry their checkpoint's etag and size; the rest keep list2's"
+        );
+        assert_eq!(
+            items[1].address.as_str(),
+            "omniverse://srv/Users/alice/foo.usd",
+            "the emitted address stays unpinned"
+        );
+        assert_eq!(
+            get_checkpoints_calls(&mock).len(),
+            3,
+            "one lookup per file, none for the folder"
+        );
+        assert_eq!(
+            stat2_calls(&mock),
+            vec![
+                json!({"path": {"path": "/Users/alice/foo.usd", "checkpoint": 4}}),
+                json!({"path": {"path": "/Users/alice/bar.usd", "checkpoint": 9}}),
+            ],
+            "one pinned stat2 per file with a checkpoint; none for the folder or the checkpoint-less file"
+        );
+    }
+
+    /// Without the flag a listing is the single list2 call.
+    #[tokio::test]
+    async fn list_without_the_flag_makes_no_get_checkpoints_call() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(CannedResponse {
+            interface: "Connection".into(),
+            method: "list2".into(),
+            frames: vec![RawFrame::from_json(&json!({
+                "status": "DONE",
+                "entries": [
+                    {"path": "/Users/alice/foo.usd", "path_type": "asset", "size": 17},
+                ],
+            }))],
+        });
+
+        let items = backend
+            .list(
+                target("omniverse://srv/Users/alice/"),
+                ListOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(items[0].versioned_address, None);
+        assert!(get_checkpoints_calls(&mock).is_empty());
+    }
+
+    /// A lookup that fails fails the page rather than emitting an entry whose
+    /// pin is silently missing. The error code and the recorded lookup pin the
+    /// failure to the checkpoint lookup for the one file entry: an earlier
+    /// rejection or a mis-decoded list2 would record no lookup at all.
+    #[tokio::test]
+    async fn list_with_versioned_address_fails_the_page_when_a_lookup_fails() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(CannedResponse {
+            interface: "Connection".into(),
+            method: "list2".into(),
+            frames: vec![RawFrame::from_json(&json!({
+                "status": "DONE",
+                "entries": [
+                    {"path": "/Users/alice/foo.usd", "path_type": "asset", "size": 17},
+                ],
+            }))],
+        });
+        // No get_checkpoints response is queued, so the lookup fails on the
+        // transport with no transport-shaped cause, which classifies as
+        // Internal.
+
+        let result = backend
+            .list(
+                target("omniverse://srv/Users/alice/"),
+                versioned_list(),
+                None,
+            )
+            .await;
+        let Err(err) = result else {
+            panic!("a failed lookup fails the page");
+        };
+        assert_eq!(err.code(), ErrorCode::Internal, "{err:?}");
+        assert_eq!(
+            get_checkpoints_calls(&mock),
+            vec![json!({"path": {"path": "/Users/alice/foo.usd"}})],
+            "the page failed at the lookup for the one file entry"
+        );
+        assert!(
+            stat2_calls(&mock).is_empty(),
+            "no pinned stat2 is attempted once the lookup has failed"
+        );
+    }
+
+    /// get_latest_version carries its own pinned address as the versioned
+    /// address on both arms: resolved from the newest checkpoint, or echoed
+    /// from a caller pin.
+    #[tokio::test]
+    async fn get_latest_version_carries_its_address_as_versioned_address() {
+        let (_shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(checkpoints_response(&[3, 1]));
+        enqueue_stat2_at_checkpoint(&mock, "/Users/alice/foo.usd", 3);
+        let latest = backend
+            .get_latest_version(target("omniverse://srv/Users/alice/foo.usd"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            latest.address.as_str(),
+            "omniverse://srv/Users/alice/foo.usd?&3"
+        );
+        assert_eq!(latest.versioned_address.as_ref(), Some(&latest.address));
+        assert_eq!(
+            latest.etag.as_deref(),
+            Some("cp3"),
+            "the facts are read at the newest checkpoint"
+        );
+        assert_eq!(get_checkpoints_calls(&mock).len(), 1);
+
+        let (_shared, backend, mock) = factory_with_mock().await;
+        enqueue_stat2_at_checkpoint(&mock, "/Users/alice/foo.usd", 5);
+        let pinned = backend
+            .get_latest_version(target("omniverse://srv/Users/alice/foo.usd?main&5"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            pinned.address.as_str(),
+            "omniverse://srv/Users/alice/foo.usd?main&5"
+        );
+        assert_eq!(pinned.versioned_address.as_ref(), Some(&pinned.address));
+        assert_eq!(
+            pinned.etag.as_deref(),
+            Some("cp5"),
+            "the facts are read at the caller's checkpoint"
+        );
+        assert!(get_checkpoints_calls(&mock).is_empty());
     }
 
     #[tokio::test]
@@ -2253,6 +3569,7 @@ mod spi_tests {
             },
             last_probed: None,
             user_metadata: ovstorage_plugin::UserMetadata::new(),
+            owning_target: None,
         };
         let mut creds = SecretBundle::default();
         creds.fields.insert(
@@ -2935,6 +4252,7 @@ mod spi_tests {
     #[tokio::test]
     async fn write_stream_zero_lft_threshold_uses_default_inline_cap() {
         let (shared, backend, mock) = factory_with_mock().await;
+        mock.enqueue(ancestor_ok());
         *shared.lft_client.lock().unwrap() = Some(lft_with_threshold(0));
         mock.enqueue(CannedResponse {
             interface: "Connection".into(),
@@ -2959,7 +4277,7 @@ mod spi_tests {
             )
             .await
             .expect("a known-size nonempty stream buffers under the default cap");
-        assert_eq!(mock.requests()[0].method, "create_asset");
+        assert_eq!(mock.requests()[1].method, "create_asset");
     }
 
     /// An excessively large server-advertised threshold must not defeat the
@@ -3357,6 +4675,7 @@ mod spi_tests {
             },
             last_probed: None,
             user_metadata: ovstorage_plugin::UserMetadata::new(),
+            owning_target: None,
         }
     }
 

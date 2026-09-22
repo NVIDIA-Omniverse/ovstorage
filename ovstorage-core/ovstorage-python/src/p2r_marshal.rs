@@ -207,6 +207,52 @@ fn object_kind(value: &str, slot: &str) -> Result<ovs::ObjectKind, OvError> {
     }
 }
 
+fn etag_strength(value: &Bound<'_, PyAny>, slot: &str) -> Result<ovs::EtagStrength, OvError> {
+    let value = match value.getattr("etag_strength") {
+        Ok(value) => value,
+        Err(error) if error.is_instance_of::<pyo3::exceptions::PyAttributeError>(value.py()) => {
+            return Ok(ovs::EtagStrength::Unspecified);
+        }
+        Err(_) => return Err(incompatible(slot, "could not read `etag_strength`")),
+    };
+    if value.is_none() {
+        return Ok(ovs::EtagStrength::Unspecified);
+    }
+    let value: String = value
+        .extract()
+        .map_err(|_| incompatible(slot, "`etag_strength` has the wrong type"))?;
+    match value.as_str() {
+        "strong" => Ok(ovs::EtagStrength::Strong),
+        "weak" => Ok(ovs::EtagStrength::Weak),
+        _ => Err(incompatible(
+            slot,
+            "`etag_strength` is not `strong`, `weak`, or None",
+        )),
+    }
+}
+
+fn versioned_address(value: &Bound<'_, PyAny>, slot: &str) -> Result<Option<ovs::Url>, OvError> {
+    let value = match value.getattr("versioned_address") {
+        Ok(value) => value,
+        Err(error) if error.is_instance_of::<pyo3::exceptions::PyAttributeError>(value.py()) => {
+            return Ok(None);
+        }
+        Err(_) => return Err(incompatible(slot, "could not read `versioned_address`")),
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+    let raw: String = value
+        .extract()
+        .map_err(|_| incompatible(slot, "`versioned_address` has the wrong type"))?;
+    // A RETURNED address, like `address` in `object_info`: a caller reads
+    // through the pin, so a spelling the host would rewrite is refused for the
+    // same reason and by the same battery.
+    ovs::marshal::address::returned_object_address(&raw)
+        .map(Some)
+        .map_err(|error| incompatible(slot, error.message()))
+}
+
 fn object_info(value: &Bound<'_, PyAny>, slot: &str) -> Result<ovs::ObjectInfo, OvError> {
     let address: String = extract_attr(value, "address", slot)?;
     // A RETURNED address, so it is decoded with the returned-address battery
@@ -225,6 +271,7 @@ fn object_info(value: &Bound<'_, PyAny>, slot: &str) -> Result<ovs::ObjectInfo, 
     let kind: String = extract_attr(value, "kind", slot)?;
     let mtime_unix_nanos: Option<u64> = extract_attr(value, "mtime_unix_nanos", slot)?;
     Ok(ovs::ObjectInfo {
+        etag_strength: etag_strength(value, slot)?,
         address,
         kind: object_kind(&kind, slot)?,
         size: extract_attr(value, "size", slot)?,
@@ -244,6 +291,7 @@ fn object_info(value: &Bound<'_, PyAny>, slot: &str) -> Result<ovs::ObjectInfo, 
             slot,
         )?),
         modified_by: None,
+        versioned_address: versioned_address(value, slot)?,
     })
 }
 
@@ -340,6 +388,7 @@ fn bytes(value: &Bound<'_, PyAny>, slot: &str) -> Result<Vec<u8>, OvError> {
 
 fn conservative_info(address: ovs::Url, size: Option<u64>) -> ovs::ObjectInfo {
     ovs::ObjectInfo {
+        etag_strength: Default::default(),
         address,
         kind: ovs::ObjectKind::File,
         size,
@@ -351,6 +400,7 @@ fn conservative_info(address: ovs::Url, size: Option<u64>) -> ovs::ObjectInfo {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
@@ -662,7 +712,7 @@ fn stream_body_input(
     crate::p2r_body::body_to_python(py, body, cancel)
 }
 
-/// Marshal `stat(address, *, full_metadata=False)`.
+/// Marshal `stat(address, *, full_metadata=False, versioned_address=False)`.
 pub(super) fn stat(
     py: Python<'_>,
     request: Request<ovs::StatRequest>,
@@ -672,6 +722,12 @@ pub(super) fn stat(
     let kw = kwargs(py);
     kw.set_item("full_metadata", input.options.full_metadata)
         .map_err(py_failure)?;
+    // Supplied only when it carries a request, the same rule
+    // `MarshalledCall::new` applies to `extensions`: an override declared
+    // without the parameter keeps working until a caller asks for a pin.
+    if input.options.versioned_address {
+        kw.set_item("versioned_address", true).map_err(py_failure)?;
+    }
     MarshalledCall::new(py, (input.address.to_string(),), kw, cancel, extensions)
 }
 
@@ -894,6 +950,10 @@ pub(super) fn list(
         .map_err(py_failure)?;
     kw.set_item("full_metadata", options.full_metadata)
         .map_err(py_failure)?;
+    // Supplied only when it carries a request, for the reason `stat` gives.
+    if options.versioned_address {
+        kw.set_item("versioned_address", true).map_err(py_failure)?;
+    }
     MarshalledCall::new(py, (input.prefix.to_string(),), kw, cancel, extensions)
 }
 

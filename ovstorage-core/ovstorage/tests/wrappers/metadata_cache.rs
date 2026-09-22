@@ -5,8 +5,8 @@
 //! watch-event invalidation, prefix invalidation, and factory config
 //! validation.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ovstorage::layers::METADATA_CACHE_KIND;
 use ovstorage::wrappers::ext;
@@ -534,6 +534,10 @@ struct ListBackedProbe {
     paginated: bool,
     stats: AtomicUsize,
     lists: AtomicUsize,
+    /// Every `StatOptions` the wrapper sent down, in call order.
+    seen_stat_options: Mutex<Vec<StatOptions>>,
+    /// Every `ListOptions` the wrapper sent down, in call order.
+    seen_list_options: Mutex<Vec<ListOptions>>,
 }
 
 impl ListBackedProbe {
@@ -549,6 +553,8 @@ impl ListBackedProbe {
             paginated: false,
             stats: AtomicUsize::new(0),
             lists: AtomicUsize::new(0),
+            seen_stat_options: Mutex::new(Vec::new()),
+            seen_list_options: Mutex::new(Vec::new()),
         })
     }
 
@@ -560,7 +566,48 @@ impl ListBackedProbe {
             paginated: true,
             stats: AtomicUsize::new(0),
             lists: AtomicUsize::new(0),
+            seen_stat_options: Mutex::new(Vec::new()),
+            seen_list_options: Mutex::new(Vec::new()),
         })
+    }
+
+    fn stat_options_seen(&self) -> Vec<StatOptions> {
+        self.seen_stat_options.lock().unwrap().clone()
+    }
+
+    fn list_options_seen(&self) -> Vec<ListOptions> {
+        self.seen_list_options.lock().unwrap().clone()
+    }
+}
+
+/// The pin the probe reports for `address` when asked: the node without the
+/// caller's credential, selected at one fixed version.
+fn probe_pin(address: &Url) -> Url {
+    let mut pin = address.clone();
+    let _ = pin.set_username("");
+    let _ = pin.set_password(None);
+    pin.set_query(Some("versionId=7"));
+    pin
+}
+
+fn stat_with(address: &Url, options: StatOptions) -> Request<StatRequest> {
+    Request::new(StatRequest {
+        address: address.clone(),
+        options,
+    })
+}
+
+fn full_metadata() -> StatOptions {
+    StatOptions {
+        full_metadata: true,
+        versioned_address: false,
+    }
+}
+
+fn pinned() -> StatOptions {
+    StatOptions {
+        full_metadata: false,
+        versioned_address: true,
     }
 }
 
@@ -592,15 +639,27 @@ impl Layer for ListBackedProbe {
         _cancel: Option<ovstorage::CancellationToken>,
     ) -> ovstorage::Result<ObjectInfo> {
         self.stats.fetch_add(1, Ordering::SeqCst);
-        Ok(object_info(request.input.address, 7))
+        self.seen_stat_options
+            .lock()
+            .unwrap()
+            .push(request.input.options.clone());
+        let mut info = object_info(request.input.address, 7);
+        if request.input.options.versioned_address {
+            info.versioned_address = Some(probe_pin(&info.address));
+        }
+        Ok(info)
     }
 
     async fn list(
         &self,
-        _request: Request<ListRequest>,
+        request: Request<ListRequest>,
         _cancel: Option<ovstorage::CancellationToken>,
     ) -> ovstorage::Result<ovstorage::ListPage> {
         self.lists.fetch_add(1, Ordering::SeqCst);
+        self.seen_list_options
+            .lock()
+            .unwrap()
+            .push(request.input.options);
         Ok(ovstorage::ListPage {
             items: self.items.clone(),
             next_page_token: self.paginated.then(|| "next".to_string()),
@@ -682,8 +741,8 @@ async fn list_backed_stat_respects_opt_out_and_ineligible_requests() {
     assert_eq!(backend.stats.load(Ordering::SeqCst), 1);
     assert_eq!(backend.lists.load(Ordering::SeqCst), 0);
 
-    // Even opted in, full_metadata and version-selected URLs bypass the
-    // listing path and delegate.
+    // Even opted in, a flagged stat skips the fresh listing and delegates,
+    // filling its own Stat row; a version-selected URL always delegates.
     let backend = ListBackedProbe::new(vec![object_info(file.clone(), 7)], true);
     let stack = build_stack(
         METADATA_CACHE_KIND,
@@ -699,6 +758,7 @@ async fn list_backed_stat_respects_opt_out_and_ineligible_requests() {
                 address: file.clone(),
                 options: StatOptions {
                     full_metadata: true,
+                    versioned_address: false,
                 },
             }),
             None,
@@ -718,6 +778,333 @@ async fn list_backed_stat_respects_opt_out_and_ineligible_requests() {
         .unwrap();
     assert_eq!(backend.stats.load(Ordering::SeqCst), 2);
     assert_eq!(backend.lists.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn metadata_cache_serves_a_default_stat_from_a_flagged_row() {
+    // A row fetched under a cost flag answers every request it covers: the
+    // default stat after a `full_metadata` one is a hit, and the mutation
+    // invalidation still reaches the row.
+    let file = Url::parse("file:///d/f").unwrap();
+    let backend = ListBackedProbe::new(Vec::new(), false);
+    let stack = build_stack(
+        METADATA_CACHE_KIND,
+        Arc::new(MetadataCacheWrapperFactory::default()),
+        backend.clone(),
+        LayerConfig::new(),
+    )
+    .await
+    .unwrap();
+
+    stack
+        .stat(stat_with(&file, full_metadata()), None)
+        .await
+        .unwrap();
+    assert_eq!(backend.stats.load(Ordering::SeqCst), 1);
+    assert!(backend.stat_options_seen()[0].full_metadata);
+    stack.stat(stat_request(&file), None).await.unwrap();
+    stack
+        .stat(stat_with(&file, full_metadata()), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.stats.load(Ordering::SeqCst),
+        1,
+        "the `full_metadata` row must serve both the default and the flagged stat"
+    );
+
+    stack
+        .write(
+            Request::new(WriteRequest {
+                address: file.clone(),
+                body: Body::Bytes(b"x".to_vec()),
+                options: WriteOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    stack.stat(stat_request(&file), None).await.unwrap();
+    assert_eq!(
+        backend.stats.load(Ordering::SeqCst),
+        2,
+        "the write must invalidate the flagged row like any other"
+    );
+}
+
+#[tokio::test]
+async fn metadata_cache_refetches_a_narrower_row_under_the_union() {
+    // A request that sets a flag the row lacks goes upstream exactly once,
+    // carrying the union of both, and the replaced row then answers every
+    // combination.
+    let file = Url::parse("file:///d/f").unwrap();
+    let backend = ListBackedProbe::new(Vec::new(), false);
+    let stack = build_stack(
+        METADATA_CACHE_KIND,
+        Arc::new(MetadataCacheWrapperFactory::default()),
+        backend.clone(),
+        LayerConfig::new(),
+    )
+    .await
+    .unwrap();
+
+    stack
+        .stat(stat_with(&file, full_metadata()), None)
+        .await
+        .unwrap();
+    assert_eq!(backend.stats.load(Ordering::SeqCst), 1);
+    let info = stack.stat(stat_with(&file, pinned()), None).await.unwrap();
+    assert_eq!(backend.stats.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        backend.stat_options_seen()[1],
+        StatOptions {
+            full_metadata: true,
+            versioned_address: true,
+        },
+        "the refetch carries the union of the row's flags and the request's"
+    );
+    assert_eq!(info.versioned_address, Some(probe_pin(&file)));
+
+    for options in [
+        full_metadata(),
+        pinned(),
+        StatOptions::default(),
+        StatOptions {
+            full_metadata: true,
+            versioned_address: true,
+        },
+    ] {
+        let info = stack.stat(stat_with(&file, options), None).await.unwrap();
+        assert_eq!(info.versioned_address, Some(probe_pin(&file)));
+    }
+    assert_eq!(
+        backend.stats.load(Ordering::SeqCst),
+        2,
+        "the widened row answers every combination without another call"
+    );
+}
+
+#[tokio::test]
+async fn list_backed_stat_flagged_stat_never_fetches_a_listing_of_its_own() {
+    // A flag means the caller pays for this object, not for a listing of its
+    // directory: on an opted-in route the flagged stat goes to the backend
+    // stat, fills its own row, and a later default stat is served from it.
+    let f = Url::parse("file:///d/f").unwrap();
+    let g = Url::parse("file:///d/g").unwrap();
+    let backend = ListBackedProbe::new(
+        vec![object_info(f.clone(), 7), object_info(g.clone(), 7)],
+        true,
+    );
+    let stack = build_stack(
+        METADATA_CACHE_KIND,
+        Arc::new(MetadataCacheWrapperFactory::default()),
+        backend.clone(),
+        LayerConfig::new(),
+    )
+    .await
+    .unwrap();
+
+    let info = stack.stat(stat_with(&f, pinned()), None).await.unwrap();
+    assert_eq!(backend.lists.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.stats.load(Ordering::SeqCst), 1);
+    assert!(backend.stat_options_seen()[0].versioned_address);
+    assert_eq!(info.versioned_address, Some(probe_pin(&f)));
+
+    stack.stat(stat_request(&f), None).await.unwrap();
+    assert_eq!(backend.lists.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        backend.stats.load(Ordering::SeqCst),
+        1,
+        "the default stat is served from the flagged stat's row"
+    );
+
+    stack.stat(stat_request(&g), None).await.unwrap();
+    assert_eq!(
+        backend.lists.load(Ordering::SeqCst),
+        1,
+        "a default stat still buys the probe listing on an opted-in route"
+    );
+    assert_eq!(backend.stats.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn list_backed_stat_answers_a_flagged_stat_only_from_a_covering_listing() {
+    let f = Url::parse("file:///d/f").unwrap();
+    let missing = Url::parse("file:///d/missing").unwrap();
+    let parent = Url::parse("file:///d/").unwrap();
+
+    // A listing fetched under the flag covers a flagged stat and answers it
+    // authoritatively, `NotFound` included.
+    let backend = ListBackedProbe::new(vec![object_info(f.clone(), 7)], true);
+    let stack = build_stack(
+        METADATA_CACHE_KIND,
+        Arc::new(MetadataCacheWrapperFactory::default()),
+        backend.clone(),
+        LayerConfig::new(),
+    )
+    .await
+    .unwrap();
+    stack
+        .list(
+            Request::new(ListRequest {
+                prefix: parent.clone(),
+                options: ListOptions {
+                    versioned_address: true,
+                    ..ListOptions::default()
+                },
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(backend.lists.load(Ordering::SeqCst), 1);
+    let error = stack
+        .stat(stat_with(&missing, pinned()), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::NotFound);
+    assert_eq!(
+        backend.stats.load(Ordering::SeqCst),
+        0,
+        "the flagged listing answers the flagged stat"
+    );
+
+    // A default listing does not cover a flagged stat, and a flagged stat
+    // buys no listing of its own: the backend stat answers.
+    let backend = ListBackedProbe::new(vec![object_info(f.clone(), 7)], true);
+    let stack = build_stack(
+        METADATA_CACHE_KIND,
+        Arc::new(MetadataCacheWrapperFactory::default()),
+        backend.clone(),
+        LayerConfig::new(),
+    )
+    .await
+    .unwrap();
+    stack
+        .list(
+            Request::new(ListRequest {
+                prefix: parent.clone(),
+                options: ListOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(backend.lists.load(Ordering::SeqCst), 1);
+    stack
+        .stat(stat_with(&missing, pinned()), None)
+        .await
+        .expect("the backend stat answers a flagged stat the listing does not cover");
+    assert_eq!(backend.stats.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        backend.lists.load(Ordering::SeqCst),
+        1,
+        "a flagged stat never triggers a fresh probe listing"
+    );
+}
+
+#[tokio::test]
+async fn list_fills_per_item_rows_under_the_listing_flags() {
+    // A listing vouches only for the pin it was asked to carry. Its rows never
+    // claim `full_metadata` (no listing carries the per-object metadata that
+    // flag pays for), so a `full_metadata` stat reaches the backend; a stat
+    // asking for the pin is served from a listing that was asked for it.
+    let f = Url::parse("file:///d/f").unwrap();
+    let backend = ListBackedProbe::new(vec![object_info(f.clone(), 7)], false);
+    let stack = build_stack(
+        METADATA_CACHE_KIND,
+        Arc::new(MetadataCacheWrapperFactory::default()),
+        backend.clone(),
+        LayerConfig::new(),
+    )
+    .await
+    .unwrap();
+
+    stack
+        .list(
+            Request::new(ListRequest {
+                prefix: Url::parse("file:///d/").unwrap(),
+                options: ListOptions {
+                    full_metadata: true,
+                    ..ListOptions::default()
+                },
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(backend.lists.load(Ordering::SeqCst), 1);
+    assert!(backend.list_options_seen()[0].full_metadata);
+
+    stack
+        .stat(stat_with(&f, full_metadata()), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.stats.load(Ordering::SeqCst),
+        1,
+        "a listing never vouches for full_metadata, so the stat reaches the backend"
+    );
+    assert!(backend.stat_options_seen()[0].full_metadata);
+
+    stack
+        .list(
+            Request::new(ListRequest {
+                prefix: Url::parse("file:///d/").unwrap(),
+                options: ListOptions {
+                    versioned_address: true,
+                    ..ListOptions::default()
+                },
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(backend.lists.load(Ordering::SeqCst), 2);
+    stack.stat(stat_with(&f, pinned()), None).await.unwrap();
+    assert_eq!(
+        backend.stats.load(Ordering::SeqCst),
+        1,
+        "the item row of a listing asked for the pin serves a pinned stat"
+    );
+
+    stack
+        .stat(stat_with(&f, full_metadata()), None)
+        .await
+        .unwrap();
+    assert_eq!(backend.stats.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        backend.stat_options_seen()[1],
+        StatOptions {
+            full_metadata: true,
+            versioned_address: true,
+        },
+        "the refetch is the union of the item row's pin flag and the request's"
+    );
+}
+
+#[tokio::test]
+async fn a_cached_answer_keeps_the_row_pin_and_takes_the_caller_address() {
+    // On a hit only `address` is rewritten to the caller's spelling; the pin
+    // is the row's own answer and comes back unchanged.
+    let alice = Url::parse("s3://alice@bucket/x").unwrap();
+    let backend = ListBackedProbe::rooted("s3://bucket/", Vec::new(), false);
+    let stack = build_stack(
+        METADATA_CACHE_KIND,
+        Arc::new(MetadataCacheWrapperFactory::default()),
+        backend.clone(),
+        LayerConfig::new(),
+    )
+    .await
+    .unwrap();
+
+    let first = stack.stat(stat_with(&alice, pinned()), None).await.unwrap();
+    let second = stack.stat(stat_with(&alice, pinned()), None).await.unwrap();
+    assert_eq!(backend.stats.load(Ordering::SeqCst), 1);
+    assert_eq!(first.address, alice);
+    assert_eq!(second.address, alice);
+    assert_eq!(first.versioned_address, Some(probe_pin(&alice)));
+    assert_eq!(second.versioned_address, first.versioned_address);
 }
 
 #[tokio::test]
@@ -1406,8 +1793,9 @@ async fn list_backed_stat_delegates_for_a_slashless_directory_entry() {
 async fn list_backed_stat_ignores_caller_credentials_when_matching_an_entry() {
     let entry = Url::parse("s3://bucket/key").unwrap();
     let with_credentials = Url::parse("s3://caller@bucket/key").unwrap();
-    let backend =
-        ListBackedProbe::rooted("s3://bucket/", vec![object_info(entry.clone(), 7)], true);
+    let mut listed = object_info(entry.clone(), 7);
+    listed.versioned_address = Some(probe_pin(&entry));
+    let backend = ListBackedProbe::rooted("s3://bucket/", vec![listed], true);
     let stack = build_stack(
         METADATA_CACHE_KIND,
         Arc::new(MetadataCacheWrapperFactory::default()),
@@ -1429,6 +1817,11 @@ async fn list_backed_stat_ignores_caller_credentials_when_matching_an_entry() {
     assert_eq!(
         info.address, with_credentials,
         "the answer is addressed as the caller asked"
+    );
+    assert_eq!(
+        info.versioned_address,
+        Some(probe_pin(&entry)),
+        "only the address is restored to the caller's spelling; the pin is the entry's own"
     );
     assert_eq!(backend.lists.load(Ordering::SeqCst), 1);
     assert_eq!(

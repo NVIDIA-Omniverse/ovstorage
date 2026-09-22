@@ -22,7 +22,9 @@
 //! - `ByteCacheWrapper` — object-byte caching over [`ovstorage_cache::Cache`], composed
 //!   **above** `RedirectFollowerWrapper` to cache post-redirect bytes. Caches
 //!   `ReadResult::Bytes` reads + `materialize` (with a lease), write-through for
-//!   buffered writes, and invalidates on mutating ops.
+//!   buffered writes, and invalidates on mutating ops. Only etags declared
+//!   [`EtagStrength::Strong`] key content;
+//!   weak or unspecified validators bypass lookup and fill.
 //! - `MetadataCacheWrapper` — `stat`/`list` caching over [`MetadataCache`],
 //!   with parent-prefix invalidation on mutations.
 //!
@@ -55,12 +57,12 @@
 //!   stream passes through un-buffered (no safe tee/staging semantics) — though
 //!   an existing cached entry serves any validated read.
 //! - **Byte-cache key identity.** The key is
-//!   `partition\0canonical_address\0etag`: an entry is tied to the object
-//!   version it was read from, lookups validate against the current `etag`
-//!   (an inner stat, served by the metadata cache composed below), and
-//!   unversioned content is never cached. Backend identity is deliberately not
-//!   part of the key — the validator is, which stays
-//!   correct even when routes move between backends or cache roots are
+//!   `partition\u{3}canonical_address\0etag`: an entry is tied to the object
+//!   version it was read from, lookups validate against the current strong
+//!   `etag` (an inner stat, served by the metadata cache composed below), and
+//!   weak, unspecified, or unversioned content is never cached. Backend
+//!   identity is deliberately not part of the key — the validator is, which
+//!   stays correct even when routes move between backends or cache roots are
 //!   shared.
 //! - **Broker-resolved OAuth bytes bypass the byte cache.** A credentialed
 //!   origin can return principal-specific representations under the same URL
@@ -106,6 +108,7 @@
 //! - `redirect_follower` — `RedirectFollowerWrapper` (`RedirectFollowerWrapperFactory`)
 //! - `byte_cache` — `ByteCacheWrapper` (`ByteCacheWrapperFactory`)
 //! - `metadata_cache` — `MetadataCacheWrapper` (`MetadataCacheWrapperFactory`)
+//! - `hub_cache` — `HubCacheWrapper` (`HubCacheWrapperFactory`), in `ovstorage-plugin-hub-cache`
 //! - `alias` — `AliasWrapper` (`AliasWrapperFactory`)
 //! - `copy_rename_fallback` — `CopyRenameFallbackWrapper` (`CopyRenameFallbackWrapperFactory`)
 //!

@@ -243,6 +243,50 @@ fn spawn_stat_probe_server(list_status: u16, list_body: &'static str) -> (String
     (endpoint, capture)
 }
 
+/// A store whose every HEAD succeeds and reports `version_id` as
+/// `x-amz-version-id`, the way a versioned (or, for `null`, a suspended or
+/// unversioned) bucket answers.
+fn spawn_head_server(version_id: &'static str) -> (String, Capture) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+    let addr = listener.local_addr().unwrap();
+    let endpoint = format!("http://{}", addr);
+    let capture = Capture::new();
+    let requests_for_thread = capture.requests.clone();
+
+    thread::Builder::new()
+        .name("ovs-test-s3-head-version".into())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let Some(raw) = read_http_request(&mut stream) else {
+                    continue;
+                };
+                requests_for_thread
+                    .lock()
+                    .expect("capture poisoned")
+                    .push(CapturedRequest { raw: raw.clone() });
+                let response = if raw.starts_with("HEAD ") {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nETag: \"head-etag\"\r\n\
+                         x-amz-version-id: {version_id}\r\nContent-Length: 0\r\n\r\n"
+                    )
+                } else {
+                    "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                        .to_string()
+                };
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                drop(stream);
+            }
+        })
+        .expect("spawn head server");
+
+    thread::sleep(Duration::from_millis(50));
+    (endpoint, capture)
+}
+
 const EMPTY_LIST_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Name>bkt</Name>
@@ -772,6 +816,83 @@ async fn stat_without_trailing_slash_keeps_file_kind() {
         .await
         .expect("HEAD against a non-slash key must succeed");
     assert_eq!(info.kind, ObjectKind::File);
+}
+
+// === Version pins on stat ===
+//
+// `x-amz-version-id` is on every HEAD of a versioned bucket, so `stat`
+// reports the pin without being asked to pay for it. A selector the caller
+// wrote is what the HEAD answered for, so it is echoed instead of the
+// header. A directory kind is never pinned, and the literal `null` names the
+// mutable null version, which pins nothing.
+
+#[tokio::test]
+async fn stat_reports_the_head_version_id_as_a_pin() {
+    use ovstorage_plugin::{ObjectKind, StatOptions};
+
+    let (endpoint, capture) = spawn_head_server("v9");
+    let backend = build_backend(&endpoint, "bkt");
+
+    let info = backend
+        .stat(target("bkt", "x.txt"), StatOptions::default(), None)
+        .await
+        .expect("HEAD succeeds");
+    assert_eq!(info.kind, ObjectKind::File);
+    assert_eq!(info.version.as_deref(), Some("v9"));
+    assert_eq!(
+        info.versioned_address.as_ref().map(|url| url.as_str()),
+        Some("s3://bkt/x.txt?versionId=v9"),
+        "the pin is reported with the flag clear because the HEAD carries it for free"
+    );
+
+    let info = backend
+        .stat(
+            target("bkt", "x.txt?versionId=v3"),
+            StatOptions::default(),
+            None,
+        )
+        .await
+        .expect("HEAD of a pinned address succeeds");
+    assert_eq!(
+        info.versioned_address.as_ref().map(|url| url.as_str()),
+        Some("s3://bkt/x.txt?versionId=v3"),
+        "the caller's selector is echoed over the header"
+    );
+    let head = capture.snapshot();
+    assert!(
+        head.last()
+            .is_some_and(|request| request.raw.contains("versionId=v3")),
+        "the HEAD must be sent for the selected version"
+    );
+
+    let info = backend
+        .stat(target("bkt", "dir/"), StatOptions::default(), None)
+        .await
+        .expect("HEAD of a marker succeeds");
+    assert_eq!(info.kind, ObjectKind::DirectoryMarker);
+    assert_eq!(
+        info.versioned_address, None,
+        "a directory kind is never pinned, whatever the marker's version id"
+    );
+}
+
+#[tokio::test]
+async fn stat_does_not_pin_the_null_version() {
+    use ovstorage_plugin::StatOptions;
+
+    let (endpoint, _capture) = spawn_head_server("null");
+    let backend = build_backend(&endpoint, "bkt");
+
+    let info = backend
+        .stat(target("bkt", "x.txt"), StatOptions::default(), None)
+        .await
+        .expect("HEAD succeeds");
+    assert_eq!(
+        info.version.as_deref(),
+        Some("null"),
+        "the opaque version id is still reported as the store spelled it"
+    );
+    assert_eq!(info.versioned_address, None);
 }
 
 #[tokio::test]

@@ -46,10 +46,8 @@ pub unsafe fn backend_change_event_from_ffi(
                 let payload = std::ptr::read(value.object.as_ptr());
                 std::mem::forget(value);
                 let address = address::object_address_from_ffi(payload.address);
-                let etag =
-                    primitive::optional_from_ffi(payload.etag, |s| primitive::str_from_ffi(s));
-                let version =
-                    primitive::optional_from_ffi(payload.version, |s| primitive::str_from_ffi(s));
+                let etag = primitive::optional_str_unset_as_none(payload.etag);
+                let version = primitive::optional_str_unset_as_none(payload.version);
                 let size = primitive::optional_from_ffi::<u64, u64, Error>(payload.size, Ok);
                 let mtime = primitive::optional_from_ffi::<i64, SystemTime, Error>(
                     payload.mtime_unix_ms,

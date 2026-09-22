@@ -8,7 +8,13 @@
 
 use std::collections::BTreeMap;
 
-use ovstorage_plugin::{Capabilities, ChangeKindSet, ErrorCode};
+use futures::StreamExt as _;
+use ovstorage_plugin::{
+    CancellationToken, Capabilities, ChangeKindSet, ErrorCode, Layer, ListOptions, ListRequest,
+    Request, Url,
+};
+
+use crate::runner::ScenarioReport;
 
 /// Address scheme for registry-driven dispatch. Coexists with the
 /// legacy `test://` scheme in [`crate::config::ADDRESS_SCHEME`].
@@ -102,6 +108,7 @@ impl Profile {
     pub fn capabilities(self) -> Capabilities {
         let mut caps = Capabilities::empty();
         caps.supports_list = true;
+        caps.supports_list_stream = true;
         caps.supports_delete = true;
         caps.supports_create_directory = true;
         caps.supports_delete_directory = true;
@@ -146,6 +153,227 @@ impl Profile {
             }
         }
         caps
+    }
+}
+
+impl Scenario {
+    /// Drive the shared streamed-listing contract against `layer`.
+    ///
+    /// Callers seed `prefix` with at least two entries visible in each mode,
+    /// then make this single call. Keeping the assertions here prevents each
+    /// provider driver from subtly choosing a different cancellation or
+    /// paging contract.
+    pub async fn drive_list_stream_parity_and_cancel(
+        &self,
+        layer: &dyn Layer,
+        prefix: Url,
+    ) -> ScenarioReport {
+        for recursive in [false, true] {
+            let options = ListOptions {
+                recursive,
+                ..ListOptions::default()
+            };
+            let request = || {
+                Request::new(ListRequest {
+                    prefix: prefix.clone(),
+                    options: options.clone(),
+                })
+            };
+
+            let buffered = match layer.list(request(), None).await {
+                Ok(page) => page.items,
+                Err(error) => {
+                    return ScenarioReport::failed(
+                        self,
+                        format!("buffered list failed (recursive={recursive}): {error}"),
+                        Vec::new(),
+                    );
+                }
+            };
+            if buffered.len() < 2 {
+                return ScenarioReport::failed(
+                    self,
+                    format!(
+                        "list-stream fixture needs at least two entries for cancellation \
+                         (recursive={recursive}, got {})",
+                        buffered.len()
+                    ),
+                    Vec::new(),
+                );
+            }
+
+            let mut stream = match layer.list_stream(request(), None).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    return ScenarioReport::failed(
+                        self,
+                        format!("list_stream failed to open (recursive={recursive}): {error}"),
+                        Vec::new(),
+                    );
+                }
+            };
+            let mut streamed = Vec::new();
+            while let Some(entry) = stream.next().await {
+                match entry {
+                    Ok(entry) => streamed.push(entry),
+                    Err(error) => {
+                        return ScenarioReport::failed(
+                            self,
+                            format!("list_stream failed (recursive={recursive}): {error}"),
+                            Vec::new(),
+                        );
+                    }
+                }
+            }
+            if streamed != buffered {
+                return ScenarioReport::failed(
+                    self,
+                    format!(
+                        "list_stream order/content differs from buffered list \
+                         (recursive={recursive}): streamed={streamed:?}, buffered={buffered:?}"
+                    ),
+                    Vec::new(),
+                );
+            }
+
+            let cancel = CancellationToken::new();
+            let mut cancelled = match layer.list_stream(request(), Some(cancel.clone())).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    return ScenarioReport::failed(
+                        self,
+                        format!(
+                            "cancellable list_stream failed to open (recursive={recursive}): \
+                             {error}"
+                        ),
+                        Vec::new(),
+                    );
+                }
+            };
+            match cancelled.next().await {
+                Some(Ok(first)) if first == buffered[0] => {}
+                Some(Ok(first)) => {
+                    return ScenarioReport::failed(
+                        self,
+                        format!(
+                            "cancellable list_stream first entry differs (recursive={recursive}): \
+                             got {first:?}, expected {:?}",
+                            buffered[0]
+                        ),
+                        Vec::new(),
+                    );
+                }
+                Some(Err(error)) => {
+                    return ScenarioReport::failed(
+                        self,
+                        format!(
+                            "cancellable list_stream failed before cancellation \
+                             (recursive={recursive}): {error}"
+                        ),
+                        Vec::new(),
+                    );
+                }
+                None => {
+                    return ScenarioReport::failed(
+                        self,
+                        format!(
+                            "cancellable list_stream ended before cancellation \
+                             (recursive={recursive})"
+                        ),
+                        Vec::new(),
+                    );
+                }
+            }
+            cancel.cancel();
+
+            // Capacity-one ABI bridges may already have an entry queued when
+            // cancellation fires. The contract is terminal at the Cancelled
+            // frame: no entry may follow that frame, and the source must not
+            // end normally instead of reporting cancellation.
+            loop {
+                match cancelled.next().await {
+                    Some(Ok(_queued_before_cancel)) => continue,
+                    Some(Err(error)) if error.code() == ErrorCode::Cancelled => break,
+                    Some(Err(error)) => {
+                        return ScenarioReport::failed(
+                            self,
+                            format!(
+                                "list_stream cancellation returned {:?}, expected Cancelled \
+                                 (recursive={recursive})",
+                                error.code()
+                            ),
+                            Vec::new(),
+                        );
+                    }
+                    None => {
+                        return ScenarioReport::failed(
+                            self,
+                            format!(
+                                "list_stream ended without Cancelled after cancellation \
+                                 (recursive={recursive})"
+                            ),
+                            Vec::new(),
+                        );
+                    }
+                }
+            }
+            if cancelled.next().await.is_some() {
+                return ScenarioReport::failed(
+                    self,
+                    format!(
+                        "list_stream delivered an entry after terminal cancellation \
+                         (recursive={recursive})"
+                    ),
+                    Vec::new(),
+                );
+            }
+
+            for paging in [
+                ListOptions {
+                    recursive,
+                    max_results: Some(1),
+                    ..ListOptions::default()
+                },
+                ListOptions {
+                    recursive,
+                    page_token: Some("conformance-page-token".to_string()),
+                    ..ListOptions::default()
+                },
+            ] {
+                let outcome = layer
+                    .list_stream(
+                        Request::new(ListRequest {
+                            prefix: prefix.clone(),
+                            options: paging,
+                        }),
+                        None,
+                    )
+                    .await;
+                match outcome {
+                    Err(error) if error.code() == ErrorCode::InvalidArgument => {}
+                    Err(error) => {
+                        return ScenarioReport::failed(
+                            self,
+                            format!(
+                                "list_stream paging returned {:?}, expected InvalidArgument \
+                                 (recursive={recursive})",
+                                error.code()
+                            ),
+                            Vec::new(),
+                        );
+                    }
+                    Ok(_) => {
+                        return ScenarioReport::failed(
+                            self,
+                            format!("list_stream accepted paging fields (recursive={recursive})"),
+                            Vec::new(),
+                        );
+                    }
+                }
+            }
+        }
+
+        ScenarioReport::passed(self, Vec::new())
     }
 }
 
@@ -260,6 +488,24 @@ impl ScenarioRegistry {
             }],
             failure_contract: FailureContract::Success,
             report_tags: &["write", "smoke"],
+        });
+        // A write creates its path. Writing to `/a/b/c` where `/a/b/` does not
+        // exist succeeds on every backend: flat stores satisfy this by
+        // construction, real-directory stores create the missing ancestors
+        // before the commit. Deliberately not gated on `has_real_directories`.
+        reg.insert(Scenario {
+            name: "write-creates-missing-ancestors",
+            vtable_slots: &["write"],
+            required_profile: Profile::Minimal,
+            required_capabilities: &[],
+            required_config: &[],
+            allowed_hosts: &[],
+            expected_calls: &[ExpectedCall {
+                method: "write",
+                allow_extra: false,
+            }],
+            failure_contract: FailureContract::Success,
+            report_tags: &["write", "directories"],
         });
         reg.insert(Scenario {
             name: "write-no-overwrite-existing",
@@ -397,6 +643,26 @@ impl ScenarioRegistry {
             }],
             failure_contract: FailureContract::Success,
             report_tags: &["list"],
+        });
+        reg.insert(Scenario {
+            name: "list-stream-parity-and-cancel",
+            vtable_slots: &["list", "list_stream"],
+            required_profile: Profile::Minimal,
+            // The slot is callable whenever buffered listing is available:
+            // layers without a native bounded path use the compatibility
+            // adapter and leave supports_list_stream false.
+            required_capabilities: &["supports_list"],
+            required_config: &[],
+            allowed_hosts: &[],
+            // TestBackend records the backend walk as `list` for both the
+            // buffered and streamed surfaces. Slot coverage is carried by
+            // `vtable_slots`; real-provider drivers assert outcomes directly.
+            expected_calls: &[ExpectedCall {
+                method: "list",
+                allow_extra: true,
+            }],
+            failure_contract: FailureContract::Success,
+            report_tags: &["list", "stream", "cancellation"],
         });
         reg.insert(Scenario {
             name: "metadata-unsupported-not-called",
@@ -729,6 +995,20 @@ impl ScenarioRegistry {
             failure_contract: FailureContract::Success,
             report_tags: &["wrapper", "protocol-slot"],
         });
+        reg.insert(Scenario {
+            name: "materialize-unsupported-without-cache",
+            vtable_slots: &["materialize"],
+            required_profile: Profile::Minimal,
+            required_capabilities: &[],
+            required_config: &[],
+            allowed_hosts: &[],
+            expected_calls: &[],
+            failure_contract: FailureContract::Errors {
+                method: "materialize",
+                code: ErrorCode::Unsupported,
+            },
+            report_tags: &["materialize", "host-wrapper"],
+        });
         reg
     }
 
@@ -776,6 +1056,11 @@ mod tests {
         assert!(reg.get("stat-basic-objectinfo").is_some());
         assert!(reg.get("write-done-inline").is_some());
         assert!(reg.get("delete-existing-object").is_some());
+        let list_stream = reg
+            .get("list-stream-parity-and-cancel")
+            .expect("streaming list scenario is registered");
+        assert_eq!(list_stream.vtable_slots, &["list", "list_stream"]);
+        assert_eq!(list_stream.required_capabilities, &["supports_list"]);
     }
 
     #[test]
@@ -788,6 +1073,7 @@ mod tests {
     fn profile_minimal_advertises_floor_capabilities() {
         let caps = Profile::Minimal.capabilities();
         assert!(caps.supports_list);
+        assert!(caps.supports_list_stream);
         assert!(!caps.supports_native_metadata_patch);
     }
 

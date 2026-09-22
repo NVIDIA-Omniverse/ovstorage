@@ -103,6 +103,12 @@ pub struct GatewayStackBuilder {
     /// so a gateway built without operator config discloses no more than one
     /// built with it.
     disclose_redirect_credentials: bool,
+    /// The operator's anonymous fallback grant: the schemes an address no
+    /// connection serves may fall back to, attempted anonymously by the backend
+    /// layer of the owning kind. Stamped onto that layer at build time. Empty
+    /// by default, so a gateway built without operator config grants nothing a
+    /// shipped one would not.
+    anonymous_fallback: BTreeSet<String>,
     /// Extra in-process Layer factories registered after the plugins, so an
     /// override (a test backend, an embedding host's bespoke layer) wins over the
     /// plugin-provided factory of the same kind.
@@ -140,6 +146,7 @@ impl Default for GatewayStackBuilder {
             auth: ListenerAuthBuildPlan::resolved_builtin(LayerConfig::new()),
             attribution_strategy: AttributionStrategy::default(),
             disclose_redirect_credentials: false,
+            anonymous_fallback: BTreeSet::new(),
             extra_factories: Vec::new(),
         }
     }
@@ -219,7 +226,7 @@ impl GatewayStackBuilder {
 
     /// Attribution strategy for the shared inner's `attribution` wrapper.
     /// `Passthrough` is the right choice for an intermediate REST gateway that
-    /// fronts another broker — the upstream broker's `ovstorage-modified-by`
+    /// fronts another broker — the upstream broker's `ovstorage_modified_by`
     /// stamp survives end-to-end.
     pub fn attribution_strategy(mut self, strategy: AttributionStrategy) -> Self {
         self.attribution_strategy = strategy;
@@ -238,6 +245,22 @@ impl GatewayStackBuilder {
     /// identically.
     pub fn redirect_disclosure(mut self, disclose: bool) -> Self {
         self.disclose_redirect_credentials = disclose;
+        self
+    }
+
+    /// The operator's anonymous fallback grant (`anonymous_fallback_schemes`,
+    /// plus `http` and `https` when `anonymous_http_fallback` allows them): the
+    /// schemes an address that no configured connection serves may fall back
+    /// to, attempted anonymously and read-only by the backend layer of the
+    /// owning kind.
+    ///
+    /// This is a property of the deployment, not of any connection: a gateway
+    /// fetch runs from the gateway's network position and reaches whatever that
+    /// position reaches, so only the operator can say whether callers may point
+    /// it at buckets they did not configure. A grant the declared graph cannot
+    /// carry is a build error rather than a silently inert setting.
+    pub fn anonymous_fallback(mut self, schemes: BTreeSet<String>) -> Self {
+        self.anonymous_fallback = schemes;
         self
     }
 
@@ -274,6 +297,12 @@ impl GatewayStackBuilder {
             self.stack_config,
             self.disclose_redirect_credentials,
         )?;
+        // Stamp the operator's anonymous fallback grant onto the backend layer
+        // of each granted scheme's kind, the same way: one top-level setting
+        // carried to the layer that reads it, with a hand-set layer key or a
+        // grant nothing can carry refused before any plugin loads.
+        let stack_config =
+            ovstorage::host::stamp_anonymous_fallback(stack_config, &self.anonymous_fallback)?;
         let plugin_dir = match self.plugin_dir {
             Some(dir) => Some(dir),
             None => ovstorage::default_plugin_dir(),
@@ -485,6 +514,38 @@ mod tests {
              the policy would hold only at the handler's out-edge",
             ovstorage::host::REDIRECT_FOLLOWER_LAYER_KIND,
         );
+    }
+
+    /// A builder nobody configured grants nothing: its default grant is empty,
+    /// and stamping that default onto the gateway's own graph leaves every
+    /// layer without the fallback key. The closed default has to hold at the
+    /// builder and not only at the TOML parser, because embedding hosts and
+    /// the test fixtures compose through the builder directly.
+    #[test]
+    fn a_gateway_built_without_operator_config_grants_no_fallback() {
+        let builder = GatewayStackBuilder::new();
+        assert!(
+            builder.anonymous_fallback.is_empty(),
+            "the builder's default grant must be empty"
+        );
+
+        let shipped = include_str!("../ovstorage-rest.toml");
+        let graph = StackConfig::from_toml_str(shipped).expect("shipped rest TOML parses");
+        let stamped =
+            ovstorage::host::stamp_anonymous_fallback(graph.clone(), &builder.anonymous_fallback)
+                .expect("the shipped graph accepts an empty grant");
+        assert_eq!(
+            stamped, graph,
+            "an empty grant must leave the shipped graph untouched"
+        );
+        for (name, table) in &stamped.layers {
+            assert!(
+                !table
+                    .config
+                    .contains_key(ovstorage::fallback::ANONYMOUS_FALLBACK_KEY),
+                "layer `{name}` carries `anonymous_fallback` with nothing granted"
+            );
+        }
     }
 
     /// The companion of the broker's guard: every layer this twin emits must be a

@@ -72,7 +72,7 @@ language you're using.
 | `NotFound` | Address doesn't exist | Confirm spelling; check `ovstorage_list` of the parent prefix |
 | `ResourceExhausted` | Object is larger than `max_bytes` | Either raise `max_bytes`, narrow with `range_start`/`range_end`, or switch to [ovstorage-user-materialize](../ovstorage-user-materialize/SKILL.md) |
 | `PermissionDenied` | Credentials can't read this object | Check `ovstorage_doctor` — connection's `auth_state_kind` |
-| `NoRoute` | No backend configured for this address scheme/prefix | See [ovstorage-user-getting-started](../ovstorage-user-getting-started/SKILL.md) |
+| `NoRoute` | No backend serves this address and no anonymous fallback is granted for its scheme | See [ovstorage-user-getting-started](../ovstorage-user-getting-started/SKILL.md) |
 | `ObjectModified` | `if_match` didn't match | Re-stat to get current identity, then decide whether to retry |
 | `Transient` | Backend hiccup | `retryable: true` — retry once or twice with backoff |
 

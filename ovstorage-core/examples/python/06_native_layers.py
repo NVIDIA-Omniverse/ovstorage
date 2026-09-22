@@ -93,6 +93,8 @@ class GitHubRepository(ovstorage.LayerBase):
         max_results: int | None = None,
         page_token: str | None = None,
         full_metadata: bool = False,
+        # Unversioned backend, so None is its honest answer either way.
+        versioned_address: bool = False,
     ) -> SimpleNamespace:
         # Be explicit about this tutorial's capability boundary. Silently
         # ignoring an option would give callers a result with the wrong meaning.

@@ -485,7 +485,10 @@ fn test_interface_method_with_bytes_param() {
     "#;
     let output = generate_from_str(input).unwrap();
     assert!(output.contains("async fn upload"));
-    assert!(output.contains("Vec<u8>"));
+    // The body is borrowed: the transport copies it into the wire frame, so
+    // the caller keeps ownership (and can re-send without a second copy).
+    assert!(output.contains("data: &[u8]"));
+    assert!(!output.contains("data: Vec<u8>"));
 }
 
 // --- Version import maps to u64 ---

@@ -30,6 +30,7 @@ const DELEGATE_PATH: &str = "/var/cache/ov/object.bin";
 
 fn object_info(address: Url) -> ObjectInfo {
     ObjectInfo {
+        etag_strength: Default::default(),
         address,
         kind: ObjectKind::File,
         etag: None,
@@ -41,6 +42,7 @@ fn object_info(address: Url) -> ObjectInfo {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
@@ -72,7 +74,7 @@ impl Layer for MaterializeProbe {
     fn descriptor(&self) -> LayerKindDescriptor {
         LayerKindDescriptor {
             kind: "materialize-probe".to_string(),
-            layer_type: LayerType::Backend,
+            layer_type: LayerType::Wrapper,
             display_name: "lease crossing probe".to_string(),
             description: None,
             config_schema: Vec::new(),

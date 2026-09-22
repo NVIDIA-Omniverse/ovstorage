@@ -161,7 +161,7 @@ pub fn attributed_router_layers(
     declared: &UserMetadataKinds,
 ) -> Vec<(String, LayerTable)> {
     // Names are resolved against every name this graph will contain — the backend
-    // layer per kind, plus the fixed wrapper names both hosts emit above the router
+    // layer per kind, plus the fixed wrapper names remote hosts emit above the router
     // — before any of them is used. The declared-graph path applies the same
     // discipline through `taken_names`/`interposed_name`; without it here, a
     // connection whose kind is literally `attribution_s3` alongside one for `s3`
@@ -237,7 +237,7 @@ pub fn attributed_router_layers(
     layers
 }
 
-/// The layer names both hosts emit above the router in their default graphs. A
+/// The layer names remote hosts emit above the router in their default graphs. A
 /// generated wrapper name must avoid these too: a connection kind colliding with
 /// one of them would otherwise produce two layers with the same name.
 /// Whether `name` is one of the layer names a host emits above the router, and so
@@ -255,6 +255,7 @@ const HOST_GRAPH_LAYER_NAMES: &[&str] = &[
     "metadata_cache",
     "redirect_follower",
     "retry",
+    "watch_limit",
     "upstream_credential",
 ];
 
@@ -938,8 +939,11 @@ mod branch_attribution_tests {
 
     /// What the fixtures' backend kinds declare about user metadata. Written out
     /// for the same reason [`types`] is: the declaration is the plugin's, and no
-    /// property of a kind's name stands in for it. The three that decline mirror
-    /// what the in-tree plugins of those kinds declare.
+    /// property of a kind's name stands in for it. This is a synthetic set, not
+    /// a mirror of the in-tree declarations: `file` stands in for "a capable
+    /// kind" throughout these fixtures (core's real `file` backend stores no
+    /// user metadata and declines), and `nucleus`, `opendal` and `http` stand in
+    /// for kinds that decline.
     fn declared() -> UserMetadataKinds {
         let mut declared = UserMetadataKinds::default();
         for (kind, layer_type) in types() {
@@ -2674,7 +2678,7 @@ kind = "s3"
         for kind in ["file", "s3", "gcs", "azure"] {
             assert!(
                 declared.carries_attribution(kind),
-                "{kind} declares user-metadata support and must carry"
+                "the fixture declares user-metadata support for {kind}, so it must carry"
             );
         }
         assert!(
@@ -2730,8 +2734,10 @@ kind = "s3"
 
         // Core's built-in file backend is in the set without being passed in,
         // because `ensure_branch_attribution` must classify a graph exactly as
-        // `build_stack` will build it.
-        assert!(carrying.carries_attribution("file"));
+        // `build_stack` will build it. It is present and declines: the file
+        // backend stores no user metadata.
+        assert_eq!(carrying.0.get("file"), Some(&false));
+        assert!(!carrying.carries_attribution("file"));
     }
 
     /// The kind-list constructor reads the same field, from a descriptor an
@@ -2766,7 +2772,8 @@ kind = "s3"
         assert!(!declared.carries_attribution("declining"));
         // Unlike `from_factories`, this constructor is the whole set: a host
         // composing a graph from the kinds it will serve gets no built-ins it
-        // did not pass in.
+        // did not pass in, so `file` is absent rather than declared.
+        assert!(!declared.0.contains_key("file"));
         assert!(!declared.carries_attribution("file"));
     }
 }

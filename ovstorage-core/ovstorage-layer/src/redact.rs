@@ -55,6 +55,33 @@ pub const REDACTED_QUERY_KEYS: &[&str] = &[
     "refresh_token",
 ];
 
+/// Name an address in an operator-facing message by its ORIGIN alone —
+/// scheme, host and port, and nothing else.
+///
+/// **Not a weaker [`redact_url`]; a different rule.** `redact_url` removes what
+/// it recognises: userinfo, and query values under [`REDACTED_QUERY_KEYS`]. Every
+/// other part of an address can carry a secret too — a signed-URL query under a
+/// name nobody listed (`plugin-http.md` positively invites one), a capability
+/// token in the path — and no list recognises those. This renders what is
+/// structurally safe instead of trying to recognise what is not, and it is the
+/// rule for any message that names a route prefix: a route-conflict refusal, a
+/// prompt asking to replace a credential, the note a repair prints on success.
+/// The last two are the ones to be careful about, because a success message is
+/// exactly what ends up in CI output and terminal captures.
+///
+/// The origin is enough to act on. It says which origin the message is about,
+/// and the operator has their own config for the rest.
+pub fn origin_only(url: &Url) -> String {
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{}://{host}:{port}", url.scheme()),
+        (Some(host), None) => format!("{}://{host}", url.scheme()),
+        // A URL with no host at all — `file:` and friends — has no origin to
+        // print, and its path is the whole address, so nothing beyond the
+        // scheme is safe to render.
+        (None, _) => url.scheme().to_string(),
+    }
+}
+
 /// Redact userinfo and known secret query values from a URL.
 pub fn redact_url(url: &Url) -> String {
     let mut scrubbed = url.clone();
@@ -222,6 +249,34 @@ mod tests {
 
     fn parse(s: &str) -> Url {
         Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn origin_only_drops_everything_a_list_cannot_recognise() {
+        // The path segment and the query key here are secrets under names no
+        // redaction list carries — a capability token and a signed query of the
+        // sort `plugin-http.md` invites — so `redact_url` preserves both. That
+        // is the whole reason this rule exists beside it.
+        let url = parse("https://user:pass@h.example:8443/s/CAP4B0RT/?sig=SECRET&x=1");
+        assert_eq!(origin_only(&url), "https://h.example:8443");
+        assert!(
+            redact_url(&url).contains("CAP4B0RT"),
+            "the contrast is the point: recognising secrets cannot catch this one",
+        );
+    }
+
+    #[test]
+    fn origin_only_omits_a_default_port_it_was_not_given() {
+        let url = parse("https://h.example/assets/");
+        assert_eq!(origin_only(&url), "https://h.example");
+    }
+
+    #[test]
+    fn origin_only_renders_a_hostless_url_as_its_scheme() {
+        // `file:` and friends put the whole address in the path, so there is no
+        // origin to print and nothing else is safe to.
+        let url = parse("file:///srv/tenant-a/secret-project/");
+        assert_eq!(origin_only(&url), "file");
     }
 
     #[test]

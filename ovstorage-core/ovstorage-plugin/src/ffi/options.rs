@@ -81,12 +81,16 @@ unsafe impl Send for ByteRange {}
 
 /// `StatOptions` shadow shape. Every options struct starts with a
 /// `struct_size` prefix; receivers validate `>= size_of::<T>()`
-/// before reading tail fields.
+/// before reading tail fields. The trailing `versioned_address` occupies
+/// padding the struct already carried, so `struct_size` is unchanged across
+/// the ABI bump that added it and the exact-match `abi_version` check is
+/// what keeps a producer from leaving it uninitialized.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct StatOptions {
     pub struct_size: usize,
     pub full_metadata: bool,
+    pub versioned_address: bool,
 }
 
 /// Tag for [`IfDestExistsV1`].
@@ -185,7 +189,9 @@ pub struct DeleteOptions {
 
 unsafe impl Send for DeleteOptions {}
 
-/// `ListOptions` shadow shape.
+/// `ListOptions` shadow shape. The trailing `versioned_address` occupies
+/// padding the struct already carried, so `struct_size` is unchanged across
+/// the ABI bump that added it.
 #[repr(C)]
 #[derive(Debug)]
 pub struct ListOptions {
@@ -194,6 +200,7 @@ pub struct ListOptions {
     pub max_results: Optional<u32>,
     pub page_token: Optional<Str>,
     pub full_metadata: bool,
+    pub versioned_address: bool,
 }
 
 unsafe impl Send for ListOptions {}

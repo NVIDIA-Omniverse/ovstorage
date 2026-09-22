@@ -39,9 +39,13 @@ pub(crate) enum Command {
     /// List configured routes.
     #[command(aliases = ["routes", "list-roots", "roots"])]
     ListRoutes,
-    /// List registered backends.
+    /// List backend kinds declared by the active Stack.
     #[command(aliases = ["backends", "kinds"])]
     ListBackends,
+    /// List registered connections, including ones that publish no route.
+    /// The id in the first column is the selector other connection commands take.
+    #[command(aliases = ["connections"])]
+    ListConnections,
     /// Show local cache status (requires OVSTORAGE_CACHE_ROOT + OVSTORAGE_STATE_ROOT).
     CacheStatus,
     /// Run the cache crash-recovery sweep in dry-run mode and print the
@@ -69,6 +73,9 @@ pub(crate) enum Command {
         address: String,
         #[arg(long)]
         full_metadata: bool,
+        /// Ask the backend for the address that names this version of the object, paying for the lookup where it is not free.
+        #[arg(long)]
+        versioned_address: bool,
     },
     /// Read an object's contents.
     #[command(aliases = ["cat", "get"])]
@@ -126,6 +133,9 @@ pub(crate) enum Command {
         recursive: bool,
         #[arg(long)]
         full_metadata: bool,
+        /// Ask the backend for the address that names this version of the object, paying for the lookup where it is not free.
+        #[arg(long)]
+        versioned_address: bool,
         #[arg(long)]
         max_results: Option<u32>,
         #[arg(long)]
@@ -266,6 +276,13 @@ pub(crate) enum Command {
         /// non-interactive mode; prompted by the wizard otherwise.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
+        /// Layer instance to attach the connection to (`[ovstorage.layers.<name>]`).
+        /// Required only when the graph has more than one backend layer of the
+        /// chosen kind, where the kind alone does not name one — the two-tenant
+        /// arrangement. `list-backends` and `list-routes` show what the active
+        /// Stack declares.
+        #[arg(long, value_name = "LAYER")]
+        target: Option<String>,
         /// Surface every config field and walk every credential field individually,
         /// instead of asking only for common fields and picking a credential method.
         /// Wizard-only; cannot be combined with positional field values.
@@ -280,6 +297,24 @@ pub(crate) enum Command {
     Reauth {
         /// Connection display name (matched against `Stack::list_connections`).
         name: String,
+    },
+    /// Remove a registered connection, freeing the route prefix it held.
+    /// Works for a connection that publishes no route — one parked in
+    /// `AwaitingAuth`, or refused into `AuthFailed` — which is the case
+    /// `list-routes` cannot show and an operator most often needs to clear.
+    Disconnect {
+        /// Connection id (the first column of `list-connections`) or display
+        /// name. The id wins when a display name is spelled like one.
+        selector: String,
+    },
+    /// Create and load a minimal file-backed stack configuration.
+    Init {
+        /// Output path. Defaults to ./ovstorage.toml.
+        #[arg(default_value = "ovstorage.toml")]
+        path: PathBuf,
+        /// Overwrite an existing file.
+        #[arg(long)]
+        force: bool,
     },
     /// Serialize the active configuration (loaded + this session's pending
     /// connections) to a TOML file.
@@ -473,8 +508,9 @@ pub(crate) async fn dispatch(
     cancel: &CancellationToken,
 ) -> ovstorage::Result<()> {
     match command {
-        Command::ListRoutes => commands::connect::list_routes(state).await?,
+        Command::ListRoutes => commands::connect::list_routes(state, cancel).await?,
         Command::ListBackends => commands::connect::list_backends(state)?,
+        Command::ListConnections => commands::connections::list(state, cancel).await?,
         Command::CacheStatus => commands::cache::cache_status(state)?,
         Command::CacheDoctor => commands::cache::cache_doctor(state)?,
         Command::CacheGc => commands::cache::cache_gc(state)?,
@@ -484,7 +520,10 @@ pub(crate) async fn dispatch(
         Command::Stat {
             address,
             full_metadata,
-        } => commands::files::stat(state, &address, full_metadata, cancel).await?,
+            versioned_address,
+        } => {
+            commands::files::stat(state, &address, full_metadata, versioned_address, cancel).await?
+        }
         Command::Read {
             address,
             output,
@@ -530,6 +569,7 @@ pub(crate) async fn dispatch(
             prefix,
             recursive,
             full_metadata,
+            versioned_address,
             max_results,
             page_token,
             format,
@@ -540,6 +580,7 @@ pub(crate) async fn dispatch(
                     prefix,
                     recursive,
                     full_metadata,
+                    versioned_address,
                     max_results,
                     page_token,
                     format,
@@ -640,6 +681,7 @@ pub(crate) async fn dispatch(
             fields,
             auth,
             name,
+            target,
             advanced,
         } => {
             commands::connect::run(
@@ -649,6 +691,7 @@ pub(crate) async fn dispatch(
                     fields,
                     auth,
                     name,
+                    target,
                     advanced,
                 },
                 cancel,
@@ -656,6 +699,10 @@ pub(crate) async fn dispatch(
             .await?
         }
         Command::Reauth { name } => commands::connect::reauth(state, &name, cancel).await?,
+        Command::Disconnect { selector } => {
+            commands::connections::disconnect(state, &selector, cancel).await?
+        }
+        Command::Init { path, force } => commands::init::run(state, &path, force, cancel).await?,
         Command::WriteConfig {
             path,
             force,
@@ -729,6 +776,11 @@ async fn build_stack(
     config: &ovstorage::StackConfig,
     cancel: Option<ovstorage::CancellationToken>,
 ) -> ovstorage::Result<Arc<ovstorage::Stack>> {
+    let factories = load_runtime_factories()?;
+    ovstorage::host::build_stack_with_cancel(config, factories, cancel).await
+}
+
+pub(crate) fn load_runtime_factories() -> ovstorage::Result<Vec<ovstorage::LoadedLayerFactory>> {
     ovstorage::init_auth_substrate(Some(&cli_auth_state_root()))?;
 
     // SAFETY: dlopen runs platform loader hooks; the user/operator controls
@@ -737,7 +789,7 @@ async fn build_stack(
         Some(dir) => unsafe { ovstorage::load_layer_plugins_from_dir(&dir, false)? },
         None => Vec::new(),
     };
-    ovstorage::host::build_stack_with_cancel(config, factories, cancel).await
+    Ok(factories)
 }
 
 fn cli_auth_state_root() -> PathBuf {
@@ -771,6 +823,7 @@ pub(crate) fn error_code_name(code: ErrorCode) -> &'static str {
         ErrorCode::CredentialUnavailable => "CredentialUnavailable",
         ErrorCode::CredentialExpired => "CredentialExpired",
         ErrorCode::PartialCompletion => "PartialCompletion",
+        ErrorCode::CommitAmbiguous => "CommitAmbiguous",
         _ => "Error",
     }
 }
@@ -802,6 +855,18 @@ fn exit_code(code: ErrorCode) -> i32 {
         // committed and a later stage is not", because the remedies differ
         // and one of them is destructive.
         ErrorCode::PartialCompletion => 19,
+        // The same distinction one step further on: the mutation COMMITTED and
+        // only the reconcile that follows it is unconfirmed. Every producer of
+        // this code raises it after the change has landed — the router's
+        // post-commit route-table catch-up is the in-tree one — so a script
+        // that sees it must not re-run the mutation (the retry takes `NotFound`
+        // for a removal, `AlreadyExists` for an add, and reads either as a real
+        // failure) and must not roll back work that succeeded. The remedy is to
+        // carry on and expect an address to resolve stale for a moment, which
+        // is the opposite of the remedy for everything `1` otherwise names. The
+        // prose saying which it was goes to stderr, where a status-checking
+        // script does not look.
+        ErrorCode::CommitAmbiguous => 20,
         _ => 1,
     }
 }
@@ -809,6 +874,98 @@ fn exit_code(code: ErrorCode) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_parses_with_default_path_and_force_flag() {
+        let cli = Cli::try_parse_from(["ovstorage", "init"]).unwrap();
+        match cli.command.unwrap() {
+            Command::Init { path, force } => {
+                assert_eq!(path, PathBuf::from("ovstorage.toml"));
+                assert!(!force);
+            }
+            _ => panic!("expected init command"),
+        }
+
+        let cli = Cli::try_parse_from(["ovstorage", "init", "custom.toml", "--force"]).unwrap();
+        match cli.command.unwrap() {
+            Command::Init { path, force } => {
+                assert_eq!(path, PathBuf::from("custom.toml"));
+                assert!(force);
+            }
+            _ => panic!("expected init command"),
+        }
+    }
+
+    #[test]
+    fn stat_parses_versioned_address_flag() {
+        let cli = Cli::try_parse_from(["ovstorage", "stat", "file:///tmp/a.bin"]).unwrap();
+        match cli.command.unwrap() {
+            Command::Stat {
+                versioned_address, ..
+            } => assert!(!versioned_address, "the pin is opt-in"),
+            _ => panic!("expected stat command"),
+        }
+
+        // The `info` alias takes the same flag.
+        let cli = Cli::try_parse_from([
+            "ovstorage",
+            "info",
+            "--versioned-address",
+            "--full-metadata",
+            "file:///tmp/a.bin",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Stat {
+                address,
+                full_metadata,
+                versioned_address,
+            } => {
+                assert_eq!(address, "file:///tmp/a.bin");
+                assert!(full_metadata);
+                assert!(versioned_address);
+            }
+            _ => panic!("expected stat command"),
+        }
+    }
+
+    #[test]
+    fn list_parses_versioned_address_flag() {
+        let cli = Cli::try_parse_from(["ovstorage", "list", "file:///tmp/"]).unwrap();
+        match cli.command.unwrap() {
+            Command::List {
+                versioned_address, ..
+            } => assert!(!versioned_address, "the pin is opt-in"),
+            _ => panic!("expected list command"),
+        }
+
+        // The `ls` alias takes the same flag alongside the existing ones.
+        let cli = Cli::try_parse_from([
+            "ovstorage",
+            "ls",
+            "--recursive",
+            "--versioned-address",
+            "--format",
+            "table",
+            "file:///tmp/",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::List {
+                prefix,
+                recursive,
+                versioned_address,
+                format,
+                ..
+            } => {
+                assert_eq!(prefix.as_deref(), Some("file:///tmp/"));
+                assert!(recursive);
+                assert!(versioned_address);
+                assert!(matches!(format, OutputFormat::Table));
+            }
+            _ => panic!("expected list command"),
+        }
+    }
 
     #[test]
     fn exit_code_maps_documented_codes() {
@@ -835,6 +992,25 @@ mod tests {
         // destructive. Documented in this crate's README exit-code table.
         assert_eq!(exit_code(ErrorCode::PartialCompletion), 19);
         assert_ne!(exit_code(ErrorCode::PartialCompletion), 1);
+        // The same reasoning one step further on: the mutation committed and
+        // only its reconcile is unconfirmed. `1` would put "the removal
+        // happened, carry on" in the same bucket as "nothing happened, and the
+        // reason is unclassified" — and re-running the mutation on that reading
+        // is how a script turns a success into a `NotFound` it treats as
+        // failure.
+        assert_eq!(exit_code(ErrorCode::CommitAmbiguous), 20);
+        assert_ne!(exit_code(ErrorCode::CommitAmbiguous), 1);
+    }
+
+    #[test]
+    fn commit_ambiguous_has_its_own_error_name() {
+        // As for `PartialCompletion`: without an arm it prints as "Error",
+        // which says nothing about a mutation that landed.
+        assert_eq!(
+            error_code_name(ErrorCode::CommitAmbiguous),
+            "CommitAmbiguous"
+        );
+        assert_ne!(error_code_name(ErrorCode::CommitAmbiguous), "Error");
     }
 
     #[test]

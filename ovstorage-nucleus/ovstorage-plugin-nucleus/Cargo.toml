@@ -17,6 +17,7 @@ nucleus-discovery = { workspace = true }
 nucleus-client = { workspace = true }
 anyhow = { version = "1.0.102", features = ["backtrace"] }
 async-trait = "0.1.89"
+futures = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 parking_lot = "0.12.5"

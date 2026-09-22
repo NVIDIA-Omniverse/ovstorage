@@ -36,10 +36,10 @@ OVC_STATIC_ASSERT(offsetof(ovc_layer_vtable, abi_version) == sizeof(size_t),
 OVC_STATIC_ASSERT(sizeof(((ovc_layer_vtable *)0)->abi_version) ==
                       sizeof(uint32_t),
                   "Layer vtable abi_version type changed");
-OVC_STATIC_ASSERT(OVSTORAGE_PLUGIN_ABI_VERSION == 15,
+OVC_STATIC_ASSERT(OVSTORAGE_PLUGIN_ABI_VERSION == 19,
                   "Layer ABI version changed");
 
-/* First operational slot, the update_connection_attributes slot, and the last operational slot. */
+/* First operational slot, selected frozen slots, and the appended last slot. */
 OVC_STATIC_ASSERT(offsetof(ovc_layer_vtable, name) ==
                       offsetof(ovc_layer_vtable, drop) +
                           sizeof(((ovc_layer_vtable *)0)->drop),
@@ -53,15 +53,19 @@ OVC_STATIC_ASSERT(offsetof(ovc_layer_vtable, authenticate_connection) ==
                                update_connection_attributes) +
                           sizeof(((ovc_layer_vtable *)0)
                                      ->update_connection_attributes),
-                  "Layer vtable last operational slot moved");
-OVC_STATIC_ASSERT(offsetof(ovc_layer_vtable, _reserved) ==
+                  "Layer vtable authenticate_connection slot moved");
+OVC_STATIC_ASSERT(offsetof(ovc_layer_vtable, list_stream) ==
                       offsetof(ovc_layer_vtable, authenticate_connection) +
                           sizeof(((ovc_layer_vtable *)0)
                                      ->authenticate_connection),
+                  "Layer vtable last operational slot moved");
+OVC_STATIC_ASSERT(offsetof(ovc_layer_vtable, _reserved) ==
+                      offsetof(ovc_layer_vtable, list_stream) +
+                          sizeof(((ovc_layer_vtable *)0)->list_stream),
                   "Layer vtable reserved section moved");
 OVC_STATIC_ASSERT(sizeof(((ovc_layer_vtable *)0)->_reserved) /
                           sizeof(((ovc_layer_vtable *)0)->_reserved[0]) ==
-                      16,
+                      15,
                   "Layer vtable reserved slot count changed");
 OVC_STATIC_ASSERT(sizeof(ovc_layer_vtable) ==
                       offsetof(ovc_layer_vtable, _reserved) +
@@ -78,6 +82,8 @@ OVC_STATIC_ASSERT(
     offsetof(ovc_layer_vtable, update_connection_attributes) == 256,
     "64-bit Layer vtable update_connection_attributes slot changed");
 OVC_STATIC_ASSERT(offsetof(ovc_layer_vtable, authenticate_connection) == 264,
+                  "64-bit Layer vtable authenticate_connection slot changed");
+OVC_STATIC_ASSERT(offsetof(ovc_layer_vtable, list_stream) == 272,
                   "64-bit Layer vtable last slot changed");
 OVC_STATIC_ASSERT(sizeof(ovc_layer_vtable) == 400,
                   "64-bit Layer vtable size changed");
@@ -90,6 +96,8 @@ OVC_STATIC_ASSERT(
     offsetof(ovc_layer_vtable, update_connection_attributes) == 128,
     "32-bit Layer vtable update_connection_attributes slot changed");
 OVC_STATIC_ASSERT(offsetof(ovc_layer_vtable, authenticate_connection) == 132,
+                  "32-bit Layer vtable authenticate_connection slot changed");
+OVC_STATIC_ASSERT(offsetof(ovc_layer_vtable, list_stream) == 136,
                   "32-bit Layer vtable last slot changed");
 OVC_STATIC_ASSERT(sizeof(ovc_layer_vtable) == 200,
                   "32-bit Layer vtable size changed");
@@ -307,7 +315,10 @@ static OvStoragePlugin_Error *ovc_unsupported_list_kinds(
       ovstorage_plugin_update_connection_attributes_request_release)        \
     X(authenticate_connection,                                              \
       OvStoragePlugin_AuthenticateRequest,                                  \
-      ovstorage_plugin_authenticate_request_release)
+      ovstorage_plugin_authenticate_request_release)                        \
+    X(list_stream,                                                          \
+      OvStoragePlugin_ListRequest,                                          \
+      ovstorage_plugin_list_request_release)
 
 #define OVC_COUNT_UNSUPPORTED_ASYNC(slot_name, request_type, release_fn) +1
 enum {
@@ -490,6 +501,9 @@ OVC_DEFINE_PASSTHROUGH_ASYNC(
 OVC_DEFINE_PASSTHROUGH_ASYNC(ovc_passthrough_authenticate_connection,
                              authenticate_connection,
                              OvStoragePlugin_AuthenticateRequest)
+OVC_DEFINE_PASSTHROUGH_ASYNC(ovc_passthrough_list_stream,
+                             list_stream,
+                             OvStoragePlugin_ListRequest)
 
 /* ------------------------------------------------------------------------- */
 /*
@@ -497,7 +511,7 @@ OVC_DEFINE_PASSTHROUGH_ASYNC(ovc_passthrough_authenticate_connection,
  *
  * `_reserved` deliberately stays all-NULL in both tables: the frozen
  * forward-compat protocol reads a NULL slot as "not implemented" (matching
- * the Rust reference's `[None; 16]`), so a newer host that assigns a real
+ * the Rust reference's `[None; 15]`), so a newer host that assigns a real
  * meaning to a reserved slot falls back instead of calling a stale stub.
  */
 
@@ -554,6 +568,7 @@ const OvStoragePlugin_LayerVTableV1 OVSTORAGE_PASSTHROUGH_VTABLE = {
     .update_connection_attributes =
         ovc_passthrough_update_connection_attributes,
     .authenticate_connection = ovc_passthrough_authenticate_connection,
+    .list_stream = ovc_passthrough_list_stream,
     /* _reserved is zero-initialized: NULL means "not implemented". */
 };
 

@@ -46,6 +46,10 @@ const REQUIRE_CPP20_ENV: &str = "OVSTORAGE_REQUIRE_CPP20";
 /// rendezvous passes. Requiring it keeps that leg from self-disabling.
 const REQUIRE_TSAN_ENV: &str = "OVSTORAGE_REQUIRE_TSAN";
 
+/// Local-only acknowledgement for a diagnosed coroutine-frame compiler race.
+/// It cannot weaken CI's required-TSan coverage.
+const ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN_ENV: &str = "OVSTORAGE_ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN";
+
 /// Whether the *target* is MSVC.
 ///
 /// One spelling, deliberately. This was written two ways in this file — the
@@ -182,6 +186,24 @@ fn c_source_files(source_dir: &Path) -> Vec<PathBuf> {
 }
 
 fn main() {
+    // The acknowledgement is local-only. Two gates make that structural rather
+    // than a convention: it may not be combined with required ThreadSanitizer,
+    // and it is refused outright under GitHub Actions or any CI that sets `CI`,
+    // so no workflow can silence the coroutine-frame probe.
+    let acknowledged = std::env::var(ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN_ENV).as_deref() == Ok("1");
+    assert!(
+        !(std::env::var(REQUIRE_TSAN_ENV).as_deref() == Ok("1") && acknowledged),
+        "{REQUIRE_TSAN_ENV}=1 and {ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN_ENV}=1 are contradictory: \
+         the acknowledgement is local-only, and CI must not carry it"
+    );
+    let in_ci = std::env::var_os("GITHUB_ACTIONS").is_some()
+        || std::env::var("CI").is_ok_and(|v| !matches!(v.trim(), "" | "0" | "false"));
+    assert!(
+        !(acknowledged && in_ci),
+        "{ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN_ENV}=1 is refused in CI (GITHUB_ACTIONS or CI is \
+         set): the acknowledgement is local-only; remove it from the workflow environment"
+    );
+
     let manifest_dir = PathBuf::from(
         std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
     );
@@ -196,6 +218,8 @@ fn main() {
     let include_dir = source_root.join("include");
     let roundtrip_c = manifest_dir.join("tests/cc/roundtrip_c.c");
     let roundtrip_cpp20 = manifest_dir.join("tests/cc/roundtrip_cpp20.cpp");
+    let etag_strength_abi_cpp20 = manifest_dir.join("tests/cc/etag_strength_abi_cpp20.cpp");
+    let versioned_address_abi_cpp20 = manifest_dir.join("tests/cc/versioned_address_abi_cpp20.cpp");
     let streams_c = manifest_dir.join("tests/cc/streams_c.c");
     let declined_release_c = manifest_dir.join("tests/cc/declined_release_c.c");
     let handoff_c = manifest_dir.join("tests/cc/handoff_c.c");
@@ -205,7 +229,11 @@ fn main() {
     let auth_event_stub_c = manifest_dir.join("tests/cc/auth_event_stub_c.c");
     let auth_decoder_plugin_fixture = manifest_dir.join("tests/cc/auth_decoder_plugin_fixture.c");
     let auth_decoder_plugin_host = manifest_dir.join("tests/cc/auth_decoder_plugin_host.c");
+    let plugin_log_host = manifest_dir.join("tests/cc/plugin_log_host.c");
+    let plugin_log_fixture = manifest_dir.join("tests/cc/plugin_log_fixture.c");
     let auth_credential_ownership = manifest_dir.join("tests/cc/auth_credential_ownership_main.c");
+    let credential_store_process_driver =
+        manifest_dir.join("tests/cc/credential_store_process_main.c");
     let sync_wait_race = manifest_dir.join("tests/cc/sync_wait_destroy_race.cpp");
     let callback_boundaries = manifest_dir.join("tests/cc/callback_boundaries_cpp20.cpp");
     let secret_wipe_c = manifest_dir.join("tests/cc/secret_wipe_c.c");
@@ -240,6 +268,8 @@ fn main() {
         .chain([
             &roundtrip_c,
             &roundtrip_cpp20,
+            &etag_strength_abi_cpp20,
+            &versioned_address_abi_cpp20,
             &streams_c,
             &declined_release_c,
             &handoff_c,
@@ -249,7 +279,10 @@ fn main() {
             &auth_event_stub_c,
             &auth_decoder_plugin_fixture,
             &auth_decoder_plugin_host,
+            &plugin_log_host,
+            &plugin_log_fixture,
             &auth_credential_ownership,
+            &credential_store_process_driver,
             &sync_wait_race,
             &callback_boundaries,
             &stack_build_abandon_repro,
@@ -265,6 +298,9 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed={REQUIRE_CPP20_ENV}");
     println!("cargo:rerun-if-env-changed={REQUIRE_TSAN_ENV}");
+    println!("cargo:rerun-if-env-changed={ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN_ENV}");
+    println!("cargo:rerun-if-env-changed=GITHUB_ACTIONS");
+    println!("cargo:rerun-if-env-changed=CI");
     // Declared unconditionally so `--cfg ovstorage_cpp20` is a known cfg even
     // on the skip path, where it is never emitted.
     println!("cargo::rustc-check-cfg=cfg(ovstorage_cpp20)");
@@ -333,6 +369,14 @@ fn main() {
             .file(&roundtrip_cpp20)
             .compile("ovstorage_c_source_roundtrip_cpp20");
 
+        cpp20_build(&include_dir)
+            .file(&etag_strength_abi_cpp20)
+            .compile("ovstorage_c_source_etag_strength_abi_cpp20");
+
+        cpp20_build(&include_dir)
+            .file(&versioned_address_abi_cpp20)
+            .compile("ovstorage_c_source_versioned_address_abi_cpp20");
+
         c_build(&include_dir)
             .file(&auth_event_stub_c)
             .compile("ovstorage_c_source_auth_event_stub_c");
@@ -346,7 +390,16 @@ fn main() {
         .file(&auth_decoder_plugin_host)
         .compile("ovstorage_c_source_auth_decoder_plugin_host");
 
+    c_build(&include_dir)
+        .file(&plugin_log_host)
+        .compile("ovstorage_c_source_plugin_log_host");
+
     build_auth_credential_ownership(&auth_credential_ownership, &include_dir, &source_dir);
+    build_credential_store_process_driver(
+        &credential_store_process_driver,
+        &include_dir,
+        &source_files,
+    );
 
     c_build(&include_dir)
         .file(&stack_async_c)
@@ -408,6 +461,22 @@ fn main() {
         compile_inspect_fixture(&include_dir, &streams_c, &fixture);
         println!(
             "cargo:rustc-env=OVSTORAGE_C_SOURCE_INSPECT_FIXTURE={}",
+            fixture.display()
+        );
+    }
+
+    {
+        let fixture_name = if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+            "libovstorage_c_source_plugin_log_fixture.dylib"
+        } else if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+            "ovstorage_c_source_plugin_log_fixture.dll"
+        } else {
+            "libovstorage_c_source_plugin_log_fixture.so"
+        };
+        let fixture = out_dir().join(fixture_name);
+        compile_plugin_log_fixture(&include_dir, &plugin_log_fixture, &fixture);
+        println!(
+            "cargo:rustc-env=OVSTORAGE_C_SOURCE_PLUGIN_LOG_FIXTURE={}",
             fixture.display()
         );
     }
@@ -540,6 +609,80 @@ fn build_auth_credential_ownership(source: &Path, include_dir: &Path, source_dir
         result => println!(
             "cargo:rustc-env=OVSTORAGE_C_SOURCE_AUTH_OWNERSHIP_STATUS=failed:\
              AuthCredential ownership driver did not build ({result:?})"
+        ),
+    }
+}
+
+/// Build the complete standalone C host plus its cross-process credential
+/// store driver. A native executable is required because Rust launches it in
+/// fresh and concurrent processes; cross builds report the conventional skip.
+fn build_credential_store_process_driver(
+    source: &Path,
+    include_dir: &Path,
+    source_files: &[PathBuf],
+) {
+    let host = std::env::var("HOST").unwrap_or_default();
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if host.is_empty() || host != target {
+        println!("cargo:rustc-env=OVSTORAGE_C_SOURCE_CRED_STORE_STATUS=skipped");
+        return;
+    }
+
+    let output_dir = out_dir();
+    let binary = output_dir.join(
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+            "credential_store_process.exe"
+        } else {
+            "credential_store_process"
+        },
+    );
+    let tool = c_build(include_dir).get_compiler();
+    let mut command = tool.to_command();
+
+    if target_is_msvc() {
+        command
+            .current_dir(&output_dir)
+            .arg("/std:c11")
+            .arg("/W4")
+            .arg("/WX")
+            .arg(format!("/I{}", include_dir.display()))
+            .args(source_files)
+            .arg(source)
+            .arg(format!("/Fe:{}", binary.display()));
+    } else {
+        command
+            .arg("-std=c99")
+            .arg("-Wall")
+            .arg("-Wextra")
+            .arg("-Werror");
+        if std::env::var("CARGO_CFG_TARGET_FAMILY").as_deref() == Ok("unix") {
+            command
+                .arg("-D_POSIX_C_SOURCE=200809L")
+                .arg("-D_XOPEN_SOURCE=700")
+                .arg("-D_FILE_OFFSET_BITS=64");
+        }
+        command
+            .arg(format!("-I{}", include_dir.display()))
+            .args(source_files)
+            .arg(source)
+            .arg("-o")
+            .arg(&binary);
+        if std::env::var("CARGO_CFG_TARGET_FAMILY").as_deref() == Ok("unix") {
+            command.arg("-lpthread").arg("-ldl");
+        }
+    }
+
+    match command.status() {
+        Ok(status) if status.success() => {
+            println!("cargo:rustc-env=OVSTORAGE_C_SOURCE_CRED_STORE_STATUS=built");
+            println!(
+                "cargo:rustc-env=OVSTORAGE_C_SOURCE_CRED_STORE_BIN={}",
+                binary.display()
+            );
+        }
+        result => println!(
+            "cargo:rustc-env=OVSTORAGE_C_SOURCE_CRED_STORE_STATUS=failed:\
+             credential-store process driver did not build ({result:?})"
         ),
     }
 }
@@ -1217,7 +1360,8 @@ fn build_sync_wait_race(manifest_dir: &Path, include_dir: &Path, coro_frames: Co
                  Clang 17+ to keep the condvar coverage. Unsetting \
                  {REQUIRE_TSAN_ENV} instead keeps this leg running WITHOUT TSan, \
                  where it still catches a wrong outcome or a hang but cannot see the \
-                 destruction race.",
+                 destruction race. {ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN_ENV}=1 is a \
+                 local-only switch and is refused under {REQUIRE_TSAN_ENV}=1.",
                 compiler_version_line(&tool)
             ),
         }
@@ -1699,6 +1843,50 @@ fn compile_auth_decoder_plugin_fixture(
     assert!(
         result.status.success(),
         "failed to build bundled C auth decoder plugin with {}:\n{}\n{}",
+        compiler.path().display(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+fn compile_plugin_log_fixture(include_dir: &Path, source: &Path, output: &Path) {
+    let compiler = c_build(include_dir).get_compiler();
+    let mut command = compiler.to_command();
+    let out_dir = out_dir();
+    if compiler.is_like_msvc() {
+        command
+            .current_dir(&out_dir)
+            .arg("/nologo")
+            .arg("/std:c11")
+            .arg("/LD")
+            .arg("/W4")
+            .arg("/WX")
+            .arg(format!("/I{}", include_dir.display()))
+            .arg(source)
+            .arg(format!(
+                "/Fo{}",
+                out_dir.join("plugin_log_fixture.obj").display()
+            ))
+            .arg(format!("/Fe:{}", output.display()));
+    } else {
+        command
+            .arg("-std=c99")
+            .arg("-fPIC")
+            .arg("-shared")
+            .arg("-Wall")
+            .arg("-Wextra")
+            .arg("-Werror")
+            .arg(format!("-I{}", include_dir.display()))
+            .arg(source)
+            .arg("-o")
+            .arg(output);
+    }
+    let result = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to invoke {}: {error}", compiler.path().display()));
+    assert!(
+        result.status.success(),
+        "failed to build plugin log fixture with {}:\n{}\n{}",
         compiler.path().display(),
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)

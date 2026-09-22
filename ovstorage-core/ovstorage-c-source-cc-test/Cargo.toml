@@ -14,6 +14,10 @@ build = "build.rs"
 name = "roundtrip"
 path = "tests/roundtrip.rs"
 
+[[test]]
+name = "plugin_log"
+path = "tests/plugin_log.rs"
+
 [dev-dependencies]
 # The permissions-sync test compares the shipped C EffectivePermissions
 # macros against the Rust definitions they must stay in lock-step with.

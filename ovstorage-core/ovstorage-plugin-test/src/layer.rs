@@ -20,6 +20,27 @@ use crate::config::TestConfig;
 use crate::recorder::ObservedCall;
 use crate::{BACKEND_KIND, Recorder, TestBackend, TestFactory, TestInstance, token_matches};
 
+fn cancellable_list_items(items: Vec<ObjectInfo>, cancel: Option<CancellationToken>) -> ListStream {
+    Box::pin(futures::stream::unfold(
+        (items.into_iter(), cancel, false),
+        |(mut items, cancel, terminal)| async move {
+            if terminal {
+                return None;
+            }
+            if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                return Some((
+                    Err(Error::new(
+                        ErrorCode::Cancelled,
+                        "test-plugin: list_stream cancelled",
+                    )),
+                    (items, cancel, true),
+                ));
+            }
+            items.next().map(|item| (Ok(item), (items, cancel, false)))
+        },
+    ))
+}
+
 /// Recovery hint the test layer attaches to its `root_info_for` `NoRoute`
 /// error.
 ///
@@ -67,10 +88,27 @@ impl BackendFactory for TestLayerFactory {
         cancel: Option<CancellationToken>,
     ) -> Result<LayerHandle> {
         let _ = &cancel; // conformance plugin op: no async work to cancel.
+        let owned_targets: Vec<String> = match config.get("test_owned_targets") {
+            Some(ConfigValue::String(value)) if !value.is_empty() => value
+                .split(',')
+                .map(|entry| entry.trim().to_string())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let attribute_to = match config.get("test_attribute_to") {
+            Some(ConfigValue::String(value)) => Some(value.clone()),
+            // A leaf attributes its own rows, as every in-tree backend does. A
+            // composite that names none reports nothing, which is the
+            // unattributable case the host cannot resolve for it.
+            _ if owned_targets.is_empty() => Some(name.to_string()),
+            _ => None,
+        };
         let layer = Arc::new(TestLayer {
             name: name.to_string(),
             shared: self.shared.clone(),
             state: Mutex::new(LayerState::default()),
+            owned_targets,
+            attribute_to,
         });
         // Non-empty layer config is a static connection; a host may instead
         // build with empty config and add roots through `add_connection`.
@@ -159,6 +197,21 @@ pub struct TestLayer {
     name: String,
     shared: Arc<TestFactory>,
     state: Mutex<LayerState>,
+    /// The internal connection-owning targets this layer declares, from the
+    /// layer config's `test_owned_targets` (a comma-separated list). Empty
+    /// takes the trait default of `[name]`.
+    ///
+    /// Declaring SEVERAL makes this a **composite** — a plugin the host cannot
+    /// attribute rows for, because nothing outside it says which of its
+    /// internal targets holds a given row. That shape is what lets a test prove
+    /// the ABI carries an attributed value: with one owned target the host's
+    /// own back-fill supplies the identical string, so a marshalling that
+    /// dropped the field would go unnoticed.
+    owned_targets: Vec<String>,
+    /// The target this layer stamps on the rows it builds, from
+    /// `test_attribute_to`. `None` leaves them unattributed, which is what
+    /// exercises the host's back-fill.
+    attribute_to: Option<String>,
 }
 
 impl TestLayer {
@@ -195,16 +248,19 @@ impl TestLayer {
         // survives `remove_connection`.
         *instance.credentials.lock().expect("instance credentials") = request.credentials;
         let connection_id = ConnectionId(fresh_id(BACKEND_KIND));
+        let mut capabilities = cfg.capabilities.clone();
+        capabilities.supports_list_stream = true;
         let connection = Connection {
             id: connection_id.clone(),
             backend_kind: BACKEND_KIND.to_string(),
             display_name: display_name.unwrap_or_else(|| "Test backend".to_string()),
             source: source.clone(),
-            capabilities: cfg.capabilities.clone(),
+            capabilities,
             current_addresses: vec![cfg.root.clone()],
             auth_state: ConnectionAuthState::Anonymous,
             last_probed: Some(SystemTime::now()),
             user_metadata: UserMetadata::new(),
+            owning_target: self.attribute_to.clone(),
         };
         let entry = RootEntry {
             root: cfg.root,
@@ -254,13 +310,14 @@ impl TestLayer {
                 connection_id: entry.connection_id.clone(),
             },
         };
-        let capabilities = entry
+        let mut capabilities = entry
             .instance
             .cfg
             .lock()
             .expect("instance cfg")
             .capabilities
             .clone();
+        capabilities.supports_list_stream = true;
         RootInfo {
             root: entry.root.clone(),
             display_name: None,
@@ -350,25 +407,6 @@ impl TestLayer {
     }
 }
 
-/// Stage materialized bytes to a unique temp file (std-only; the harness
-/// carries no tempfile dependency in its library target).
-fn stage_to_temp_file(bytes: &[u8]) -> Result<std::path::PathBuf> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "ovstorage-plugin-test-materialize-{}-{seq}.bin",
-        std::process::id()
-    ));
-    std::fs::write(&path, bytes).map_err(|err| {
-        Error::new(
-            ErrorCode::Internal,
-            format!("test-plugin: stage materialize temp file: {err}"),
-        )
-    })?;
-    Ok(path)
-}
-
 fn resolved_target(backend: &TestBackend, url: &Url) -> ResolvedTarget {
     let root = backend
         .instance
@@ -387,6 +425,14 @@ fn resolved_target(backend: &TestBackend, url: &Url) -> ResolvedTarget {
 impl Layer for TestLayer {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn owned_targets(&self) -> Vec<String> {
+        if self.owned_targets.is_empty() {
+            vec![self.name.clone()]
+        } else {
+            self.owned_targets.clone()
+        }
     }
 
     fn descriptor(&self) -> LayerKindDescriptor {
@@ -544,11 +590,16 @@ impl Layer for TestLayer {
             "write_redirect / continue_write",
             |caps| caps.supports_write_redirect,
         )?;
+        // The commit stashes metadata that travelled out through the caller
+        // inside the continuation, so a host attribution layer's value is taken
+        // from the request instead. Read before the input is moved.
+        let attested = ovstorage_plugin::attested_modified_by(&request.extensions);
         backend
             .continue_write(
                 target,
                 request.input.redirects,
                 request.input.results,
+                attested.as_deref(),
                 cancel,
             )
             .await
@@ -636,45 +687,6 @@ impl Layer for TestLayer {
             .await
     }
 
-    async fn materialize(
-        &self,
-        request: Request<ReadRequest>,
-        cancel: Option<CancellationToken>,
-    ) -> Result<LocalDelegate> {
-        // Compat parity: the adapter services materialize via the backend
-        // `read` + host-side temp staging, so the recorded call is `read`
-        // on both paths. The staging happens here (plugin-side) because
-        // the harness has no access to the host's staging helper.
-        let (backend, target) = self.target(&request.input.address)?;
-        match backend.read(target, request.input.options, cancel).await? {
-            ReadResult::LocalDelegate(local) => Ok(local),
-            ReadResult::Bytes { bytes, info } => Ok(LocalDelegate {
-                path: stage_to_temp_file(&bytes)?,
-                info,
-                guard: None,
-            }),
-            ReadResult::Stream { mut stream, info } => {
-                use futures::StreamExt as _;
-                // Harness objects are small by construction; drain then
-                // stage rather than streaming to disk.
-                let mut bytes = Vec::new();
-                while let Some(chunk) = stream.next().await {
-                    bytes.extend_from_slice(&chunk?);
-                }
-                Ok(LocalDelegate {
-                    path: stage_to_temp_file(&bytes)?,
-                    info,
-                    guard: None,
-                })
-            }
-            ReadResult::Redirect(_) => Err(Error::new(
-                ErrorCode::Unsupported,
-                "test-plugin: materialize on a redirect-configured root needs a host-side \
-                 follower; compose a redirect-follower / byte-cache wrapper above this layer",
-            )),
-        }
-    }
-
     async fn list(
         &self,
         request: Request<ListRequest>,
@@ -709,6 +721,50 @@ impl Layer for TestLayer {
             recursive,
         );
         paginate_list_items(items, max_results, page_token)
+    }
+
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        let prefix = request.input.prefix;
+        let (backend, caps) = self.route(&prefix)?;
+        if !caps.supports_list {
+            return Err(Error::new(
+                ErrorCode::Unsupported,
+                "test-plugin: route does not support list",
+            ));
+        }
+        let options = request.input.options;
+        if options.max_results.is_some() || options.page_token.is_some() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+
+        let recursive = options.recursive;
+        let target = resolved_target(&backend, &prefix);
+        let backend_options = ListOptions {
+            max_results: None,
+            page_token: None,
+            ..options
+        };
+        let stream_cancel = cancel.clone();
+        let items = backend
+            .list(target, backend_options, cancel.clone())
+            .await?;
+        let stream = cancellable_list_items(items, cancel);
+        Ok(cancel_list_stream(
+            Box::pin(IncrementalListFold::new(
+                stream,
+                &prefix,
+                caps.has_real_directories,
+                recursive,
+            )),
+            stream_cancel,
+        ))
     }
 
     async fn list_versions(
@@ -822,6 +878,7 @@ impl Layer for TestLayer {
             auth_state: ConnectionAuthState::Anonymous,
             last_probed: Some(SystemTime::now()),
             user_metadata: UserMetadata::new(),
+            owning_target: self.attribute_to.clone(),
         })
     }
 
@@ -960,15 +1017,20 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn layer_with_root(root: &str) -> TestLayer {
+    fn layer_with_config(root: &str, extra: &[(&str, ConfigValue)]) -> TestLayer {
         let factory = TestLayerFactory::default();
         let layer = TestLayer {
             name: "test".to_string(),
             shared: factory.shared,
             state: Mutex::new(LayerState::default()),
+            owned_targets: Vec::new(),
+            attribute_to: Some("test".to_string()),
         };
         let mut config = HashMap::new();
         config.insert("test_root".into(), ConfigValue::String(root.into()));
+        for (key, value) in extra {
+            config.insert((*key).into(), value.clone());
+        }
         layer
             .install_connection(
                 ConnectionRequest {
@@ -986,6 +1048,10 @@ mod tests {
         layer
     }
 
+    fn layer_with_root(root: &str) -> TestLayer {
+        layer_with_config(root, &[])
+    }
+
     fn runtime_connection(root: &str) -> ConnectionRequest {
         let mut config = HashMap::new();
         config.insert("test_root".into(), ConfigValue::String(root.into()));
@@ -996,6 +1062,106 @@ mod tests {
             persist: false,
             display_name: None,
         }
+    }
+
+    #[tokio::test]
+    async fn redirect_metadata_survives_rounds_and_terminal_commit_reasserts_attribution() {
+        let layer = layer_with_config(
+            "test://demo/",
+            &[
+                (
+                    "test_redirect_url",
+                    ConfigValue::String("https://test.example".into()),
+                ),
+                ("test_continue_write_loops", ConfigValue::Int(2)),
+            ],
+        );
+        let address = Url::parse("test://demo/attributed.bin").unwrap();
+        let user_metadata = UserMetadata::from([
+            ("project".to_string(), "scene".to_string()),
+            (
+                ATTRIBUTION_KEY_MODIFIED_BY.to_string(),
+                "caller-forged".to_string(),
+            ),
+            ("ovstorage_forged".to_string(), "remove-me".to_string()),
+        ]);
+        let batch1 = layer
+            .write_redirect(
+                Request::new(WriteRequest {
+                    address: address.clone(),
+                    body: Body::Bytes(Vec::new()),
+                    options: WriteOptions {
+                        user_metadata: Some(user_metadata.clone()),
+                        ..WriteOptions::default()
+                    },
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let results_for = |batch: &WriteRedirectBatch| RedirectResultBatch {
+            results: batch
+                .redirects
+                .iter()
+                .map(|_| RedirectResult {
+                    status_code: 200,
+                    captured_headers: Vec::new(),
+                    captured_body: Vec::new(),
+                })
+                .collect(),
+        };
+
+        let mut first_request = Request::new(ContinueWriteRequest {
+            address: address.clone(),
+            results: results_for(&batch1),
+            redirects: batch1,
+        });
+        first_request.extensions.insert(
+            ovstorage_plugin::ext::ATTRIBUTED_MODIFIED_BY,
+            b"intermediate-host".to_vec(),
+        );
+        let first_step = layer.continue_write(first_request, None).await.unwrap();
+        let WriteStep::Redirects(batch2) = first_step else {
+            panic!("expected a second redirect round");
+        };
+        let continued = crate::decode_continuation(&batch2.continuation).unwrap();
+        assert_eq!(continued.user_metadata, Some(user_metadata));
+
+        let mut terminal_request = Request::new(ContinueWriteRequest {
+            address,
+            results: results_for(&batch2),
+            redirects: batch2,
+        });
+        terminal_request.extensions.insert(
+            ovstorage_plugin::ext::ATTRIBUTED_MODIFIED_BY,
+            b"terminal-host".to_vec(),
+        );
+        let terminal_step = layer.continue_write(terminal_request, None).await.unwrap();
+        let WriteStep::Done(_) = terminal_step else {
+            panic!("expected Done after the final round");
+        };
+        let stored_info = layer
+            .stat(
+                Request::new(StatRequest {
+                    address: Url::parse("test://demo/attributed.bin").unwrap(),
+                    options: StatOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let stored_metadata = stored_info.user_metadata.unwrap();
+        assert_eq!(
+            stored_metadata.get("project").map(String::as_str),
+            Some("scene")
+        );
+        assert_eq!(
+            stored_metadata
+                .get(ATTRIBUTION_KEY_MODIFIED_BY)
+                .map(String::as_str),
+            Some("terminal-host")
+        );
+        assert!(!stored_metadata.contains_key("ovstorage_forged"));
     }
 
     /// Poll one already-queued item off an update stream.
@@ -1171,54 +1337,5 @@ mod tests {
         assert_eq!(roots.roots.len(), 1);
         assert_eq!(roots.roots[0].root.as_str(), "test://demo/");
         assert!(stream.is_some());
-    }
-
-    /// `materialize` is serviced through `read`, so the recorded call is
-    /// `read`, and returns a readable staged temp file.
-    #[tokio::test]
-    async fn materialize_stages_via_read_and_records_read() {
-        let layer = layer_with_root("test://demo/");
-        let address = Url::parse("test://demo/staged.txt").unwrap();
-        layer
-            .write(
-                Request::new(WriteRequest {
-                    address: address.clone(),
-                    body: Body::Bytes(b"staged-bytes".to_vec()),
-                    options: WriteOptions::default(),
-                }),
-                None,
-            )
-            .await
-            .expect("seed write");
-        let recorder = layer
-            .shared
-            .recorder_for(&Url::parse("test://demo/").unwrap())
-            .expect("recorder");
-        recorder.clear();
-
-        let delegate = layer
-            .materialize(
-                Request::new(ReadRequest {
-                    address,
-                    options: ReadOptions::default(),
-                }),
-                None,
-            )
-            .await
-            .expect("materialize stages the object");
-        let staged = std::fs::read(&delegate.path).expect("staged file readable");
-        assert_eq!(staged, b"staged-bytes");
-        std::fs::remove_file(&delegate.path).ok();
-
-        let recorded: Vec<&str> = recorder
-            .snapshot()
-            .iter()
-            .map(|call| call.method_name())
-            .collect();
-        assert_eq!(
-            recorded,
-            vec!["read"],
-            "materialize must record its delegated `read`"
-        );
     }
 }

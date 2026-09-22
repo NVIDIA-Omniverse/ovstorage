@@ -5,7 +5,10 @@ use super::*;
 use ovstorage::auth::flow::test_support::FakeIdp;
 use ovstorage::auth::{AuthRefreshLock, OAuthCredentialProvider, OAuthStrategy};
 use ovstorage::ext::LayerExt as _;
-use ovstorage::{ConfigValue, ConnectionRequest, SecretBundle};
+use ovstorage::{
+    ConfigValue, ConnectionRequest, RedirectResult, RedirectResultBatch, SecretBundle,
+};
+use ovstorage_broker_protocol as protocol;
 
 fn sqlite_store(state_root: &std::path::Path) -> Arc<dyn ovstorage::auth::SecretStore> {
     Arc::new(ovstorage::auth::SqliteSecretStore::open(state_root).expect("open sqlite store"))
@@ -147,6 +150,192 @@ async fn broker_grpc_round_trips_without_client_backend_plugin() {
     );
     shutdown_test_server(server).await;
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn broker_grpc_round_trips_sealed_write_continuations_and_maps_refusals() {
+    let config = HashMap::from([
+        (
+            "test_redirect_url".to_string(),
+            ConfigValue::String("https://redirect.test.example".into()),
+        ),
+        ("test_continue_write_loops".to_string(), ConfigValue::Int(1)),
+    ]);
+    let broker = Arc::new(
+        BrokerStackFixture::new()
+            .test_backend(config)
+            .build_broker()
+            .await,
+    );
+    let server = spawn_broker_grpc_tcp_listener(broker, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let channel =
+        tonic::transport::Endpoint::from_shared(format!("http://{}", server.local_addr()))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+    let mut client = pb::broker_service_client::BrokerServiceClient::new(channel)
+        .max_decoding_message_size(protocol::BROKER_GRPC_MAX_DECODING_MESSAGE_SIZE);
+
+    let address = address::parse("test://demo/grpc-sealed.bin").unwrap();
+    let redirects = client
+        .write_redirect(pb::WriteRedirectRequest {
+            address: protocol::object_address_to_proto(&address),
+            options: Some(protocol::write_options_to_proto(&WriteOptions::default())),
+        })
+        .await
+        .expect("write_redirect succeeds over gRPC")
+        .into_inner()
+        .redirects
+        .expect("write_redirect returns a batch");
+    assert!(
+        redirects
+            .continuation
+            .starts_with(crate::continuation_seal::CONTINUATION_SEAL_TAG.as_bytes()),
+        "the opaque wire continuation carries the versioned seal envelope"
+    );
+    let results = RedirectResultBatch {
+        results: redirects
+            .redirects
+            .iter()
+            .map(|_| RedirectResult {
+                status_code: 200,
+                captured_headers: Vec::new(),
+                captured_body: Vec::new(),
+            })
+            .collect(),
+    };
+    let response = client
+        .continue_write(pb::ContinueWriteRequest {
+            address: protocol::object_address_to_proto(&address),
+            redirects: Some(redirects),
+            results: Some(protocol::redirect_result_batch_to_proto(&results)),
+        })
+        .await
+        .expect("the unchanged sealed continuation round-trips over gRPC")
+        .into_inner();
+    let step = response.step.expect("continue_write returns a step");
+    let pb::continue_write_response::Step::Done(done) = step else {
+        panic!("one-round gRPC upload must complete");
+    };
+    let done = protocol::write_result_from_proto(Some(done)).expect("write result decodes");
+    assert_eq!(done.info.address, address);
+
+    let refused_address = address::parse("test://demo/grpc-tampered.bin").unwrap();
+    let mut tampered = client
+        .write_redirect(pb::WriteRedirectRequest {
+            address: protocol::object_address_to_proto(&refused_address),
+            options: Some(protocol::write_options_to_proto(&WriteOptions::default())),
+        })
+        .await
+        .expect("second write_redirect succeeds over gRPC")
+        .into_inner()
+        .redirects
+        .expect("second write_redirect returns a batch");
+    let refused_results = RedirectResultBatch {
+        results: tampered
+            .redirects
+            .iter()
+            .map(|_| RedirectResult {
+                status_code: 200,
+                captured_headers: Vec::new(),
+                captured_body: Vec::new(),
+            })
+            .collect(),
+    };
+    tampered.continuation[0] ^= 1;
+    let error = client
+        .continue_write(pb::ContinueWriteRequest {
+            address: protocol::object_address_to_proto(&refused_address),
+            redirects: Some(tampered),
+            results: Some(protocol::redirect_result_batch_to_proto(&refused_results)),
+        })
+        .await
+        .expect_err("a tampered wire continuation is refused");
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("continuation seal"));
+
+    shutdown_test_server(server).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn broker_grpc_production_client_round_trips_a_continuation_larger_than_tonic_default() {
+    const TONIC_DEFAULT_MAX_DECODING_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+    const PADDING_LEN: usize = 5 * 1024 * 1024;
+
+    let config = HashMap::from([
+        (
+            "test_redirect_url".to_string(),
+            ConfigValue::String("https://redirect.test.example".into()),
+        ),
+        ("test_continue_write_loops".to_string(), ConfigValue::Int(1)),
+    ]);
+    let broker = Arc::new(
+        BrokerStackFixture::new()
+            .test_backend(config)
+            .build_broker()
+            .await,
+    );
+    let server = spawn_broker_grpc_tcp_listener(broker, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let client = broker_client_stack(&server.endpoint_url()).await;
+    let address = address::parse("test://demo/grpc-large-continuation.bin").unwrap();
+    let options = WriteOptions {
+        user_metadata: Some(HashMap::from([(
+            "padding".to_string(),
+            "x".repeat(PADDING_LEN),
+        )])),
+        ..WriteOptions::default()
+    };
+
+    let redirects = client
+        .write_redirect(
+            ovstorage::Request::new(WriteRequest {
+                address: address.clone(),
+                body: Body::Bytes(Vec::new()),
+                options,
+            }),
+            None,
+        )
+        .await
+        .expect("a continuation larger than tonic's default fits the broker gRPC response");
+    assert!(
+        redirects.continuation.len() > TONIC_DEFAULT_MAX_DECODING_MESSAGE_SIZE,
+        "the test must exercise a continuation larger than tonic's default decoding limit"
+    );
+    assert!(
+        redirects.continuation.len()
+            < PADDING_LEN + crate::continuation_seal::CONTINUATION_SEAL_HEADER_LEN + 1024,
+        "the compact envelope must not base64-expand the plugin continuation"
+    );
+    let results = RedirectResultBatch {
+        results: redirects
+            .redirects
+            .iter()
+            .map(|_| RedirectResult {
+                status_code: 200,
+                captured_headers: Vec::new(),
+                captured_body: Vec::new(),
+            })
+            .collect(),
+    };
+
+    let step = client
+        .continue_write(
+            ovstorage::Request::new(ContinueWriteRequest {
+                address: address.clone(),
+                redirects,
+                results,
+            }),
+            None,
+        )
+        .await
+        .expect("the large sealed continuation fits the broker gRPC request");
+    let ovstorage::WriteStep::Done(done) = step else {
+        panic!("one-round large-continuation upload must complete");
+    };
+    assert_eq!(done.info.address, address);
+
+    shutdown_test_server(server).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

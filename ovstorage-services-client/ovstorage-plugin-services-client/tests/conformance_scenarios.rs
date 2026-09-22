@@ -4,18 +4,21 @@
 //! Registry-as-spec conformance pass for the omniverse-storage-service
 //! plugin (RFC-0066): iterate every named scenario in
 //! `ovstorage_plugin_test::ScenarioRegistry::with_defaults()` and either
-//! DRIVE it against `OmniverseStorageBackend` or SKIP it with a concrete
-//! reason. Recorder-based `expected_calls` verification is
+//! DRIVE it against the plugin implementation or SKIP it with a concrete
+//! reason. Layer-specific scenarios cross the producer/consumer ABI bridge;
+//! recorder-based `expected_calls` verification is
 //! test-backend-only, so driven scenarios assert the observable outcome
 //! (success shape or the exact `failure_contract` error code) and push
 //! `ScenarioReport::passed`.
 //!
-//! Hermetic fixture: an in-process tonic Storage API fake served over a
-//! tokio duplex channel — the same transport fixture shape as
-//! `tests/end_to_end.rs` / `tests/streaming_invariant.rs` (no network, no
-//! auth; the fake mirrors the fileobject/filefolder v1alpha wire contract
-//! that `skills/ovstorage-contributor-services-client-conformance/SKILL.md`
-//! documents as covered by the service's own conformance suite).
+//! Hermetic fixture: an in-process tonic Storage API fake. Backend drivers use
+//! the tokio duplex transport from `tests/end_to_end.rs` /
+//! `tests/streaming_invariant.rs`; the Layer/ABI driver binds loopback because
+//! the real factory must dial its configured endpoint. No external network or
+//! auth is involved; the fake mirrors the fileobject/filefolder v1alpha wire
+//! contract that
+//! `skills/ovstorage-contributor-services-client-conformance/SKILL.md`
+//! documents as covered by the service's own conformance suite.
 //!
 //! Applicability is gated on the scenario's `required_profile` /
 //! `required_capabilities` against the plugin's real advertised bits
@@ -33,25 +36,29 @@
 //! observable at the plugin seam.
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::{Stream, StreamExt};
 use ovstorage_plugin::{
-    BackendId, Capabilities, DeleteOptions, ErrorCode, ListOptions, ObjectKind, ReadOptions,
-    ReadResult, RedirectResult, RedirectResultBatch, ResolvedTarget, StatOptions, Url,
-    WriteOptions, WriteStep,
+    BackendFactory, BackendId, CancellationToken, Capabilities, ConfigValue, DeleteOptions,
+    ErrorCode, LayerConfig, LayerHandle, ListOptions, ListRequest, ObjectKind, ReadOptions,
+    ReadResult, RedirectResult, RedirectResultBatch, Request as LayerRequest, ResolvedTarget,
+    StatOptions, Url, WriteOptions, WriteStep,
 };
 use ovstorage_plugin_services_client::auth::DiscoveryState;
 use ovstorage_plugin_services_client::backend::OmniverseStorageBackend;
 use ovstorage_plugin_services_client::factory::descriptor_capabilities;
+use ovstorage_plugin_services_client::layer::OmniverseStorageLayerFactory;
 use ovstorage_plugin_services_client::transport::OmniverseStorageTransport;
 use ovstorage_plugin_test::{
     ConformanceReport, FailureContract, Profile, Scenario, ScenarioOutcome, ScenarioRegistry,
     ScenarioReport, ScenarioRunner,
 };
+use ovstorage_services_protos::nvidia::omniverse::storage::capabilities::v1alpha as cap;
 use ovstorage_services_protos::nvidia::omniverse::storage::filefolder::v1alpha as ff;
 use ovstorage_services_protos::nvidia::omniverse::storage::fileobject::v1alpha as fo;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -304,6 +311,61 @@ impl fo::file_object_service_server::FileObjectService for FakeFileObjectService
 #[derive(Clone)]
 struct FakeFileFolderService {
     recorded: Arc<Mutex<Recorded>>,
+    list_stat_behavior: ListStatBehavior,
+}
+
+#[derive(Clone)]
+enum ListStatBehavior {
+    SingleFrame,
+    GatedTwoFrames(Arc<GatedListStat>),
+}
+
+struct GatedListStat {
+    calls: AtomicUsize,
+    parity_release: Semaphore,
+    cancellation_release: Semaphore,
+    released_second_frames: AtomicUsize,
+}
+
+impl GatedListStat {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            calls: AtomicUsize::new(0),
+            parity_release: Semaphore::new(0),
+            cancellation_release: Semaphore::new(0),
+            released_second_frames: AtomicUsize::new(0),
+        })
+    }
+
+    fn next_call(&self) -> usize {
+        self.calls.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    async fn wait_to_release_second_frame(&self, call: usize) {
+        let semaphore = match call {
+            // Call one is the buffered parity oracle and may drain both frames.
+            1 => return,
+            2 => &self.parity_release,
+            3 => &self.cancellation_release,
+            // Unexpected extra calls stay observable through `calls` without
+            // parking the fixture forever.
+            _ => return,
+        };
+        let permit = semaphore
+            .acquire()
+            .await
+            .expect("list-stat frame gate remains open");
+        permit.forget();
+        self.released_second_frames.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn release_parity_frame(&self) {
+        self.parity_release.add_permits(1);
+    }
+
+    fn release_cancellation_frame(&self) {
+        self.cancellation_release.add_permits(1);
+    }
 }
 
 #[tonic::async_trait]
@@ -330,35 +392,64 @@ impl ff::file_folder_service_server::FileFolderService for FakeFileFolderService
             .map(|folder| folder.uri)
             .unwrap_or_default();
         self.recorded.lock().unwrap().list_stat_folders.push(folder);
-        // One page: a subfolder plus a stat-carrying file entry, and one
-        // unaddressable sibling of each.
-        //
-        // The doubled separator is a spelling `parse_server_address` refuses:
-        // it names a different node from the one it spells, so no caller could
-        // act on it. Both are placed FIRST so that a page which aborted on one
-        // would hide every valid entry behind it — which is exactly what the
-        // scenario's fold assertion then detects.
-        let stream = tokio_stream::iter(vec![Ok(ff::ListStatResponse {
-            subfolder_addresses: vec![
-                ff::FolderAddress {
-                    uri: "omni://server/dir//unaddressable/".into(),
-                },
-                ff::FolderAddress {
-                    uri: "omni://server/dir/sub/".into(),
-                },
-            ],
-            entries: vec![
-                ff::ListItem {
-                    resource_address: "omni://server/dir//unaddressable.usd".into(),
-                    resource_info: Some(resource_info("e0", 3)),
-                },
-                ff::ListItem {
-                    resource_address: "omni://server/dir/file.usd".into(),
-                    resource_info: Some(resource_info("e1", 17)),
-                },
-            ],
-        })]);
-        Ok(Response::new(Box::pin(stream)))
+        match &self.list_stat_behavior {
+            ListStatBehavior::SingleFrame => {
+                // One page: a subfolder plus a stat-carrying file entry, and
+                // one unaddressable sibling of each.
+                //
+                // The doubled separator is a spelling `parse_server_address`
+                // refuses: it names a different node from the one it spells,
+                // so no caller could act on it. Both are placed FIRST so that a
+                // page which aborted on one would hide every valid entry behind
+                // it — which is exactly what the scenario's fold assertion then
+                // detects.
+                let stream = tokio_stream::iter(vec![Ok(ff::ListStatResponse {
+                    subfolder_addresses: vec![
+                        ff::FolderAddress {
+                            uri: "omni://server/dir//unaddressable/".into(),
+                        },
+                        ff::FolderAddress {
+                            uri: "omni://server/dir/sub/".into(),
+                        },
+                    ],
+                    entries: vec![
+                        ff::ListItem {
+                            resource_address: "omni://server/dir//unaddressable.usd".into(),
+                            resource_info: Some(resource_info("e0", 3)),
+                        },
+                        ff::ListItem {
+                            resource_address: "omni://server/dir/file.usd".into(),
+                            resource_info: Some(resource_info("e1", 17)),
+                        },
+                    ],
+                })]);
+                Ok(Response::new(Box::pin(stream)))
+            }
+            ListStatBehavior::GatedTwoFrames(gate) => {
+                let call = gate.next_call();
+                let first = ff::ListStatResponse {
+                    subfolder_addresses: vec![ff::FolderAddress {
+                        uri: "omni://server/dir/sub/".into(),
+                    }],
+                    entries: Vec::new(),
+                };
+                let second = ff::ListStatResponse {
+                    subfolder_addresses: Vec::new(),
+                    entries: vec![ff::ListItem {
+                        resource_address: "omni://server/dir/file.usd".into(),
+                        resource_info: Some(resource_info("e1", 17)),
+                    }],
+                };
+                let gate = gate.clone();
+                let stream = futures::stream::once(async move { Ok(first) }).chain(
+                    futures::stream::once(async move {
+                        gate.wait_to_release_second_frame(call).await;
+                        Ok(second)
+                    }),
+                );
+                Ok(Response::new(Box::pin(stream)))
+            }
+        }
     }
 
     async fn create_folder(
@@ -383,6 +474,37 @@ impl ff::file_folder_service_server::FileFolderService for FakeFileFolderService
     }
 }
 
+#[derive(Clone)]
+struct FakeCapabilitiesService;
+
+#[tonic::async_trait]
+impl cap::capabilities_service_server::CapabilitiesService for FakeCapabilitiesService {
+    async fn list_top_level_addresses(
+        &self,
+        _req: Request<cap::ListTopLevelAddressesRequest>,
+    ) -> std::result::Result<Response<cap::ListTopLevelAddressesResponse>, Status> {
+        Ok(Response::new(cap::ListTopLevelAddressesResponse {
+            items: vec![cap::TopLevelAddressEntry {
+                top_level_address: "omni://server/".into(),
+            }],
+        }))
+    }
+
+    async fn list_routes(
+        &self,
+        _req: Request<cap::ListRoutesRequest>,
+    ) -> std::result::Result<Response<cap::ListRoutesResponse>, Status> {
+        Ok(Response::new(cap::ListRoutesResponse::default()))
+    }
+
+    async fn list_services(
+        &self,
+        _req: Request<cap::ListServicesRequest>,
+    ) -> std::result::Result<Response<cap::ListServicesResponse>, Status> {
+        Ok(Response::new(cap::ListServicesResponse::default()))
+    }
+}
+
 /// Backend wired to a fresh scripted fake over a duplex channel.
 async fn spawn_backend(
     write_behavior: WriteBehavior,
@@ -394,6 +516,7 @@ async fn spawn_backend(
     };
     let filefolder = FakeFileFolderService {
         recorded: recorded.clone(),
+        list_stat_behavior: ListStatBehavior::SingleFrame,
     };
     let (client, server) = tokio::io::duplex(64 * 1024);
     let mut server_io = Some(server);
@@ -423,6 +546,56 @@ async fn spawn_backend(
     // Detach the server task; it shuts down when its duplex peer closes.
     drop(server_task);
     (backend, recorded)
+}
+
+/// Real Layer routing/recovery wired to the scripted services over a loopback
+/// endpoint, plus the same Layer exported and re-imported through the v18 ABI.
+async fn spawn_layer_over_abi(
+    write_behavior: WriteBehavior,
+) -> (LayerHandle, Arc<Mutex<Recorded>>, Arc<GatedListStat>) {
+    let recorded = Arc::new(Mutex::new(Recorded::default()));
+    let list_gate = GatedListStat::new();
+    let fileobject = FakeFileObjectService {
+        write_behavior,
+        recorded: recorded.clone(),
+    };
+    let filefolder = FakeFileFolderService {
+        recorded: recorded.clone(),
+        list_stat_behavior: ListStatBehavior::GatedTwoFrames(list_gate.clone()),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind services-client conformance fixture");
+    let authority = listener
+        .local_addr()
+        .expect("services-client conformance fixture address");
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(
+                cap::capabilities_service_server::CapabilitiesServiceServer::new(
+                    FakeCapabilitiesService,
+                ),
+            )
+            .add_service(fo::file_object_service_server::FileObjectServiceServer::new(fileobject))
+            .add_service(ff::file_folder_service_server::FileFolderServiceServer::new(filefolder))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .ok();
+    });
+
+    let mut config = LayerConfig::new();
+    config.insert(
+        "address".into(),
+        ConfigValue::String(format!("grpc://{authority}")),
+    );
+    let layer = OmniverseStorageLayerFactory::default()
+        .create_backend("services-conformance", &config, None)
+        .await
+        .expect("create services-client Layer against scripted endpoint");
+    let handle = ovstorage_plugin::thunks_v2::export_handle(layer);
+    let foreign = ovstorage_plugin::consume_v2::ForeignVtableLayer::from_handle(handle, None)
+        .expect("import services-client Layer through the foreign vtable bridge");
+    (foreign, recorded, list_gate)
 }
 
 fn target(path: &str) -> ResolvedTarget {
@@ -460,6 +633,7 @@ fn advertises(caps: &Capabilities, bit: &str) -> bool {
         "supports_version_listing" => caps.supports_version_listing,
         "has_real_directories" => caps.has_real_directories,
         "supports_recursive_list" => caps.supports_recursive_list,
+        "supports_list_stream" => caps.supports_list_stream,
         "supports_server_side_copy" => caps.supports_server_side_copy,
         "supports_server_side_rename" => caps.supports_server_side_rename,
         "supports_atomic_rename" => caps.supports_atomic_rename,
@@ -844,6 +1018,198 @@ async fn drive_list_one_level_vs_recursive(scenario: &Scenario) -> ScenarioRepor
     }
 }
 
+/// The service has one-level `ListStat` only, so exercise streamed parity and
+/// cancellation for the supported mode here; the companion listing scenario
+/// above pins the recursive `Unsupported` branch.
+async fn drive_list_stream_parity_and_cancel(scenario: &Scenario) -> ScenarioReport {
+    let (foreign, recorded, list_gate) = spawn_layer_over_abi(WriteBehavior::Inline).await;
+    let prefix = Url::parse("omni://server/dir/").expect("scenario prefix parses");
+    let gate_timeout = std::time::Duration::from_secs(2);
+    // Every walk crosses the producer/consumer ABI. The fake's first walk is
+    // the ungated buffered oracle; walks two and three each emit exactly one
+    // entry, then park before their second ListStat frame.
+    let buffered = match foreign
+        .list(
+            LayerRequest::new(ListRequest {
+                prefix: prefix.clone(),
+                options: ListOptions::default(),
+            }),
+            None,
+        )
+        .await
+    {
+        Ok(page) => page.items,
+        Err(err) => return fail(scenario, format!("buffered list failed: {err}")),
+    };
+    let mut stream = match tokio::time::timeout(
+        gate_timeout,
+        foreign.list_stream(
+            LayerRequest::new(ListRequest {
+                prefix: prefix.clone(),
+                options: ListOptions::default(),
+            }),
+            None,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => return fail(scenario, format!("list_stream failed to open: {err}")),
+        Err(_) => {
+            list_gate.release_parity_frame();
+            return fail(
+                scenario,
+                "list_stream did not open before the gated second ListStat frame; the Layer likely used the buffered adapter"
+                    .into(),
+            );
+        }
+    };
+    let first = match tokio::time::timeout(gate_timeout, stream.next()).await {
+        Ok(Some(Ok(item))) => item,
+        Ok(other) => {
+            list_gate.release_parity_frame();
+            return fail(
+                scenario,
+                format!("list_stream first entry failed before frame release: {other:?}"),
+            );
+        }
+        Err(_) => {
+            list_gate.release_parity_frame();
+            return fail(
+                scenario,
+                "list_stream did not yield the first frame while the second frame was gated".into(),
+            );
+        }
+    };
+    if first != buffered[0] {
+        list_gate.release_parity_frame();
+        return fail(
+            scenario,
+            format!(
+                "list_stream first entry differs from buffered list: {first:?} != {:?}",
+                buffered[0]
+            ),
+        );
+    }
+    if list_gate.released_second_frames.load(Ordering::SeqCst) != 0 {
+        list_gate.release_parity_frame();
+        return fail(
+            scenario,
+            "the second ListStat frame was released before the first streamed entry".into(),
+        );
+    }
+
+    list_gate.release_parity_frame();
+    let mut streamed = vec![first];
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(item) => streamed.push(item),
+            Err(err) => return fail(scenario, format!("list_stream failed: {err}")),
+        }
+    }
+    if streamed != buffered {
+        return fail(
+            scenario,
+            format!("streamed list differs from buffered list: {streamed:?} != {buffered:?}"),
+        );
+    }
+    if list_gate.released_second_frames.load(Ordering::SeqCst) != 1 {
+        return fail(
+            scenario,
+            "the full stream did not consume exactly one gated second frame".into(),
+        );
+    }
+
+    let cancel = CancellationToken::new();
+    let mut stream = match tokio::time::timeout(
+        gate_timeout,
+        foreign.list_stream(
+            LayerRequest::new(ListRequest {
+                prefix,
+                options: ListOptions::default(),
+            }),
+            Some(cancel.clone()),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => {
+            return fail(
+                scenario,
+                format!("cancellable list_stream failed to open: {err}"),
+            );
+        }
+        Err(_) => {
+            list_gate.release_cancellation_frame();
+            return fail(
+                scenario,
+                "cancellable list_stream did not open before its gated second ListStat frame"
+                    .into(),
+            );
+        }
+    };
+    match tokio::time::timeout(gate_timeout, stream.next()).await {
+        Ok(Some(Ok(first))) if first == buffered[0] => {}
+        Ok(other) => {
+            list_gate.release_cancellation_frame();
+            return fail(
+                scenario,
+                format!("cancellable list_stream first entry mismatch: {other:?}"),
+            );
+        }
+        Err(_) => {
+            list_gate.release_cancellation_frame();
+            return fail(
+                scenario,
+                "cancellable list_stream did not yield its first gated frame".into(),
+            );
+        }
+    }
+    cancel.cancel();
+    match tokio::time::timeout(gate_timeout, stream.next()).await {
+        Ok(Some(Err(err))) if err.code() == ErrorCode::Cancelled => {}
+        Ok(other) => {
+            list_gate.release_cancellation_frame();
+            return fail(
+                scenario,
+                format!("list_stream cancellation must be terminal Cancelled: {other:?}"),
+            );
+        }
+        Err(_) => {
+            list_gate.release_cancellation_frame();
+            return fail(
+                scenario,
+                "list_stream cancellation did not cross the v17 bridge promptly".into(),
+            );
+        }
+    }
+    if stream.next().await.is_some() {
+        list_gate.release_cancellation_frame();
+        return fail(scenario, "an entry followed terminal cancellation".into());
+    }
+    if list_gate.released_second_frames.load(Ordering::SeqCst) != 1 {
+        list_gate.release_cancellation_frame();
+        return fail(
+            scenario,
+            "cancellation allowed the gated second ListStat frame to escape".into(),
+        );
+    }
+    if recorded.lock().unwrap().list_stat_folders.len() != 3 {
+        return fail(
+            scenario,
+            "buffered, streamed, and cancellable listing must each issue one ListStat RPC".into(),
+        );
+    }
+    if list_gate.calls.load(Ordering::SeqCst) != 3 {
+        return fail(
+            scenario,
+            "the Layer/ABI scenario must open exactly three ListStat streams".into(),
+        );
+    }
+    pass(scenario)
+}
+
 /// Protocol-slot contract at the plugin seam: `write_redirect` only plans
 /// (no `CompleteRedirectUpload` fires), and the mutation commits at
 /// `continue_write` → `WriteStep::Done` — with the captured completion
@@ -955,6 +1321,9 @@ async fn conformance_scenarios_cover_the_registry() {
                 "write-done-inline" => drive_write_done_inline(scenario).await,
                 "delete-existing-object" => drive_delete_existing_object(scenario).await,
                 "list-one-level-vs-recursive" => drive_list_one_level_vs_recursive(scenario).await,
+                "list-stream-parity-and-cancel" => {
+                    drive_list_stream_parity_and_cancel(scenario).await
+                }
                 "write-redirect-commits-on-done" => {
                     drive_write_redirect_commits_on_done(scenario).await
                 }
@@ -967,7 +1336,8 @@ async fn conformance_scenarios_cover_the_registry() {
                 ),
                 "compat-gates-v1-capability"
                 | "retry-never-replays-continue-write"
-                | "protocol-slots-pass-through" => runner.skip(
+                | "protocol-slots-pass-through"
+                | "materialize-unsupported-without-cache" => runner.skip(
                     scenario.name,
                     "host/wrapper-side protocol-slot contract; driven in ovstorage's \
                      conformance_protocol_slots.rs",
@@ -1035,6 +1405,7 @@ async fn conformance_scenarios_cover_the_registry() {
         vec![
             "delete-existing-object",
             "list-one-level-vs-recursive",
+            "list-stream-parity-and-cancel",
             "read-streamed-empty",
             "stat-basic-objectinfo",
             "stat-not-found",

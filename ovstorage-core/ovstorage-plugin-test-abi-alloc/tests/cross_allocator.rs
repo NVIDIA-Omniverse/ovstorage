@@ -28,8 +28,10 @@
 //! value the host releases, and the host producing one the plugin releases.
 //! One of each per round-trip would cancel in a single net figure.
 //!
-//! Gate-based: every round-trip is awaited to completion, so there is
-//! nothing in flight when a sample is taken.
+//! Gate-based: every round-trip is awaited, then allocator sampling waits for
+//! the completion task's own allocation to return to its quiescent baseline.
+//! The callback wakes the host before Tokio reclaims that final task, so an
+//! awaited result alone is not a runtime-quiescence signal.
 //!
 //! # Rebuild the cdylib
 //!
@@ -49,6 +51,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ovstorage::ext::LayerExt as _;
 use ovstorage::{
@@ -64,6 +67,14 @@ const PLUGIN_PATH: &str = env!("OVSTORAGE_PLUGIN_TEST_ALLOC_SO");
 /// measures; both samples run after warm-up.
 const FEW: usize = 5;
 const MANY: usize = 105;
+
+/// Completion callbacks run inside the plugin runtime task. The awaiting host
+/// can resume before Tokio reclaims that task's allocator block, so allocator
+/// samples wait for a short stable interval after warm-up and for the measured
+/// batch to return to that baseline.
+const QUIESCENCE_POLL: Duration = Duration::from_millis(5);
+const QUIESCENCE_WINDOW: Duration = Duration::from_millis(100);
+const QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Read one of the cdylib's counter exports.
 ///
@@ -81,7 +92,7 @@ fn counter(symbol: &[u8]) -> i64 {
 }
 
 /// The two directions, sampled together so one reading covers both.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Probes {
     /// Blocks the plugin minted on its own allocator and never got back.
     retained: i64,
@@ -105,6 +116,57 @@ impl Probes {
             probes.retained, probes.foreign_frees,
         );
         probes
+    }
+}
+
+/// Wait until plugin allocator accounting has stopped changing. This is used
+/// only after first-use warm-up, where the stable value becomes the baseline
+/// for the strict measured batches below.
+async fn probes_after_quiescence() -> Probes {
+    let deadline = Instant::now() + QUIESCENCE_TIMEOUT;
+    let mut probes = Probes::read();
+    let mut unchanged_since = Instant::now();
+
+    loop {
+        tokio::time::sleep(QUIESCENCE_POLL).await;
+        let current = Probes::read();
+        if current == probes {
+            if unchanged_since.elapsed() >= QUIESCENCE_WINDOW {
+                return current;
+            }
+        } else {
+            probes = current;
+            unchanged_since = Instant::now();
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "plugin allocator accounting did not quiesce within {QUIESCENCE_TIMEOUT:?}: \
+             retained {}, foreign frees {}",
+            current.retained,
+            current.foreign_frees,
+        );
+    }
+}
+
+/// Wait for the final completion task in a measured batch to release its own
+/// plugin-global allocation. A genuine cross-ABI retained block cannot return
+/// to `baseline`, so it reaches the deadline and still fails this gate.
+async fn probes_at_retained_baseline(baseline: i64) -> Probes {
+    let deadline = Instant::now() + QUIESCENCE_TIMEOUT;
+
+    loop {
+        let current = Probes::read();
+        if current.retained == baseline {
+            return current;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "plugin allocator retained {} blocks after the ABI batch; expected the quiescent \
+             baseline {baseline}",
+            current.retained,
+        );
+        tokio::time::sleep(QUIESCENCE_POLL).await;
     }
 }
 
@@ -263,16 +325,18 @@ async fn round_trip(fixture: &Fixture) {
     }
 }
 
-async fn drive(fixture: &Fixture, count: usize) -> Probes {
-    let before = Probes::read();
+async fn drive(fixture: &Fixture, count: usize, before: Probes) -> (Probes, Probes) {
     for _ in 0..count {
         round_trip(fixture).await;
     }
-    let after = Probes::read();
-    Probes {
-        retained: after.retained - before.retained,
-        foreign_frees: after.foreign_frees - before.foreign_frees,
-    }
+    let after = probes_at_retained_baseline(before.retained).await;
+    (
+        Probes {
+            retained: after.retained - before.retained,
+            foreign_frees: after.foreign_frees - before.foreign_frees,
+        },
+        after,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -284,8 +348,9 @@ async fn abi_values_do_not_ride_the_plugin_global_allocator() {
         round_trip(&fixture).await;
     }
 
-    let few = drive(&fixture, FEW).await;
-    let many = drive(&fixture, MANY).await;
+    let baseline = probes_after_quiescence().await;
+    let (few, baseline) = drive(&fixture, FEW, baseline).await;
+    let (many, _) = drive(&fixture, MANY, baseline).await;
 
     // Any per-round-trip imbalance shows up as a difference that scales with
     // the extra `MANY - FEW` round-trips. Warm-up state appears in both

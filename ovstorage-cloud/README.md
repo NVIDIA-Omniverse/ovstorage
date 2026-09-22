@@ -12,6 +12,7 @@ and dependency graph.
 - [`ovstorage-plugin-s3`](ovstorage-plugin-s3/README.md) — AWS S3 + S3-compatible (MinIO, Cloudflare R2, Backblaze B2, custom). Hand-rolled SigV4 signer, native multipart uploads, presigned-URL redirects.
 - [`ovstorage-plugin-gcs`](ovstorage-plugin-gcs/README.md) — Google Cloud Storage. OAuth bearer tokens, V4 query-signing for service accounts, resumable uploads.
 - [`ovstorage-plugin-azure`](ovstorage-plugin-azure/README.md) — Azure Blob and ADLS Gen2 (HNS-aware). Shared Access Signatures, shared-key signing, lease-based atomic writes.
+- [`ovstorage-plugin-huggingface`](ovstorage-plugin-huggingface/README.md) — Hugging Face Hub repositories (read-only). Hand-rolled Hub REST client; revision-pinned addresses, LFS reads via signed CDN redirects.
 - [`ovstorage-plugin-opendal`](ovstorage-plugin-opendal/README.md) — long-tail backends fronted by Apache OpenDAL. Driver-specific capabilities mapped to ovstorage's capability matrix. The descriptor's `service` enum advertises only the OpenDAL services the workspace actually compiles in (`fs`, `s3`, `webdav`); additional services require enabling their `services-*` feature on the workspace's `opendal` dep and adding a matching `DriverSpec`.
 
 Plugin authors writing additional cloud-flavored backends should start at

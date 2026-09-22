@@ -736,6 +736,180 @@ async fn sows_request_and_response_bodies_stay_out_of_events() {
     }
 }
 
+/// A websocket server that turns one real SOWS request into a remote error.
+///
+/// The client chooses the request id, so the server reads it from bytes 1..5
+/// of the `REQUEST_SEND` frame and copies it into the `RESPONSE_ERROR` frame.
+/// The response payload is the two-byte little-endian code followed by the
+/// server-chosen message with no length prefix.
+async fn sows_error_server(message: String) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let path = unique_path();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        let (mut sink, mut stream) = ws.split();
+        if let Some(Ok(Message::Binary(data))) = stream.next().await {
+            assert!(data.len() >= 5, "SOWS request frame is missing its id");
+            assert_eq!(data[0], 1, "expected a REQUEST_SEND frame");
+            let id = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+
+            let mut frame = Vec::with_capacity(7 + message.len());
+            frame.push(0u8); // RESPONSE_ERROR
+            frame.extend_from_slice(&id.to_le_bytes());
+            frame.extend_from_slice(&403u16.to_le_bytes());
+            frame.extend_from_slice(message.as_bytes());
+            let _ = sink.send(Message::Binary(frame)).await;
+        }
+        std::future::pending::<()>().await;
+    });
+    format!("ws://127.0.0.1:{port}{path}")
+}
+
+/// The real SOWS read loop sanitizes `RESPONSE_ERROR` prose before constructing
+/// the error delivered to a subscription.
+///
+/// This is deliberately not a unit test of the helper or `remote_error`: the
+/// server reads the id from a request the transport framed, sends the wire
+/// error response, and `recv_raw` observes the error after the pending-map
+/// demux. That closes the call-site gap where a correct helper could remain
+/// unused on the server-error path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sows_response_error_is_redacted_and_bounded_end_to_end() {
+    const ERROR_SENTINEL: &str = "sentinel-sows-error-must-not-be-logged";
+
+    install_capture();
+    let message = format!(
+        "denied wss://[::1]/p?access_token={ERROR_SENTINEL}&X-Amz-Signature={ERROR_SENTINEL} {}",
+        "x".repeat(4096)
+    );
+    let original_len = message.len();
+    let url = sows_error_server(message).await;
+
+    let transport = SowsTransport::connect(&url).await.unwrap();
+    let mut sub = transport
+        .send("Tokens", "subscribe", serde_json::json!({}), None)
+        .await
+        .unwrap();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(30), sub.recv_raw())
+        .await
+        .expect("the error server never answered; it most likely panicked")
+        .expect_err("a RESPONSE_ERROR frame must fail the subscription");
+    let displayed = err.to_string();
+
+    assert!(
+        displayed.contains("access_token=REDACTED"),
+        "the surfaced error lost its redaction marker: {displayed}"
+    );
+    assert!(
+        displayed.contains("X-Amz-Signature=REDACTED"),
+        "the surfaced error lost its signed-URL redaction marker: {displayed}"
+    );
+    assert!(
+        displayed.contains(&format!(
+            "[truncated; original length: {original_len} bytes]"
+        )),
+        "the surfaced error lost its truncation marker: {displayed}"
+    );
+    assert!(
+        displayed.len() <= 640,
+        "the surfaced error was not bounded: {} bytes",
+        displayed.len()
+    );
+    assert!(
+        !displayed.contains(ERROR_SENTINEL),
+        "the surfaced error retained the server credential: {displayed}"
+    );
+
+    let all = snapshot();
+    let mine = events_for_conn(&all, "nucleus_transport::sows", &conn_id_for(&all, &url));
+    assert!(
+        mine.iter()
+            .any(|e| e.contains("received remote error for request") && e.contains(" code=403")),
+        "the SOWS RESPONSE_ERROR arm emitted no event, so this proves nothing: {mine:?}"
+    );
+    for event in &all {
+        assert!(
+            !event.contains(ERROR_SENTINEL),
+            "a RESPONSE_ERROR credential reached a tracing event: {event}"
+        );
+    }
+}
+
+/// A ConnLib server that pushes metadata whose `id` has the wrong JSON type.
+///
+/// serde includes the offending string in its diagnostic, so putting a
+/// credential-bearing URL there drives server-chosen text through the real
+/// metadata parser and its warning site.
+async fn malformed_metadata_server(id: String) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let path = unique_path();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        let frame = serde_json::to_vec(&serde_json::json!({ "id": id })).unwrap();
+        let _ = ws.send(Message::Binary(frame)).await;
+        std::future::pending::<()>().await;
+    });
+    format!("ws://127.0.0.1:{port}{path}")
+}
+
+/// Poll until this ConnLib connection emits its metadata-parse warning.
+///
+/// The server can send before `connect` returns and the read loop runs on the
+/// plugin-wide runtime, so sleeping once is only a race. Requiring the named
+/// warning keeps the negative leak assertion from succeeding over connect
+/// events alone.
+async fn capture_with_metadata_parse_warning(base: &str) -> Vec<String> {
+    for _ in 0..600 {
+        let all = snapshot();
+        let conn_id = conn_id_for(&all, base);
+        if events_for_conn(&all, "nucleus_transport::connlib", &conn_id)
+            .iter()
+            .any(|e| e.contains("failed to parse response metadata"))
+        {
+            return all;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("ConnLib never logged a metadata-parse warning, so this proves nothing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connlib_metadata_parse_warning_redacts_server_text() {
+    const METADATA_SENTINEL: &str = "sentinel-connlib-metadata-must-not-be-logged";
+
+    install_capture();
+    let url =
+        malformed_metadata_server(format!("wss://h/p?access_token={METADATA_SENTINEL}")).await;
+    let _transport = ConnLibTransport::connect(&url).await.unwrap();
+    let all = capture_with_metadata_parse_warning(&url).await;
+    let mine = events_for_conn(&all, "nucleus_transport::connlib", &conn_id_for(&all, &url));
+
+    assert!(
+        mine.iter().any(|e| {
+            e.contains("failed to parse response metadata") && e.contains("access_token=REDACTED")
+        }),
+        "the metadata warning lost its redaction marker: {mine:?}"
+    );
+    for event in &all {
+        assert!(
+            !event.contains(METADATA_SENTINEL),
+            "malformed ConnLib metadata reached a tracing event: {event}"
+        );
+    }
+}
+
 /// A websocket server that completes the handshake and then sends one text
 /// frame.
 ///

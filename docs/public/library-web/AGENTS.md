@@ -1,5 +1,9 @@
 # library-web — agent routing
 
+> **Not recommended for new deployments.** `ovstorage-rest` is maintained for
+> deployments that already exist; see [README.md](README.md) for why it is
+> not the recommended entry point for new work.
+
 Terse map for agents working on REST callers of `ovstorage-rest`. For
 prose, see [README.md](README.md).
 

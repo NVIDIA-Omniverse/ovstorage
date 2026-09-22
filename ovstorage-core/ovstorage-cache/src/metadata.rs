@@ -12,8 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use ovstorage_layer::{
-    ListOptions, ListPage, ListVersionsOptions, ObjectInfo, Result, StatOptions, Url, node_address,
-    node_spellings,
+    ListOptions, ListPage, ObjectInfo, Result, StatOptions, Url, node_address, node_spellings,
 };
 
 pub const DEFAULT_TTL: Duration = Duration::from_secs(30);
@@ -27,6 +26,91 @@ pub enum MetadataKind {
     Stat,
     List,
     ListVersions,
+}
+
+/// The cost knobs a metadata request may set, recorded on every cache row so
+/// a request is served only by a row fetched under at least what it asks for.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CostFlags {
+    pub full_metadata: bool,
+    pub versioned_address: bool,
+}
+
+impl CostFlags {
+    /// True when a row fetched under `self` may answer a request asking for
+    /// `requested`: every flag the request sets, the row also set.
+    #[must_use]
+    pub fn covers(self, requested: CostFlags) -> bool {
+        (self.full_metadata || !requested.full_metadata)
+            && (self.versioned_address || !requested.versioned_address)
+    }
+
+    #[must_use]
+    pub fn union(self, other: CostFlags) -> CostFlags {
+        CostFlags {
+            full_metadata: self.full_metadata || other.full_metadata,
+            versioned_address: self.versioned_address || other.versioned_address,
+        }
+    }
+
+    /// True when no cost knob is set.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self == CostFlags::default()
+    }
+
+    /// Raise `options` to at least `self`; a flag the caller set stays set.
+    pub fn widen_stat(self, options: &mut StatOptions) {
+        options.full_metadata |= self.full_metadata;
+        options.versioned_address |= self.versioned_address;
+    }
+}
+
+impl From<&StatOptions> for CostFlags {
+    fn from(options: &StatOptions) -> Self {
+        Self {
+            full_metadata: options.full_metadata,
+            versioned_address: options.versioned_address,
+        }
+    }
+}
+
+impl From<&ListOptions> for CostFlags {
+    fn from(options: &ListOptions) -> Self {
+        Self {
+            full_metadata: options.full_metadata,
+            versioned_address: options.versioned_address,
+        }
+    }
+}
+
+/// Outcome of [`MetadataCache::get`].
+///
+/// `Hit` carries the payload by value like [`MetadataCachePayload`] itself; a
+/// hit is one clone out of the cache either way, and a box would add an
+/// allocation per hit to save the stack of a `Miss`.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug)]
+pub enum MetadataLookup {
+    /// A live row whose flags cover the request.
+    Hit(MetadataCachePayload),
+    /// A live row fetched under `stored`, which does not cover the request.
+    /// The caller refetches under `stored.union(requested)` and stores that,
+    /// so the one row per address only widens until a refresh replaces it.
+    Narrower { stored: CostFlags },
+    /// No live row: absent, or expired and evicted here.
+    Miss,
+}
+
+impl MetadataLookup {
+    /// The payload of a [`MetadataLookup::Hit`], `None` otherwise.
+    #[must_use]
+    pub fn hit(self) -> Option<MetadataCachePayload> {
+        match self {
+            Self::Hit(payload) => Some(payload),
+            Self::Narrower { .. } | Self::Miss => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -66,7 +150,6 @@ pub struct MetadataCacheKey {
     /// A digest rather than the credential itself: the key is cloned into
     /// eviction victim lists and appears in trace fields.
     pub credential_scope: Option<u64>,
-    pub options_hash: u64,
 }
 
 /// The credential-scope component for `url`, or `None` when it carries none.
@@ -103,6 +186,9 @@ struct Entry {
     /// ObjectInfos this entry charges to the cache budget.
     /// Stat=1, List/ListVersions=one per item.
     size: usize,
+    /// The cost flags the payload was fetched under. A request is served
+    /// only when these cover its own.
+    flags: CostFlags,
 }
 
 #[derive(Default)]
@@ -147,20 +233,30 @@ impl MetadataCache {
         self.ttl
     }
 
-    /// `None` on miss or TTL expiry. On hit, bumps `last_accessed`; on
-    /// expiry, evicts the stale entry.
-    pub fn get(&self, key: &MetadataCacheKey) -> Option<MetadataCachePayload> {
+    /// Look up `key` for a request asking for `requested`.
+    ///
+    /// A live row answers only when the flags it was fetched under cover the
+    /// request's; a live row fetched under fewer flags reports them as
+    /// [`MetadataLookup::Narrower`] so the caller can refetch under the union
+    /// and replace it. On a hit, bumps `last_accessed`; on TTL expiry, evicts
+    /// the stale entry.
+    pub fn get(&self, key: &MetadataCacheKey, requested: CostFlags) -> MetadataLookup {
         let mut state = self.state.lock();
         let Some(entry) = state.entries.get_mut(key) else {
-            record_miss(key);
-            return None;
+            record_miss(key, false);
+            return MetadataLookup::Miss;
         };
         if entry.inserted_at.elapsed() >= entry.ttl {
             let size = entry.size;
             state.entries.remove(key);
             state.current_size = state.current_size.saturating_sub(size);
-            record_miss(key);
-            return None;
+            record_miss(key, false);
+            return MetadataLookup::Miss;
+        }
+        if !entry.flags.covers(requested) {
+            let stored = entry.flags;
+            record_miss(key, true);
+            return MetadataLookup::Narrower { stored };
         }
         entry.last_accessed = Instant::now();
         let payload = entry.payload.clone();
@@ -178,16 +274,26 @@ impl MetadataCache {
             "kind" => operation_label(key.kind)
         )
         .increment(1);
-        Some(payload)
+        MetadataLookup::Hit(payload)
     }
 
-    /// Returns whether the payload was RETAINED.
+    /// Store `payload` as fetched under `flags`. Returns whether the payload
+    /// was RETAINED.
+    ///
+    /// A refresh replaces the row and its flags even when the new flags are
+    /// narrower: the payload is fresher, and the next request that needs more
+    /// widens the row again with one upstream call.
     ///
     /// Callers that register side state keyed on "this address is cached" need
     /// the answer: an oversized payload is dropped here after the prior value
     /// has already been removed, so a caller that assumes storage would be
     /// registering for an entry that does not exist.
-    pub fn insert(&self, key: MetadataCacheKey, payload: MetadataCachePayload) -> bool {
+    pub fn insert(
+        &self,
+        key: MetadataCacheKey,
+        payload: MetadataCachePayload,
+        flags: CostFlags,
+    ) -> bool {
         let now = Instant::now();
         let ttl = self.ttl;
         let size = object_info_count(&payload).max(1);
@@ -233,6 +339,7 @@ impl MetadataCache {
                 last_accessed: now,
                 ttl,
                 size,
+                flags,
             },
         );
         state.current_size += size;
@@ -414,32 +521,6 @@ impl NotificationDispatcher for DisabledDispatcher {
     }
 }
 
-/// Hash for cache keys; stable within a process.
-pub fn hash_stat_options(options: &StatOptions) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    options.full_metadata.hash(&mut hasher);
-    hasher.finish()
-}
-
-pub fn hash_list_options(options: &ListOptions) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    options.recursive.hash(&mut hasher);
-    options.max_results.hash(&mut hasher);
-    options.page_token.hash(&mut hasher);
-    options.full_metadata.hash(&mut hasher);
-    hasher.finish()
-}
-
-pub fn hash_list_versions_options(options: &ListVersionsOptions) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    options.max_results.hash(&mut hasher);
-    options.page_token.hash(&mut hasher);
-    hasher.finish()
-}
-
 /// ObjectInfos chargeable to the cache budget for `payload`. Stat = 1,
 /// List = number of items in the page, ListVersions = number of versions.
 fn object_info_count(payload: &MetadataCachePayload) -> usize {
@@ -561,14 +642,16 @@ fn redacted_key_address(address: &str) -> String {
     }
 }
 
-/// Emit the miss trace event + counter. Called for both a plain absence and a
-/// TTL-expiry eviction so both hits and misses are counted and hit-rate
+/// Emit the miss trace event + counter. Called for a plain absence, a
+/// TTL-expiry eviction and a live row whose flags do not cover the request
+/// (`narrower`), so hits and misses are both counted and hit-rate
 /// (`hits / (hits + misses)`) is computable.
-fn record_miss(key: &MetadataCacheKey) {
+fn record_miss(key: &MetadataCacheKey, narrower: bool) {
     tracing::event!(
         target: "ovstorage.metadata_cache",
         tracing::Level::DEBUG,
         cache.hit = false,
+        cache.narrower = narrower,
         cache.kind = "metadata",
         cache.operation = operation_label(key.kind),
         address = %redacted_key_address(&key.address),
@@ -599,6 +682,7 @@ mod tests {
 
     fn stub_info() -> ObjectInfo {
         ObjectInfo {
+            etag_strength: Default::default(),
             address: url("file:///tmp/x"),
             kind: ObjectKind::File,
             etag: None,
@@ -610,6 +694,7 @@ mod tests {
             system_metadata: None,
             user_metadata: None,
             modified_by: None,
+            versioned_address: None,
         }
     }
 
@@ -672,10 +757,13 @@ mod tests {
             principal_id: None,
             address: "file:/tmp/x".into(),
             credential_scope: None,
-            options_hash: 0,
         };
         assert!(
-            cache.insert(key, MetadataCachePayload::Stat(stub_info())),
+            cache.insert(
+                key,
+                MetadataCachePayload::Stat(stub_info()),
+                CostFlags::default()
+            ),
             "a payload that fits is retained and says so"
         );
 
@@ -685,18 +773,21 @@ mod tests {
             principal_id: None,
             address: "file:/tmp/dir/".into(),
             credential_scope: None,
-            options_hash: 0,
         };
         let page = ListPage {
             items: (0..64).map(|_| stub_info()).collect(),
             next_page_token: None,
         };
         assert!(
-            !cache.insert(big.clone(), MetadataCachePayload::List(page)),
+            !cache.insert(
+                big.clone(),
+                MetadataCachePayload::List(page),
+                CostFlags::default()
+            ),
             "a payload over the whole budget is dropped, and says so"
         );
         assert!(
-            cache.get(&big).is_none(),
+            cache.get(&big, CostFlags::default()).hit().is_none(),
             "and really is absent, so a caller that registered on it would be \
              registering for nothing"
         );
@@ -710,12 +801,15 @@ mod tests {
             principal_id: None,
             address: "file:/tmp/x".into(),
             credential_scope: None,
-            options_hash: 0,
         };
-        assert!(cache.get(&key).is_none());
-        cache.insert(key.clone(), MetadataCachePayload::Stat(stub_info()));
+        assert!(cache.get(&key, CostFlags::default()).hit().is_none());
+        cache.insert(
+            key.clone(),
+            MetadataCachePayload::Stat(stub_info()),
+            CostFlags::default(),
+        );
         assert!(matches!(
-            cache.get(&key),
+            cache.get(&key, CostFlags::default()).hit(),
             Some(MetadataCachePayload::Stat(_))
         ));
     }
@@ -729,11 +823,14 @@ mod tests {
             principal_id: None,
             address: target.as_str().into(),
             credential_scope: None,
-            options_hash: 0,
         };
-        cache.insert(key.clone(), MetadataCachePayload::Stat(stub_info()));
+        cache.insert(
+            key.clone(),
+            MetadataCachePayload::Stat(stub_info()),
+            CostFlags::default(),
+        );
         cache.invalidate_address(&target);
-        assert!(cache.get(&key).is_none());
+        assert!(cache.get(&key, CostFlags::default()).hit().is_none());
     }
 
     /// Both spellings of one node are one node, so a write to either drops
@@ -753,14 +850,12 @@ mod tests {
                 principal_id: None,
                 address: url("file:///tmp/docs").as_str().into(),
                 credential_scope: None,
-                options_hash: 0,
             };
             let slashed = MetadataCacheKey {
                 kind: MetadataKind::List,
                 principal_id: None,
                 address: url("file:///tmp/docs/").as_str().into(),
                 credential_scope: None,
-                options_hash: 0,
             };
             // A sibling whose name merely starts with the node's: the two
             // spellings must not become a substring match.
@@ -769,30 +864,38 @@ mod tests {
                 principal_id: None,
                 address: url("file:///tmp/docsx").as_str().into(),
                 credential_scope: None,
-                options_hash: 0,
             };
-            cache.insert(bare.clone(), MetadataCachePayload::Stat(stub_info()));
+            cache.insert(
+                bare.clone(),
+                MetadataCachePayload::Stat(stub_info()),
+                CostFlags::default(),
+            );
             cache.insert(
                 slashed.clone(),
                 MetadataCachePayload::List(ListPage {
                     items: vec![stub_info()],
                     next_page_token: None,
                 }),
+                CostFlags::default(),
             );
-            cache.insert(sibling.clone(), MetadataCachePayload::Stat(stub_info()));
+            cache.insert(
+                sibling.clone(),
+                MetadataCachePayload::Stat(stub_info()),
+                CostFlags::default(),
+            );
 
             cache.invalidate_address(&url(written));
 
             assert!(
-                cache.get(&bare).is_none(),
+                cache.get(&bare, CostFlags::default()).hit().is_none(),
                 "a write spelled {written} must drop the slashless row"
             );
             assert!(
-                cache.get(&slashed).is_none(),
+                cache.get(&slashed, CostFlags::default()).hit().is_none(),
                 "a write spelled {written} must drop the slashed row"
             );
             assert!(
-                cache.get(&sibling).is_some(),
+                cache.get(&sibling, CostFlags::default()).hit().is_some(),
                 "a write spelled {written} must not reach a sibling node"
             );
         }
@@ -814,24 +917,30 @@ mod tests {
                 principal_id: None,
                 address: ovstorage_layer::node_address(&url("s3://b/dir?versionId=1")),
                 credential_scope: None,
-                options_hash: 0,
             };
             let sibling = MetadataCacheKey {
                 kind: MetadataKind::Stat,
                 principal_id: None,
                 address: ovstorage_layer::node_address(&url("s3://b/dirx?versionId=1")),
                 credential_scope: None,
-                options_hash: 0,
             };
-            cache.insert(pinned.clone(), MetadataCachePayload::Stat(stub_info()));
-            cache.insert(sibling.clone(), MetadataCachePayload::Stat(stub_info()));
+            cache.insert(
+                pinned.clone(),
+                MetadataCachePayload::Stat(stub_info()),
+                CostFlags::default(),
+            );
+            cache.insert(
+                sibling.clone(),
+                MetadataCachePayload::Stat(stub_info()),
+                CostFlags::default(),
+            );
             cache.invalidate_prefix(&url(prefix));
             assert!(
-                cache.get(&pinned).is_none(),
+                cache.get(&pinned, CostFlags::default()).hit().is_none(),
                 "a sweep of {prefix} must reach the pinned row under it"
             );
             assert!(
-                cache.get(&sibling).is_some(),
+                cache.get(&sibling, CostFlags::default()).hit().is_some(),
                 "a sweep of {prefix} must not reach a textual sibling"
             );
         }
@@ -858,7 +967,6 @@ mod tests {
                 principal_id: None,
                 address: ovstorage_layer::node_address(&url("s3://b/d/?snapshot=7")),
                 credential_scope: None,
-                options_hash: 0,
             };
             cache.insert(
                 list_key.clone(),
@@ -866,10 +974,11 @@ mod tests {
                     items: vec![stub_info()],
                     next_page_token: None,
                 }),
+                CostFlags::default(),
             );
             cache.invalidate_lists_containing(&url(changed));
             assert_eq!(
-                cache.get(&list_key).is_none(),
+                cache.get(&list_key, CostFlags::default()).hit().is_none(),
                 swept,
                 "a change at {changed} against a listing of s3://b/d/?snapshot=7"
             );
@@ -885,11 +994,14 @@ mod tests {
             principal_id: None,
             address: ovstorage_layer::node_address(&url("s3://b/dir/x?versionId=2")),
             credential_scope: None,
-            options_hash: 0,
         };
-        cache.insert(other.clone(), MetadataCachePayload::Stat(stub_info()));
+        cache.insert(
+            other.clone(),
+            MetadataCachePayload::Stat(stub_info()),
+            CostFlags::default(),
+        );
         cache.invalidate_prefix(&url("s3://b/dir/?versionId=1"));
-        assert!(cache.get(&other).is_some());
+        assert!(cache.get(&other, CostFlags::default()).hit().is_some());
     }
 
     /// A credential IS part of what a response means, even though it is not
@@ -915,27 +1027,44 @@ mod tests {
             principal_id: None,
             credential_scope: credential_scope(address),
             address: ovstorage_layer::node_address(address),
-            options_hash: 0,
         };
 
-        cache.insert(key_for(&alice), MetadataCachePayload::Stat(stub_info()));
+        cache.insert(
+            key_for(&alice),
+            MetadataCachePayload::Stat(stub_info()),
+            CostFlags::default(),
+        );
         assert!(
-            cache.get(&key_for(&alice)).is_some(),
+            cache
+                .get(&key_for(&alice), CostFlags::default())
+                .hit()
+                .is_some(),
             "control: the caller who filled the row reads it back"
         );
         assert!(
-            cache.get(&key_for(&mallory)).is_none(),
+            cache
+                .get(&key_for(&mallory), CostFlags::default())
+                .hit()
+                .is_none(),
             "a different credential must not read another's cached metadata"
         );
         assert!(
-            cache.get(&key_for(&anonymous)).is_none(),
+            cache
+                .get(&key_for(&anonymous), CostFlags::default())
+                .hit()
+                .is_none(),
             "an unauthenticated caller must not read a credentialed row"
         );
 
         // Invalidation still reaches it: the address field carries no
         // credential, so a needle written without one matches.
         cache.invalidate_address(&anonymous);
-        assert!(cache.get(&key_for(&alice)).is_none());
+        assert!(
+            cache
+                .get(&key_for(&alice), CostFlags::default())
+                .hit()
+                .is_none()
+        );
     }
 
     /// A credential in an address is not part of what it names.
@@ -958,20 +1087,27 @@ mod tests {
                 principal_id: None,
                 address: ovstorage_layer::node_address(&url(stored)),
                 credential_scope: None,
-                options_hash: 0,
             };
-            cache.insert(key.clone(), MetadataCachePayload::Stat(stub_info()));
+            cache.insert(
+                key.clone(),
+                MetadataCachePayload::Stat(stub_info()),
+                CostFlags::default(),
+            );
             cache.invalidate_address(&url(invalidated));
             assert!(
-                cache.get(&key).is_none(),
+                cache.get(&key, CostFlags::default()).hit().is_none(),
                 "a row stored for {stored} must be dropped by an invalidation of {invalidated}"
             );
 
             let cache = MetadataCache::new(&cfg());
-            cache.insert(key.clone(), MetadataCachePayload::Stat(stub_info()));
+            cache.insert(
+                key.clone(),
+                MetadataCachePayload::Stat(stub_info()),
+                CostFlags::default(),
+            );
             cache.invalidate_prefix(&url(invalidated));
             assert!(
-                cache.get(&key).is_none(),
+                cache.get(&key, CostFlags::default()).hit().is_none(),
                 "a row stored for {stored} must be swept by a prefix of {invalidated}"
             );
         }
@@ -991,38 +1127,47 @@ mod tests {
                 principal_id: None,
                 address: url("file:///tmp/docs").as_str().into(),
                 credential_scope: None,
-                options_hash: 0,
             };
             let child = MetadataCacheKey {
                 kind: MetadataKind::Stat,
                 principal_id: None,
                 address: url("file:///tmp/docs/a").as_str().into(),
                 credential_scope: None,
-                options_hash: 0,
             };
             let sibling = MetadataCacheKey {
                 kind: MetadataKind::Stat,
                 principal_id: None,
                 address: url("file:///tmp/docsx").as_str().into(),
                 credential_scope: None,
-                options_hash: 0,
             };
-            cache.insert(bare.clone(), MetadataCachePayload::Stat(stub_info()));
-            cache.insert(child.clone(), MetadataCachePayload::Stat(stub_info()));
-            cache.insert(sibling.clone(), MetadataCachePayload::Stat(stub_info()));
+            cache.insert(
+                bare.clone(),
+                MetadataCachePayload::Stat(stub_info()),
+                CostFlags::default(),
+            );
+            cache.insert(
+                child.clone(),
+                MetadataCachePayload::Stat(stub_info()),
+                CostFlags::default(),
+            );
+            cache.insert(
+                sibling.clone(),
+                MetadataCachePayload::Stat(stub_info()),
+                CostFlags::default(),
+            );
 
             cache.invalidate_prefix(&url(written));
 
             assert!(
-                cache.get(&bare).is_none(),
+                cache.get(&bare, CostFlags::default()).hit().is_none(),
                 "prefix spelled {written} must cover the node itself"
             );
             assert!(
-                cache.get(&child).is_none(),
+                cache.get(&child, CostFlags::default()).hit().is_none(),
                 "prefix spelled {written} must cover a child"
             );
             assert!(
-                cache.get(&sibling).is_some(),
+                cache.get(&sibling, CostFlags::default()).hit().is_some(),
                 "prefix spelled {written} must not cover a textual sibling"
             );
         }
@@ -1037,20 +1182,26 @@ mod tests {
             principal_id: None,
             address: prefix.join("x").unwrap().as_str().into(),
             credential_scope: None,
-            options_hash: 0,
         };
         let other = MetadataCacheKey {
             kind: MetadataKind::Stat,
             principal_id: None,
             address: url("file:///other/y").as_str().into(),
             credential_scope: None,
-            options_hash: 0,
         };
-        cache.insert(key.clone(), MetadataCachePayload::Stat(stub_info()));
-        cache.insert(other.clone(), MetadataCachePayload::Stat(stub_info()));
+        cache.insert(
+            key.clone(),
+            MetadataCachePayload::Stat(stub_info()),
+            CostFlags::default(),
+        );
+        cache.insert(
+            other.clone(),
+            MetadataCachePayload::Stat(stub_info()),
+            CostFlags::default(),
+        );
         cache.invalidate_prefix(&prefix);
-        assert!(cache.get(&key).is_none());
-        assert!(cache.get(&other).is_some());
+        assert!(cache.get(&key, CostFlags::default()).hit().is_none());
+        assert!(cache.get(&other, CostFlags::default()).hit().is_some());
     }
 
     #[test]
@@ -1064,10 +1215,13 @@ mod tests {
             principal_id: None,
             address: "file:/tmp/x".into(),
             credential_scope: None,
-            options_hash: 0,
         };
-        cache.insert(key.clone(), MetadataCachePayload::Stat(stub_info()));
-        assert!(cache.get(&key).is_none());
+        cache.insert(
+            key.clone(),
+            MetadataCachePayload::Stat(stub_info()),
+            CostFlags::default(),
+        );
+        assert!(cache.get(&key, CostFlags::default()).hit().is_none());
     }
 
     #[tokio::test]
@@ -1081,14 +1235,17 @@ mod tests {
             principal_id: None,
             address: target.as_str().into(),
             credential_scope: None,
-            options_hash: 0,
         };
-        cache.insert(key.clone(), MetadataCachePayload::Stat(stub_info()));
+        cache.insert(
+            key.clone(),
+            MetadataCachePayload::Stat(stub_info()),
+            CostFlags::default(),
+        );
         tx.send(Invalidation::Address(target.clone()))
             .await
             .unwrap();
         for _ in 0..50 {
-            if cache.get(&key).is_none() {
+            if cache.get(&key, CostFlags::default()).hit().is_none() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1096,19 +1253,116 @@ mod tests {
         panic!("invalidation task did not invalidate the entry within 500ms");
     }
 
+    fn stat_key(address: &str) -> MetadataCacheKey {
+        MetadataCacheKey {
+            kind: MetadataKind::Stat,
+            principal_id: None,
+            address: address.into(),
+            credential_scope: None,
+        }
+    }
+
+    const FULL: CostFlags = CostFlags {
+        full_metadata: true,
+        versioned_address: false,
+    };
+    const PINNED: CostFlags = CostFlags {
+        full_metadata: false,
+        versioned_address: true,
+    };
+
     #[test]
-    fn options_hash_is_stable_within_process() {
-        let a = StatOptions {
+    fn cost_flags_cover_when_every_requested_flag_is_stored() {
+        let none = CostFlags::default();
+        let both = FULL.union(PINNED);
+        assert!(none.covers(none));
+        assert!(FULL.covers(none));
+        assert!(!none.covers(FULL));
+        assert!(both.covers(PINNED));
+        assert!(!PINNED.covers(FULL));
+        assert!(both.covers(both));
+        assert_eq!(FULL.union(PINNED), PINNED.union(FULL));
+        assert!(none.is_empty());
+        assert!(!PINNED.is_empty());
+        let mut options = StatOptions {
             full_metadata: true,
+            versioned_address: false,
         };
-        let b = StatOptions {
-            full_metadata: true,
+        PINNED.widen_stat(&mut options);
+        assert_eq!(
+            options,
+            StatOptions {
+                full_metadata: true,
+                versioned_address: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_row_serves_every_request_its_flags_cover() {
+        let cache = MetadataCache::new(&cfg());
+        let key = stat_key("file:///d/x");
+        let both = FULL.union(PINNED);
+        cache.insert(key.clone(), MetadataCachePayload::Stat(stub_info()), both);
+        for requested in [CostFlags::default(), FULL, PINNED, both] {
+            assert!(
+                matches!(cache.get(&key, requested), MetadataLookup::Hit(_)),
+                "a row fetched under {both:?} must answer {requested:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_fetched_under_narrower_flags_reports_them() {
+        let cache = MetadataCache::new(&cfg());
+        let key = stat_key("file:///d/x");
+        cache.insert(key.clone(), MetadataCachePayload::Stat(stub_info()), FULL);
+        assert!(matches!(
+            cache.get(&key, PINNED),
+            MetadataLookup::Narrower { stored } if stored == FULL
+        ));
+        assert!(matches!(
+            cache.get(&key, FULL.union(PINNED)),
+            MetadataLookup::Narrower { stored } if stored == FULL
+        ));
+        assert!(matches!(
+            cache.get(&key, CostFlags::default()),
+            MetadataLookup::Hit(_)
+        ));
+        assert!(matches!(cache.get(&key, FULL), MetadataLookup::Hit(_)));
+        assert!(matches!(
+            cache.get(&stat_key("file:///d/absent"), CostFlags::default()),
+            MetadataLookup::Miss
+        ));
+    }
+
+    #[test]
+    fn a_refresh_replaces_the_row_and_its_flags() {
+        let cache = MetadataCache::new(&cfg());
+        let key = stat_key("file:///d/x");
+        cache.insert(
+            key.clone(),
+            MetadataCachePayload::Stat(stub_info()),
+            FULL.union(PINNED),
+        );
+        let mut fresher = stub_info();
+        fresher.size = Some(9);
+        cache.insert(
+            key.clone(),
+            MetadataCachePayload::Stat(fresher),
+            CostFlags::default(),
+        );
+        // Freshness wins over width: the narrower refresh is the row now.
+        assert!(matches!(
+            cache.get(&key, FULL),
+            MetadataLookup::Narrower { stored } if stored.is_empty()
+        ));
+        let Some(MetadataCachePayload::Stat(info)) = cache.get(&key, CostFlags::default()).hit()
+        else {
+            panic!("the refreshed row must answer a default request");
         };
-        assert_eq!(hash_stat_options(&a), hash_stat_options(&b));
-        let c = StatOptions {
-            full_metadata: false,
-        };
-        assert_ne!(hash_stat_options(&a), hash_stat_options(&c));
+        assert_eq!(info.size, Some(9));
+        assert_eq!(cache.current_size(), 1);
     }
 
     #[test]
@@ -1122,22 +1376,23 @@ mod tests {
             principal_id: None,
             address: "file:///d".into(),
             credential_scope: None,
-            options_hash: 0,
         };
         // A small value that fits the budget.
         cache.insert(
             key.clone(),
             MetadataCachePayload::ListVersions(vec![stub_info()]),
+            CostFlags::default(),
         );
-        assert!(cache.get(&key).is_some());
+        assert!(cache.get(&key, CostFlags::default()).hit().is_some());
         // Refresh with a payload larger than the entire budget: it must not be
         // cached, and must not leave the old value behind to be served stale.
         cache.insert(
             key.clone(),
             MetadataCachePayload::ListVersions(vec![stub_info(), stub_info(), stub_info()]),
+            CostFlags::default(),
         );
         assert!(
-            cache.get(&key).is_none(),
+            cache.get(&key, CostFlags::default()).hit().is_none(),
             "stale entry served after oversized refresh"
         );
         assert_eq!(cache.current_size(), 0);
@@ -1151,24 +1406,30 @@ mod tests {
             principal_id: None,
             address: url("file:///foo/x").as_str().into(),
             credential_scope: None,
-            options_hash: 0,
         };
         let sibling = MetadataCacheKey {
             kind: MetadataKind::Stat,
             principal_id: None,
             address: url("file:///foobar").as_str().into(),
             credential_scope: None,
-            options_hash: 0,
         };
-        cache.insert(descendant.clone(), MetadataCachePayload::Stat(stub_info()));
-        cache.insert(sibling.clone(), MetadataCachePayload::Stat(stub_info()));
+        cache.insert(
+            descendant.clone(),
+            MetadataCachePayload::Stat(stub_info()),
+            CostFlags::default(),
+        );
+        cache.insert(
+            sibling.clone(),
+            MetadataCachePayload::Stat(stub_info()),
+            CostFlags::default(),
+        );
         cache.invalidate_prefix(&url("file:///foo"));
         assert!(
-            cache.get(&descendant).is_none(),
+            cache.get(&descendant, CostFlags::default()).hit().is_none(),
             "descendant of the prefix should be invalidated"
         );
         assert!(
-            cache.get(&sibling).is_some(),
+            cache.get(&sibling, CostFlags::default()).hit().is_some(),
             "textual-prefix sibling (file:///foobar) must survive"
         );
     }
@@ -1184,7 +1445,6 @@ mod tests {
             principal_id: None,
             address: url("file:///d/").as_str().into(),
             credential_scope: None,
-            options_hash: 0,
         };
         cache.insert(
             list_key.clone(),
@@ -1192,6 +1452,7 @@ mod tests {
                 items: vec![stub_info()],
                 next_page_token: None,
             }),
+            CostFlags::default(),
         );
 
         // A single-object change under the directory must invalidate the
@@ -1200,7 +1461,7 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..50 {
-            if cache.get(&list_key).is_none() {
+            if cache.get(&list_key, CostFlags::default()).hit().is_none() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

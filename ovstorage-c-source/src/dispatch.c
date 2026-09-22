@@ -13,6 +13,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <sys/time.h>
+#endif
 
 typedef struct ovc_dispatch_pump_link ovc_dispatch_pump_link;
 typedef struct ovc_dispatch_operation ovc_dispatch_operation;
@@ -73,7 +80,8 @@ typedef enum ovc_dispatch_operation_kind {
     OVC_DISPATCH_CONNECTION_LIST = 14,
     OVC_DISPATCH_WATCH_STREAM = 15,
     OVC_DISPATCH_WRITE_REDIRECT_BATCH = 16,
-    OVC_DISPATCH_WRITE_STEP = 17
+    OVC_DISPATCH_WRITE_STEP = 17,
+    OVC_DISPATCH_ROOT_INFO = 18
 } ovc_dispatch_operation_kind;
 
 typedef union ovc_dispatch_callback {
@@ -88,6 +96,7 @@ typedef union ovc_dispatch_callback {
     OvStorage_ConnectionCallback connection;
     OvStorage_AuthEventCallback auth;
     OvStorage_RootInfoListCallback root_list;
+    OvStorage_RootInfoCallback root_info;
     OvStorage_ConnectionListCallback connection_list;
     OvStorage_WatchDirectoryCallback watch;
     OvStorage_WriteRedirectCallback write_redirect;
@@ -132,7 +141,8 @@ typedef enum ovc_dispatch_io_task_kind {
     OVC_DISPATCH_IO_TASK_WRITE_STREAM = 19,
     OVC_DISPATCH_IO_TASK_WATCH_DIRECTORY = 20,
     OVC_DISPATCH_IO_TASK_WRITE_REDIRECT = 21,
-    OVC_DISPATCH_IO_TASK_CONTINUE_WRITE = 22
+    OVC_DISPATCH_IO_TASK_CONTINUE_WRITE = 22,
+    OVC_DISPATCH_IO_TASK_ROOT_INFO_FOR = 23
 } ovc_dispatch_io_task_kind;
 
 typedef union ovc_dispatch_io_request {
@@ -149,6 +159,7 @@ typedef union ovc_dispatch_io_request {
     OvStoragePlugin_UpdateMetadataRequest update_metadata;
     OvStoragePlugin_CheckAccessRequest check_access;
     OvStoragePlugin_ListAddressRootsRequest list_address_roots;
+    OvStoragePlugin_RootInfoForRequest root_info_for;
     OvStoragePlugin_ListConnectionsRequest list_connections;
     OvStoragePlugin_LayerConnectionRequest layer_connection;
     OvStoragePlugin_UpdateConnectionAttributesRequest update_attributes;
@@ -229,6 +240,101 @@ static char *ovc_dispatch_slice_copy(const char *bytes, size_t length)
 }
 
 /*
+ * The unset/encoded-empty discrimination, over a payload whose `Optional` has
+ * already been found present — that is this function's precondition, and the
+ * two unwrappers below are the only callers that establish it. It performs no
+ * `present` test of its own.
+ *
+ * `present` can outrun the payload, and the two shapes underneath it say
+ * different things. `present` with `ptr == NULL && len == 0` is exactly what a
+ * calloc'd struct already holds, so the producer never wrote this field; NULL
+ * is the honest answer and it is what the header promises. `present` with a
+ * non-NULL pointer and a zero length is a producer that encoded an empty string
+ * on purpose, and it is copied through — that shape is reachable by
+ * construction from the other side of the boundary, because the Rust
+ * `str_to_ffi` allocates a sentinel for the empty string rather than emitting
+ * NULL. Testing the decoded length alone cannot separate the two, and it would
+ * discard a statement the producer deliberately made.
+ *
+ * The two shapes differ in reachability, and the difference runs the opposite
+ * way from what "empty" suggests. No in-tree producer emits the UNSET shape:
+ * the Rust marshalling routes every optional through `str_to_ffi`, and the C
+ * file backend allocates a sentinel rather than yielding NULL, so ruling it out
+ * is defence-in-depth for a public ABI a third-party plugin also writes
+ * against. The ENCODED-EMPTY shape is reachable by construction, so copying it
+ * through preserves a statement a producer made rather than tolerating a
+ * malformed one.
+ *
+ * The taxonomy is the one a well-formed producer can emit; a NULL pointer with
+ * a non-zero length is malformed, and `ovc_dispatch_slice_copy` refuses it.
+ *
+ * `*out` is always written. False means the copy itself failed and the caller
+ * must abandon the conversion; the unset shape is not a failure and leaves
+ * `*out` NULL, as does an absent `Optional` short-circuited by an unwrapper.
+ */
+static bool ovc_dispatch_readable_str_copy(const char **out,
+                                           const OvStoragePlugin_Str *value)
+{
+    char *copy;
+
+    *out = NULL;
+    if (value->ptr == NULL && value->len == 0) {
+        return true;
+    }
+    copy = ovc_dispatch_slice_copy(value->ptr, value->len);
+    if (copy == NULL) {
+        return false;
+    }
+    *out = copy;
+    return true;
+}
+
+/*
+ * Optional-string copy for the plugin -> client conversion, where the client
+ * contract on every one of these fields is "NULL when absent". The rule is
+ * written here once rather than at each field, so a field added later adopts it
+ * by calling this instead of by re-deriving the condition.
+ *
+ * The parameter is the whole `Optional`, not its unpacked payload, and that is
+ * load-bearing rather than a matter of taste. `ovstorage_plugin.h` says of
+ * every `Optional_*`: "`present == true` means `value` is initialized;
+ * otherwise `value` carries unspecified bytes and must not be read." A helper
+ * taking `(present, bytes, length)` forces each call site to evaluate
+ * `.value.ptr` and `.value.len` to build the argument list, which is a read of
+ * the payload before anything has tested `present`. Taking a pointer to the
+ * `Optional` keeps the only `value` expression inside the `present` arm, where
+ * the ABI permits it, and leaves a call site with no payload expression to
+ * evaluate at all — the property is carried by the signature rather than by a
+ * rule each site has to remember.
+ */
+static bool ovc_dispatch_opt_str_copy(
+    const char **out,
+    const OvStoragePlugin_Optional_Str *optional)
+{
+    *out = NULL;
+    if (!optional->present) {
+        return true;
+    }
+    return ovc_dispatch_readable_str_copy(out, &optional->value);
+}
+
+/*
+ * The same rule over the connection-id wrapper, whose payload is a `Str` one
+ * struct further in. It exists so the `.value.id` read stays behind the
+ * `present` test rather than being spelled at the call site.
+ */
+static bool ovc_dispatch_opt_connection_id_copy(
+    const char **out,
+    const OvStoragePlugin_Optional_ConnectionId *optional)
+{
+    *out = NULL;
+    if (!optional->present) {
+        return true;
+    }
+    return ovc_dispatch_readable_str_copy(out, &optional->value.id);
+}
+
+/*
  * Lossy variant: each interior NUL becomes the two-character escape "\0"
  * instead of failing the conversion, so this fails only when memory is
  * exhausted.  The result is a
@@ -301,6 +407,32 @@ static char *ovc_dispatch_slice_copy_filtered(const char *bytes, size_t length)
     }
     copy[out_index] = '\0';
     return copy;
+}
+
+/*
+ * `ovc_dispatch_opt_str_copy` for a field of a value whose other strings
+ * FILTER interior NULs rather than refusing them: the `present` gate and the
+ * unset-shape test are the same, and the copy that follows is the filtering
+ * one, so the conversion this feeds keeps failing only on OOM.
+ */
+static bool ovc_dispatch_opt_str_copy_filtered(
+    const char **out,
+    const OvStoragePlugin_Optional_Str *optional)
+{
+    char *copy;
+
+    *out = NULL;
+    if (!optional->present ||
+        (optional->value.ptr == NULL && optional->value.len == 0)) {
+        return true;
+    }
+    copy = ovc_dispatch_slice_copy_filtered(optional->value.ptr,
+                                            optional->value.len);
+    if (copy == NULL) {
+        return false;
+    }
+    *out = copy;
+    return true;
 }
 
 /*
@@ -795,6 +927,7 @@ static bool ovc_dispatch_root_slots_supported(
            vtable->remove_connection != NULL &&
            vtable->update_connection_credentials != NULL &&
            vtable->authenticate_connection != NULL &&
+           vtable->root_info_for != NULL &&
            vtable->list_address_roots != NULL &&
            vtable->write_stream != NULL &&
            vtable->write_redirect != NULL &&
@@ -966,6 +1099,9 @@ static void ovc_dispatch_object_info_clear(OvStoragePlugin_ObjectInfo *info,
     if (info->modified_by.present) {
         ovc_dispatch_abi_str_clear(&info->modified_by.value);
     }
+    if (info->versioned_address.present) {
+        ovc_dispatch_abi_str_clear(&info->versioned_address.value);
+    }
     memset(info, 0, sizeof(*info));
     if (free_outer) {
         ovc_abi_free(info);
@@ -994,6 +1130,9 @@ static void ovc_dispatch_backend_item_clear(
     }
     if (info->modified_by.present) {
         ovc_dispatch_abi_str_clear(&info->modified_by.value);
+    }
+    if (info->versioned_address.present) {
+        ovc_dispatch_abi_str_clear(&info->versioned_address.value);
     }
     memset(info, 0, sizeof(*info));
     if (free_outer) {
@@ -1907,21 +2046,25 @@ static OvStorage_Info *ovc_dispatch_info_from_object(
         info->mtime_unix_nanos =
             (uint64_t)source->mtime_unix_ms.value * UINT64_C(1000000);
     }
-    if (source->etag.present) {
-        info->etag = ovc_dispatch_slice_copy(source->etag.value.ptr,
-                                             source->etag.value.len);
-        if (info->etag == NULL) {
-            ovstorage_info_destroy(info);
-            return NULL;
-        }
+    if (!ovc_dispatch_opt_str_copy(&info->etag, &source->etag)) {
+        ovstorage_info_destroy(info);
+        return NULL;
     }
-    if (source->version.present) {
-        info->version = ovc_dispatch_slice_copy(source->version.value.ptr,
-                                                source->version.value.len);
-        if (info->version == NULL) {
-            ovstorage_info_destroy(info);
-            return NULL;
-        }
+    switch (source->etag_strength) {
+    case OvStoragePlugin_EtagStrengthV1_Strong:
+        info->etag_strength = OVSTORAGE_ETAG_STRENGTH_STRONG;
+        break;
+    case OvStoragePlugin_EtagStrengthV1_Weak:
+        info->etag_strength = OVSTORAGE_ETAG_STRENGTH_WEAK;
+        break;
+    case OvStoragePlugin_EtagStrengthV1_Unspecified:
+    default:
+        info->etag_strength = OVSTORAGE_ETAG_STRENGTH_UNSPECIFIED;
+        break;
+    }
+    if (!ovc_dispatch_opt_str_copy(&info->version, &source->version)) {
+        ovstorage_info_destroy(info);
+        return NULL;
     }
     if (source->user_metadata.present) {
         metadata = NULL;
@@ -1945,13 +2088,15 @@ static OvStorage_Info *ovc_dispatch_info_from_object(
         }
         info->system_metadata = metadata;
     }
-    if (source->modified_by.present) {
-        info->modified_by = ovc_dispatch_slice_copy(
-            source->modified_by.value.ptr, source->modified_by.value.len);
-        if (info->modified_by == NULL) {
-            ovstorage_info_destroy(info);
-            return NULL;
-        }
+    if (!ovc_dispatch_opt_str_copy(&info->modified_by,
+                                   &source->modified_by)) {
+        ovstorage_info_destroy(info);
+        return NULL;
+    }
+    if (!ovc_dispatch_opt_str_copy(&info->versioned_address,
+                                   &source->versioned_address)) {
+        ovstorage_info_destroy(info);
+        return NULL;
     }
     if (source->effective_permissions.present) {
         info->has_effective_permissions = true;
@@ -1987,6 +2132,11 @@ static OvStorage_Info *ovc_dispatch_info_from_backend_item(
     object.mtime_unix_ms = source->mtime_unix_ms;
     object.user_metadata = source->user_metadata;
     object.system_metadata = source->system_metadata;
+    object.etag_strength = source->etag_strength;
+    object.versioned_address = source->versioned_address;
+    object.checksums = source->checksums;
+    object.effective_permissions = source->effective_permissions;
+    object.modified_by = source->modified_by;
     return ovc_dispatch_info_from_object(&object);
 }
 
@@ -2123,6 +2273,9 @@ static void ovc_dispatch_connection_clear(
             &connection->auth_state.auth_failed.error_message);
     }
     ovc_dispatch_abi_key_values_clear(&connection->user_metadata);
+    if (connection->owning_target.present) {
+        ovc_dispatch_abi_str_clear(&connection->owning_target.value);
+    }
     memset(connection, 0, sizeof(*connection));
     if (free_outer) {
         ovc_abi_free(connection);
@@ -2131,8 +2284,8 @@ static void ovc_dispatch_connection_clear(
 
 /*
  * Every string field — id, backend_kind, display_name, addresses,
- * user_metadata keys/values, broker principal, auth-failure message —
- * FILTERS interior NULs out (auth-EVENT strings are
+ * user_metadata keys/values, broker principal, auth-failure message,
+ * owning target — FILTERS interior NULs out (auth-EVENT strings are
  * different — they escape NULs per ffi/mod.rs's cstring_lossy).  The
  * conversion never fails on string content, only on OOM or a malformed
  * ABI slice.
@@ -2287,6 +2440,14 @@ static OvStorage_Connection *ovc_dispatch_connection_from_plugin(
             (uint64_t)source->last_probed_unix_ms.value *
             UINT64_C(1000000);
     }
+    /* The same unset-versus-empty rule the root-info field applies: a
+     * payload the plugin never wrote is NULL, an empty name it encoded on
+     * purpose is kept, because an empty layer instance name routes. */
+    if (!ovc_dispatch_opt_str_copy_filtered(&connection->owning_target,
+                                            &source->owning_target)) {
+        ovstorage_connection_destroy(connection);
+        return NULL;
+    }
     return connection;
 }
 
@@ -2379,62 +2540,48 @@ static OvStorage_RootInfo *ovc_dispatch_root_info_from_plugin(
         ovstorage_root_info_destroy(root);
         return NULL;
     }
-    if (source->display_name.present) {
-        root->display_name = ovc_dispatch_slice_copy(
-            source->display_name.value.ptr,
-            source->display_name.value.len);
-        if (root->display_name == NULL) {
-            ovstorage_root_info_destroy(root);
-            return NULL;
-        }
+    if (!ovc_dispatch_opt_str_copy(&root->display_name,
+                                   &source->display_name)) {
+        ovstorage_root_info_destroy(root);
+        return NULL;
     }
-    if (source->connection_id.present) {
-        root->has_connection_id = true;
-        root->connection_id = ovc_dispatch_slice_copy(
-            source->connection_id.value.id.ptr,
-            source->connection_id.value.id.len);
-        if (root->connection_id == NULL) {
-            ovstorage_root_info_destroy(root);
-            return NULL;
-        }
+    /* The flag follows the copy rather than `present`: a field the producer
+     * never wrote is absent, and flagging it would hand the client a
+     * positively-marked empty connection id — worse than the empty string
+     * alone, because `has_connection_id` is what a client tests before using
+     * it. */
+    if (!ovc_dispatch_opt_connection_id_copy(&root->connection_id,
+                                             &source->connection_id)) {
+        ovstorage_root_info_destroy(root);
+        return NULL;
     }
+    root->has_connection_id = root->connection_id != NULL;
     root->visible = source->visible;
     root->visibility = (OvStorage_AddressVisibility)source->visibility;
     root->range_read_strategy =
         (OvStorage_RangeReadStrategy)source->range_read_strategy;
     ovc_dispatch_capabilities_copy(&root->capabilities,
                                    &source->capabilities);
-    if (source->owning_target.present) {
-        root->owning_target = ovc_dispatch_slice_copy(
-            source->owning_target.value.ptr,
-            source->owning_target.value.len);
-        if (root->owning_target == NULL) {
-            ovstorage_root_info_destroy(root);
-            return NULL;
-        }
+    /* An empty target is the case that decides the shape of the rule: an
+     * unset payload here means the Layer reports no owner, while a target the
+     * plugin deliberately encoded as empty is a real attribution — an empty
+     * layer instance name is legal and routes — so the two must not collapse.
+     * `ovc_dispatch_opt_str_copy` keeps them apart, and the host-side Rust
+     * decoder applies the same discrimination to the same field in
+     * `root_info_from_ffi`. */
+    if (!ovc_dispatch_opt_str_copy(&root->owning_target,
+                                   &source->owning_target)) {
+        ovstorage_root_info_destroy(root);
+        return NULL;
     }
     root->source_kind = (OvStorage_RouteSourceKind)source->source.tag;
     root->source_static_layer = (OvStorage_ConfigLayer)source->source.layer;
-    if (source->source.connection_id.present) {
-        root->source_connection_id = ovc_dispatch_slice_copy(
-            source->source.connection_id.value.id.ptr,
-            source->source.connection_id.value.id.len);
-    }
-    if (source->source.broker_principal.present) {
-        root->source_broker_principal = ovc_dispatch_slice_copy(
-            source->source.broker_principal.value.ptr,
-            source->source.broker_principal.value.len);
-    }
-    if (source->source.alias_to.present) {
-        root->source_alias_to = ovc_dispatch_slice_copy(
-            source->source.alias_to.value.ptr,
-            source->source.alias_to.value.len);
-    }
-    if ((source->source.connection_id.present &&
-         root->source_connection_id == NULL) ||
-        (source->source.broker_principal.present &&
-         root->source_broker_principal == NULL) ||
-        (source->source.alias_to.present && root->source_alias_to == NULL)) {
+    if (!ovc_dispatch_opt_connection_id_copy(&root->source_connection_id,
+                                             &source->source.connection_id) ||
+        !ovc_dispatch_opt_str_copy(&root->source_broker_principal,
+                                   &source->source.broker_principal) ||
+        !ovc_dispatch_opt_str_copy(&root->source_alias_to,
+                                   &source->source.alias_to)) {
         ovstorage_root_info_destroy(root);
         return NULL;
     }
@@ -2445,30 +2592,22 @@ static OvStorage_RootInfo *ovc_dispatch_root_info_from_plugin(
             source->source.alias_source.value.layer;
         root->source_alias_source_runtime_persisted =
             source->source.alias_source.value.persisted;
-        if (source->source.alias_source.value.broker_principal.present) {
-            root->source_alias_source_broker_principal =
-                ovc_dispatch_slice_copy(
-                    source->source.alias_source.value.broker_principal.value.ptr,
-                    source->source.alias_source.value.broker_principal.value.len);
-            if (root->source_alias_source_broker_principal == NULL) {
-                ovstorage_root_info_destroy(root);
-                return NULL;
-            }
+        if (!ovc_dispatch_opt_str_copy(
+                &root->source_alias_source_broker_principal,
+                &source->source.alias_source.value.broker_principal)) {
+            ovstorage_root_info_destroy(root);
+            return NULL;
         }
     }
     if (source->alias_state.present) {
         root->has_alias_state = true;
         root->alias_state_kind =
             (OvStorage_AliasStateKind)source->alias_state.value.tag;
-        if (source->alias_state.value.reason.present) {
-            root->alias_state_chain_too_long_reason =
-                ovc_dispatch_slice_copy(
-                    source->alias_state.value.reason.value.ptr,
-                    source->alias_state.value.reason.value.len);
-            if (root->alias_state_chain_too_long_reason == NULL) {
-                ovstorage_root_info_destroy(root);
-                return NULL;
-            }
+        if (!ovc_dispatch_opt_str_copy(
+                &root->alias_state_chain_too_long_reason,
+                &source->alias_state.value.reason)) {
+            ovstorage_root_info_destroy(root);
+            return NULL;
         }
     }
     metadata = NULL;
@@ -2497,6 +2636,169 @@ static OvStorage_RootInfo *ovc_dispatch_root_info_from_plugin(
         root->icon_len = source->icon.value.len;
     }
     return root;
+}
+
+/* Convert a plugin-side SecretBundle into an owned, public `OvStorage_SecretBundle`
+ * -- the direction `ovc_dispatch_secret_bundle_copy` below goes the other way. Built
+ * through the same public `ovstorage_secret_value_create_*`/`ovstorage_secret_bundle_add`
+ * calls a host would use, rather than poking `internal.h`'s private layout
+ * directly, so it inherits their existing secret-wipe-on-drop guarantee for
+ * free instead of a second implementation of it.
+ *
+ * Returns NULL only on OOM or malformed input (nothing partial escapes: a
+ * bundle that fails part way through is destroyed before returning) --
+ * never merely because `source` has no entries. `AuthEvent` distinguishes
+ * "no credentials field" (`Optional::present == false`, never reaching
+ * this function) from "an explicit, present-but-empty bundle" (`present
+ * == true`, `entries.len == 0`): the latter is a real request to
+ * replace/clear credentials, and collapsing it to NULL here would make it
+ * indistinguishable from the former at
+ * `ovstorage_auth_event_take_succeeded_credentials`, silently dropping
+ * the clear. A key's field name uses the same lossy NUL-escaping every
+ * other plugin string in this file does; the values themselves are typed
+ * payloads, not strings, so nothing about them is lossy. */
+/* A malformed plugin `Bytes` slice -- a NULL `ptr` paired with a nonzero
+ * `len` -- would otherwise reach `ovc_secret_bytes_copy`, which silently
+ * treats `(NULL, len)` as `(NULL, 0)` and drops the length: a plugin bug
+ * would alter credential content rather than being rejected. */
+static bool ovc_dispatch_plugin_bytes_valid(const OvStoragePlugin_Bytes *bytes)
+{
+    return bytes->ptr != NULL || bytes->len == 0;
+}
+
+static OvStorage_SecretBundle *ovc_dispatch_secret_bundle_from_plugin(
+    const OvStoragePlugin_SecretBundle *source)
+{
+    OvStorage_SecretBundle *bundle;
+    size_t index;
+
+    if (source == NULL) {
+        return NULL;
+    }
+    /* A non-NULL `entries.ptr` is only required when there is at least one
+     * entry to read from it: a present-but-empty bundle legitimately pairs
+     * `len == 0` with `ptr == NULL`. */
+    if (source->entries.len != 0 && source->entries.ptr == NULL) {
+        return NULL;
+    }
+    bundle = ovstorage_secret_bundle_create();
+    if (bundle == NULL) {
+        return NULL;
+    }
+    for (index = 0; index < source->entries.len; ++index) {
+        OvStoragePlugin_SecretBundleEntry const *entry =
+            &source->entries.ptr[index];
+        char *key;
+        OvStorage_SecretValue *value;
+        bool added;
+        bool shape_valid;
+
+        switch (entry->value.tag) {
+        case OvStoragePlugin_SecretValueTag_Bytes:
+            shape_valid = ovc_dispatch_plugin_bytes_valid(
+                &entry->value.bytes.bytes);
+            break;
+        case OvStoragePlugin_SecretValueTag_File:
+            shape_valid = ovc_dispatch_plugin_bytes_valid(
+                &entry->value.file.bytes);
+            break;
+        case OvStoragePlugin_SecretValueTag_OAuthToken:
+            shape_valid = ovc_dispatch_plugin_bytes_valid(
+                    &entry->value.oauth_token.token.bytes) &&
+                (!entry->value.oauth_token.refresh.present ||
+                 ovc_dispatch_plugin_bytes_valid(
+                     &entry->value.oauth_token.refresh.value.bytes));
+            break;
+        case OvStoragePlugin_SecretValueTag_MtlsCertPair:
+            shape_valid = ovc_dispatch_plugin_bytes_valid(
+                    &entry->value.mtls_cert_pair.cert_pem.bytes) &&
+                ovc_dispatch_plugin_bytes_valid(
+                    &entry->value.mtls_cert_pair.key_pem.bytes);
+            break;
+        case OvStoragePlugin_SecretValueTag_SystemIdentity:
+        default:
+            shape_valid = true;
+            break;
+        }
+        if (!shape_valid) {
+            ovstorage_secret_bundle_destroy(bundle);
+            return NULL;
+        }
+        key = ovc_dispatch_slice_copy_lossy(entry->field.ptr,
+                                            entry->field.len);
+        if (key == NULL) {
+            ovstorage_secret_bundle_destroy(bundle);
+            return NULL;
+        }
+        switch (entry->value.tag) {
+        case OvStoragePlugin_SecretValueTag_Bytes:
+            value = ovstorage_secret_value_create_bytes(
+                (const uint8_t *)entry->value.bytes.bytes.ptr,
+                entry->value.bytes.bytes.len);
+            break;
+        case OvStoragePlugin_SecretValueTag_File:
+            value = ovstorage_secret_value_create_file(
+                (const uint8_t *)entry->value.file.bytes.ptr,
+                entry->value.file.bytes.len);
+            break;
+        case OvStoragePlugin_SecretValueTag_OAuthToken: {
+            OvStoragePlugin_SecretValueOAuthToken const *token =
+                &entry->value.oauth_token;
+            const uint8_t *refresh_data = NULL;
+            size_t refresh_len = 0;
+            bool has_refresh = token->refresh.present;
+            uint64_t expires_at_unix_nanos = 0;
+            bool has_expires_at = token->expires_at_unix_ms.present;
+
+            if (has_refresh) {
+                refresh_data =
+                    (const uint8_t *)token->refresh.value.bytes.ptr;
+                refresh_len = token->refresh.value.bytes.len;
+            }
+            if (has_expires_at) {
+                int64_t expires_ms = token->expires_at_unix_ms.value;
+                if (expires_ms < 0 ||
+                    (uint64_t)expires_ms > UINT64_MAX / UINT64_C(1000000)) {
+                    has_expires_at = false;
+                } else {
+                    expires_at_unix_nanos =
+                        (uint64_t)expires_ms * UINT64_C(1000000);
+                }
+            }
+            value = ovstorage_secret_value_create_oauth_token(
+                (const uint8_t *)token->token.bytes.ptr,
+                token->token.bytes.len, refresh_data, refresh_len,
+                has_refresh, expires_at_unix_nanos, has_expires_at);
+            break;
+        }
+        case OvStoragePlugin_SecretValueTag_MtlsCertPair:
+            value = ovstorage_secret_value_create_mtls_cert_pair(
+                (const uint8_t *)entry->value.mtls_cert_pair.cert_pem.bytes.ptr,
+                entry->value.mtls_cert_pair.cert_pem.bytes.len,
+                (const uint8_t *)entry->value.mtls_cert_pair.key_pem.bytes.ptr,
+                entry->value.mtls_cert_pair.key_pem.bytes.len);
+            break;
+        case OvStoragePlugin_SecretValueTag_SystemIdentity:
+            value = ovstorage_secret_value_create_system_identity();
+            break;
+        default:
+            value = NULL;
+            break;
+        }
+        if (value == NULL) {
+            free(key);
+            ovstorage_secret_bundle_destroy(bundle);
+            return NULL;
+        }
+        added = ovstorage_secret_bundle_add(bundle, key, value);
+        free(key);
+        if (!added) {
+            ovstorage_secret_value_destroy(value);
+            ovstorage_secret_bundle_destroy(bundle);
+            return NULL;
+        }
+    }
+    return bundle;
 }
 
 static void ovc_dispatch_auth_event_clear(OvStoragePlugin_AuthEvent *event)
@@ -2607,6 +2909,22 @@ static OvStorage_AuthEvent *ovc_dispatch_auth_event_from_plugin(
         if (event->as.succeeded.connection == NULL) {
             ovstorage_auth_event_destroy(event);
             return NULL;
+        }
+        if (source->succeeded.credentials.present) {
+            /* `ovc_dispatch_secret_bundle_from_plugin` returns NULL only
+             * on OOM or malformed input when its argument is non-NULL, so
+             * NULL here is unambiguous: unlike the field being absent
+             * (`present == false`, which never reaches this branch), a
+             * present-but-empty bundle converts to a real, non-NULL,
+             * zero-entry bundle -- the explicit "clear credentials"
+             * request it is. */
+            event->as.succeeded.credentials =
+                ovc_dispatch_secret_bundle_from_plugin(
+                    &source->succeeded.credentials.value);
+            if (event->as.succeeded.credentials == NULL) {
+                ovstorage_auth_event_destroy(event);
+                return NULL;
+            }
         }
         break;
     case OvStoragePlugin_AuthEventTag_Failed:
@@ -2958,16 +3276,73 @@ static bool ovc_dispatch_stat_options(
         return true;
     }
     out->full_metadata = options->full_metadata;
+    out->versioned_address = options->versioned_address;
     return true;
 }
 
-/* Marshal caller write options into the plugin request.
+/* Marshal a no_overwrite/if_match_etag precondition pair -- the shape every
+ * app-facing options struct with a destination precondition spells the same
+ * way (`OvStorage_WriteOptions`, `OvStorage_CopyOptions`) -- into a plugin
+ * `IfDestExistsV1` tagged union. `*out` must already be zeroed; only the
+ * `tag` and, when it becomes `MatchEtag`, `match_etag.etag` are written.
  *
  * `*out_reason` is written only on failure, and names the option that is
  * wrong rather than leaving the caller with the entry point's catch-all
  * "arguments are invalid" — an if-match etag is usually computed from a
  * prior stat, so a caller who gets it wrong needs to be told which of the
  * two preconditions the host refused. */
+static bool ovc_dispatch_if_dest_from_precondition(
+    OvStoragePlugin_IfDestExistsV1 *out,
+    bool no_overwrite,
+    const char *if_match_etag,
+    const char **out_reason)
+{
+    out->tag = OvStoragePlugin_IfDestExistsTag_Overwrite;
+    if (no_overwrite && if_match_etag != NULL) {
+        *out_reason =
+            "set both no_overwrite and if_match_etag; a destination "
+            "precondition is one or the other";
+        return false;
+    }
+    if (no_overwrite) {
+        out->tag = OvStoragePlugin_IfDestExistsTag_Fail;
+        return true;
+    }
+    if (if_match_etag != NULL) {
+        if (if_match_etag[0] == '\0') {
+            *out_reason =
+                "carries an empty if_match_etag; pass NULL for no "
+                "precondition";
+            return false;
+        }
+        if (!ovc_dispatch_utf8_valid(if_match_etag)) {
+            *out_reason = "carries a non-UTF-8 if_match_etag";
+            return false;
+        }
+        if (!ovc_dispatch_abi_cstring_copy(&out->match_etag.etag,
+                                           if_match_etag)) {
+            *out_reason = "could not allocate the if_match_etag precondition";
+            return false;
+        }
+        out->tag = OvStoragePlugin_IfDestExistsTag_MatchEtag;
+    }
+    return true;
+}
+
+/* Release what `ovc_dispatch_if_dest_from_precondition` allocated, for the
+ * paths that abandon the request before it becomes a task (a task's own
+ * teardown covers it). Safe on a zeroed struct: the zero tag is
+ * `Overwrite`, which owns nothing. */
+static void ovc_dispatch_if_dest_clear(OvStoragePlugin_IfDestExistsV1 *if_dest)
+{
+    if (if_dest->tag == OvStoragePlugin_IfDestExistsTag_MatchEtag) {
+        ovc_dispatch_abi_str_clear(&if_dest->match_etag.etag);
+        if_dest->tag = OvStoragePlugin_IfDestExistsTag_Overwrite;
+    }
+}
+
+/* Marshal caller write options into the plugin request. See
+ * `ovc_dispatch_if_dest_from_precondition` for the precondition half. */
 static bool ovc_dispatch_write_options(
     OvStoragePlugin_WriteOptions *out,
     const OvStorage_WriteOptions *options,
@@ -2979,31 +3354,10 @@ static bool ovc_dispatch_write_options(
     if (options == NULL) {
         return true;
     }
-    if (options->no_overwrite && options->if_match_etag != NULL) {
-        *out_reason =
-            "write options set both no_overwrite and if_match_etag; a "
-            "destination precondition is one or the other";
+    if (!ovc_dispatch_if_dest_from_precondition(
+            &out->if_dest, options->no_overwrite, options->if_match_etag,
+            out_reason)) {
         return false;
-    }
-    if (options->no_overwrite) {
-        out->if_dest.tag = OvStoragePlugin_IfDestExistsTag_Fail;
-    } else if (options->if_match_etag != NULL) {
-        if (options->if_match_etag[0] == '\0') {
-            *out_reason =
-                "write options carry an empty if_match_etag; pass NULL for "
-                "no precondition";
-            return false;
-        }
-        if (!ovc_dispatch_utf8_valid(options->if_match_etag)) {
-            *out_reason = "write options carry a non-UTF-8 if_match_etag";
-            return false;
-        }
-        if (!ovc_dispatch_abi_cstring_copy(&out->if_dest.match_etag.etag,
-                                           options->if_match_etag)) {
-            *out_reason = "could not allocate the if_match_etag precondition";
-            return false;
-        }
-        out->if_dest.tag = OvStoragePlugin_IfDestExistsTag_MatchEtag;
     }
     out->size_hint.present = options->has_size_hint;
     out->size_hint.value = options->size_hint;
@@ -3016,15 +3370,45 @@ static bool ovc_dispatch_write_options(
 static void ovc_dispatch_write_options_clear(
     OvStoragePlugin_WriteOptions *options)
 {
-    if (options->if_dest.tag == OvStoragePlugin_IfDestExistsTag_MatchEtag) {
-        ovc_dispatch_abi_str_clear(&options->if_dest.match_etag.etag);
-        options->if_dest.tag = OvStoragePlugin_IfDestExistsTag_Overwrite;
+    ovc_dispatch_if_dest_clear(&options->if_dest);
+}
+
+/*
+ * Marshal a caller's page token. NULL is the first page; a non-NULL token is
+ * one a prior `next_page_token` handed back, so an empty string is refused
+ * rather than forwarded: an absent `next_page_token` propagated as "" would
+ * otherwise re-list from the start and nothing would say so. The empty
+ * `if_match_etag` refusal is the same rule on the write side.
+ */
+static bool ovc_dispatch_page_token_from_option(
+    OvStoragePlugin_Optional_Str *out,
+    const char *page_token,
+    const char **out_reason)
+{
+    if (page_token == NULL) {
+        return true;
     }
+    if (page_token[0] == '\0') {
+        *out_reason = "carries an empty page_token; pass NULL for the first "
+                      "page";
+        return false;
+    }
+    if (!ovc_dispatch_utf8_valid(page_token)) {
+        *out_reason = "carries a non-UTF-8 page_token";
+        return false;
+    }
+    if (!ovc_dispatch_abi_cstring_copy(&out->value, page_token)) {
+        *out_reason = "could not allocate the page_token";
+        return false;
+    }
+    out->present = true;
+    return true;
 }
 
 static bool ovc_dispatch_list_options(
     OvStoragePlugin_ListOptions *out,
-    const OvStorage_ListOptions *options)
+    const OvStorage_ListOptions *options,
+    const char **out_reason)
 {
     memset(out, 0, sizeof(*out));
     out->struct_size = sizeof(*out);
@@ -3035,15 +3419,10 @@ static bool ovc_dispatch_list_options(
     out->max_results.present = options->has_max_results;
     out->max_results.value = options->max_results;
     out->full_metadata = options->full_metadata;
-    if (options->page_token != NULL) {
-        out->page_token.present = true;
-        if (!ovc_dispatch_utf8_valid(options->page_token) ||
-            !ovc_dispatch_abi_cstring_copy(&out->page_token.value,
-                                           options->page_token)) {
-            return false;
-        }
-    }
-    return true;
+    out->versioned_address = options->versioned_address;
+    return ovc_dispatch_page_token_from_option(&out->page_token,
+                                               options->page_token,
+                                               out_reason);
 }
 
 static void ovc_dispatch_list_options_clear(
@@ -3057,7 +3436,8 @@ static void ovc_dispatch_list_options_clear(
 
 static bool ovc_dispatch_list_versions_options(
     OvStoragePlugin_ListVersionsOptions *out,
-    const OvStorage_ListVersionsOptions *options)
+    const OvStorage_ListVersionsOptions *options,
+    const char **out_reason)
 {
     memset(out, 0, sizeof(*out));
     out->struct_size = sizeof(*out);
@@ -3066,15 +3446,9 @@ static bool ovc_dispatch_list_versions_options(
     }
     out->max_results.present = options->has_max_results;
     out->max_results.value = options->max_results;
-    if (options->page_token != NULL) {
-        out->page_token.present = true;
-        if (!ovc_dispatch_utf8_valid(options->page_token) ||
-            !ovc_dispatch_abi_cstring_copy(&out->page_token.value,
-                                           options->page_token)) {
-            return false;
-        }
-    }
-    return true;
+    return ovc_dispatch_page_token_from_option(&out->page_token,
+                                               options->page_token,
+                                               out_reason);
 }
 
 static void ovc_dispatch_list_versions_options_clear(
@@ -3164,14 +3538,12 @@ static OvStorage_List *ovc_dispatch_list_from_plugin(
         items[index] = *converted;
         free(converted);
     }
-    if (source->next_page_token.present) {
-        list->next_page_token = ovc_dispatch_slice_copy(
-            source->next_page_token.value.ptr,
-            source->next_page_token.value.len);
-        if (list->next_page_token == NULL) {
-            ovstorage_list_destroy(list);
-            return NULL;
-        }
+    /* An unset token reaches the client as NULL so a caller paging on
+     * `next_page_token != NULL` stops instead of re-listing with "". */
+    if (!ovc_dispatch_opt_str_copy(&list->next_page_token,
+                                   &source->next_page_token)) {
+        ovstorage_list_destroy(list);
+        return NULL;
     }
     return list;
 }
@@ -3212,14 +3584,10 @@ static OvStorage_VersionList *ovc_dispatch_version_list_from_plugin(
         items[index] = *converted;
         free(converted);
     }
-    if (source->next_page_token.present) {
-        list->next_page_token = ovc_dispatch_slice_copy(
-            source->next_page_token.value.ptr,
-            source->next_page_token.value.len);
-        if (list->next_page_token == NULL) {
-            ovstorage_version_list_destroy(list);
-            return NULL;
-        }
+    if (!ovc_dispatch_opt_str_copy(&list->next_page_token,
+                                   &source->next_page_token)) {
+        ovstorage_version_list_destroy(list);
+        return NULL;
     }
     return list;
 }
@@ -3240,6 +3608,8 @@ static bool ovc_dispatch_access_from_plugin(
     OvStorage_AccessDecision *out,
     const OvStoragePlugin_AccessDecision *source)
 {
+    const char *reason;
+
     memset(out, 0, sizeof(*out));
     if (source == NULL) {
         return false;
@@ -3249,13 +3619,12 @@ static bool ovc_dispatch_access_from_plugin(
     out->denied_ops.write = source->denied_ops.write;
     out->denied_ops.delete_ = source->denied_ops.delete_;
     out->denied_ops.update_metadata = source->denied_ops.update_metadata;
-    if (source->reason.present) {
-        out->reason = ovc_dispatch_slice_copy(source->reason.value.ptr,
-                                              source->reason.value.len);
-        if (out->reason == NULL) {
-            return false;
-        }
+    /* The public field is `char *` because the client frees it in place;
+     * the helper writes through `const char **`. */
+    if (!ovc_dispatch_opt_str_copy(&reason, &source->reason)) {
+        return false;
     }
+    out->reason = (char *)reason;
     return true;
 }
 
@@ -3285,7 +3654,7 @@ static void ovc_dispatch_local_delegate_clear(
 }
 
 static OvStorage_LocalDelegate *ovc_dispatch_local_delegate_from_plugin(
-    const OvStoragePlugin_LocalDelegate *source)
+    OvStoragePlugin_LocalDelegate *source)
 {
     OvStorage_LocalDelegate *delegate;
 
@@ -3303,6 +3672,10 @@ static OvStorage_LocalDelegate *ovc_dispatch_local_delegate_from_plugin(
         ovstorage_local_delegate_destroy(delegate);
         return NULL;
     }
+    delegate->release = source->lease.drop_fn;
+    delegate->release_context = source->lease.state;
+    source->lease.drop_fn = NULL;
+    source->lease.state = NULL;
     return delegate;
 }
 
@@ -3357,6 +3730,9 @@ static void ovc_dispatch_fire_callback_error(
         break;
     case OVC_DISPATCH_ROOT_LIST:
         callback.root_list(error->code, NULL, error, user_data);
+        break;
+    case OVC_DISPATCH_ROOT_INFO:
+        callback.root_info(error->code, NULL, error, user_data);
         break;
     case OVC_DISPATCH_CONNECTION_LIST:
         callback.connection_list(error->code, NULL, error, user_data);
@@ -3478,9 +3854,150 @@ static void ovc_dispatch_operation_fail_status(
     ovc_dispatch_operation_free(operation);
 }
 
+/* Identity of a just-opened local delegate file, re-checked once the stream
+ * reaches EOF (see `ovc_dispatch_local_file_next`) and against
+ * `materialize`'s own, earlier stat (see
+ * `ovc_dispatch_local_file_identity_matches_info`) right after opening.
+ * The EOF re-check deliberately does not compare bytes actually read
+ * against `materialize`'s size: that size is not always a byte count
+ * (e.g. a procfs-style regular file reporting `st_size == 0` while
+ * streaming real content), so comparing bytes read against it produces
+ * false `ObjectModified` failures on such files. Comparing this struct's
+ * own open-time fstat against a second fstat of the *same* open handle at
+ * EOF instead catches a concurrent truncation or rewrite (same or
+ * different length) without depending on `st_size` meaning "how many bytes
+ * this stream will yield" for every filesystem. */
+typedef struct ovc_dispatch_local_file_identity {
+    bool valid;
+    uint64_t size;
+    int64_t mtime_seconds;
+    long mtime_nanoseconds;
+} ovc_dispatch_local_file_identity;
+
 typedef struct ovc_dispatch_local_file_stream {
     FILE *file;
+    ovc_dispatch_local_file_identity opened_identity;
 } ovc_dispatch_local_file_stream;
+
+#if defined(_WIN32)
+/* `_fstat64`'s `st_mtime` is a `time_t` -- whole seconds only -- while
+ * `materialize`'s own Windows stat (`ovc_file_win32_filetime_nanos` in
+ * file_backend.c) reads the file's FILETIME directly, which carries
+ * 100ns resolution. Comparing a second-truncated mtime against that
+ * sub-second value mismatches on nearly every file, not just a raced
+ * one, so this reads the same handle's FILETIME to match materialize's
+ * precision instead of going through `_fstat64`. */
+static int64_t ovc_dispatch_win32_filetime_nanos(FILETIME value)
+{
+    ULARGE_INTEGER ticks;
+    const uint64_t unix_epoch_ticks = UINT64_C(116444736000000000);
+    uint64_t unix_ticks;
+
+    ticks.LowPart = value.dwLowDateTime;
+    ticks.HighPart = value.dwHighDateTime;
+    if (ticks.QuadPart < unix_epoch_ticks) {
+        return 0;
+    }
+    unix_ticks = ticks.QuadPart - unix_epoch_ticks;
+    if (unix_ticks > (uint64_t)INT64_MAX / UINT64_C(100)) {
+        return INT64_MAX;
+    }
+    return (int64_t)(unix_ticks * UINT64_C(100));
+}
+#endif
+
+static ovc_dispatch_local_file_identity ovc_dispatch_local_file_identity_get(
+    FILE *file)
+{
+    ovc_dispatch_local_file_identity identity;
+
+    memset(&identity, 0, sizeof(identity));
+#if defined(_WIN32)
+    {
+        struct _stat64 st;
+        HANDLE handle;
+        FILETIME creation_time;
+        FILETIME access_time;
+        FILETIME write_time;
+        int64_t nanos;
+
+        if (_fstat64(_fileno(file), &st) != 0) {
+            return identity;
+        }
+        identity.valid = true;
+        identity.size = (uint64_t)st.st_size;
+        identity.mtime_seconds = (int64_t)st.st_mtime;
+        identity.mtime_nanoseconds = 0;
+
+        handle = (HANDLE)_get_osfhandle(_fileno(file));
+        if (handle != INVALID_HANDLE_VALUE &&
+            GetFileTime(handle, &creation_time, &access_time, &write_time)) {
+            nanos = ovc_dispatch_win32_filetime_nanos(write_time);
+            identity.mtime_seconds = nanos / INT64_C(1000000000);
+            identity.mtime_nanoseconds = (long)(nanos % INT64_C(1000000000));
+        }
+    }
+#else
+    {
+        struct stat st;
+
+        if (fstat(fileno(file), &st) != 0) {
+            return identity;
+        }
+        identity.valid = true;
+        identity.size = (uint64_t)st.st_size;
+#if defined(__APPLE__)
+        identity.mtime_seconds = (int64_t)st.st_mtimespec.tv_sec;
+        identity.mtime_nanoseconds = st.st_mtimespec.tv_nsec;
+#else
+        identity.mtime_seconds = (int64_t)st.st_mtim.tv_sec;
+        identity.mtime_nanoseconds = st.st_mtim.tv_nsec;
+#endif
+    }
+#endif
+    return identity;
+}
+
+static bool ovc_dispatch_local_file_identity_equal(
+    const ovc_dispatch_local_file_identity *left,
+    const ovc_dispatch_local_file_identity *right)
+{
+    return left->valid && right->valid && left->size == right->size &&
+           left->mtime_seconds == right->mtime_seconds &&
+           left->mtime_nanoseconds == right->mtime_nanoseconds;
+}
+
+/* `materialize`'s own stat, recorded in `ObjectInfo` before this file is
+ * opened, catches a replace-or-truncate race that the open-to-EOF check in
+ * `ovc_dispatch_local_file_next` cannot see: that check only compares two
+ * fstats of the *same* open handle, so a replacement already in place by
+ * the time this `fopen` runs is invisible to it -- both fstats describe
+ * the replacement and agree with each other. Comparing the freshly opened
+ * handle's identity against the materialize-time identity closes that gap.
+ * A field the delegate never populated (e.g. a pseudo-file backend that
+ * leaves `size` absent, since `st_size` is not a byte count there) is
+ * skipped rather than treated as a mismatch. */
+static bool ovc_dispatch_local_file_identity_matches_info(
+    const ovc_dispatch_local_file_identity *identity,
+    const OvStoragePlugin_ObjectInfo *info)
+{
+    if (!identity->valid) {
+        return true;
+    }
+    if (info->size.present && info->size.value != identity->size) {
+        return false;
+    }
+    if (info->mtime_unix_ms.present) {
+        int64_t identity_mtime_ms;
+
+        identity_mtime_ms = identity->mtime_seconds * INT64_C(1000) +
+                            identity->mtime_nanoseconds / 1000000;
+        if (info->mtime_unix_ms.value != identity_mtime_ms) {
+            return false;
+        }
+    }
+    return true;
+}
 
 static OvStoragePlugin_ErrorCode ovc_dispatch_native_error_code(
     int native_error)
@@ -3732,6 +4249,30 @@ static OvStoragePlugin_StreamStep ovc_dispatch_local_file_next(
     }
     ovc_abi_free(bytes);
     if (feof(stream->file)) {
+        /* Ask #5: a whole-object read has no identity re-check on this
+         * path (that exists only for the buffered/ranged read below) --
+         * re-fstat`ing the same open handle at EOF and comparing against
+         * the identity captured when it was opened is what stands in for
+         * one. A file truncated or rewritten (same or different length)
+         * between open and this read completing yields short or mixed
+         * content with no other signal; failing here turns that into a
+         * reported error instead of a silent, wrong `Ok`. */
+        if (stream->opened_identity.valid) {
+            ovc_dispatch_local_file_identity eof_identity;
+
+            eof_identity = ovc_dispatch_local_file_identity_get(stream->file);
+            if (eof_identity.valid &&
+                !ovc_dispatch_local_file_identity_equal(
+                    &stream->opened_identity, &eof_identity)) {
+                ovc_dispatch_plugin_error_init(
+                    out_error,
+                    OvStoragePlugin_ErrorCode_ObjectModified,
+                    "local delegate file identity changed during the "
+                    "read; the file was truncated or rewritten during "
+                    "the read");
+                return OvStoragePlugin_StreamStep_Failed;
+            }
+        }
         return OvStoragePlugin_StreamStep_Ended;
     }
     native_error = errno == 0 ? EIO : errno;
@@ -3796,6 +4337,18 @@ static bool ovc_dispatch_local_delegate_to_stream(
         return false;
     }
     state->file = file;
+    state->opened_identity = ovc_dispatch_local_file_identity_get(file);
+    if (!ovc_dispatch_local_file_identity_matches_info(
+            &state->opened_identity, &result->local_delegate.info)) {
+        (void)fclose(file);
+        free(state);
+        *out_error = ovc_dispatch_plugin_error_create(
+            OvStoragePlugin_ErrorCode_ObjectModified,
+            "local delegate file identity did not match the materialized "
+            "object; the file was replaced or truncated before it could "
+            "be opened");
+        return false;
+    }
 
     result->stream.info = result->local_delegate.info;
     memset(&result->local_delegate.info,
@@ -3899,6 +4452,10 @@ static void ovc_dispatch_result_discard(ovc_dispatch_operation_kind kind,
         ovc_abi_free(envelope);
         break;
     }
+    case OVC_DISPATCH_ROOT_INFO:
+        ovc_dispatch_root_info_clear(
+            (OvStoragePlugin_RootInfo *)result, true);
+        break;
     case OVC_DISPATCH_CONNECTION_LIST: {
         OvStoragePlugin_ListConnectionsResult *envelope;
 
@@ -4233,21 +4790,10 @@ static bool ovc_dispatch_change_from_plugin(
         if (out->address == NULL) {
             return false;
         }
-        if (object->etag.present) {
-            out->etag = ovc_dispatch_slice_copy(object->etag.value.ptr,
-                                                object->etag.value.len);
-            if (out->etag == NULL) {
-                ovc_dispatch_public_change_clear(out);
-                return false;
-            }
-        }
-        if (object->version.present) {
-            out->version = ovc_dispatch_slice_copy(
-                object->version.value.ptr, object->version.value.len);
-            if (out->version == NULL) {
-                ovc_dispatch_public_change_clear(out);
-                return false;
-            }
+        if (!ovc_dispatch_opt_str_copy(&out->etag, &object->etag) ||
+            !ovc_dispatch_opt_str_copy(&out->version, &object->version)) {
+            ovc_dispatch_public_change_clear(out);
+            return false;
         }
         out->has_size = object->size.present;
         if (out->has_size) {
@@ -4953,6 +5499,27 @@ static void ovc_dispatch_complete(int32_t status,
         ovc_dispatch_operation_leave(operation->handle);
         break;
     }
+    case OVC_DISPATCH_ROOT_INFO: {
+        OvStoragePlugin_RootInfo *plugin_root;
+        OvStorage_RootInfo *root;
+
+        plugin_root = (OvStoragePlugin_RootInfo *)result;
+        root = ovc_dispatch_root_info_from_plugin(plugin_root);
+        ovc_dispatch_root_info_clear(plugin_root, true);
+        if (root == NULL) {
+            ovc_dispatch_operation_fail(operation,
+                                        NULL,
+                                        false,
+                                        "could not convert address root");
+            return;
+        }
+        operation->callback.root_info(OvStorage_Status_Ok,
+                                      root,
+                                      NULL,
+                                      operation->user_data);
+        ovc_dispatch_operation_leave(operation->handle);
+        break;
+    }
     case OVC_DISPATCH_CONNECTION_LIST: {
         OvStoragePlugin_ListConnectionsResult *envelope;
         OvStorage_ConnectionList *list;
@@ -5147,6 +5714,9 @@ static void ovc_dispatch_io_request_clear(ovc_dispatch_io_task *task)
         break;
     case OVC_DISPATCH_IO_TASK_CHECK_ACCESS:
         ovc_dispatch_abi_str_clear(&task->request.check_access.address);
+        break;
+    case OVC_DISPATCH_IO_TASK_ROOT_INFO_FOR:
+        ovc_dispatch_abi_str_clear(&task->request.root_info_for.url);
         break;
     case OVC_DISPATCH_IO_TASK_ERROR:
     case OVC_DISPATCH_IO_TASK_LIST_ADDRESS_ROOTS:
@@ -5357,6 +5927,13 @@ static void ovc_dispatch_io_task_run(void *argument)
                                         &task->cancel,
                                         ovc_dispatch_complete,
                                         task->operation);
+        break;
+    case OVC_DISPATCH_IO_TASK_ROOT_INFO_FOR:
+        root.vtable->root_info_for(root.state,
+                                   &task->request.root_info_for,
+                                   &task->cancel,
+                                   ovc_dispatch_complete,
+                                   task->operation);
         break;
     case OVC_DISPATCH_IO_TASK_LIST_CONNECTIONS:
         root.vtable->list_connections(root.state,
@@ -6086,6 +6663,7 @@ void ovstorage_list(const OvStorage_LayerHandle *handle,
     ovc_dispatch_callback callback;
     ovc_dispatch_operation *operation;
     ovc_dispatch_io_task *task;
+    const char *reason;
     bool valid;
 
     if (on_complete == NULL) {
@@ -6102,8 +6680,9 @@ void ovstorage_list(const OvStorage_LayerHandle *handle,
     }
     memset(&request, 0, sizeof(request));
     request.struct_size = sizeof(request);
+    reason = "list arguments are invalid";
     valid = ovc_dispatch_address_valid(prefix) &&
-            ovc_dispatch_list_options(&request.options, options);
+            ovc_dispatch_list_options(&request.options, options, &reason);
     if (valid) {
         valid = ovc_dispatch_abi_cstring_copy(&request.prefix, prefix);
     }
@@ -6139,7 +6718,7 @@ void ovstorage_list(const OvStorage_LayerHandle *handle,
         ovc_dispatch_list_options_clear(&request.options);
         task->kind = OVC_DISPATCH_IO_TASK_ERROR;
         task->error_status = OvStorage_Status_InvalidArgument;
-        task->error_message = "list arguments are invalid";
+        task->error_message = reason;
         ovc_dispatch_io_task_submit(task);
         return;
     }
@@ -6163,6 +6742,7 @@ void ovstorage_list_versions(const OvStorage_LayerHandle *handle,
     ovc_dispatch_callback callback;
     ovc_dispatch_operation *operation;
     ovc_dispatch_io_task *task;
+    const char *reason;
     bool valid;
 
     if (on_complete == NULL) {
@@ -6179,8 +6759,10 @@ void ovstorage_list_versions(const OvStorage_LayerHandle *handle,
     }
     memset(&request, 0, sizeof(request));
     request.struct_size = sizeof(request);
+    reason = "list_versions arguments are invalid";
     valid = ovc_dispatch_address_valid(address) &&
-            ovc_dispatch_list_versions_options(&request.options, options);
+            ovc_dispatch_list_versions_options(
+                &request.options, options, &reason);
     if (valid) {
         valid = ovc_dispatch_abi_cstring_copy(&request.address, address);
     }
@@ -6216,7 +6798,7 @@ void ovstorage_list_versions(const OvStorage_LayerHandle *handle,
         ovc_dispatch_list_versions_options_clear(&request.options);
         task->kind = OVC_DISPATCH_IO_TASK_ERROR;
         task->error_status = OvStorage_Status_InvalidArgument;
-        task->error_message = "list_versions arguments are invalid";
+        task->error_message = reason;
         ovc_dispatch_io_task_submit(task);
         return;
     }
@@ -6430,6 +7012,7 @@ void ovstorage_watch_directory(
 void ovstorage_copy(const OvStorage_LayerHandle *handle,
                     const char *src,
                     const char *dest,
+                    const OvStorage_CopyOptions *options,
                     const OvStorage_CancelToken *cancel,
                     OvStorage_InfoCallback on_complete,
                     void *user_data)
@@ -6439,6 +7022,7 @@ void ovstorage_copy(const OvStorage_LayerHandle *handle,
     ovc_dispatch_callback callback;
     ovc_dispatch_operation *operation;
     ovc_dispatch_io_task *task;
+    const char *reason;
     bool valid;
 
     if (on_complete == NULL) {
@@ -6456,9 +7040,14 @@ void ovstorage_copy(const OvStorage_LayerHandle *handle,
     memset(&request, 0, sizeof(request));
     request.struct_size = sizeof(request);
     request.options.struct_size = sizeof(request.options);
-    request.options.if_dest.tag = OvStoragePlugin_IfDestExistsTag_Overwrite;
+    reason = "copy arguments are invalid";
     valid = ovc_dispatch_address_valid(src) &&
-            ovc_dispatch_address_valid(dest);
+            ovc_dispatch_address_valid(dest) &&
+            ovc_dispatch_if_dest_from_precondition(
+                &request.options.if_dest,
+                options != NULL && options->no_overwrite,
+                options != NULL ? options->if_match_etag : NULL,
+                &reason);
     if (valid) {
         valid = ovc_dispatch_abi_cstring_copy(&request.source, src) &&
                 ovc_dispatch_abi_cstring_copy(&request.destination, dest);
@@ -6472,6 +7061,7 @@ void ovstorage_copy(const OvStorage_LayerHandle *handle,
     if (operation == NULL) {
         ovc_dispatch_abi_str_clear(&request.source);
         ovc_dispatch_abi_str_clear(&request.destination);
+        ovc_dispatch_if_dest_clear(&request.options.if_dest);
         ovc_dispatch_fire_inline_error(OVC_DISPATCH_INFO_WRITE_STEP,
                                        callback,
                                        user_data,
@@ -6484,6 +7074,7 @@ void ovstorage_copy(const OvStorage_LayerHandle *handle,
     if (task == NULL) {
         ovc_dispatch_abi_str_clear(&request.source);
         ovc_dispatch_abi_str_clear(&request.destination);
+        ovc_dispatch_if_dest_clear(&request.options.if_dest);
         ovc_dispatch_operation_fail_status(
             operation,
             OvStorage_Status_Internal,
@@ -6493,9 +7084,10 @@ void ovstorage_copy(const OvStorage_LayerHandle *handle,
     if (!valid) {
         ovc_dispatch_abi_str_clear(&request.source);
         ovc_dispatch_abi_str_clear(&request.destination);
+        ovc_dispatch_if_dest_clear(&request.options.if_dest);
         task->kind = OVC_DISPATCH_IO_TASK_ERROR;
         task->error_status = OvStorage_Status_InvalidArgument;
-        task->error_message = "copy arguments are invalid";
+        task->error_message = reason;
         ovc_dispatch_io_task_submit(task);
         return;
     }
@@ -6510,6 +7102,7 @@ void ovstorage_copy(const OvStorage_LayerHandle *handle,
 void ovstorage_rename(const OvStorage_LayerHandle *handle,
                       const char *src,
                       const char *dest,
+                      const OvStorage_CopyOptions *options,
                       const OvStorage_CancelToken *cancel,
                       OvStorage_StatusCallback on_complete,
                       void *user_data)
@@ -6519,6 +7112,7 @@ void ovstorage_rename(const OvStorage_LayerHandle *handle,
     ovc_dispatch_callback callback;
     ovc_dispatch_operation *operation;
     ovc_dispatch_io_task *task;
+    const char *reason;
     bool valid;
 
     if (on_complete == NULL) {
@@ -6536,9 +7130,14 @@ void ovstorage_rename(const OvStorage_LayerHandle *handle,
     memset(&request, 0, sizeof(request));
     request.struct_size = sizeof(request);
     request.options.struct_size = sizeof(request.options);
-    request.options.if_dest.tag = OvStoragePlugin_IfDestExistsTag_Overwrite;
+    reason = "rename arguments are invalid";
     valid = ovc_dispatch_address_valid(src) &&
-            ovc_dispatch_address_valid(dest);
+            ovc_dispatch_address_valid(dest) &&
+            ovc_dispatch_if_dest_from_precondition(
+                &request.options.if_dest,
+                options != NULL && options->no_overwrite,
+                options != NULL ? options->if_match_etag : NULL,
+                &reason);
     if (valid) {
         valid = ovc_dispatch_abi_cstring_copy(&request.source, src) &&
                 ovc_dispatch_abi_cstring_copy(&request.destination, dest);
@@ -6552,6 +7151,7 @@ void ovstorage_rename(const OvStorage_LayerHandle *handle,
     if (operation == NULL) {
         ovc_dispatch_abi_str_clear(&request.source);
         ovc_dispatch_abi_str_clear(&request.destination);
+        ovc_dispatch_if_dest_clear(&request.options.if_dest);
         ovc_dispatch_fire_inline_error(OVC_DISPATCH_STATUS,
                                        callback,
                                        user_data,
@@ -6564,6 +7164,7 @@ void ovstorage_rename(const OvStorage_LayerHandle *handle,
     if (task == NULL) {
         ovc_dispatch_abi_str_clear(&request.source);
         ovc_dispatch_abi_str_clear(&request.destination);
+        ovc_dispatch_if_dest_clear(&request.options.if_dest);
         ovc_dispatch_operation_fail_status(
             operation,
             OvStorage_Status_Internal,
@@ -6573,9 +7174,10 @@ void ovstorage_rename(const OvStorage_LayerHandle *handle,
     if (!valid) {
         ovc_dispatch_abi_str_clear(&request.source);
         ovc_dispatch_abi_str_clear(&request.destination);
+        ovc_dispatch_if_dest_clear(&request.options.if_dest);
         task->kind = OVC_DISPATCH_IO_TASK_ERROR;
         task->error_status = OvStorage_Status_InvalidArgument;
-        task->error_message = "rename arguments are invalid";
+        task->error_message = reason;
         ovc_dispatch_io_task_submit(task);
         return;
     }
@@ -7895,6 +8497,77 @@ static OvStorage_RootInfoList *ovc_dispatch_root_list_from_plugin(
     return list;
 }
 
+void ovstorage_root_info_for(
+    const OvStorage_LayerHandle *handle,
+    const char *address,
+    const OvStorage_CancelToken *cancel,
+    OvStorage_RootInfoCallback on_complete,
+    void *user_data)
+{
+    OvStoragePlugin_RootInfoForRequest request;
+    ovc_dispatch_callback callback;
+    ovc_dispatch_operation *operation;
+    ovc_dispatch_io_task *task;
+    bool valid;
+
+    if (on_complete == NULL) {
+        return;
+    }
+    callback.root_info = on_complete;
+    if (handle == NULL) {
+        ovc_dispatch_fire_inline_error(OVC_DISPATCH_ROOT_INFO,
+                                       callback,
+                                       user_data,
+                                       OvStorage_Status_InvalidArgument,
+                                       "root_info_for needs a live Stack");
+        return;
+    }
+    memset(&request, 0, sizeof(request));
+    request.struct_size = sizeof(request);
+    valid = ovc_dispatch_address_valid(address);
+    if (valid) {
+        valid = ovc_dispatch_abi_cstring_copy(&request.url, address);
+    }
+    operation = ovc_dispatch_operation_create(
+        (OvStorage_LayerHandle *)handle,
+        OVC_DISPATCH_ROOT_INFO,
+        callback,
+        user_data,
+        NULL);
+    if (operation == NULL) {
+        ovc_dispatch_abi_str_clear(&request.url);
+        ovc_dispatch_fire_inline_error(OVC_DISPATCH_ROOT_INFO,
+                                       callback,
+                                       user_data,
+                                       OvStorage_Status_Internal,
+                                       "Stack is closing or out of memory");
+        return;
+    }
+    task = ovc_dispatch_io_task_create(
+        operation, OVC_DISPATCH_IO_TASK_ROOT_INFO_FOR);
+    if (task == NULL) {
+        ovc_dispatch_abi_str_clear(&request.url);
+        ovc_dispatch_operation_fail_status(
+            operation,
+            OvStorage_Status_Internal,
+            "could not allocate a root_info_for dispatch task");
+        return;
+    }
+    if (!valid) {
+        ovc_dispatch_abi_str_clear(&request.url);
+        task->kind = OVC_DISPATCH_IO_TASK_ERROR;
+        task->error_status = OvStorage_Status_InvalidArgument;
+        task->error_message = "root_info_for arguments are invalid";
+        ovc_dispatch_io_task_submit(task);
+        return;
+    }
+    task->request.root_info_for = request;
+    task->cancel = ovc_cancel_token_mint(cancel);
+    task->has_cancel = true;
+    memset(&request, 0, sizeof(request));
+    ovc_dispatch_io_task_submit(task);
+}
+
 void ovstorage_list_address_roots(
     const OvStorage_LayerHandle *handle,
     const OvStorage_CancelToken *cancel,
@@ -8099,6 +8772,7 @@ OvStorage_Status ovstorage_import_handle(OvStoragePlugin_LayerHandle handle,
 #if defined(_WIN32)
 #include <direct.h>
 #include <io.h>
+#include <share.h>
 
 typedef DWORD ovc_dispatch_test_thread_id;
 
@@ -8140,6 +8814,9 @@ typedef struct ovc_dispatch_test_result {
     OvStorage_AccessDecision access;
     bool had_error;
     OvStorage_Status error_code;
+    /* True when the error message names user metadata: the file backend's
+     * refusal must say what was declined, not just carry the code. */
+    bool error_names_user_metadata;
     size_t callback_count;
     ovc_dispatch_test_thread_id callback_thread;
 } ovc_dispatch_test_result;
@@ -8170,9 +8847,12 @@ typedef struct ovc_dispatch_test_fake_layer {
     size_t local_size;
     size_t read_calls;
     size_t read_returns;
+    size_t materialize_calls;
+    size_t materialize_returns;
     size_t streams_created;
     size_t stream_next_calls;
     size_t stream_drop_calls;
+    size_t local_lease_drop_calls;
     size_t root_calls;
     size_t root_update_next_calls;
     size_t root_update_drop_calls;
@@ -8310,6 +8990,16 @@ static void ovc_dispatch_test_fake_stream_drop(void *opaque)
     ++stream->layer->stream_drop_calls;
     ovc_dispatch_test_fake_unlock(stream->layer);
     free(stream);
+}
+
+static void ovc_dispatch_test_fake_local_lease_drop(void *opaque)
+{
+    ovc_dispatch_test_fake_layer *layer;
+
+    layer = (ovc_dispatch_test_fake_layer *)opaque;
+    ovc_dispatch_test_fake_lock(layer);
+    ++layer->local_lease_drop_calls;
+    ovc_dispatch_test_fake_unlock(layer);
 }
 
 static void ovc_dispatch_test_cancel_wake(void *opaque)
@@ -8466,6 +9156,9 @@ static void ovc_dispatch_test_fake_read(
         ovc_dispatch_test_fake_info(&result->local_delegate.info,
                                     moved.address,
                                     (uint64_t)layer->local_size);
+        result->local_delegate.lease.state = layer;
+        result->local_delegate.lease.drop_fn =
+            ovc_dispatch_test_fake_local_lease_drop;
         memset(&moved.address, 0, sizeof(moved.address));
     } else {
         assert(strcmp(address, "test://redirect") == 0);
@@ -8542,6 +9235,57 @@ static void ovc_dispatch_test_fake_read(
     }
     ovc_dispatch_test_fake_lock(layer);
     ++layer->read_returns;
+    ovc_dispatch_test_fake_unlock(layer);
+}
+
+static void ovc_dispatch_test_fake_materialize(
+    void *opaque,
+    const OvStoragePlugin_ReadRequest *request,
+    const OvStoragePlugin_CancelTokenFFI *cancel,
+    OvStoragePlugin_OnComplete on_complete,
+    void *user_data)
+{
+    ovc_dispatch_test_fake_layer *layer;
+    OvStoragePlugin_ReadRequest moved;
+    OvStoragePlugin_LocalDelegate *result;
+    char *address;
+
+    (void)cancel;
+    layer = (ovc_dispatch_test_fake_layer *)opaque;
+    assert(request != NULL);
+    assert(request->struct_size >= sizeof(*request));
+    moved = *request;
+    address = ovc_dispatch_slice_copy(moved.address.ptr,
+                                      moved.address.len);
+    assert(address != NULL);
+    assert(strcmp(address, "test://local") == 0);
+    ovc_dispatch_test_fake_lock(layer);
+    ++layer->materialize_calls;
+    ovc_dispatch_test_fake_unlock(layer);
+
+    result = (OvStoragePlugin_LocalDelegate *)ovc_abi_alloc(
+        sizeof(*result));
+    assert(result != NULL);
+    memset(result, 0, sizeof(*result));
+    assert(ovc_dispatch_abi_cstring_copy(&result->path,
+                                         layer->local_path));
+    ovc_dispatch_test_fake_info(&result->info,
+                                moved.address,
+                                (uint64_t)layer->local_size);
+    result->lease.state = layer;
+    result->lease.drop_fn = ovc_dispatch_test_fake_local_lease_drop;
+    memset(&moved.address, 0, sizeof(moved.address));
+    free(address);
+    ovc_dispatch_abi_str_clear(&moved.address);
+    if (moved.options.if_match.present) {
+        ovc_dispatch_abi_str_clear(&moved.options.if_match.value);
+    }
+    on_complete(OvStoragePlugin_FFI_STATUS_OK,
+                result,
+                NULL,
+                user_data);
+    ovc_dispatch_test_fake_lock(layer);
+    ++layer->materialize_returns;
     ovc_dispatch_test_fake_unlock(layer);
 }
 
@@ -8631,6 +9375,8 @@ static OvStorage_LayerHandle *ovc_dispatch_test_fake_handle_create(
     g_ovc_dispatch_test_fake_vtable.drop =
         ovc_dispatch_test_fake_layer_drop;
     g_ovc_dispatch_test_fake_vtable.read = ovc_dispatch_test_fake_read;
+    g_ovc_dispatch_test_fake_vtable.materialize =
+        ovc_dispatch_test_fake_materialize;
     g_ovc_dispatch_test_fake_vtable.list_address_roots =
         ovc_dispatch_test_fake_roots;
     root.state = layer;
@@ -8675,6 +9421,9 @@ static void ovc_dispatch_test_info_complete(
     result->info = info;
     result->had_error = error != NULL;
     result->error_code = error == NULL ? OvStorage_Status_Ok : error->code;
+    result->error_names_user_metadata =
+        error != NULL && error->message != NULL &&
+        strstr(error->message, "user metadata") != NULL;
     result->callback_thread = ovc_dispatch_test_thread_self();
     ++result->callback_count;
     ovc_dispatch_test_sync(ovc_completion_latch_complete(&result->completed));
@@ -9152,6 +9901,26 @@ static void ovc_dispatch_test_round_trip(OvStorage_LayerHandle *handle,
     ovc_dispatch_test_sync(
         ovc_completion_latch_destroy(&listed.completed));
 
+    /* An empty page token is an absent one a caller propagated; the entry
+     * point refuses it instead of listing the first page again. */
+    list_options.page_token = "";
+    memset(&listed, 0, sizeof(listed));
+    ovc_dispatch_test_sync(ovc_completion_latch_init(&listed.completed));
+    ovstorage_list(handle,
+                   root_address,
+                   &list_options,
+                   NULL,
+                   ovc_dispatch_test_list_complete,
+                   &listed);
+    ovc_dispatch_test_sync(ovc_completion_latch_wait(&listed.completed));
+    assert(listed.status == OvStorage_Status_InvalidArgument);
+    assert(listed.had_error);
+    assert(listed.callback_count == 1);
+    assert(listed.list == NULL);
+    ovc_dispatch_test_sync(
+        ovc_completion_latch_destroy(&listed.completed));
+    list_options.page_token = NULL;
+
     memset(&versions_options, 0, sizeof(versions_options));
     memset(&listed, 0, sizeof(listed));
     ovc_dispatch_test_sync(ovc_completion_latch_init(&listed.completed));
@@ -9232,6 +10001,7 @@ static void ovc_dispatch_test_namespace_ops(
                    source_address,
                    copied_address,
                    NULL,
+                   NULL,
                    ovc_dispatch_test_info_complete,
                    &result);
     ovc_dispatch_test_result_wait(&result);
@@ -9282,16 +10052,14 @@ static void ovc_dispatch_test_namespace_ops(
     /* The public const options are borrowed and were cloned before return. */
     ovstorage_update_metadata_options_destroy(metadata_options);
     ovc_dispatch_test_result_wait(&result);
-    assert(result.status == OvStorage_Status_Ok);
-    assert(!result.had_error);
+    /* The file backend stores no user metadata: a set patch is refused with
+     * Unsupported, delivered through the dispatcher with its message. */
+    assert(result.status == OvStorage_Status_Unsupported);
+    assert(result.had_error);
+    assert(result.error_code == OvStorage_Status_Unsupported);
+    assert(result.error_names_user_metadata);
     assert(result.callback_count == 1);
-    assert(result.info != NULL);
-    assert(ovc_dispatch_test_has_user_metadata(result.info,
-                                               "color",
-                                               "blue"));
-    assert(ovc_dispatch_test_has_user_metadata(result.info,
-                                               "obsolete",
-                                               "old"));
+    assert(result.info == NULL);
     ovc_dispatch_test_result_destroy(&result);
 
     metadata_options = ovstorage_update_metadata_options_create();
@@ -9309,16 +10077,13 @@ static void ovc_dispatch_test_namespace_ops(
                               &result);
     ovstorage_update_metadata_options_destroy(metadata_options);
     ovc_dispatch_test_result_wait(&result);
-    assert(result.status == OvStorage_Status_Ok);
-    assert(!result.had_error);
+    /* A remove-only patch is refused the same way. */
+    assert(result.status == OvStorage_Status_Unsupported);
+    assert(result.had_error);
+    assert(result.error_code == OvStorage_Status_Unsupported);
+    assert(result.error_names_user_metadata);
     assert(result.callback_count == 1);
-    assert(result.info != NULL);
-    assert(ovc_dispatch_test_has_user_metadata(result.info,
-                                               "color",
-                                               "blue"));
-    assert(!ovc_dispatch_test_has_user_metadata(result.info,
-                                                "obsolete",
-                                                "old"));
+    assert(result.info == NULL);
     ovc_dispatch_test_result_destroy(&result);
     ovstorage_error_clear(&builder_error);
 
@@ -9332,12 +10097,14 @@ static void ovc_dispatch_test_namespace_ops(
                            ovc_dispatch_test_access_complete,
                            &result);
     ovc_dispatch_test_result_wait(&result);
+    /* check_access reports the filesystem's verdict: a writable root denies
+     * nothing, even though update_metadata itself is Unsupported here. */
     assert(result.status == OvStorage_Status_Ok);
     assert(!result.had_error);
     assert(result.callback_count == 1);
-    assert(!result.access.allowed);
-    assert(result.access.denied_ops.update_metadata);
-    assert(result.access.reason != NULL);
+    assert(result.access.allowed);
+    assert(!result.access.denied_ops.update_metadata);
+    assert(result.access.reason == NULL);
     ovstorage_access_decision_clear(&result.access);
     assert(result.access.reason == NULL);
     ovc_dispatch_test_result_destroy(&result);
@@ -9346,6 +10113,7 @@ static void ovc_dispatch_test_namespace_ops(
     ovstorage_rename(handle,
                      copied_address,
                      renamed_address,
+                     NULL,
                      NULL,
                      ovc_dispatch_test_status_complete,
                      &result);
@@ -9368,9 +10136,11 @@ static void ovc_dispatch_test_namespace_ops(
     assert(result.status == OvStorage_Status_Ok);
     assert(!result.had_error);
     assert(result.info != NULL);
-    assert(ovc_dispatch_test_has_user_metadata(result.info,
-                                               "color",
-                                               "blue"));
+    /* The renamed object carries the backend's empty user-metadata map. */
+    assert(result.info->user_metadata_len == 0);
+    assert(!ovc_dispatch_test_has_user_metadata(result.info,
+                                                "color",
+                                                "blue"));
     ovc_dispatch_test_result_destroy(&result);
 
     ovc_dispatch_test_result_init(&result);
@@ -9385,6 +10155,8 @@ static void ovc_dispatch_test_namespace_ops(
     assert(result.callback_count == 1);
     assert(result.info != NULL);
     assert(result.info->kind == OvStorage_ObjectKind_Directory);
+    assert(result.info->has_effective_permissions);
+    assert(result.info->effective_permissions.read);
     ovc_dispatch_test_result_destroy(&result);
 
     ovc_dispatch_test_result_init(&result);
@@ -9438,10 +10210,12 @@ static void ovc_dispatch_test_fake_io(const char *local_path,
     ovc_dispatch_test_result result;
     ovc_dispatch_test_stream_result stream_result;
     ovc_dispatch_test_root_result roots;
+    ovc_dispatch_test_local_result local;
     OvStorage_CancelToken *cancel;
     ovc_dispatch_test_thread_id caller_thread;
     size_t next_before;
     size_t drops_before;
+    size_t lease_drops_before;
 
     caller_thread = ovc_dispatch_test_thread_self();
     handle = ovc_dispatch_test_fake_handle_create(&layer,
@@ -9580,6 +10354,32 @@ static void ovc_dispatch_test_fake_io(const char *local_path,
     assert(local_len == 0 ||
            memcmp(stream_result.bytes, local_bytes, local_len) == 0);
 
+    ovc_dispatch_test_fake_lock(&layer);
+    lease_drops_before = layer.local_lease_drop_calls;
+    ovc_dispatch_test_fake_unlock(&layer);
+    memset(&local, 0, sizeof(local));
+    ovc_dispatch_test_sync(ovc_completion_latch_init(&local.completed));
+    ovstorage_read_local_file(handle,
+                              "test://local",
+                              &options,
+                              NULL,
+                              ovc_dispatch_test_local_complete,
+                              &local);
+    ovc_dispatch_test_sync(ovc_completion_latch_wait(&local.completed));
+    assert(local.status == OvStorage_Status_Ok);
+    assert(!local.had_error);
+    assert(local.callback_count == 1);
+    assert(local.delegate != NULL);
+    ovc_dispatch_test_fake_lock(&layer);
+    assert(layer.local_lease_drop_calls == lease_drops_before);
+    ovc_dispatch_test_fake_unlock(&layer);
+    ovstorage_local_delegate_destroy(local.delegate);
+    ovc_dispatch_test_fake_lock(&layer);
+    assert(layer.local_lease_drop_calls == lease_drops_before + 1);
+    ovc_dispatch_test_fake_unlock(&layer);
+    ovc_dispatch_test_sync(
+        ovc_completion_latch_destroy(&local.completed));
+
     ovc_dispatch_test_result_init(&result);
     ovstorage_read_bytes(handle,
                          "test://redirect",
@@ -9646,6 +10446,8 @@ static void ovc_dispatch_test_fake_io(const char *local_path,
     ovc_dispatch_test_fake_lock(&layer);
     assert(layer.read_calls == 7);
     assert(layer.read_returns == layer.read_calls);
+    assert(layer.materialize_calls == 1);
+    assert(layer.materialize_returns == layer.materialize_calls);
     assert(layer.streams_created == 3);
     assert(layer.stream_drop_calls == layer.streams_created);
     assert(layer.layer_drop_calls == 1);
@@ -9653,6 +10455,237 @@ static void ovc_dispatch_test_fake_io(const char *local_path,
     ovc_dispatch_test_fake_unlock(&layer);
     ovc_dispatch_test_sync(ovc_cond_destroy(&layer.changed));
     ovc_dispatch_test_sync(ovc_mutex_destroy(&layer.mutex));
+}
+
+/* Exercises `ovc_dispatch_local_file_identity_get`/`_equal` directly
+ * rather than driving a full `ovstorage_read_stream` race: the mechanism
+ * they back needs the underlying file to change between the stream's open
+ * and its EOF, and a test that arranges that by racing a concurrent writer
+ * against the read is worse than none (it would be flaky by construction).
+ * Calling the identity functions on the same open `FILE*` before and after
+ * an out-of-band rewrite reproduces exactly what the race would produce,
+ * deterministically.
+ *
+ * On Windows this needs an explicit share mode: two `fopen`/`fopen_s`
+ * handles onto the same path deny each other by the CRT's default sharing
+ * behavior, unlike POSIX, and the second open (opening the path again to
+ * rewrite it while the first handle is still held open, exactly what an
+ * external writer racing this read would do) would otherwise fail. */
+static FILE *ovc_dispatch_test_fopen(const char *path, const char *mode)
+{
+#if defined(_WIN32)
+    return _fsopen(path, mode, _SH_DENYNO);
+#else
+    return fopen(path, mode);
+#endif
+}
+
+static void ovc_dispatch_test_local_file_identity(const char *local_path)
+{
+    FILE *file;
+    FILE *writer;
+    ovc_dispatch_local_file_identity opened;
+    ovc_dispatch_local_file_identity unchanged;
+    ovc_dispatch_local_file_identity after_length_change;
+
+    file = ovc_dispatch_test_fopen(local_path, "wb");
+    assert(file != NULL);
+    assert(fwrite("hello", 1, 5, file) == 5);
+    assert(fclose(file) == 0);
+
+    file = ovc_dispatch_test_fopen(local_path, "rb");
+    assert(file != NULL);
+    opened = ovc_dispatch_local_file_identity_get(file);
+    assert(opened.valid);
+    assert(opened.size == 5);
+
+    /* Re-fstat`ing the same untouched handle answers the same identity --
+     * this is the "nothing happened" case every ordinary read takes. */
+    unchanged = ovc_dispatch_local_file_identity_get(file);
+    assert(unchanged.valid);
+    assert(ovc_dispatch_local_file_identity_equal(&opened, &unchanged));
+
+    /* Rewrite the file out-of-band while `file` stays open, exactly what a
+     * concurrent writer racing this read would do. A length change is
+     * detected by `size` alone regardless of the filesystem's mtime clock
+     * resolution, so this case needs no explicit mtime manipulation to be
+     * deterministic. */
+    writer = ovc_dispatch_test_fopen(local_path, "wb");
+    assert(writer != NULL);
+    assert(fwrite("hello world", 1, 11, writer) == 11);
+    assert(fclose(writer) == 0);
+    after_length_change = ovc_dispatch_local_file_identity_get(file);
+    assert(after_length_change.valid);
+    assert(!ovc_dispatch_local_file_identity_equal(&opened, &after_length_change));
+
+    assert(fclose(file) == 0);
+    assert(unlink(local_path) == 0);
+}
+
+/* Sets a file's mtime to an exact, caller-chosen value via an OS mtime call
+ * that goes through neither `ovc_dispatch_local_file_identity_get` nor
+ * `materialize`'s own stat, so a test built on this can compute the expected
+ * `info.mtime_unix_ms` directly from the value passed in here rather than
+ * from either side of the comparison under test. */
+#if defined(_WIN32)
+static bool ovc_dispatch_test_set_mtime(
+    const char *path, int64_t unix_seconds, long nanoseconds)
+{
+    HANDLE handle;
+    FILETIME write_time;
+    ULARGE_INTEGER ticks;
+    const uint64_t unix_epoch_ticks = UINT64_C(116444736000000000);
+    bool ok;
+
+    handle = CreateFileA(path,
+                         FILE_WRITE_ATTRIBUTES,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         NULL,
+                         OPEN_EXISTING,
+                         FILE_ATTRIBUTE_NORMAL,
+                         NULL);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    ticks.QuadPart = unix_epoch_ticks +
+                     (uint64_t)unix_seconds * UINT64_C(10000000) +
+                     (uint64_t)nanoseconds / 100;
+    write_time.dwLowDateTime = ticks.LowPart;
+    write_time.dwHighDateTime = ticks.HighPart;
+    ok = SetFileTime(handle, NULL, NULL, &write_time) != 0;
+    CloseHandle(handle);
+    return ok;
+}
+#else
+static bool ovc_dispatch_test_set_mtime(
+    const char *path, int64_t unix_seconds, long nanoseconds)
+{
+    struct timeval times[2];
+
+    times[0].tv_sec = (time_t)unix_seconds;
+    times[0].tv_usec = nanoseconds / 1000;
+    times[1] = times[0];
+    return utimes(path, times) == 0;
+}
+#endif
+
+/* Exercises `ovc_dispatch_local_file_identity_matches_info` directly: the
+ * race it closes (materialize stats the object, an external process
+ * replaces or truncates it, *then* the dispatcher opens the path) lands
+ * strictly before the open this function validates against, so there is
+ * no open handle to race a concurrent writer against the way
+ * `ovc_dispatch_test_local_file_identity` does above. Replacing the file
+ * before ever opening it reproduces exactly that ordering, deterministically.
+ *
+ * `info.mtime_unix_ms` throughout is computed from the exact values handed
+ * to `ovc_dispatch_test_set_mtime`, never from `ovc_dispatch_local_file_
+ * identity_get` -- a self-consistent test that derived the expected value
+ * from the function under test would pass even if that function's
+ * precision were simply wrong on both sides of the comparison, which is
+ * exactly the shape of bug this test exists to catch. */
+static void ovc_dispatch_test_local_file_identity_matches_info(
+    const char *local_path)
+{
+    FILE *file;
+    OvStoragePlugin_ObjectInfo info;
+    const int64_t base_seconds = INT64_C(1700000000);
+    const long base_nanos = 500000000L;
+
+    file = ovc_dispatch_test_fopen(local_path, "wb");
+    assert(file != NULL);
+    assert(fwrite("hello", 1, 5, file) == 5);
+    assert(fclose(file) == 0);
+    assert(ovc_dispatch_test_set_mtime(local_path, base_seconds, base_nanos));
+
+    memset(&info, 0, sizeof(info));
+    info.size.present = true;
+    info.size.value = 5;
+    info.mtime_unix_ms.present = true;
+    info.mtime_unix_ms.value =
+        base_seconds * INT64_C(1000) + base_nanos / 1000000;
+
+    /* No replacement yet: the freshly opened handle's identity matches the
+     * materialize-time `ObjectInfo` exactly. */
+    file = ovc_dispatch_test_fopen(local_path, "rb");
+    assert(file != NULL);
+    {
+        ovc_dispatch_local_file_identity opened;
+
+        opened = ovc_dispatch_local_file_identity_get(file);
+        assert(opened.valid);
+        assert(ovc_dispatch_local_file_identity_matches_info(&opened,
+                                                              &info));
+    }
+    assert(fclose(file) == 0);
+
+    /* Rewrite the SAME five bytes, changing only the mtime. A save-in-place
+     * edit that preserves length is exactly the case `size` alone cannot
+     * catch, so this isolates the mtime field: if `size` were the only
+     * thing this function actually checked, this case would wrongly pass. */
+    file = ovc_dispatch_test_fopen(local_path, "wb");
+    assert(file != NULL);
+    assert(fwrite("HELLO", 1, 5, file) == 5);
+    assert(fclose(file) == 0);
+    assert(ovc_dispatch_test_set_mtime(
+        local_path, base_seconds + 1, base_nanos));
+
+    file = ovc_dispatch_test_fopen(local_path, "rb");
+    assert(file != NULL);
+    {
+        ovc_dispatch_local_file_identity opened;
+
+        opened = ovc_dispatch_local_file_identity_get(file);
+        assert(opened.valid);
+        assert(opened.size == 5);
+        assert(!ovc_dispatch_local_file_identity_matches_info(&opened,
+                                                               &info));
+    }
+    assert(fclose(file) == 0);
+
+    /* Replace the file -- with a different length, mtime restored to the
+     * original baseline so this case isolates `size` the same way the
+     * mtime-only case above isolates mtime -- strictly before the next
+     * open, exactly what a materialize-to-open race produces. The
+     * open-to-EOF check in `ovc_dispatch_local_file_next` cannot see this:
+     * both its fstats describe the replacement and agree with each other.
+     * The materialize-time comparison must be the one that catches it. */
+    file = ovc_dispatch_test_fopen(local_path, "wb");
+    assert(file != NULL);
+    assert(fwrite("goodbye world", 1, 13, file) == 13);
+    assert(fclose(file) == 0);
+    assert(ovc_dispatch_test_set_mtime(local_path, base_seconds, base_nanos));
+
+    file = ovc_dispatch_test_fopen(local_path, "rb");
+    assert(file != NULL);
+    {
+        ovc_dispatch_local_file_identity opened;
+
+        opened = ovc_dispatch_local_file_identity_get(file);
+        assert(opened.valid);
+        assert(!ovc_dispatch_local_file_identity_matches_info(&opened,
+                                                               &info));
+    }
+    assert(fclose(file) == 0);
+
+    /* A field the delegate never populated is not a mismatch: this is the
+     * pseudo-file exception, exercised directly rather than by locating an
+     * actual procfs-style file, which is not available on every host this
+     * test runs on. */
+    {
+        OvStoragePlugin_ObjectInfo absent_info;
+        ovc_dispatch_local_file_identity opened;
+
+        memset(&absent_info, 0, sizeof(absent_info));
+        file = ovc_dispatch_test_fopen(local_path, "rb");
+        assert(file != NULL);
+        opened = ovc_dispatch_local_file_identity_get(file);
+        assert(opened.valid);
+        assert(ovc_dispatch_local_file_identity_matches_info(&opened,
+                                                              &absent_info));
+        assert(fclose(file) == 0);
+    }
+
+    assert(unlink(local_path) == 0);
 }
 
 static void ovc_dispatch_test_destroy_drains_callback(
@@ -9764,6 +10797,626 @@ static int ovc_dispatch_test_root_url(char *out,
 #endif
 }
 
+/*
+ * The client contract says `OvStorage_RootInfo.owning_target` is NULL when the
+ * Layer reports none, and an UNSET payload is not an attribution: a plugin that
+ * sets `present` and leaves the `Str` alone — the shape a calloc'd struct
+ * already has — must reach the caller as NULL, not as a non-NULL empty string
+ * that reads as attributed and routes a connection op nowhere. A target the
+ * plugin deliberately encoded as empty is a different statement and is kept.
+ *
+ * All three shapes are asserted, because a guard that rejected too much would
+ * silence an attribution the plugin actually made, and the caller would be back
+ * to deriving the owner from the address. The middle case — non-NULL pointer,
+ * zero length — is what separates discriminating on the encoding from testing
+ * the decoded length.
+ */
+static void ovc_dispatch_test_empty_owning_target_is_not_an_attribution(void)
+{
+    OvStoragePlugin_RootInfo source;
+    OvStorage_RootInfo *converted;
+    char root_text[] = "file:///data/root/";
+    char kind_text[] = "file";
+    char target_text[] = "files";
+
+    memset(&source, 0, sizeof(source));
+    source.struct_size = sizeof(source);
+    source.root.ptr = root_text;
+    source.root.len = strlen(root_text);
+    source.layer_kind.ptr = kind_text;
+    source.layer_kind.len = strlen(kind_text);
+
+    /* Present with a zeroed `Str`: the calloc shape. */
+    source.owning_target.present = true;
+    source.owning_target.value.ptr = NULL;
+    source.owning_target.value.len = 0;
+    converted = ovc_dispatch_root_info_from_plugin(&source);
+    assert(converted != NULL);
+    assert(converted->owning_target == NULL);
+    ovstorage_root_info_destroy(converted);
+
+    /* Present with a non-NULL pointer and a zero length: a producer that
+     * encoded the empty target deliberately. That is a different statement
+     * from the calloc shape above and it must survive as an empty string,
+     * because an empty layer instance name is legal and routes. This is the
+     * half a `len > 0` test cannot express. */
+    source.owning_target.value.ptr = target_text;
+    source.owning_target.value.len = 0;
+    converted = ovc_dispatch_root_info_from_plugin(&source);
+    assert(converted != NULL);
+    assert(converted->owning_target != NULL);
+    assert(converted->owning_target[0] == '\0');
+    ovstorage_root_info_destroy(converted);
+
+    /* A real target still crosses verbatim. */
+    source.owning_target.value.ptr = target_text;
+    source.owning_target.value.len = strlen(target_text);
+    converted = ovc_dispatch_root_info_from_plugin(&source);
+    assert(converted != NULL);
+    assert(converted->owning_target != NULL);
+    assert(strcmp(converted->owning_target, target_text) == 0);
+    ovstorage_root_info_destroy(converted);
+
+    /* And an absent `Optional` is unchanged: still NULL. */
+    memset(&source.owning_target, 0, sizeof(source.owning_target));
+    converted = ovc_dispatch_root_info_from_plugin(&source);
+    assert(converted != NULL);
+    assert(converted->owning_target == NULL);
+    ovstorage_root_info_destroy(converted);
+}
+
+/*
+ * `OvStorage_RootInfo` carries eight optional strings and the header documents
+ * every one of them "NULL when absent", so the rule is a property of the
+ * conversion rather than of any field. These two helpers name the whole set on
+ * both sides of it: every field is driven with the same payload shape and every
+ * field is asserted, so each shape below is one assertion over the whole set
+ * rather than eight per-field cases, and the membership of the set is written
+ * down in one place.
+ */
+#define OVC_DISPATCH_TEST_ROOT_OPTIONAL_COUNT 8
+
+static void ovc_dispatch_test_root_optionals_set(
+    OvStoragePlugin_RootInfo *source,
+    bool present,
+    char *bytes,
+    size_t length)
+{
+    source->display_name.present = present;
+    source->display_name.value.ptr = bytes;
+    source->display_name.value.len = length;
+    source->connection_id.present = present;
+    source->connection_id.value.id.ptr = bytes;
+    source->connection_id.value.id.len = length;
+    source->owning_target.present = present;
+    source->owning_target.value.ptr = bytes;
+    source->owning_target.value.len = length;
+    source->source.connection_id.present = present;
+    source->source.connection_id.value.id.ptr = bytes;
+    source->source.connection_id.value.id.len = length;
+    source->source.broker_principal.present = present;
+    source->source.broker_principal.value.ptr = bytes;
+    source->source.broker_principal.value.len = length;
+    source->source.alias_to.present = present;
+    source->source.alias_to.value.ptr = bytes;
+    source->source.alias_to.value.len = length;
+    /* The two payloads that carry an optional string inside another
+     * `Optional` stay present throughout: the inner `present` is what this
+     * test varies. */
+    source->source.alias_source.present = true;
+    source->source.alias_source.value.broker_principal.present = present;
+    source->source.alias_source.value.broker_principal.value.ptr = bytes;
+    source->source.alias_source.value.broker_principal.value.len = length;
+    source->alias_state.present = true;
+    source->alias_state.value.reason.present = present;
+    source->alias_state.value.reason.value.ptr = bytes;
+    source->alias_state.value.reason.value.len = length;
+}
+
+static void ovc_dispatch_test_root_optionals_collect(
+    const OvStorage_RootInfo *converted,
+    const char *out[OVC_DISPATCH_TEST_ROOT_OPTIONAL_COUNT])
+{
+    out[0] = converted->display_name;
+    out[1] = converted->connection_id;
+    out[2] = converted->owning_target;
+    out[3] = converted->source_connection_id;
+    out[4] = converted->source_broker_principal;
+    out[5] = converted->source_alias_to;
+    out[6] = converted->source_alias_source_broker_principal;
+    out[7] = converted->alias_state_chain_too_long_reason;
+}
+
+/*
+ * The client contract is that an optional string is NULL when the producer said
+ * nothing, and a producer says nothing from C by setting `present` over a slice
+ * it never wrote — which is what `calloc` already left there. Copying that shape
+ * hands the client a non-NULL empty string, and the client has no way back from
+ * it to "absent"; on `connection_id` it is worse still, because the flag beside
+ * it answers "is there an id at all", and a positively-flagged empty identifier
+ * is one a client will go on to use.
+ *
+ * The encoded-empty shape is asserted in the same sweep because it is the half
+ * that makes this a discrimination rather than a length test: a producer that
+ * deliberately encoded an empty string said something, and the Rust `str_to_ffi`
+ * emits exactly that shape (a sentinel allocation, `len == 0`) for every empty
+ * string that crosses, so it is reachable by construction rather than
+ * hypothetical.
+ */
+static void ovc_dispatch_test_unset_optional_strings_reach_the_client_as_null(
+    void)
+{
+    OvStoragePlugin_RootInfo source;
+    OvStorage_RootInfo *converted;
+    const char *values[OVC_DISPATCH_TEST_ROOT_OPTIONAL_COUNT];
+    char root_text[] = "file:///data/root/";
+    char kind_text[] = "file";
+    char value_text[] = "supplied";
+    size_t index;
+
+    memset(&source, 0, sizeof(source));
+    source.struct_size = sizeof(source);
+    source.root.ptr = root_text;
+    source.root.len = strlen(root_text);
+    source.layer_kind.ptr = kind_text;
+    source.layer_kind.len = strlen(kind_text);
+
+    /* Present over a zeroed slice: the producer never wrote the field. */
+    ovc_dispatch_test_root_optionals_set(&source, true, NULL, 0);
+    converted = ovc_dispatch_root_info_from_plugin(&source);
+    assert(converted != NULL);
+    ovc_dispatch_test_root_optionals_collect(converted, values);
+    for (index = 0; index < OVC_DISPATCH_TEST_ROOT_OPTIONAL_COUNT; ++index) {
+        assert(values[index] == NULL);
+    }
+    assert(!converted->has_connection_id);
+    ovstorage_root_info_destroy(converted);
+
+    /* Present over a real allocation of zero length: an empty string the
+     * producer encoded on purpose, which survives as an empty string. */
+    ovc_dispatch_test_root_optionals_set(&source, true, value_text, 0);
+    converted = ovc_dispatch_root_info_from_plugin(&source);
+    assert(converted != NULL);
+    ovc_dispatch_test_root_optionals_collect(converted, values);
+    for (index = 0; index < OVC_DISPATCH_TEST_ROOT_OPTIONAL_COUNT; ++index) {
+        assert(values[index] != NULL);
+        assert(values[index][0] == '\0');
+    }
+    assert(converted->has_connection_id);
+    ovstorage_root_info_destroy(converted);
+
+    /* A supplied value still crosses verbatim. */
+    ovc_dispatch_test_root_optionals_set(&source,
+                                         true,
+                                         value_text,
+                                         strlen(value_text));
+    converted = ovc_dispatch_root_info_from_plugin(&source);
+    assert(converted != NULL);
+    ovc_dispatch_test_root_optionals_collect(converted, values);
+    for (index = 0; index < OVC_DISPATCH_TEST_ROOT_OPTIONAL_COUNT; ++index) {
+        assert(values[index] != NULL);
+        assert(strcmp(values[index], value_text) == 0);
+    }
+    assert(converted->has_connection_id);
+    ovstorage_root_info_destroy(converted);
+
+    /* And an absent `Optional` reaches the client as NULL. */
+    ovc_dispatch_test_root_optionals_set(&source, false, value_text, 0);
+    converted = ovc_dispatch_root_info_from_plugin(&source);
+    assert(converted != NULL);
+    ovc_dispatch_test_root_optionals_collect(converted, values);
+    for (index = 0; index < OVC_DISPATCH_TEST_ROOT_OPTIONAL_COUNT; ++index) {
+        assert(values[index] == NULL);
+    }
+    assert(!converted->has_connection_id);
+    ovstorage_root_info_destroy(converted);
+}
+
+/*
+ * The nine optional strings that reach the client through an operation
+ * result rather than through root info: two page tokens, four object-info
+ * strings (etag, version, modified_by, versioned_address), one access
+ * reason, and two change-event strings. Each is documented "NULL when
+ * absent", so the rule is a property of the conversion and the set is named
+ * once here on both sides of it; the test comment below says why the page
+ * tokens lead.
+ */
+#define OVC_DISPATCH_TEST_PAYLOAD_STRING_COUNT 9
+
+typedef struct ovc_dispatch_test_payload_sources {
+    OvStoragePlugin_ListPage page;
+    OvStoragePlugin_VersionPage version_page;
+    OvStoragePlugin_ObjectInfo object;
+    OvStoragePlugin_AccessDecision access;
+    OvStoragePlugin_BackendChangeEvent change;
+} ovc_dispatch_test_payload_sources;
+
+typedef struct ovc_dispatch_test_payload_converted {
+    OvStorage_List *list;
+    OvStorage_VersionList *version_list;
+    OvStorage_Info *info;
+    OvStorage_AccessDecision access;
+    OvStorage_BackendChangeEvent change;
+} ovc_dispatch_test_payload_converted;
+
+/* Only what a converter refuses to proceed without; zero already satisfies
+ * the rest: empty item lists, an object kind of File, a change kind of
+ * Created, a change time of zero, and a cursor with no bytes. */
+static void ovc_dispatch_test_payload_sources_init(
+    ovc_dispatch_test_payload_sources *sources,
+    char *address_text)
+{
+    memset(sources, 0, sizeof(*sources));
+    sources->object.address.ptr = address_text;
+    sources->object.address.len = strlen(address_text);
+    sources->change.tag = OvStoragePlugin_BackendChangeEventTag_Object;
+    sources->change.object.address.ptr = address_text;
+    sources->change.object.address.len = strlen(address_text);
+}
+
+/* The source side of the set, in the same index order the collect helper
+ * uses on the client side. */
+static void ovc_dispatch_test_payload_strings_fields(
+    ovc_dispatch_test_payload_sources *sources,
+    OvStoragePlugin_Optional_Str *fields[OVC_DISPATCH_TEST_PAYLOAD_STRING_COUNT])
+{
+    fields[0] = &sources->page.next_page_token;
+    fields[1] = &sources->version_page.next_page_token;
+    fields[2] = &sources->object.etag;
+    fields[3] = &sources->object.version;
+    fields[4] = &sources->object.modified_by;
+    fields[5] = &sources->object.versioned_address;
+    fields[6] = &sources->access.reason;
+    fields[7] = &sources->change.object.etag;
+    fields[8] = &sources->change.object.version;
+}
+
+static void ovc_dispatch_test_payload_strings_set(
+    ovc_dispatch_test_payload_sources *sources,
+    bool present,
+    char *bytes,
+    size_t length)
+{
+    OvStoragePlugin_Optional_Str
+        *fields[OVC_DISPATCH_TEST_PAYLOAD_STRING_COUNT];
+    size_t index;
+
+    ovc_dispatch_test_payload_strings_fields(sources, fields);
+    for (index = 0; index < OVC_DISPATCH_TEST_PAYLOAD_STRING_COUNT; ++index) {
+        fields[index]->present = present;
+        fields[index]->value.ptr = bytes;
+        fields[index]->value.len = length;
+    }
+}
+
+/* Every converter must succeed before any string is examined, so a wrong
+ * precondition fails here, on the converter, rather than in the sweep. */
+static void ovc_dispatch_test_payload_convert(
+    ovc_dispatch_test_payload_converted *out,
+    const ovc_dispatch_test_payload_sources *sources)
+{
+    memset(out, 0, sizeof(*out));
+    out->list = ovc_dispatch_list_from_plugin(&sources->page);
+    assert(out->list != NULL);
+    out->version_list =
+        ovc_dispatch_version_list_from_plugin(&sources->version_page);
+    assert(out->version_list != NULL);
+    out->info = ovc_dispatch_info_from_object(&sources->object);
+    assert(out->info != NULL);
+    assert(ovc_dispatch_access_from_plugin(&out->access, &sources->access));
+    assert(ovc_dispatch_change_from_plugin(&out->change, &sources->change));
+}
+
+static void ovc_dispatch_test_payload_strings_collect(
+    const ovc_dispatch_test_payload_converted *converted,
+    const char *out[OVC_DISPATCH_TEST_PAYLOAD_STRING_COUNT])
+{
+    out[0] = converted->list->next_page_token;
+    out[1] = converted->version_list->next_page_token;
+    out[2] = converted->info->etag;
+    out[3] = converted->info->version;
+    out[4] = converted->info->modified_by;
+    out[5] = converted->info->versioned_address;
+    out[6] = converted->access.reason;
+    out[7] = converted->change.etag;
+    out[8] = converted->change.version;
+}
+
+/* The two by-value outputs are cleared in place and clearing zeroes their
+ * pointers, so collection has to come before this. */
+static void ovc_dispatch_test_payload_converted_destroy(
+    ovc_dispatch_test_payload_converted *converted)
+{
+    ovstorage_list_destroy(converted->list);
+    ovstorage_version_list_destroy(converted->version_list);
+    ovstorage_info_destroy(converted->info);
+    ovstorage_access_decision_clear(&converted->access);
+    ovc_dispatch_public_change_clear(&converted->change);
+    memset(converted, 0, sizeof(*converted));
+}
+
+/*
+ * A `next_page_token` is the optional string a client acts on with the least
+ * ceremony: a lister stops when it is NULL and re-issues with it otherwise.
+ * A producer that sets `present` over a slice it never wrote — the shape a
+ * calloc'd struct already holds — and was copied through as "" would send
+ * that lister round again with an empty token, and the request side's
+ * refusal of "" is what turns that silent re-list into an error the caller
+ * sees. The two rules meet on this field, so the page tokens lead the set.
+ *
+ * The encoded-empty shape is asserted in the same sweep because it is what
+ * makes this a discrimination rather than a length test: the Rust
+ * `str_to_ffi` and the C file backend both emit a sentinel allocation with
+ * `len == 0` for every empty string that crosses, so a rule keyed on the
+ * length alone would turn a statement the producer made into silence.
+ */
+static void ovc_dispatch_test_unset_payload_strings_reach_the_client_as_null(
+    void)
+{
+    ovc_dispatch_test_payload_sources sources;
+    ovc_dispatch_test_payload_converted converted;
+    OvStoragePlugin_Optional_Str
+        *fields[OVC_DISPATCH_TEST_PAYLOAD_STRING_COUNT];
+    const char *values[OVC_DISPATCH_TEST_PAYLOAD_STRING_COUNT];
+    char address_text[] = "file:///data/root/object.bin";
+    char value_text[] = "supplied";
+    char supplied_text[OVC_DISPATCH_TEST_PAYLOAD_STRING_COUNT][11] = {
+        "supplied-0", "supplied-1", "supplied-2", "supplied-3",
+        "supplied-4", "supplied-5", "supplied-6", "supplied-7",
+        "supplied-8",
+    };
+    size_t index;
+
+    ovc_dispatch_test_payload_sources_init(&sources, address_text);
+
+    /* Present over a zeroed slice: the producer never wrote the field. */
+    ovc_dispatch_test_payload_strings_set(&sources, true, NULL, 0);
+    ovc_dispatch_test_payload_convert(&converted, &sources);
+    ovc_dispatch_test_payload_strings_collect(&converted, values);
+    for (index = 0; index < OVC_DISPATCH_TEST_PAYLOAD_STRING_COUNT; ++index) {
+        assert(values[index] == NULL);
+    }
+    ovc_dispatch_test_payload_converted_destroy(&converted);
+
+    /* Present over a real allocation of zero length: an empty string the
+     * producer encoded on purpose, which survives as an empty string. */
+    ovc_dispatch_test_payload_strings_set(&sources, true, value_text, 0);
+    ovc_dispatch_test_payload_convert(&converted, &sources);
+    ovc_dispatch_test_payload_strings_collect(&converted, values);
+    for (index = 0; index < OVC_DISPATCH_TEST_PAYLOAD_STRING_COUNT; ++index) {
+        assert(values[index] != NULL);
+        assert(values[index][0] == '\0');
+    }
+    ovc_dispatch_test_payload_converted_destroy(&converted);
+
+    /* Distinct supplied values cross verbatim and land at their own index,
+     * so a converter that copies one source into another's field fails. */
+    ovc_dispatch_test_payload_strings_fields(&sources, fields);
+    for (index = 0; index < OVC_DISPATCH_TEST_PAYLOAD_STRING_COUNT; ++index) {
+        fields[index]->present = true;
+        fields[index]->value.ptr = supplied_text[index];
+        fields[index]->value.len = strlen(supplied_text[index]);
+    }
+    ovc_dispatch_test_payload_convert(&converted, &sources);
+    ovc_dispatch_test_payload_strings_collect(&converted, values);
+    for (index = 0; index < OVC_DISPATCH_TEST_PAYLOAD_STRING_COUNT; ++index) {
+        assert(values[index] != NULL);
+        assert(strcmp(values[index], supplied_text[index]) == 0);
+    }
+    ovc_dispatch_test_payload_converted_destroy(&converted);
+
+    /* And an absent `Optional` reaches the client as NULL. */
+    ovc_dispatch_test_payload_strings_set(&sources, false, value_text, 0);
+    ovc_dispatch_test_payload_convert(&converted, &sources);
+    ovc_dispatch_test_payload_strings_collect(&converted, values);
+    for (index = 0; index < OVC_DISPATCH_TEST_PAYLOAD_STRING_COUNT; ++index) {
+        assert(values[index] == NULL);
+    }
+    ovc_dispatch_test_payload_converted_destroy(&converted);
+}
+
+/*
+ * `create_directory` and `update_metadata` complete through a backend-item
+ * conversion rather than an object-info one, and the two structs carry the
+ * same eleven metadata fields. Every field the plugin reports must reach the
+ * client, so the three the delegate converts from its own struct —
+ * checksums, effective permissions, modified_by — are driven with values
+ * the file backend never emits and asserted on the public `Info`.
+ */
+static void ovc_dispatch_test_backend_item_carries_every_reported_field(void)
+{
+    OvStoragePlugin_BackendItemInfo source;
+    OvStoragePlugin_ChecksumEntry checksum;
+    OvStorage_Info *info;
+    char address_text[] = "file:///data/root/dir/";
+    char algorithm_text[] = "sha256";
+    char modified_by_text[] = "alice";
+    uint8_t digest[] = {0xab, 0xcd, 0xef};
+
+    memset(&source, 0, sizeof(source));
+    memset(&checksum, 0, sizeof(checksum));
+    checksum.algorithm.token.ptr = algorithm_text;
+    checksum.algorithm.token.len = strlen(algorithm_text);
+    checksum.bytes.ptr = digest;
+    checksum.bytes.len = sizeof(digest);
+    source.kind = OvStoragePlugin_ObjectKindV1_Directory;
+    source.checksums.ptr = &checksum;
+    source.checksums.len = 1;
+    source.effective_permissions.present = true;
+    source.effective_permissions.value.bits =
+        OVC_DISPATCH_PERMISSION_READ | OVC_DISPATCH_PERMISSION_UPDATE_METADATA;
+    source.modified_by.present = true;
+    source.modified_by.value.ptr = modified_by_text;
+    source.modified_by.value.len = strlen(modified_by_text);
+
+    info = ovc_dispatch_info_from_backend_item(&source, address_text);
+    assert(info != NULL);
+    assert(strcmp(info->address, address_text) == 0);
+    assert(info->kind == OvStorage_ObjectKind_Directory);
+    assert(info->checksums_len == 1);
+    assert(info->checksums != NULL);
+    assert(strcmp(info->checksums[0].algorithm, algorithm_text) == 0);
+    assert(info->checksums[0].bytes_len == sizeof(digest));
+    assert(memcmp(info->checksums[0].bytes, digest, sizeof(digest)) == 0);
+    assert(info->has_effective_permissions);
+    assert(info->effective_permissions.read);
+    assert(!info->effective_permissions.write);
+    assert(!info->effective_permissions.delete_);
+    assert(info->effective_permissions.update_metadata);
+    assert(info->modified_by != NULL);
+    assert(strcmp(info->modified_by, modified_by_text) == 0);
+    ovstorage_info_destroy(info);
+
+    /* And a plugin that reports none of the three still converts, with each
+     * documented "the backend did not report one" value in place. */
+    memset(&source, 0, sizeof(source));
+    info = ovc_dispatch_info_from_backend_item(&source, address_text);
+    assert(info != NULL);
+    assert(info->checksums_len == 0);
+    assert(!info->has_effective_permissions);
+    assert(info->modified_by == NULL);
+    ovstorage_info_destroy(info);
+}
+
+/*
+ * The request-side page token is the one caller string whose emptiness is a
+ * mistake rather than a value: a token comes from a prior `next_page_token`,
+ * and NULL already means the first page, so "" can only be an absent token
+ * a caller propagated. Both list converters refuse it with a reason that
+ * names the field, the way the write side refuses an empty `if_match_etag`,
+ * and the accepting shapes are asserted alongside so the guard cannot widen.
+ */
+static void ovc_dispatch_test_empty_page_token_is_refused(void)
+{
+    OvStoragePlugin_ListOptions list_options;
+    OvStoragePlugin_ListVersionsOptions versions_options;
+    OvStorage_ListOptions options;
+    OvStorage_ListVersionsOptions versions;
+    const char *reason;
+    const char token_text[] = "tok";
+
+    memset(&options, 0, sizeof(options));
+    memset(&versions, 0, sizeof(versions));
+
+    /* NULL is the first page: no token crosses and no reason is written. */
+    reason = NULL;
+    assert(ovc_dispatch_list_options(&list_options, &options, &reason));
+    assert(!list_options.page_token.present);
+    assert(ovc_dispatch_list_versions_options(
+        &versions_options, &versions, &reason));
+    assert(!versions_options.page_token.present);
+    assert(reason == NULL);
+    ovc_dispatch_list_options_clear(&list_options);
+    ovc_dispatch_list_versions_options_clear(&versions_options);
+
+    /* A token a prior page handed back crosses verbatim. */
+    options.page_token = token_text;
+    versions.page_token = token_text;
+    assert(ovc_dispatch_list_options(&list_options, &options, &reason));
+    assert(list_options.page_token.present);
+    assert(list_options.page_token.value.len == strlen(token_text));
+    assert(memcmp(list_options.page_token.value.ptr,
+                  token_text,
+                  strlen(token_text)) == 0);
+    assert(ovc_dispatch_list_versions_options(
+        &versions_options, &versions, &reason));
+    assert(versions_options.page_token.present);
+    assert(versions_options.page_token.value.len == strlen(token_text));
+    assert(memcmp(versions_options.page_token.value.ptr,
+                  token_text,
+                  strlen(token_text)) == 0);
+    assert(reason == NULL);
+    ovc_dispatch_list_options_clear(&list_options);
+    ovc_dispatch_list_versions_options_clear(&versions_options);
+
+    /* "" is refused before anything is allocated, and the reason says which
+     * field so a caller is not left with the entry point's catch-all. */
+    options.page_token = "";
+    versions.page_token = "";
+    reason = NULL;
+    assert(!ovc_dispatch_list_options(&list_options, &options, &reason));
+    assert(!list_options.page_token.present);
+    assert(reason != NULL && strstr(reason, "page_token") != NULL);
+    reason = NULL;
+    assert(!ovc_dispatch_list_versions_options(
+        &versions_options, &versions, &reason));
+    assert(!versions_options.page_token.present);
+    assert(reason != NULL && strstr(reason, "page_token") != NULL);
+    ovc_dispatch_list_options_clear(&list_options);
+    ovc_dispatch_list_versions_options_clear(&versions_options);
+
+    /* Non-UTF-8 is refused with its own reason. */
+    options.page_token = "\xff";
+    versions.page_token = "\xff";
+    reason = NULL;
+    assert(!ovc_dispatch_list_options(&list_options, &options, &reason));
+    assert(reason != NULL && strstr(reason, "UTF-8") != NULL);
+    reason = NULL;
+    assert(!ovc_dispatch_list_versions_options(
+        &versions_options, &versions, &reason));
+    assert(reason != NULL && strstr(reason, "UTF-8") != NULL);
+    ovc_dispatch_list_options_clear(&list_options);
+    ovc_dispatch_list_versions_options_clear(&versions_options);
+}
+
+/*
+ * `OvStorage_Connection::owning_target` follows the root-info field's rule:
+ * an absent `Optional` and a present-but-unwritten payload both reach the
+ * client as NULL, an empty name the plugin encoded on purpose survives as
+ * "", and a real name crosses verbatim. The fixture carries only the three
+ * strings the converter refuses to proceed without.
+ */
+static void ovc_dispatch_test_connection_owning_target_crosses_by_shape(void)
+{
+    OvStoragePlugin_Connection source;
+    OvStorage_Connection *converted;
+    char id_text[] = "conn-1";
+    char kind_text[] = "file";
+    char name_text[] = "Files";
+    char target_text[] = "files";
+
+    memset(&source, 0, sizeof(source));
+    source.id.id.ptr = id_text;
+    source.id.id.len = strlen(id_text);
+    source.backend_kind.ptr = kind_text;
+    source.backend_kind.len = strlen(kind_text);
+    source.display_name.ptr = name_text;
+    source.display_name.len = strlen(name_text);
+
+    /* An absent `Optional` is NULL. */
+    converted = ovc_dispatch_connection_from_plugin(&source);
+    assert(converted != NULL);
+    assert(converted->owning_target == NULL);
+    ovstorage_connection_destroy(converted);
+
+    /* Present over a zeroed `Str`: the calloc shape, still NULL. */
+    source.owning_target.present = true;
+    source.owning_target.value.ptr = NULL;
+    source.owning_target.value.len = 0;
+    converted = ovc_dispatch_connection_from_plugin(&source);
+    assert(converted != NULL);
+    assert(converted->owning_target == NULL);
+    ovstorage_connection_destroy(converted);
+
+    /* Present over a real allocation of zero length: a deliberately empty
+     * name, kept because an empty layer instance name routes. */
+    source.owning_target.value.ptr = target_text;
+    source.owning_target.value.len = 0;
+    converted = ovc_dispatch_connection_from_plugin(&source);
+    assert(converted != NULL);
+    assert(converted->owning_target != NULL);
+    assert(converted->owning_target[0] == '\0');
+    ovstorage_connection_destroy(converted);
+
+    /* A real name crosses verbatim. */
+    source.owning_target.value.len = strlen(target_text);
+    converted = ovc_dispatch_connection_from_plugin(&source);
+    assert(converted != NULL);
+    assert(converted->owning_target != NULL);
+    assert(strcmp(converted->owning_target, target_text) == 0);
+    ovstorage_connection_destroy(converted);
+}
+
 int main(void)
 {
     static const uint8_t payload[] = "the second stack is still alive";
@@ -9784,6 +11437,12 @@ int main(void)
     assert(ovc_dispatch_plugin_code_from_status(
                OvStorage_Status_NoRoute) ==
            OvStoragePlugin_ErrorCode_NoRoute);
+    ovc_dispatch_test_empty_owning_target_is_not_an_attribution();
+    ovc_dispatch_test_unset_optional_strings_reach_the_client_as_null();
+    ovc_dispatch_test_unset_payload_strings_reach_the_client_as_null();
+    ovc_dispatch_test_backend_item_carries_every_reported_field();
+    ovc_dispatch_test_empty_page_token_is_refused();
+    ovc_dispatch_test_connection_owning_target_crosses_by_shape();
     assert(ovc_temp_dir_create("ovstorage-dispatch-a",
                                directory_a,
                                sizeof(directory_a)) == 0);
@@ -9819,6 +11478,30 @@ int main(void)
     ovc_dispatch_test_fake_io(native_object_b,
                               payload,
                               sizeof(payload) - 1);
+    {
+        char identity_object_b[1024];
+
+        written = snprintf(identity_object_b,
+                           sizeof(identity_object_b),
+                           "%s%cidentity.bin",
+                           directory_b,
+                           OVC_PATH_SEPARATOR);
+        assert(written > 0 && (size_t)written < sizeof(identity_object_b));
+        ovc_dispatch_test_local_file_identity(identity_object_b);
+    }
+    {
+        char identity_matches_info_object_b[1024];
+
+        written = snprintf(identity_matches_info_object_b,
+                           sizeof(identity_matches_info_object_b),
+                           "%s%cidentity-matches-info.bin",
+                           directory_b,
+                           OVC_PATH_SEPARATOR);
+        assert(written > 0 &&
+              (size_t)written < sizeof(identity_matches_info_object_b));
+        ovc_dispatch_test_local_file_identity_matches_info(
+            identity_matches_info_object_b);
+    }
     ovc_dispatch_test_namespace_ops(stack_b,
                                     root_b,
                                     object_b,

@@ -102,11 +102,40 @@ export OVSTORAGE_PLUGIN_DIR="$(git rev-parse --show-toplevel)/target/release"
 python my_app.py
 ```
 
-If you have CLI-written connection config, turn it into `ConnectionRequest`
-objects and attach them to the stack with `Stack.connection(...)` before build
-time. This is hand work: there is no `load_config` on the Python surface, so
-`ovstorage.toml` and the connections the CLI writes cannot be loaded from
-Python. The composer is explicit about what loads and what gets connected.
+### Load a Stack from configuration
+
+`Stack.from_config()` loads the same `[ovstorage]` graph and connections that
+the CLI writes:
+
+```python
+registry = ovstorage.PluginRegistry([ovstorage.bundled_plugins_dir()])
+stack = await ovstorage.Stack.from_config().with_registry(registry).build()
+```
+
+With no `path`, resolution is `$OVSTORAGE_CONFIG`, then
+`./ovstorage.toml`, then `$XDG_CONFIG_HOME/ovstorage/ovstorage.toml` (defaulting
+to `~/.config/ovstorage/ovstorage.toml`), and finally an empty stack when no
+file exists. Pass `path=` to load one file explicitly or `toml=` to parse an
+in-memory document; the two arguments are mutually exclusive. File loading,
+including `path=`, applies the `OVSTORAGE__` environment overlay, while
+`toml=` skips that overlay.
+
+Configuration declares the complete graph, so a `from_config()` composer
+cannot also use `.layer()`, `.backend()`, `.wrapper()`, `.router()`, or
+`.connection()`. `.with_registry()` remains available so configured plugin
+layer kinds can be loaded before `build()`.
+
+`from_config()` does not accept the constructor-only
+`interactive_auth_capability`, `credential_cache_durability`,
+`credential_callback`, `credential_callback_name`, or `principal_id` options.
+For this path, declare non-interactive credentials in each
+`[ovstorage.connections.credentials]` table; `${NAME}` references resolve
+from the environment when the stack is built. A connection may omit that
+table when its backend accepts anonymous access or when the application will
+run the backend's native interactive-auth flow after the build. The binding
+still detects its normal environment/default interactive capability, but a
+`from_config()` composer cannot override that capability or attach callback,
+principal, or cache settings.
 
 ## What you import
 
@@ -276,7 +305,7 @@ The dispatchable override surface is:
 
 | Method | Python signature | Returns |
 |---|---|---|
-| `stat` | `stat(address: str, full_metadata: bool = False)` | `Info` |
+| `stat` | `stat(address: str, full_metadata: bool = False, versioned_address: bool = False)` | `Info` |
 | `read` | `read(address: str, if_match: str \| None = None, range_start: int \| None = None, range_end_inclusive: int \| None = None, max_bytes: int \| None = None)` | `AsyncIterator[bytes] \| bytes \| tuple[bytes, Info]` |
 | `write` | `write(address: str, data: bytes \| bytearray \| memoryview, if_dest_exists: Literal["overwrite", "fail", "match_etag"] = "overwrite", if_dest_etag: str \| None = None, size_hint: int \| None = None, user_metadata: dict[str, str] \| None = None, message: str \| None = None)` | `Info` |
 | `write_stream` | `write_stream(address: str, data: AsyncIterator[bytes] \| bytes \| bytearray \| memoryview, if_dest_exists: Literal["overwrite", "fail", "match_etag"] = "overwrite", if_dest_etag: str \| None = None, size_hint: int \| None = None, user_metadata: dict[str, str] \| None = None, message: str \| None = None)` | `Info` |
@@ -286,13 +315,22 @@ The dispatchable override surface is:
 | `update_metadata` | `update_metadata(address: str, if_match: str \| None = None, allow_rewrite_emulation: bool = False, user_metadata_set: dict[str, str] \| None = None, user_metadata_remove: list[str] \| None = None, message: str \| None = None)` | `Info` |
 | `check_access` | `check_access(address: str, read: bool = False, write: bool = False, delete: bool = False, update_metadata: bool = False)` | `AccessDecision` |
 | `materialize` | `materialize(address: str, if_match: str \| None = None, range_start: int \| None = None, range_end_inclusive: int \| None = None, max_bytes: int \| None = None)` | `LocalDelegate` |
-| `list` | `list(prefix: str, recursive: bool = False, max_results: int \| None = None, page_token: str \| None = None, full_metadata: bool = False)` | `ListPage` |
+| `list` | `list(prefix: str, recursive: bool = False, max_results: int \| None = None, page_token: str \| None = None, full_metadata: bool = False, versioned_address: bool = False)` | `ListPage` |
 | `list_versions` | `list_versions(address: str, max_results: int \| None = None, page_token: str \| None = None)` | `VersionPage` |
 | `get_latest_version` | `get_latest_version(address: str, if_match: str \| None = None, range_start: int \| None = None, range_end_inclusive: int \| None = None, max_bytes: int \| None = None)` | `Info` |
 | `create_directory` | `create_directory(address: str)` | `Info` |
 | `delete_directory` | `delete_directory(address: str)` | `None` |
 | `probe` | `probe(target: str, request: ConnectionRequest)` | `Connection` |
 | `watch_directory` | `watch_directory(prefix: str, recursive: bool = False, include_metadata_changes: bool = True, since: bytes \| None = None, poll_interval_seconds: float = 1.0)` | `AsyncIterator[ChangeEvent]` |
+
+The `versioned_address` keyword reaches a `stat` or `list` override only when
+it is `True`, so an override declared without it keeps serving default calls.
+
+`user_metadata`, `user_metadata_set` and `user_metadata_remove` carry
+`str` keys; a key matching `[a-z_][a-z0-9_]*` is accepted by every
+backend that stores user metadata, wider names are backend-specific,
+and the `ovstorage_` prefix is reserved for host-attested keys — see
+[User-metadata keys](../plugin-storage/CONFORMANCE.md#user-metadata-keys).
 
 `LayerBase(layer_type="router", ...)` is intentionally unsupported. Routers are
 native only, and Python declaration edges are always names rather than nested
@@ -379,8 +417,10 @@ the event loop guarantees the operation never reaches the Rust side. Dispatch
 is lazy: the Rust operation is not started until the coroutine's first step,
 which is also why an un-awaited call does nothing at all.
 Once the coroutine has started, fast paths such as
-`stat("file:///unrouted")` may resolve to `NoRoute` synchronously inside the
-runtime worker before a subsequent cancellation is observed;
+`stat("file:///unrouted")` — an address no configured route matches, on a
+scheme with no anonymous fallback granted — may resolve to `NoRoute`
+synchronously inside the runtime worker before a subsequent cancellation is
+observed;
 `await asyncio.sleep(0); task.cancel()` may therefore find the future already
 settled.
 
@@ -460,8 +500,24 @@ The Python bridge keeps the following constraints explicit:
 ## Etag-bound writes
 
 Every read returns an `Info` containing the caller-facing `ObjectAddress`
-plus `etag`, `version`, `size`, and `mtime_unix_nanos`. The address names
-*which* object; the etag asserts *which version of its bytes* you observed.
+plus `etag`, `etag_strength`, `version`, `versioned_address`, `size`, and
+`mtime_unix_nanos`. The address names *which* object; the etag asserts *which
+version of its bytes* you observed.
+
+`full_metadata` and `versioned_address` are cost knobs, not inclusion lists.
+Leaving one clear says "spend no extra round-trips on this"; setting it says
+"I will pay". A backend that already has the value in hand returns it either
+way, so an absent field means "the backend has none" only when you asked, and
+a present field does not mean you asked. With `versioned_address` set, a
+versioning backend returns the pinned address for every object it versions;
+an absent `versioned_address` under the flag means the backend does not
+version this object.
+
+`Info.versioned_address` (`str | None`) is the address that serves this exact
+version — a pin, not an identity or a durable key; writes through it are
+refused. Ask for it with `stat(address, versioned_address=True)` or
+`list(prefix, versioned_address=True)`; `list_versions` and
+`get_latest_version` return it equal to the item's own address.
 
 The Python binding exposes the same optimistic-concurrency options used by the
 layer protocol. `write` and `write_stream` accept `if_dest_exists` plus
@@ -521,11 +577,13 @@ reference is `ovstorage-python/tests/test_credential_callback.py`.
 - **Typed Error subclasses.** Catch `ovstorage.Error` for the common base,
   or catch subclasses such as `ovstorage.NotFoundError`,
   `ovstorage.NoRouteError`, and `ovstorage.UnsupportedError` when you need
-  category-specific handling. Each exception also exposes `.code` (for
-  example `"NotFound"`) and `next_action`. The message format is the stable
-  category prefix, then the redacted message. Nine bucket base classes sit
-  between `Error` and the per-code classes, so you can catch a whole category
-  as well as a single code.
+  category-specific handling. `NoRouteError` means no configured route
+  matches the address and no anonymous fallback is granted for its scheme.
+  Each exception also exposes `.code` (for example `"NotFound"`) and
+  `next_action`. The message format is the stable category prefix, then the
+  redacted message. Nine bucket base classes sit between `Error` and the
+  per-code classes, so you can catch a whole category as well as a single
+  code.
 - **Connection requests are consume-on-use.** Every mutating method on a
   `ConnectionRequest` (including the scalar `set_*` setters) raises after
   that request has been passed to `Stack.connection(...)`. Build a fresh
@@ -829,7 +887,8 @@ code.
 
 Options marshaling is field-for-field with the plugin ABI. The binding must
 not reinterpret absent metadata fields as wildcard strings or sentinel
-numbers: an omitted ETag / version / size / mtime remains `None`.
+numbers: an omitted ETag / version / versioned address / size / mtime remains
+`None`.
 Object deletion uses `delete(address, if_match=None)`. Directory operations are
 separate: `create_directory(address)` and `delete_directory(address)` expose
 the corresponding native layer slots rather than overloading object deletion.

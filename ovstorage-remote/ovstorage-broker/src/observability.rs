@@ -17,6 +17,8 @@
 //!   allow / deny / error) — emitted by the shared auth layer
 //! - `broker_watch_fanout` (Gauge)
 //! - `broker_redirect_emissions_total` (Counter, label `kind`)
+//! - `broker_continuation_seal_refusals_total` (Counter, label `reason`:
+//!   malformed / tag / mac)
 //! - `broker_lifecycle_events_total` (Counter, label `event`:
 //!   reload_ok / reload_failed / drain_start / drain_complete)
 //! - `broker_uptime_seconds` (Gauge)
@@ -51,6 +53,7 @@ pub const CACHE_OBJECT_FILLS: &str = "broker_cache_object_fills_total";
 pub const CACHE_EVICTIONS: &str = "broker_cache_evictions_total";
 pub const WATCH_FANOUT: &str = "broker_watch_fanout";
 pub const REDIRECT_EMISSIONS: &str = "broker_redirect_emissions_total";
+pub const CONTINUATION_SEAL_REFUSALS: &str = "broker_continuation_seal_refusals_total";
 pub const LIFECYCLE_EVENTS: &str = "broker_lifecycle_events_total";
 pub const UPTIME_SECONDS: &str = "broker_uptime_seconds";
 
@@ -287,6 +290,10 @@ fn describe_broker_metrics() {
         "Plugin-driven redirects forwarded to the client."
     );
     describe_counter!(
+        CONTINUATION_SEAL_REFUSALS,
+        "Client-driven write continuations refused due to an invalid seal, by bounded reason."
+    );
+    describe_counter!(
         LIFECYCLE_EVENTS,
         "Broker lifecycle events: reload outcomes, drain transitions."
     );
@@ -295,6 +302,15 @@ fn describe_broker_metrics() {
         Unit::Seconds,
         "Seconds since the broker process started."
     );
+}
+
+/// Publish metadata for broker-owned metrics and materialize every bounded
+/// refusal reason so a healthy process exposes explicit zero-valued series.
+fn initialize_broker_metrics() {
+    describe_broker_metrics();
+    for refusal in crate::continuation_seal::ContinuationSealRefusal::ALL {
+        metrics::counter!(CONTINUATION_SEAL_REFUSALS, "reason" => refusal.reason()).absolute(0);
+    }
 }
 
 // --- Recorder installation ---
@@ -330,8 +346,6 @@ static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 pub fn install_recorders(
     config: Option<&BrokerObservabilityConfig>,
 ) -> ovstorage::Result<(PrometheusHandle, MetricsGuard)> {
-    describe_broker_metrics();
-
     let prometheus_recorder = PrometheusBuilder::new()
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full(RPC_SECONDS.to_owned()),
@@ -369,6 +383,8 @@ pub fn install_recorders(
         let _ = metrics::set_global_recorder(prometheus_recorder);
     }
 
+    initialize_broker_metrics();
+
     // Spawn a task that refreshes the uptime gauge every 5 seconds so
     // the value is reasonably fresh on scrape.
     let started = std::time::SystemTime::now();
@@ -400,6 +416,11 @@ pub fn prometheus_handle() -> Option<PrometheusHandle> {
 }
 
 fn build_otlp_meter_provider(endpoint: &str) -> ovstorage::Result<SdkMeterProvider> {
+    // The exporter's HTTP client is a reqwest copy linked without a rustls
+    // crypto provider (see `reqwest-otlp` in `Cargo.toml`); it resolves the
+    // process-wide default at connect time. Install `ring`, the provider
+    // behind every other TLS client in the broker, unless one is already set.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_http()
         .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
@@ -556,5 +577,34 @@ mod tests {
     #[test]
     fn describe_does_not_panic() {
         describe_broker_metrics();
+    }
+
+    #[test]
+    fn startup_metrics_include_zero_valued_continuation_seal_refusal_reasons() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, initialize_broker_metrics);
+
+        let rendered = handle.render();
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == "# TYPE broker_continuation_seal_refusals_total counter"),
+            "counter type is absent from scrape:\n{rendered}"
+        );
+        for reason in ["malformed", "tag", "mac"] {
+            let expected =
+                format!("broker_continuation_seal_refusals_total{{reason=\"{reason}\"}} 0");
+            assert!(
+                rendered.lines().any(|line| line == expected),
+                "zero-valued {reason} counter is absent from scrape:\n{rendered}"
+            );
+        }
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line == "broker_continuation_seal_refusals_total 0"),
+            "an unlabelled refusal series must not accompany the reason-labelled series:\n{rendered}"
+        );
     }
 }

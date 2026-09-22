@@ -2093,6 +2093,7 @@ mod tests {
             },
             last_probed: None,
             user_metadata: UserMetadata::new(),
+            owning_target: None,
         }
     }
 

@@ -55,8 +55,10 @@ ovstorage_plugin::ovstorage_layer_plugin!(
 //      Import it (`import_handle`) to drive its slots across the FFI.
 //   2. Each of the three dynamic-query slots — `root_info_for`,
 //      `list_address_roots`, `list_connections` — signals arrival, then PARKS.
-//      `stat` stays immediate, so a host can prove a sibling op keeps running
-//      while an introspection is parked.
+//      `stat` and `list` stay immediate, so a host can prove a sibling op
+//      keeps running while an introspection is parked; both answer a version
+//      pin only when their options ask for one, so a host can prove its
+//      request path carries the flag.
 //   3. `ovstorage_test_park_wait_arrived()` blocks the caller until a parked op
 //      reaches its park point — a deterministic in-flight rendezvous, no sleeps.
 //   4. `ovstorage_test_release_park_gate()` releases every parked op; they then
@@ -178,14 +180,26 @@ async fn park_until_released_or_cancelled(cancel: &Option<CancellationToken>) ->
 const PARK_KIND: &str = "test-park";
 /// Root the parked fixture owns.
 const PARK_ROOT: &str = "park://data/";
-/// The single object [`ParkBackend::stat`] serves, so a host can prove a
-/// sibling op progresses while an introspection is parked.
+/// The single object [`ParkBackend::stat`] serves and [`ParkBackend::list`]
+/// lists, so a host can prove a sibling op progresses while an introspection
+/// is parked.
 const PARK_OBJECT: &str = "park://data/a.bin";
 /// Byte length reported for [`PARK_OBJECT`].
 const PARK_PAYLOAD_LEN: u64 = b"parked fixture payload".len() as u64;
 
-fn park_object_info(address: Url, size: u64) -> ObjectInfo {
+/// `pinned` decides whether the info carries its `?version=1` pin. The options
+/// contract would let the fixture hand the pin over unasked, but a pin that
+/// arrives regardless proves nothing about the host: a request path that
+/// drops the `versioned_address` flag still sees it. Tying the pin to the
+/// flag turns a dropped flag into a missing pin and an invented flag into an
+/// unexpected one.
+fn park_object_info(address: Url, size: u64, pinned: bool) -> ObjectInfo {
+    let versioned_address = pinned.then(|| {
+        address::with_query_pair(&address, "version", "1")
+            .expect("a non-empty key forms a valid query pair")
+    });
     ObjectInfo {
+        etag_strength: EtagStrength::Strong,
         address,
         kind: ObjectKind::File,
         etag: Some(format!("size:{size}")),
@@ -197,6 +211,7 @@ fn park_object_info(address: Url, size: u64) -> ObjectInfo {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address,
     }
 }
 
@@ -218,8 +233,8 @@ fn park_descriptor() -> LayerKindDescriptor {
 
 /// Backend whose three dynamic-query slots (`root_info_for`,
 /// `list_address_roots`, `list_connections`) park until released or cancelled;
-/// `stat` stays immediate so a host can prove a sibling op keeps running while
-/// an introspection is parked. Exported by
+/// `stat` and `list` stay immediate so a host can prove a sibling op keeps
+/// running while an introspection is parked. Exported by
 /// [`ovstorage_test_export_parked_stack`]; kept separate from the conformance
 /// `TestLayer` so this fixture's process-wide gate can't leak into the
 /// loader-path tests in `tests/loaded.rs`.
@@ -244,7 +259,11 @@ impl ParkBackend {
             connection_id: None,
             // Static route, no owning connection — so no owning target either.
             owning_target: None,
-            capabilities: Capabilities::empty(),
+            // `list` is the one object verb besides `stat` this fixture serves.
+            capabilities: Capabilities {
+                supports_list: true,
+                ..Capabilities::empty()
+            },
             range_read_strategy: RangeReadStrategy::Native,
             source: RouteSource::Static {
                 layer: ConfigLayer::Programmatic,
@@ -337,20 +356,60 @@ impl Layer for ParkBackend {
 
     /// Immediate (never parks): the "sibling op" a host runs to prove the
     /// plugin runtime keeps servicing work while an introspection is parked.
+    /// The version pin travels only when the options ask for it.
     async fn stat(
         &self,
         request: Request<StatRequest>,
         _cancel: Option<CancellationToken>,
     ) -> Result<ObjectInfo> {
-        let address = request.input.address;
+        let StatRequest { address, options } = request.input;
         if address.as_str() == PARK_OBJECT {
-            Ok(park_object_info(address, PARK_PAYLOAD_LEN))
+            Ok(park_object_info(
+                address,
+                PARK_PAYLOAD_LEN,
+                options.versioned_address,
+            ))
         } else {
             Err(Error::new(
                 ErrorCode::NotFound,
                 "test-plugin: parked fixture only serves park://data/a.bin",
             ))
         }
+    }
+
+    /// Immediate (never parks), like `stat`: one page holding the single
+    /// object when `prefix` contains it, else an empty page. `recursive`
+    /// changes nothing because the object sits directly under the only
+    /// prefix that contains it, and a one-item page fits any `max_results`
+    /// window. The fixture pages nothing, so a page token is refused rather
+    /// than answered with a silently restarted listing. The version pin
+    /// travels only when the options ask for it.
+    async fn list(
+        &self,
+        request: Request<ListRequest>,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<ListPage> {
+        let ListRequest { prefix, options } = request.input;
+        if options.page_token.is_some() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "test-plugin: parked fixture serves one page and takes no page token",
+            ));
+        }
+        let object = Url::parse(PARK_OBJECT).expect("park object parses");
+        let items = if address::is_ancestor_or_self(&prefix, &object) {
+            vec![park_object_info(
+                object,
+                PARK_PAYLOAD_LEN,
+                options.versioned_address,
+            )]
+        } else {
+            Vec::new()
+        };
+        Ok(ListPage {
+            items,
+            next_page_token: None,
+        })
     }
 }
 
@@ -464,6 +523,93 @@ mod tests {
         TEST_SERIAL
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+    }
+
+    #[test]
+    fn parked_fixture_etags_are_declared_strong() {
+        let backend = ParkBackend::seeded();
+        let info = futures::executor::block_on(backend.stat(
+            Request::new(StatRequest {
+                address: Url::parse(PARK_OBJECT).unwrap(),
+                options: StatOptions::default(),
+            }),
+            None,
+        ))
+        .unwrap();
+        assert!(info.etag.is_some());
+        assert_eq!(info.etag_strength, EtagStrength::Strong);
+    }
+
+    /// The version pin `stat` and `list` answer for [`PARK_OBJECT`] when their
+    /// options ask for one.
+    const PARK_OBJECT_PIN: &str = "park://data/a.bin?version=1";
+
+    fn stat_pin(versioned_address: bool) -> Option<Url> {
+        let backend = ParkBackend::seeded();
+        futures::executor::block_on(backend.stat(
+            Request::new(StatRequest {
+                address: Url::parse(PARK_OBJECT).unwrap(),
+                options: StatOptions {
+                    versioned_address,
+                    ..StatOptions::default()
+                },
+            }),
+            None,
+        ))
+        .unwrap()
+        .versioned_address
+    }
+
+    fn list_root(options: ListOptions) -> Result<ListPage> {
+        let backend = ParkBackend::seeded();
+        futures::executor::block_on(backend.list(
+            Request::new(ListRequest {
+                prefix: Url::parse(PARK_ROOT).unwrap(),
+                options,
+            }),
+            None,
+        ))
+    }
+
+    /// The pin is the fixture's answer to the flag and nothing else, so a
+    /// host driving either verb can tell a request path that drops the flag
+    /// from one that carries it, and one that invents the flag from one that
+    /// leaves it alone.
+    #[test]
+    fn parked_fixture_pins_only_when_asked() {
+        assert_eq!(stat_pin(false), None);
+        assert_eq!(
+            stat_pin(true).as_ref().map(Url::as_str),
+            Some(PARK_OBJECT_PIN)
+        );
+
+        let unasked = list_root(ListOptions::default()).unwrap();
+        assert_eq!(unasked.items.len(), 1);
+        assert_eq!(unasked.items[0].address.as_str(), PARK_OBJECT);
+        assert_eq!(unasked.items[0].versioned_address, None);
+        assert_eq!(unasked.next_page_token, None);
+
+        let asked = list_root(ListOptions {
+            versioned_address: true,
+            ..ListOptions::default()
+        })
+        .unwrap();
+        assert_eq!(asked.items.len(), 1);
+        assert_eq!(asked.items[0].address.as_str(), PARK_OBJECT);
+        assert_eq!(
+            asked.items[0].versioned_address.as_ref().map(Url::as_str),
+            Some(PARK_OBJECT_PIN)
+        );
+    }
+
+    #[test]
+    fn parked_fixture_list_refuses_a_page_token() {
+        let error = list_root(ListOptions {
+            page_token: Some("stale".to_string()),
+            ..ListOptions::default()
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
     }
 
     /// Every wait here is bounded. `ovstorage_test_park_wait_arrived` blocks

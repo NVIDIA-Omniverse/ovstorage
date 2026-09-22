@@ -125,6 +125,7 @@ pub fn descriptor_capabilities() -> Capabilities {
         supports_atomic_rename: true,
         has_real_directories: true,
         supports_list: true,
+        supports_list_stream: true,
         wants_list_backed_stat: false,
         supports_recursive_list: false,
         supports_create_directory: true,

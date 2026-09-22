@@ -49,6 +49,52 @@ attribution_strategy = "user_metadata"
 # governs writes as well.
 redirect_credential_disclosure = "refuse"
 
+# Which cloud schemes an address that NO configured connection serves may fall
+# back to. Top-level key, like the two above — keep it above the first table
+# header.
+#
+# Empty (default) — an unrouted `s3://`, `gs://` or `azure://` address answers
+#   NoRoute. Nothing is attempted.
+# A list of `"s3"`, `"gs"`, `"azure"` — an unrouted address on a listed scheme
+#   routes to that scheme's backend layer, which attempts it ANONYMOUSLY: no
+#   credential of any kind is attached, never this process's ambient identity,
+#   and the fallback serves reads only. Public buckets become readable through
+#   the gateway without a connection per bucket.
+#
+# This is a property of the deployment, not of any connection. A gateway fetch
+# runs from this gateway's network position and reaches whatever that position
+# reaches, so only you can say whether clients of this gateway should be able to
+# point it at buckets you did not configure. It grants routability, never
+# authority: the listener's auth layer evaluates every address first, and a
+# caller the policy does not cover is denied before the fallback is consulted.
+#
+# The graph below must declare the backend layer of each granted scheme's kind
+# (`[ovstorage.layers.s3]`, `[ovstorage.layers.gcs]`, `[ovstorage.layers.azure]`)
+# and list it in the router's `children`, or startup refuses rather than
+# letting a grant sit silently inert. The backend layer reads the grant from its
+# `anonymous_fallback` layer key, which this host stamps from here; setting that
+# layer key by hand is a startup error rather than a second spelling of this
+# policy. The shipped graph declares only `file`, so this list must stay empty
+# until a cloud layer is added. The broker spells this key the same way.
+anonymous_fallback_schemes = []
+
+# Whether an unrouted `http://` or `https://` address may be fetched anonymously.
+# Top-level key — keep it above the first table header.
+#
+# A separate switch because it means something different from the cloud list
+# above: an http fallback is not a public bucket but an arbitrary origin,
+# fetched from THIS process's network position, so allowing it lets any client
+# the policy admits reach anything this gateway can reach. An anonymous http
+# fetch is streamed by the gateway, never surfaced as a `307`: there is no
+# connection whose redirect policy could apply, and the client is handed bytes,
+# not an origin. Cloud instance-metadata endpoints (169.254.169.254,
+# metadata.google.internal and kin) are refused whatever is set here.
+#
+# `refuse` (default) — an unrouted http address answers NoRoute.
+# `allow` — refused at startup in this release, in which the http tier is not
+#   available: a grant that did nothing would be worse than one that fails loud.
+anonymous_http_fallback = "refuse"
+
 # Single listener. Auth is FAIL-CLOSED: an absent `auth` refuses to start,
 # forcing a conscious choice — so no allow-all default ships.
 [server]
@@ -63,7 +109,7 @@ listen = "127.0.0.1:8080"
 # --- The shared inner data-plane Stack -------------------------------------
 #
 # alias → copy_rename_fallback →
-# redirect_follower(follow_reads=false) → router → attribution_file → file
+# redirect_follower(follow_reads=false) → router → file
 #
 # No caches, no retry (HTTP clients retry). `follow_reads = false` is
 # REST-critical: a backend read redirect flows up unfollowed so the handler
@@ -77,14 +123,17 @@ listen = "127.0.0.1:8080"
 #     path, so an emulated copy stamps its destination.
 #   * A branch whose backend cannot carry a `user_metadata` key omits the layer,
 #     so the gateway never manufactures metadata that backend must refuse.
-#     Declare the layer on `file`, `s3`, `gcs`, `azure`,
-#     `omniverse-storage-service` and `broker` branches; omit it on `nucleus` (which rejects non-empty
-#     `user_metadata`), `opendal` (which rejects it on presigned writes, and on
-#     ordinary writes whenever the connection's driver cannot store it) and
-#     `http` (read-only).
+#     Declare the layer on `s3`, `gcs`, `azure`, `omniverse-storage-service`
+#     and `broker` branches; omit it on `file` (which stores no user metadata
+#     and rejects a non-empty `user_metadata`), `nucleus` (which rejects
+#     non-empty `user_metadata`), `opendal` (which rejects it on presigned
+#     writes, and on ordinary writes whenever the connection's driver cannot
+#     store it) and `http` (read-only). The shipped graph below connects only
+#     `file`, so it declares no attribution wrapper; a config that wraps a
+#     `file` branch in one is refused at startup.
 #
 # A branch without the layer also gets no harvest and no inbound sanitizing: a
-# reserved `ovstorage-*` key already stored on one of its objects surfaces to
+# reserved `ovstorage_*` key already stored on one of its objects surfaces to
 # clients verbatim in `user_metadata` rather than being promoted to the typed
 # `modified_by` and hidden, and a client-supplied value for the reserved key
 # reaches that backend unaltered. On that branch it stays a raw `user_metadata`
@@ -96,8 +145,8 @@ listen = "127.0.0.1:8080"
 # returned, so a value planted on an unsanitized branch of an upstream broker is
 # promoted into the attested `modified_by` when read through a broker fronting
 # it. `modified_by` from a chained broker is only as trustworthy as the
-# sanitizing on every branch beneath it. On `nucleus` and `http` none of this
-# happens at all: neither stores nor returns user metadata. On `opendal` it does,
+# sanitizing on every branch beneath it. On `file`, `nucleus` and `http` none of
+# this happens at all: none of them stores user metadata. On `opendal` it does,
 # over a driver that persists metadata.
 [ovstorage]
 root = "alias"
@@ -129,15 +178,14 @@ follow_reads = false
 
 # Forks to one branch per connected kind. A branch is the backend Layer itself
 # (`target = kind`), or an attribution wrapper over it — the router resolves a
-# child by the targets that child owns, and a wrapper reports its inner's.
+# child by the targets that child owns, and a wrapper reports its inner's. The
+# `file` backend carries no user metadata, so its branch is the bare backend
+# Layer: no gateway-attested `modified_by` overlay sits between the router and
+# it. A capable branch (`s3`, `gcs`, `azure`, ...) is declared as
+# `attribution_<kind>` with `kind = "attribution"` and `inner = "<kind>"`, or
+# left to the gateway, which adds the wrapper for every capable branch.
 [ovstorage.layers.router]
-children = ["attribution_file"]
-
-# Gateway-attested `modified_by` overlay for the `file` branch (strategy from the
-# top-level `attribution_strategy`).
-[ovstorage.layers.attribution_file]
-kind = "attribution"
-inner = "file"
+children = ["file"]
 
 [ovstorage.layers.file]
 kind = "file"

@@ -64,11 +64,12 @@ into `src/lib.rs`.
   **(`build_redirect_policy_accepts_three_modes` and
   `build_redirect_policy_rejects_unknown` cover policy parsing;
   cross-host integration test deferred.)**
-- Weak ETags never satisfy an exact `if_match` by themselves; strong
-  ETags are sent as `If-Match` and mismatches surface as
-  `ObjectModified`.
-  **(`weak_etag_in_check_identity_is_not_comparable` plus
-  `http_read_forwards_strong_etag_precondition_and_maps_412`.)**
+- Strong and weak ETags round-trip through `if_match` as normalized opaque
+  tokens. The plugin performs a post-response validator comparison instead of
+  sending a wire `If-Match`, so weak origins remain usable and mismatches
+  surface as `ObjectModified`.
+  **(`stat_etag_round_trips_through_if_match` and
+  `weak_origin_etag_round_trips_through_if_match`.)**
 - Default-header banlist rejects `Authorization`, `Cookie`,
   `Proxy-Authorization`.
   **(`parse_default_headers_rejects_credential_headers`,
@@ -146,12 +147,13 @@ into `src/lib.rs`.
   **(`a_config_address_may_not_carry_a_query_or_a_fragment`.)**
 
 The `tests` module in `src/lib.rs` covers anonymous HEAD + GET
-(`anonymous_http_read_and_stat`), the strong-ETag `If-Match` wire
-shape and 412 → `ObjectModified` mapping
-(`http_read_forwards_strong_etag_precondition_and_maps_412`),
+(`anonymous_http_read_and_stat`), post-response ETag comparison and
+412 → `ObjectModified` mapping
+(`stat_etag_round_trips_through_if_match`,
+`weak_origin_etag_round_trips_through_if_match`, and
+`http_read_maps_origin_412_without_sending_if_match`),
 library-driven retry on retryable statuses
-(`http_read_retries_retryable_status_via_library`), weak-ETag
-suppression (`weak_etag_in_check_identity_is_not_comparable`),
+(`http_read_retries_retryable_status_via_library`),
 default-header banlist
 (`parse_default_headers_rejects_credential_headers` /
 `_accepts_safe_headers`), fragment stripping in a route URL

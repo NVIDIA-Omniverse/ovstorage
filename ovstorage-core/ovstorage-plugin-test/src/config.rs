@@ -38,6 +38,7 @@ pub struct TestConfig {
     pub write_returns_unsupported: bool,
     pub write_stream_returns_unsupported: bool,
     pub write_redirect_returns_unsupported: bool,
+    pub write_redirect_rejects_user_metadata: bool,
 
     pub auth_flow: AuthFlow,
     pub auth_drives_host_callbacks: bool,
@@ -191,6 +192,11 @@ impl TestConfig {
             .unwrap_or(0)
             .max(0) as u64;
 
+        // Accept native Bool values from TOML and typed Rust callers, plus the
+        // strict String form that survives the pytest fixture's bool coercion.
+        let write_redirect_rejects_user_metadata =
+            optional_bool_or_string_flag(cfg, "test_write_redirect_rejects_user_metadata")?;
+
         let require_token = optional_string(cfg, "test_require_token")?;
         // String-typed knobs (not Bool): the pytest conftest coerces Python
         // `True` to `Int`, which `optional_bool` rejects — strings keep the
@@ -227,6 +233,7 @@ impl TestConfig {
             write_returns_unsupported,
             write_stream_returns_unsupported,
             write_redirect_returns_unsupported,
+            write_redirect_rejects_user_metadata,
             auth_flow,
             auth_drives_host_callbacks,
             require_token,
@@ -578,6 +585,19 @@ fn optional_string_flag(cfg: &HashMap<String, ConfigValue>, key: &str) -> Result
     }
 }
 
+/// An optional boolean knob that accepts native Bool values and strict
+/// `"true"`/`"false"` String values (absent = false).
+fn optional_bool_or_string_flag(cfg: &HashMap<String, ConfigValue>, key: &str) -> Result<bool> {
+    match cfg.get(key) {
+        Some(ConfigValue::Bool(value)) => Ok(*value),
+        Some(ConfigValue::String(_)) | None => optional_string_flag(cfg, key),
+        Some(other) => Err(Error::new(
+            ErrorCode::InvalidArgument,
+            format!("{key} must be a Bool or a \"true\"/\"false\" String, got {other:?}"),
+        )),
+    }
+}
+
 fn optional_bool(cfg: &HashMap<String, ConfigValue>, key: &str) -> Result<Option<bool>> {
     match cfg.get(key) {
         Some(ConfigValue::Bool(b)) => Ok(Some(*b)),
@@ -672,6 +692,7 @@ mod tests {
         assert_eq!(cfg.root.as_str(), "test://demo/");
         assert_eq!(cfg.multipart_parts, 0);
         assert_eq!(cfg.continue_write_loops, 1);
+        assert!(!cfg.write_redirect_rejects_user_metadata);
         assert_eq!(cfg.auth_flow, AuthFlow::Succeed);
         assert_eq!(cfg.inject_error_count, -1);
     }
@@ -700,6 +721,29 @@ mod tests {
         assert_eq!(cfg.multipart_parts, 3);
         assert_eq!(cfg.continue_write_loops, 2);
         assert_eq!(cfg.redirect_credential, RedirectCredential::None);
+    }
+
+    #[test]
+    fn parses_write_redirect_rejects_user_metadata_knob() {
+        let cfg = TestConfig::from_request(&req(with_root())).unwrap();
+        assert!(!cfg.write_redirect_rejects_user_metadata);
+
+        for value in [ConfigValue::Bool(true), ConfigValue::String("true".into())] {
+            let mut c = with_root();
+            c.insert("test_write_redirect_rejects_user_metadata".into(), value);
+            let cfg = TestConfig::from_request(&req(c)).unwrap();
+            assert!(cfg.write_redirect_rejects_user_metadata);
+        }
+
+        for value in [
+            ConfigValue::Bool(false),
+            ConfigValue::String("false".into()),
+        ] {
+            let mut c = with_root();
+            c.insert("test_write_redirect_rejects_user_metadata".into(), value);
+            let cfg = TestConfig::from_request(&req(c)).unwrap();
+            assert!(!cfg.write_redirect_rejects_user_metadata);
+        }
     }
 
     /// The declaration a host's disclosure policy reads. Absent means `None`

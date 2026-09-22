@@ -68,6 +68,8 @@ pub struct ResponseParsing {
     pub content_checksum_algorithm: Optional<ChecksumAlgorithm>,
     /// See `crate::ResponseParsing::checksum_headers`.
     pub checksum_headers: List<ChecksumHeaderBinding>,
+    /// See `crate::ResponseParsing::etag_strength`. Tail-appended in ABI v18.
+    pub etag_strength: EtagStrengthV1,
 }
 
 unsafe impl Send for ResponseParsing {}
@@ -230,25 +232,29 @@ unsafe impl Send for WriteRedirectBatch {}
 
 /// One redirect's outcome as reported by the party that performed it.
 ///
-/// Caller-supplied input, not an observation. That party is a redirect follower
-/// inside a host stack on one route — the library deployment, and equally the
-/// broker's own `write` path — or a remote client driving the redirect protocol
-/// over the broker's `continue_write` RPC. Check the batch cardinality against
-/// the redirect batch yourself, at the top of `continue_write`: no follower
-/// route performs that check, and the RPC's own is against a count the same
-/// caller supplied. That RPC is also the only place a status outside `200..300`
-/// is refused; nothing else is validated, and the echoed continuation blob is
-/// unauthenticated too.
+/// Reported input at the Layer SPI, not an observation. That party is a redirect
+/// follower inside a host stack on one route — the library deployment, and
+/// equally the broker's own `write` path — or a remote client driving the
+/// redirect protocol over the broker's `continue_write` RPC. Check the batch
+/// cardinality against the redirect batch yourself, at the top of
+/// `continue_write`: no follower route performs that check, and the RPC's own is
+/// against a count the same caller supplied. That RPC is also the only place a
+/// status outside `200..300` is refused.
 ///
-/// The request address is the only authenticated part of the call, so **derive
-/// the object you act on from it** rather than taking it from the continuation.
-/// Comparing the continuation's copy against the address is weaker: on the
-/// client-driven route the caller supplies both sides, presenting an address it
-/// is authorized for beside a blob whose recorded copy it rewrote to match.
-/// Values the address cannot supply — a server-issued session
+/// The broker's client-driven RPC additionally verifies an HMAC-SHA256 envelope
+/// binding the continuation bytes to the request address, then strips it before
+/// Layer dispatch. That seal does not cover redirect results, prevent
+/// same-address replay, bind a principal, or apply to follower routes and
+/// non-broker hosts. The Layer SPI itself supplies no continuation integrity.
+///
+/// The request address is the only authenticated input on every route, so
+/// **derive the object you act on from it** rather than taking it from the
+/// continuation. The broker seal protects its client-driven route, but a direct
+/// SPI caller or another host can still rewrite the continuation's copy to match
+/// the address. Values the address cannot supply — a server-issued session
 /// handle, the preconditions of the original write — have to travel in the blob;
-/// treat those as caller-chosen and do not build a guarantee another principal
-/// depends on out of them.
+/// on an unsealed route, treat those as caller-chosen and do not build a
+/// guarantee another principal depends on out of them.
 ///
 /// These values may shape the result returned, and must never be evidence about
 /// connection authentication, credential validity, quota, principal identity, or

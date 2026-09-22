@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ovstorage::{
-    Body, BodyStream, CancellationToken, Layer, LayerHandle, LayerKindDescriptor, Request, Result,
-    WriteRequest, WriteResult,
+    Body, BodyStream, CancellationToken, Layer, LayerHandle, LayerKindDescriptor, ListRequest,
+    ListStream, Request, Result, WriteRequest, WriteResult,
 };
 
 /// Aggregate body cap; tonic bounds each frame, not their cumulative length.
@@ -171,6 +171,14 @@ impl Layer for PostAuthWriteNormalizer {
 
     fn list_kinds(&self, cx: &ovstorage::Extensions) -> Result<Vec<LayerKindDescriptor>> {
         self.inner.list_kinds(cx)
+    }
+
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        self.inner.list_stream(request, cancel).await
     }
 
     async fn write(

@@ -1116,6 +1116,88 @@ async fn list_address_roots_filters_per_root_by_authz() {
     );
 }
 
+#[tokio::test]
+async fn list_address_roots_carries_visibility_and_omits_suppressed_roots() {
+    fn connection(root: &str) -> ovstorage::ConnectionConfig {
+        ovstorage::ConnectionConfig::from_request(ConnectionRequest {
+            backend_kind: "test".into(),
+            config: HashMap::from([("test_root".into(), ConfigValue::String(root.into()))]),
+            credentials: SecretBundle::default(),
+            persist: false,
+            display_name: Some(root.into()),
+        })
+    }
+
+    fn visibility_rule(address: &str, visibility: &str) -> toml::Value {
+        toml::Value::Table(toml::Table::from_iter([
+            ("address".into(), toml::Value::String(address.into())),
+            ("visibility".into(), toml::Value::String(visibility.into())),
+        ]))
+    }
+
+    let mut stack_config = rest_stack_config(
+        vec![
+            connection("test://visible/"),
+            connection("test://hidden/"),
+            connection("test://suppressed/"),
+        ],
+        &ovstorage_authz::UserMetadataKinds::from_factories(&[]),
+    );
+    stack_config
+        .layers
+        .get_mut("alias")
+        .expect("REST stack has an alias layer")
+        .config
+        .insert(
+            "visibility".into(),
+            toml::Value::Array(vec![
+                visibility_rule("test://hidden/", "hidden"),
+                visibility_rule("test://suppressed/", "suppressed"),
+            ]),
+        );
+
+    // SAFETY: dlopen of build-script-populated fixture only.
+    let gateway = unsafe {
+        GatewayStackBuilder::new()
+            .plugin_dir(plugin_dir())
+            .allow_test_plugins(true)
+            .auth_config(conformance_auth_config(None, None))
+            .stack_config(stack_config)
+            .build()
+            .await
+            .unwrap()
+    };
+    let response = router(gateway)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/address-roots")
+                .body(AxumBody::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let items = parsed["items"].as_array().expect("items array");
+
+    let visibility_for = |address: &str| {
+        items
+            .iter()
+            .find(|item| item["address"].as_str() == Some(address))
+            .and_then(|item| item["visibility"].as_str())
+    };
+    assert_eq!(visibility_for("test://visible/"), Some("visible"));
+    assert_eq!(visibility_for("test://hidden/"), Some("hidden"));
+    assert!(
+        !items
+            .iter()
+            .any(|item| item["address"].as_str() == Some("test://suppressed/")),
+        "suppressed root must be omitted: {items:?}"
+    );
+}
+
 mod oidc {
     use super::*;
     use base64::Engine as _;

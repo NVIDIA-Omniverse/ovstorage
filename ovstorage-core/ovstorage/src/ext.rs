@@ -24,10 +24,10 @@ use crate::{
     Body, Capabilities, Connection, CopyOptions, CopyRequest, CreateDirectoryOptions,
     CreateDirectoryRequest, DeleteDirectoryOptions, DeleteDirectoryRequest, DeleteOptions,
     DeleteRequest, EMPTY_LAYER_KIND, Error, ErrorCode, Extensions, Layer, LayerType, ListOptions,
-    ListPage, ListRequest, LocalDelegate, ObjectInfo, ReadOptions, ReadRequest, ReadResult,
-    ReadStream, RenameOptions, RenameRequest, Request, Result, RootInfo, StatOptions, StatRequest,
-    StorageBackendKindDescriptor, UpdateMetadataOptions, UpdateMetadataRequest, Url, WriteOptions,
-    WriteRequest, WriteResult, WriteStep, address, layer_kind_to_backend_descriptor,
+    ListPage, ListRequest, ListStream, LocalDelegate, ObjectInfo, ReadOptions, ReadRequest,
+    ReadResult, ReadStream, RenameOptions, RenameRequest, Request, Result, RootInfo, StatOptions,
+    StatRequest, StorageBackendKindDescriptor, UpdateMetadataOptions, UpdateMetadataRequest, Url,
+    WriteOptions, WriteRequest, WriteResult, WriteStep, address, layer_kind_to_backend_descriptor,
     validate_update_metadata_options,
 };
 use ovstorage_layer::{canonicalize, io_error};
@@ -183,6 +183,28 @@ pub trait LayerExt: Layer {
         cancel: Option<CancellationToken>,
     ) -> Result<ListPage>;
 
+    /// Stream entries below `prefix` until the stream is exhausted or dropped.
+    ///
+    /// Dropping the stream stops the listing and makes no promise that it can
+    /// be resumed. `opts.max_results` and `opts.page_token` must be unset; use
+    /// [`LayerExt::list_page`] when a buffered, resumable page is required.
+    /// Cancellation uses the token supplied when the stream is opened.
+    ///
+    /// # Errors
+    ///
+    /// The [`Layer::list_stream`] contract: [`ErrorCode::NotFound`],
+    /// [`ErrorCode::InvalidArgument`] (object prefix or paging fields set),
+    /// [`ErrorCode::NoRoute`], [`ErrorCode::PermissionDenied`],
+    /// [`ErrorCode::Unsupported`], [`ErrorCode::Cancelled`], and
+    /// [`ErrorCode::Transient`]. The prefix is converted to directory form
+    /// before dispatch, so both spellings stream the same listing.
+    async fn list_stream(
+        &self,
+        prefix: Url,
+        opts: ListOptions,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream>;
+
     /// # Errors
     ///
     /// The [`Layer::create_directory`] contract:
@@ -201,7 +223,9 @@ pub trait LayerExt: Layer {
     ///
     /// The [`Layer::delete_directory`] contract:
     /// [`ErrorCode::DirectoryNotEmpty`], [`ErrorCode::InvalidArgument`]
-    /// (the target is an object), [`ErrorCode::NotFound`],
+    /// (the target is an object (use [`Layer::delete`]) or a symlink, which is
+    /// operator state that `delete_directory` does not remove or follow),
+    /// [`ErrorCode::NotFound`],
     /// [`ErrorCode::NoRoute`], [`ErrorCode::PermissionDenied`],
     /// [`ErrorCode::Unsupported`], [`ErrorCode::Cancelled`], and
     /// [`ErrorCode::Transient`].
@@ -557,6 +581,27 @@ impl<L: Layer + ?Sized> LayerExt for L {
         .await
     }
 
+    async fn list_stream(
+        &self,
+        prefix: Url,
+        opts: ListOptions,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        let prefix = address::to_directory(&prefix)?;
+        Layer::list_stream(
+            self,
+            Request {
+                extensions: Extensions::new(),
+                input: ListRequest {
+                    prefix,
+                    options: opts,
+                },
+            },
+            cancel,
+        )
+        .await
+    }
+
     async fn create_directory(
         &self,
         addr: Url,
@@ -709,7 +754,83 @@ impl<L: Layer + ?Sized> LayerExt for L {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::StackConfig;
+    use crate::{LayerKindDescriptor, StackConfig};
+    use std::sync::Mutex;
+
+    struct ListStreamProbe {
+        request: Mutex<Option<ListRequest>>,
+        cancel: Mutex<Option<CancellationToken>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Layer for ListStreamProbe {
+        fn name(&self) -> &str {
+            "list-stream-probe"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            LayerKindDescriptor {
+                kind: "list-stream-probe".to_string(),
+                layer_type: LayerType::Backend,
+                display_name: "List stream probe".to_string(),
+                description: None,
+                config_schema: Vec::new(),
+                credential_schema: Vec::new(),
+                credential_methods: Vec::new(),
+                icon: None,
+                accepts_connections: false,
+                auth_capable: false,
+                supports_user_metadata: false,
+            }
+        }
+
+        async fn list_stream(
+            &self,
+            request: Request<ListRequest>,
+            cancel: Option<CancellationToken>,
+        ) -> Result<ListStream> {
+            *self.request.lock().unwrap() = Some(request.input);
+            *self.cancel.lock().unwrap() = cancel;
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn list_stream_canonicalizes_prefix_and_delegates() {
+        let layer = ListStreamProbe {
+            request: Mutex::new(None),
+            cancel: Mutex::new(None),
+        };
+        let options = ListOptions {
+            recursive: true,
+            ..ListOptions::default()
+        };
+        let cancel = CancellationToken::new();
+
+        let _stream = LayerExt::list_stream(
+            &layer,
+            Url::parse("test://root/prefix").unwrap(),
+            options.clone(),
+            Some(cancel.clone()),
+        )
+        .await
+        .unwrap();
+
+        let request = layer.request.lock().unwrap().take().unwrap();
+        assert_eq!(request.prefix.as_str(), "test://root/prefix/");
+        assert_eq!(request.options, options);
+
+        cancel.cancel();
+        assert!(
+            layer
+                .cancel
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_cancelled()
+        );
+    }
 
     /// An unconfigured host is a one-layer Stack rooted at `EmptyLayer`, whose
     /// reserved `"empty"` backend kind must not surface as connectable.

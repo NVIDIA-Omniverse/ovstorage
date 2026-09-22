@@ -547,9 +547,11 @@ class _RecordingOperations(ovstorage.LayerBase):
     def _record(self, slot: str, *args: object, **kwargs: object) -> None:
         self.calls.setdefault(slot, []).append((args, kwargs))
 
-    async def stat(self, address: str, full_metadata: bool = False) -> object:
-        self._record("stat", address, full_metadata)
-        return await self._next("stat", address, full_metadata)
+    async def stat(
+        self, address: str, full_metadata: bool = False, **kwargs: object
+    ) -> object:
+        self._record("stat", address, full_metadata, **kwargs)
+        return await self._next("stat", address, full_metadata, **kwargs)
 
     async def read(self, address: str, **kwargs: object) -> object:
         self._record("read", address, **kwargs)
@@ -679,6 +681,7 @@ async def test_successful_version_page_and_connection_results_decode(
     path.write_bytes(b"successful-decode")
     address = path.as_uri()
     expected_info = await native.stat(address)
+    assert expected_info.etag_strength == "weak"
     expected_connection = (await native.list_connections())[0]
 
     leaf = _SuccessfulDecodeLeaf(
@@ -695,6 +698,7 @@ async def test_successful_version_page_and_connection_results_decode(
     assert len(versions.items) == 1
     assert versions.items[0].address == expected_info.address
     assert versions.items[0].etag == expected_info.etag
+    assert versions.items[0].etag_strength == "weak"
     assert versions.items[0].size == expected_info.size
 
     connection = await stack.probe(
@@ -705,6 +709,163 @@ async def test_successful_version_page_and_connection_results_decode(
     assert connection.backend_kind == expected_connection.backend_kind
     assert connection.addresses == expected_connection.addresses
     assert connection.user_metadata == expected_connection.user_metadata
+
+
+class _InfoStrengthLeaf(ovstorage.LayerBase):
+    async def stat(self, _address: str, **_kwargs: object) -> object:
+        return self.info
+
+
+async def test_python_info_etag_strength_is_optional_and_strict(
+    tmp_path: pathlib.Path,
+) -> None:
+    native = await _native_file_stack(tmp_path)
+    path = tmp_path / "etag-strength.bin"
+    path.write_bytes(b"etag-strength")
+    address = path.as_uri()
+    native_info = await native.stat(address)
+    projected = {
+        "address": native_info.address,
+        "kind": native_info.kind,
+        "size": native_info.size,
+        "mtime_unix_nanos": native_info.mtime_unix_nanos,
+        "etag": native_info.etag,
+        "version": native_info.version,
+        "system_metadata": native_info.system_metadata,
+        "user_metadata": native_info.user_metadata,
+    }
+
+    for name, declaration, expected in (
+        ("omitted", {}, None),
+        ("declared-none", {"etag_strength": None}, None),
+        ("declared-strong", {"etag_strength": "strong"}, "strong"),
+    ):
+        leaf = _InfoStrengthLeaf(
+            name=name,
+            layer_type="backend",
+            roots=[tmp_path.as_uri() + "/"],
+        )
+        leaf.info = SimpleNamespace(**projected, **declaration)
+        stack = await ovstorage.Stack(root=name).backend(leaf).build()
+        assert (await stack.stat(address)).etag_strength == expected
+
+    for garbage in ("durable", 1):
+        leaf = _InfoStrengthLeaf(
+            name=f"garbage-{garbage}",
+            layer_type="backend",
+            roots=[tmp_path.as_uri() + "/"],
+        )
+        leaf.info = SimpleNamespace(**projected, etag_strength=garbage)
+        stack = await ovstorage.Stack(root=f"garbage-{garbage}").backend(leaf).build()
+        with pytest.raises(ovstorage.IncompatibleTypeError, match="etag_strength"):
+            await stack.stat(address)
+
+
+async def test_python_info_versioned_address_is_optional_and_validated(
+    tmp_path: pathlib.Path,
+) -> None:
+    native = await _native_file_stack(tmp_path)
+    path = tmp_path / "versioned-address.bin"
+    path.write_bytes(b"versioned-address")
+    address = path.as_uri()
+    native_info = await native.stat(address)
+    projected = {
+        "address": native_info.address,
+        "kind": native_info.kind,
+        "size": native_info.size,
+        "mtime_unix_nanos": native_info.mtime_unix_nanos,
+        "etag": native_info.etag,
+        "etag_strength": native_info.etag_strength,
+        "version": native_info.version,
+        "system_metadata": native_info.system_metadata,
+        "user_metadata": native_info.user_metadata,
+    }
+    pin = native_info.address + "?versionId=abc"
+
+    for name, declaration, expected in (
+        ("omitted", {}, None),
+        ("declared-none", {"versioned_address": None}, None),
+        ("declared-pin", {"versioned_address": pin}, pin),
+    ):
+        leaf = _InfoStrengthLeaf(
+            name=name,
+            layer_type="backend",
+            roots=[tmp_path.as_uri() + "/"],
+        )
+        leaf.info = SimpleNamespace(**projected, **declaration)
+        stack = await ovstorage.Stack(root=name).backend(leaf).build()
+        assert (await stack.stat(address)).versioned_address == expected
+
+    # A pin is a returned address, so it goes through the same battery as
+    # `address`: a spelling the URL parser rewrites names a different object
+    # from the one a caller would reach through it, and is refused.
+    retargeting = tmp_path.as_uri() + "/a/../" + path.name + "?v=1"
+    for label, garbage, detail in (
+        ("int", 1, "versioned_address"),
+        ("retargeting", retargeting, "different object"),
+    ):
+        leaf = _InfoStrengthLeaf(
+            name=f"garbage-{label}",
+            layer_type="backend",
+            roots=[tmp_path.as_uri() + "/"],
+        )
+        leaf.info = SimpleNamespace(**projected, versioned_address=garbage)
+        stack = await ovstorage.Stack(root=f"garbage-{label}").backend(leaf).build()
+        with pytest.raises(ovstorage.IncompatibleTypeError, match=detail):
+            await stack.stat(address)
+
+
+class _ShortSignatureStatLeaf(ovstorage.LayerBase):
+    """Declared without `versioned_address` and without `**kwargs`."""
+
+    async def stat(self, address: str, full_metadata: bool = False) -> object:
+        del full_metadata
+        return await self.delegate.stat(address)
+
+
+@pytest.mark.parametrize("position", ["wrapper", "leaf"])
+async def test_versioned_address_keyword_is_supplied_only_when_requested(
+    tmp_path: pathlib.Path, position: str
+) -> None:
+    path = tmp_path / "pin.bin"
+    path.write_bytes(b"pin")
+    address = path.as_uri()
+    prefix = tmp_path.as_uri() + "/"
+    stack, layer = await _recording_stack(tmp_path, position)
+
+    await stack.stat(address)
+    assert layer.calls["stat"][-1] == ((address, False), {})
+    await stack.stat(address, versioned_address=True)
+    assert layer.calls["stat"][-1] == ((address, False), {"versioned_address": True})
+
+    await stack.list(prefix)
+    assert "versioned_address" not in layer.calls["list"][-1][1]
+    await stack.list(prefix, versioned_address=True)
+    assert layer.calls["list"][-1][1]["versioned_address"] is True
+
+    # The keyword is absent from an unflagged call, so an override declared
+    # against the shorter signature keeps serving it.
+    leaf = _ShortSignatureStatLeaf(
+        name="short-stat", layer_type="backend", roots=[prefix]
+    )
+    leaf.delegate = await _native_file_stack(tmp_path)
+    short = await ovstorage.Stack(root="short-stat").backend(leaf).build()
+    assert (await short.stat(address)).address == address
+
+
+async def test_native_file_backend_reports_no_versioned_address(
+    tmp_path: pathlib.Path,
+) -> None:
+    native = await _native_file_stack(tmp_path)
+    path = tmp_path / "unpinned.bin"
+    path.write_bytes(b"unpinned")
+    address = path.as_uri()
+
+    info = await native.stat(address, versioned_address=True)
+    assert info.versioned_address is None
+    page = await native.list(tmp_path.as_uri() + "/", versioned_address=True)
+    assert [item.address for item in page.items] == [address]
+    assert page.items[0].versioned_address is None
 
 
 async def _recording_stack(
@@ -792,8 +953,11 @@ async def test_python_operation_overrides_round_trip_like_native_file_stack(
     assert (await stack.copy(source, copied)).size == (await control.stat(copied)).size
     await stack.rename(copied, renamed)
     assert (await stack.stat(renamed)).size == len(b"bridge")
-    updated = await stack.update_metadata(renamed, user_metadata_set={"owner": "python"})
-    assert updated.user_metadata == (await control.stat(renamed)).user_metadata
+    # The file backend stores no user metadata: the bridged and the native
+    # stack refuse the update alike, and both stat an empty map.
+    with pytest.raises(ovstorage.UnsupportedError):
+        await stack.update_metadata(renamed, user_metadata_set={"owner": "python"})
+    assert (await stack.stat(renamed)).user_metadata == (await control.stat(renamed)).user_metadata == {}
     decision = await stack.check_access(source, read=True, write=True, delete=True)
     assert decision.allowed is True
     delegate = await stack.materialize(source)
@@ -912,7 +1076,6 @@ async def test_forwarding_base_methods_preserve_preconditions_and_ranges(
         b"original",
         if_dest_exists="fail",
         size_hint=8,
-        user_metadata={"owner": "python"},
         message="create",
     )
     assert created.etag is not None
@@ -920,9 +1083,19 @@ async def test_forwarding_base_methods_preserve_preconditions_and_ranges(
         "if_dest_exists": "fail",
         "if_dest_etag": None,
         "size_hint": 8,
-        "user_metadata": {"owner": "python"},
+        "user_metadata": None,
         "message": "create",
     }
+    # `user_metadata` is forwarded verbatim as well. The file leaf stores no
+    # user metadata and refuses a non-empty map, so the wrapper sees the option
+    # and the caller sees the refusal.
+    with pytest.raises(ovstorage.UnsupportedError):
+        await stack.write(
+            (root / "tagged.bin").as_uri(),
+            b"tagged",
+            user_metadata={"owner": "python"},
+        )
+    assert layer.calls["write"][1][1]["user_metadata"] == {"owner": "python"}
 
     with pytest.raises(ovstorage.AlreadyExistsError):
         await stack.write(address, b"clobber", if_dest_exists="fail")
@@ -1105,6 +1278,7 @@ async def test_list_results_reject_an_address_the_host_would_rewrite(
     stack = await ovstorage.Stack(root="honest-page").backend(layer).build()
     page = await stack.list(root.as_uri() + "/")
     assert [item.address for item in page.items] == [real.as_uri()]
+    assert page.items[0].etag_strength is None
 
 
 class _WrongInfoReadStream:
@@ -1180,9 +1354,11 @@ async def test_transparent_declaration_wrapper_delegates_all_unoverridden_ops(
     assert (await wrapped.write_stream(streamed, b"stream")).size == len(b"stream")
     assert (await wrapped.copy(address, copied)).size == (await control.stat(copied)).size
     await wrapped.rename(copied, renamed)
-    assert (await wrapped.update_metadata(renamed, user_metadata_set={"same": "yes"})).user_metadata == {
-        "same": "yes"
-    }
+    # The file backend stores no user metadata: the update is refused through
+    # the transparent wrapper exactly as it is natively.
+    with pytest.raises(ovstorage.UnsupportedError):
+        await wrapped.update_metadata(renamed, user_metadata_set={"same": "yes"})
+    assert (await wrapped.stat(renamed)).user_metadata == (await control.stat(renamed)).user_metadata == {}
     assert (await wrapped.check_access(address, read=True)).allowed is True
     delegate = await wrapped.materialize(address)
     assert pathlib.Path(delegate).read_bytes() == b"same"

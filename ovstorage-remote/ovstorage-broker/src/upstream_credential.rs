@@ -21,8 +21,8 @@ use ovstorage::wrappers::ext;
 use ovstorage::{
     AuthEvent, AuthEventStream, AuthenticateRequest, BackendId, CancellationToken, Capabilities,
     Connection, ConnectionAuthState, ConnectionSource, Error, ErrorCode, Layer, LayerConfig,
-    LayerHandle, LayerKindDescriptor, LayerType, LocalDelegate, ObjectInfo, ReadRequest,
-    ReadResult, Request, Result, SecretBundle, SecretValue, StatRequest,
+    LayerHandle, LayerKindDescriptor, LayerType, ListRequest, ListStream, LocalDelegate,
+    ObjectInfo, ReadRequest, ReadResult, Request, Result, SecretBundle, SecretValue, StatRequest,
     UpdateConnectionCredentialsRequest, Url, WrapperFactory, bail_if_cancelled,
 };
 
@@ -776,6 +776,10 @@ fn accepted_connection(
         },
         last_probed: None,
         user_metadata: std::collections::HashMap::new(),
+        // The caller addressed this key, so the target is in hand and does not
+        // have to be recovered by anybody downstream. This is not the loaded-
+        // composite case the host back-fill covers -- there is nothing to infer.
+        owning_target: Some(key.target),
     }
 }
 
@@ -791,6 +795,14 @@ impl Layer for UpstreamCredentialWrapper {
 
     fn inner_layer(&self) -> Option<&LayerHandle> {
         Some(&self.inner)
+    }
+
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        self.inner.list_stream(request, cancel).await
     }
 
     async fn stat(
@@ -968,6 +980,7 @@ mod tests {
             auth_state: ConnectionAuthState::Anonymous,
             last_probed: None,
             user_metadata: std::collections::HashMap::new(),
+            owning_target: None,
         }
     }
 
@@ -1057,6 +1070,7 @@ mod tests {
             Ok(LocalDelegate {
                 path: std::env::temp_dir().join("ovstorage-upstream-materialize-probe"),
                 info: ObjectInfo {
+                    etag_strength: Default::default(),
                     address,
                     kind: ovstorage::ObjectKind::File,
                     etag: Some("probe-etag".into()),
@@ -1068,6 +1082,7 @@ mod tests {
                     system_metadata: None,
                     user_metadata: None,
                     modified_by: None,
+                    versioned_address: None,
                 },
                 guard: None,
             })

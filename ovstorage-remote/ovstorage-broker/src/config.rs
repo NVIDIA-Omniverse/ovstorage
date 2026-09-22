@@ -43,6 +43,46 @@ pub struct BrokerConfig {
     /// Governs the read and the write path identically.
     #[serde(default)]
     pub redirect_credential_disclosure: RedirectDisclosureConfig,
+    /// Which cloud schemes an address that no configured connection serves may
+    /// fall back to, attempted anonymously by the backend layer of that kind.
+    ///
+    /// Empty by default: an unrouted `s3://`, `gs://` or `azure://` address
+    /// answers `NoRoute`. A granted scheme lets the address route to the
+    /// scheme's backend, which attaches no credential at all and serves reads
+    /// only. This is a property of the deployment rather than of any
+    /// connection — a brokered fetch runs from this broker's network position
+    /// and reaches whatever that position reaches — which is why it is an
+    /// operator setting here rather than a rule. It grants routability, never
+    /// authority: the per-listener auth layer still evaluates every address
+    /// first, so a caller the policy does not cover is denied before the
+    /// fallback is consulted.
+    ///
+    /// The graph must declare the backend layer of each granted scheme's kind
+    /// (`s3`, `gcs`, `azure`) and route it from the router, or startup refuses.
+    /// `http`/`https` are granted through [`Self::anonymous_http_fallback`],
+    /// not here.
+    #[serde(default)]
+    pub anonymous_fallback_schemes: Vec<CloudFallbackScheme>,
+    /// Whether an `http://` or `https://` address that no connection serves may
+    /// be fetched anonymously.
+    ///
+    /// A separate switch from the cloud schemes because it means something
+    /// different: an `http` fallback is not a public bucket but an arbitrary
+    /// origin, fetched from **this** process's network position, so granting it
+    /// lets a client reach anything the broker can. Cloud instance-metadata
+    /// endpoints are refused regardless of this setting. `allow` is refused at
+    /// startup in this release, loudly rather than silently ignored.
+    #[serde(default)]
+    pub anonymous_http_fallback: AnonymousHttpFallbackConfig,
+    /// Continuation-seal key configuration.
+    ///
+    /// Configure a shared key when redirects issued by one broker replica may
+    /// be continued through another, or when in-flight writes must survive a
+    /// process restart. The key file contains raw key bytes (not hex or base64)
+    /// and must be at least 32 bytes long. Without `key_path`, the broker uses a
+    /// process-local random key that is carried across in-process reloads.
+    #[serde(default)]
+    pub continuation_seal: ContinuationSealConfig,
     /// Per-name OAuth provider registry.
     ///
     /// ```toml
@@ -76,6 +116,25 @@ pub struct BrokerConfig {
     pub auth: AuthStateConfig,
 }
 
+impl BrokerConfig {
+    /// The schemes the operator granted an anonymous fallback for, as the set
+    /// [`ovstorage::host::stamp_anonymous_fallback`] consumes: the cloud
+    /// schemes verbatim, plus `http` and `https` together when
+    /// [`Self::anonymous_http_fallback`] allows them.
+    pub fn anonymous_fallback_set(&self) -> std::collections::BTreeSet<String> {
+        let mut schemes: std::collections::BTreeSet<String> = self
+            .anonymous_fallback_schemes
+            .iter()
+            .map(|scheme| scheme.as_scheme().to_string())
+            .collect();
+        if self.anonymous_http_fallback.allows() {
+            schemes.insert("http".to_string());
+            schemes.insert("https".to_string());
+        }
+        schemes
+    }
+}
+
 /// Operator control over the auth directory — `auth.sqlite`, its advisory
 /// refresh locks, and the credential bytes.
 ///
@@ -98,6 +157,17 @@ pub struct AuthStateConfig {
     /// two brokers on one host must stay isolated from each other.
     #[serde(default)]
     pub state_root: Option<PathBuf>,
+}
+
+/// Operator control over the secret that authenticates client-driven write
+/// continuations.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContinuationSealConfig {
+    /// Path to a file containing at least 32 raw key bytes. The first 32 bytes
+    /// are used as the HMAC-SHA256 key.
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
 }
 
 /// Whether redirects may carry a connection-wide credential to the client.
@@ -124,6 +194,62 @@ pub enum RedirectDisclosureConfig {
 
 impl RedirectDisclosureConfig {
     pub fn discloses(self) -> bool {
+        matches!(self, Self::Allow)
+    }
+}
+
+/// A cloud scheme an operator may grant an anonymous fallback for.
+///
+/// ```toml
+/// anonymous_fallback_schemes = []            # default; an unrouted address is NoRoute
+/// # anonymous_fallback_schemes = ["s3", "gs"] # public buckets on those schemes are readable
+/// ```
+///
+/// A closed set, so a typo is a startup error rather than a grant that
+/// silently never applies. `http` and `https` are deliberately absent: they
+/// are a different kind of grant and have their own key.
+#[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudFallbackScheme {
+    /// `s3://bucket/key`, attempted against the bucket's region anonymously.
+    S3,
+    /// `gs://bucket/object`, attempted against the public GCS endpoint.
+    Gs,
+    /// `azure://account/container/blob`, attempted against the account's blob
+    /// endpoint anonymously.
+    Azure,
+}
+
+impl CloudFallbackScheme {
+    /// The URL scheme this grant covers, as the route table spells it.
+    pub fn as_scheme(self) -> &'static str {
+        match self {
+            Self::S3 => "s3",
+            Self::Gs => "gs",
+            Self::Azure => "azure",
+        }
+    }
+}
+
+/// Whether an unrouted `http://` or `https://` address may be fetched
+/// anonymously from this process's network position.
+///
+/// ```toml
+/// anonymous_http_fallback = "refuse"  # default; an unrouted http address is NoRoute
+/// # anonymous_http_fallback = "allow" # refused at startup in this release
+/// ```
+#[derive(Copy, Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnonymousHttpFallbackConfig {
+    /// An `http`/`https` address no connection serves answers `NoRoute`.
+    #[default]
+    Refuse,
+    /// Such an address may be fetched anonymously by the `http` backend layer.
+    Allow,
+}
+
+impl AnonymousHttpFallbackConfig {
+    pub fn allows(self) -> bool {
         matches!(self, Self::Allow)
     }
 }

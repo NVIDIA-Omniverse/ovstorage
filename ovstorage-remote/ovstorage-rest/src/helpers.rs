@@ -136,8 +136,10 @@ const COPY_RENAME_IF_MATCH_REJECTION: &str = "If-Match not accepted on copy / re
 
 /// Normalize the etag value out of a quoted-or-bare RFC 7232 etag
 /// header. Strips a leading `W/` (weak-etag prefix, tolerated but
-/// compared strongly) and any surrounding double quotes. Returns
-/// `Ok(None)` when the header is absent or empty.
+/// compared strongly) and any surrounding double quotes. Validator strength
+/// is carried out of band on object metadata; precondition options contain
+/// only this normalized opaque token. Returns `Ok(None)` when the header is
+/// absent or empty.
 ///
 /// RFC 7232's wildcard form (`If-Match: *`) means "match any current
 /// representation", which the SPI cannot represent as an etag string.
@@ -329,11 +331,17 @@ pub(crate) fn to_object_info(info: &ovstorage::ObjectInfo) -> schema::ObjectInfo
         address: info.address.to_string(),
         kind: object_kind_str(info.kind).into(),
         etag: info.etag.clone(),
+        etag_strength: match info.etag_strength {
+            ovstorage::EtagStrength::Unspecified => None,
+            ovstorage::EtagStrength::Strong => Some(schema::EtagStrengthResponse::Strong),
+            ovstorage::EtagStrength::Weak => Some(schema::EtagStrengthResponse::Weak),
+        },
         version: info.version.clone(),
         size: info.size,
         mtime_unix_nanos: info.mtime.and_then(system_time_to_unix_nanos),
         system_metadata: info.system_metadata.clone(),
         user_metadata: info.user_metadata.clone(),
+        versioned_address: info.versioned_address.as_ref().map(|url| url.to_string()),
     }
 }
 
@@ -420,6 +428,13 @@ pub(crate) fn to_address_root(root: &ovstorage::AddressRoot) -> schema::AddressR
         backend_kind: root.backend_kind.clone(),
         connection_id: root.connection_id.as_ref().map(|c| c.0.clone()),
         capabilities: to_capabilities(&root.capabilities),
+        visibility: match root.visibility {
+            ovstorage::AddressVisibility::Visible => schema::AddressVisibilityResponse::Visible,
+            ovstorage::AddressVisibility::Hidden => schema::AddressVisibilityResponse::Hidden,
+            ovstorage::AddressVisibility::Suppressed => {
+                schema::AddressVisibilityResponse::Suppressed
+            }
+        },
     }
 }
 

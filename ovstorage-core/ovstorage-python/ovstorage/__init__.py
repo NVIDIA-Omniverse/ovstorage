@@ -129,6 +129,7 @@ alias = _native.alias
 byte_cache = _native.byte_cache
 copy_rename_fallback = _native.copy_rename_fallback
 file = _native.file
+hub_cache = _native.hub_cache
 metadata_cache = _native.metadata_cache
 plugin = _native.plugin
 redirect_follower = _native.redirect_follower

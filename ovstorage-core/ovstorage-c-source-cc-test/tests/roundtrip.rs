@@ -3,12 +3,15 @@
 
 use std::ffi::c_int;
 use std::ffi::{CString, c_char};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Output};
 use std::sync::OnceLock;
 
 // Portable entry points: compiled on every target so the completeness and
 // header-conformance gates keep running when Windows CI returns.
 unsafe extern "C" {
     fn ovstorage_c_source_completeness() -> c_int;
+    fn ovstorage_c_source_list_entry_stream_free_contract() -> c_int;
     fn ovstorage_c_source_header_ovstorage_c() -> c_int;
     fn ovstorage_c_source_header_defaults_c() -> c_int;
     fn ovstorage_c_source_header_plugin_c() -> c_int;
@@ -28,6 +31,8 @@ unsafe extern "C" {
     fn ovstorage_c_source_auth_nul_progress() -> c_int;
     fn ovstorage_c_source_stream_concurrency() -> c_int;
     fn ovstorage_c_source_auth_terminal_contract() -> c_int;
+    fn ovstorage_c_source_auth_credentials_round_trip() -> c_int;
+    fn ovstorage_c_source_auth_credentials_empty_bundle_present() -> c_int;
     fn ovstorage_c_source_pump_reap_contract() -> c_int;
     fn ovstorage_c_source_file_backend_etag_precondition() -> c_int;
     fn ovstorage_c_source_default_vtables_reserved_null() -> c_int;
@@ -44,6 +49,8 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn ovstorage_c_source_header_hpp_cpp20() -> c_int;
     fn ovstorage_c_source_roundtrip_cpp20() -> c_int;
+    fn ovstorage_c_source_etag_strength_abi_cpp20(fixture_path: *const c_char) -> c_int;
+    fn ovstorage_c_source_versioned_address_abi_cpp20(fixture_path: *const c_char) -> c_int;
 }
 
 // Plugin inspection and parked-discovery drivers need a dynamically loaded
@@ -169,6 +176,322 @@ fn pure_c_auth_credential_decoder_reclaims_every_nested_allocation() {
     }
 }
 
+struct CredentialScratch {
+    path: PathBuf,
+}
+
+impl CredentialScratch {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the system clock is after the Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ovstorage-c-source-cred-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap_or_else(|error| {
+            panic!(
+                "failed to create credential-store scratch directory {}: {error}",
+                path.display()
+            )
+        });
+        Self { path }
+    }
+}
+
+impl Drop for CredentialScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn credential_store_process_driver() -> Option<&'static str> {
+    match env!("OVSTORAGE_C_SOURCE_CRED_STORE_STATUS") {
+        "built" => match option_env!("OVSTORAGE_C_SOURCE_CRED_STORE_BIN") {
+            Some(path) => Some(path),
+            None => panic!("a built credential-store process driver has no binary path"),
+        },
+        "skipped" => {
+            eprintln!("skipping pure-C credential-store process coverage for a cross build");
+            None
+        }
+        failure => panic!("pure-C credential-store process coverage unavailable: {failure}"),
+    }
+}
+
+fn run_cred_driver(dir: &Path, namespace: &str, args: &[&str]) -> ExitStatus {
+    let binary = credential_store_process_driver()
+        .expect("run_cred_driver is called only when the native driver was built");
+    Command::new(binary)
+        .arg(dir)
+        .arg(namespace)
+        .args(args)
+        .status()
+        .unwrap_or_else(|error| panic!("failed to run credential-store driver `{binary}`: {error}"))
+}
+
+fn run_cred_driver_output(dir: &Path, namespace: &str, args: &[&str]) -> Output {
+    let binary = credential_store_process_driver()
+        .expect("run_cred_driver_output is called only when the native driver was built");
+    Command::new(binary)
+        .arg(dir)
+        .arg(namespace)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run credential-store driver `{binary}`: {error}"))
+}
+
+fn credential_record_path(dir: &Path, namespace: &str) -> PathBuf {
+    dir.join("c-credentials")
+        .join(format!("{}.creds", credential_namespace_stem(namespace)))
+}
+
+fn credential_temp_path(dir: &Path, namespace: &str) -> PathBuf {
+    dir.join("c-credentials").join(format!(
+        "{}.creds.tmp",
+        credential_namespace_stem(namespace)
+    ))
+}
+
+fn credential_namespace_stem(namespace: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    namespace
+        .as_bytes()
+        .iter()
+        .flat_map(|byte| [HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]])
+        .map(char::from)
+        .collect()
+}
+
+fn assert_cred_driver_success(dir: &Path, namespace: &str, args: &[&str]) {
+    let status = run_cred_driver(dir, namespace, args);
+    assert!(
+        status.success(),
+        "credential-store driver {:?} failed: {status}",
+        args.first().copied().unwrap_or("<missing phase>")
+    );
+    assert!(
+        !credential_temp_path(dir, namespace).exists(),
+        "credential-store operation left its temporary record behind"
+    );
+}
+
+#[test]
+fn pure_c_credentials_survive_a_process_restart() {
+    if credential_store_process_driver().is_none() {
+        return;
+    }
+    let scratch = CredentialScratch::new();
+    let namespace = "restart-app";
+    let record = credential_record_path(&scratch.path, namespace);
+
+    assert_cred_driver_success(&scratch.path, namespace, &["put", "k", "v1"]);
+    assert!(
+        record.is_file(),
+        "the first put did not create the record file"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = |path: &Path| {
+            std::fs::metadata(path)
+                .unwrap_or_else(|error| panic!("failed to stat {}: {error}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(&scratch.path), 0o700, "auth directory mode");
+        assert_eq!(
+            mode(&scratch.path.join("c-credentials")),
+            0o700,
+            "credential directory mode"
+        );
+        assert_eq!(mode(&record), 0o600, "credential record mode");
+    }
+
+    assert_cred_driver_success(&scratch.path, namespace, &["get", "k", "v1"]);
+    assert_cred_driver_success(&scratch.path, "other-app", &["absent", "k"]);
+    assert_cred_driver_success(&scratch.path, namespace, &["put", "k", "v2"]);
+    assert_cred_driver_success(&scratch.path, namespace, &["get", "k", "v2"]);
+    assert_cred_driver_success(&scratch.path, namespace, &["delete", "k"]);
+    assert_cred_driver_success(&scratch.path, namespace, &["absent", "k"]);
+}
+
+#[test]
+fn pure_c_credential_store_serialises_concurrent_processes() {
+    let Some(binary) = credential_store_process_driver() else {
+        return;
+    };
+    let scratch = CredentialScratch::new();
+    let namespace = "contention-app";
+    let mut children = Vec::new();
+
+    for worker in 0..4 {
+        children.push(
+            Command::new(binary)
+                .arg(&scratch.path)
+                .arg(namespace)
+                .arg("contend")
+                .arg(worker.to_string())
+                .arg("20")
+                .spawn()
+                .unwrap_or_else(|error| {
+                    panic!("failed to launch credential contention worker {worker}: {error}")
+                }),
+        );
+    }
+    for (worker, mut child) in children.into_iter().enumerate() {
+        let status = child.wait().unwrap_or_else(|error| {
+            panic!("failed to wait for credential contention worker {worker}: {error}")
+        });
+        assert!(
+            status.success(),
+            "contention worker {worker} failed: {status}"
+        );
+    }
+    assert!(
+        !credential_temp_path(&scratch.path, namespace).exists(),
+        "concurrent credential operations left a temporary record behind"
+    );
+    for worker in 0..4 {
+        let key = format!("worker-{worker}");
+        let value = format!("{worker}:19");
+        assert_cred_driver_success(
+            &scratch.path,
+            namespace,
+            &["get", key.as_str(), value.as_str()],
+        );
+    }
+}
+
+#[test]
+fn pure_c_credential_store_refuses_a_corrupt_file() {
+    if credential_store_process_driver().is_none() {
+        return;
+    }
+    let scratch = CredentialScratch::new();
+    let namespace = "corrupt-app";
+    let record = credential_record_path(&scratch.path, namespace);
+
+    assert_cred_driver_success(&scratch.path, namespace, &["put", "k", "v"]);
+    let original = std::fs::read(&record)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", record.display()));
+    assert!(
+        original.len() > 1,
+        "credential record is unexpectedly short"
+    );
+
+    let truncated = original[..original.len() - 1].to_vec();
+    let mut bad_trailer = original;
+    let trailer = bad_trailer
+        .last_mut()
+        .expect("the non-empty credential record has a trailer byte");
+    *trailer ^= 0x80;
+
+    for corrupt in [&truncated, &bad_trailer] {
+        std::fs::write(&record, corrupt)
+            .unwrap_or_else(|error| panic!("failed to corrupt {}: {error}", record.display()));
+        let before = std::fs::read(&record)
+            .unwrap_or_else(|error| panic!("failed to re-read {}: {error}", record.display()));
+
+        let get =
+            run_cred_driver_output(&scratch.path, namespace, &["get-expect-unavailable", "k"]);
+        assert_eq!(
+            get.status.code(),
+            Some(2),
+            "corrupt credential read did not report StateRootUnavailable: {}",
+            String::from_utf8_lossy(&get.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&get.stderr).contains(&record.to_string_lossy()[..]),
+            "corrupt credential diagnostic did not name {}: {}",
+            record.display(),
+            String::from_utf8_lossy(&get.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&record).expect("read record after refused get"),
+            before,
+            "a refused get changed the corrupt record"
+        );
+
+        let put = run_cred_driver_output(&scratch.path, namespace, &["put", "k", "v2"]);
+        assert!(
+            !put.status.success(),
+            "put unexpectedly replaced a corrupt credential record"
+        );
+        assert_eq!(
+            std::fs::read(&record).expect("read record after refused put"),
+            before,
+            "a refused put changed the corrupt record"
+        );
+        assert!(
+            !credential_temp_path(&scratch.path, namespace).exists(),
+            "a refused corrupt-file operation left a temporary record behind"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn pure_c_credential_store_lock_timeout_is_transient() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let Some(binary) = credential_store_process_driver() else {
+        return;
+    };
+    let scratch = CredentialScratch::new();
+    let namespace = "timeout-app";
+
+    /* Materialize the private directory and lock file before the holder opens
+     * it directly. The holder announces only after fcntl owns the lock. */
+    assert_cred_driver_success(&scratch.path, namespace, &["put", "seed", "seed"]);
+    let mut holder = Command::new(binary)
+        .arg(&scratch.path)
+        .arg(namespace)
+        .args(["hold-lock", "15"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to launch credential lock holder: {error}"));
+    let stdout = holder
+        .stdout
+        .take()
+        .expect("the credential lock holder has piped stdout");
+    let mut ready = String::new();
+    BufReader::new(stdout)
+        .read_line(&mut ready)
+        .expect("read credential lock holder readiness");
+    if ready != "locked\n" {
+        let _ = holder.kill();
+        let status = holder.wait().expect("reap failed credential lock holder");
+        panic!("credential lock holder was not ready ({status}): {ready:?}");
+    }
+
+    let put = run_cred_driver_output(&scratch.path, namespace, &["put", "k", "v"]);
+    let _ = holder.kill();
+    let _ = holder.wait();
+
+    let stderr = String::from_utf8_lossy(&put.stderr);
+    assert!(
+        !put.status.success(),
+        "put unexpectedly succeeded while another process held the lock"
+    );
+    assert!(
+        stderr.contains("Transient") || stderr.contains("held by another process"),
+        "lock timeout diagnostic was not transient: {stderr}"
+    );
+}
+
 #[test]
 fn frozen_c_api_is_link_complete() {
     ensure_runtime_contracts();
@@ -176,6 +499,18 @@ fn frozen_c_api_is_link_complete() {
     // this C symbol. Calling it forces all frozen API references into the link.
     let status = unsafe { ovstorage_c_source_completeness() };
     assert_eq!(status, 0, "the frozen C API completeness table failed");
+}
+
+#[test]
+fn list_entry_stream_free_drops_once_and_accepts_null() {
+    ensure_runtime_contracts();
+    // SAFETY: the C entry owns its heap stream fixture and keeps the
+    // drop-counter state live until the destructor returns.
+    let status = unsafe { ovstorage_c_source_list_entry_stream_free_contract() };
+    assert_eq!(
+        status, 0,
+        "the list-entry stream destructor contract failed"
+    );
 }
 
 #[test]
@@ -239,6 +574,7 @@ fn cpp_wrapper_c_operation_parity_is_exact() {
             "ovstorage_list_address_roots",
             "LayerHandle::list_address_roots",
         ),
+        ("ovstorage_root_info_for", "LayerHandle::root_info_for"),
     ];
     let c_operations = C_HEADER
         .split(';')
@@ -429,6 +765,33 @@ fn authenticate_connection_ends_with_empty_success_fire() {
 }
 
 #[test]
+fn auth_credentials_round_trip_through_the_plugin_decoder() {
+    ensure_runtime_contracts();
+    // SAFETY: the C entry owns its stub Layer, callback state, and the
+    // taken SecretBundle it forwards through update_connection_credentials.
+    let status = unsafe { ovstorage_c_source_auth_credentials_round_trip() };
+    assert_eq!(
+        status, 0,
+        "a Succeeded auth event's credentials did not survive decode, \
+         take, and re-encode through update_connection_credentials"
+    );
+}
+
+#[test]
+fn auth_credentials_empty_bundle_present_is_not_collapsed_to_absent() {
+    ensure_runtime_contracts();
+    // SAFETY: the C entry owns its stub Layer, callback state, and the
+    // taken SecretBundle it forwards through update_connection_credentials.
+    let status = unsafe { ovstorage_c_source_auth_credentials_empty_bundle_present() };
+    assert_eq!(
+        status, 0,
+        "a present-but-empty plugin SecretBundle must decode to a real, \
+         non-NULL bundle, not collapse to the same NULL that means \
+         \"no credentials field was reported\""
+    );
+}
+
+#[test]
 fn file_backend_etag_mismatch_reports_object_modified() {
     ensure_runtime_contracts();
     // SAFETY: the C entry owns its Registry, backend handle, temp directory,
@@ -614,6 +977,67 @@ fn parked_discovery_through_the_cpp_wrapper_is_nonblocking_and_cancellable() {
         status, 0,
         "a parked discovery driven through the C++ wrapper must be non-blocking, \
          cancel to Cancelled, and leave the imported root reusable/destructible"
+    );
+}
+
+/// Current metadata crosses Rust plugin ABI -> pure-C dispatch -> public C
+/// snapshot -> C++ with its etag strength unchanged.
+#[test]
+#[cfg(ovstorage_cpp20)]
+fn cpp20_etag_strength_crosses_ffi() {
+    let _serial = PARK_FIXTURE_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    ensure_runtime_contracts();
+    let require = require_env("OVSTORAGE_REQUIRE_TEST_PLUGINS");
+    let Some(fixture) = locate_test_plugin_so(
+        "ovstorage-plugin-test-abi",
+        "ovstorage_plugin_test_abi",
+        require,
+    ) else {
+        return;
+    };
+    let fixture = CString::new(fixture.to_string_lossy().into_owned())
+        .expect("fixture path has no interior NUL");
+    // SAFETY: the path stays live for the call. The C++ driver imports the
+    // current fixture handle, waits for stat to complete, and returns only
+    // after every owned snapshot is destroyed.
+    let status = unsafe { ovstorage_c_source_etag_strength_abi_cpp20(fixture.as_ptr()) };
+    assert_eq!(
+        status, 0,
+        "the C++ projection did not preserve current etag strength"
+    );
+}
+
+/// A version pin crosses Rust plugin ABI -> pure-C dispatch -> public C
+/// snapshot -> C++ unchanged, and only when asked for. The fixture pins an
+/// item only when the request flag reaches it, so the options forms of
+/// `stat` and `list` prove the C and C++ request paths carry the flag, and
+/// the bool and positional forms prove they do not invent it.
+#[test]
+#[cfg(ovstorage_cpp20)]
+fn cpp20_versioned_address_crosses_ffi() {
+    let _serial = PARK_FIXTURE_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    ensure_runtime_contracts();
+    let require = require_env("OVSTORAGE_REQUIRE_TEST_PLUGINS");
+    let Some(fixture) = locate_test_plugin_so(
+        "ovstorage-plugin-test-abi",
+        "ovstorage_plugin_test_abi",
+        require,
+    ) else {
+        return;
+    };
+    let fixture = CString::new(fixture.to_string_lossy().into_owned())
+        .expect("fixture path has no interior NUL");
+    // SAFETY: the path stays live for the call. The C++ driver imports the
+    // current fixture handle, waits for every stat and list to complete, and
+    // returns only after every owned snapshot is destroyed.
+    let status = unsafe { ovstorage_c_source_versioned_address_abi_cpp20(fixture.as_ptr()) };
+    assert_eq!(
+        status, 0,
+        "the C++ projection did not carry the versioned_address flag and pin faithfully"
     );
 }
 
@@ -1116,6 +1540,238 @@ fn run_driver(binary: &str, timeout: std::time::Duration) -> Option<DriverRun> {
     Some(run)
 }
 
+/// The bounded re-run's observable outcome, before the build-time verdict or
+/// local acknowledgement is considered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoroutineProbeRun {
+    Hung,
+    Completed {
+        exit_code: Option<i32>,
+        reported_known_race: bool,
+    },
+}
+
+/// What the toolchain probe test must do with its build-time and re-run
+/// evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoroutineProbeDisposition {
+    RaceFree,
+    AcknowledgedUnsupportedToolchain,
+    KnownRace,
+    UnrelatedFailure,
+    SelfCheckFailure,
+    AbnormalTermination,
+    Hung,
+}
+
+/// Classifies all probe evidence in one place so the acknowledgement can
+/// soften only the diagnosed compiler race. A broken or inconclusive re-run
+/// remains fatal even when the build-time run recorded the known race.
+fn classify_coroutine_probe(
+    recorded_racy: bool,
+    rerun: CoroutineProbeRun,
+    acknowledged: bool,
+    require_tsan: bool,
+) -> CoroutineProbeDisposition {
+    let rerun_observed_race = match rerun {
+        CoroutineProbeRun::Hung => return CoroutineProbeDisposition::Hung,
+        CoroutineProbeRun::Completed {
+            exit_code: Some(0), ..
+        } => false,
+        CoroutineProbeRun::Completed {
+            exit_code: Some(1),
+            reported_known_race: true,
+        } => true,
+        CoroutineProbeRun::Completed {
+            exit_code: Some(1),
+            reported_known_race: false,
+        } => return CoroutineProbeDisposition::UnrelatedFailure,
+        CoroutineProbeRun::Completed {
+            exit_code: Some(2), ..
+        } => return CoroutineProbeDisposition::SelfCheckFailure,
+        CoroutineProbeRun::Completed { .. } => {
+            return CoroutineProbeDisposition::AbnormalTermination;
+        }
+    };
+
+    if !(recorded_racy || rerun_observed_race) {
+        CoroutineProbeDisposition::RaceFree
+    } else if acknowledgement_applies(acknowledged, require_tsan) {
+        CoroutineProbeDisposition::AcknowledgedUnsupportedToolchain
+    } else {
+        CoroutineProbeDisposition::KnownRace
+    }
+}
+
+/// What happened to `cpp20_sync_wait_does_not_destroy_a_condvar_in_use`'s
+/// ThreadSanitizer coverage, from `OVSTORAGE_C_SOURCE_SYNC_WAIT_RACE_STATUS`.
+///
+/// `build.rs` decides that build on its own run of the probe, so both the
+/// acknowledged report and the fatal failure text answer from the recorded
+/// status instead of asserting the degraded case. When the build-time run did
+/// not record the race (this test can still find it on its re-run), that
+/// regression was built WITH ThreadSanitizer and will itself halt on this
+/// compiler's frame race.
+fn sync_wait_coverage_line(sync_wait_status: Option<&str>) -> String {
+    match sync_wait_status {
+        Some("built-without-tsan-racy-coroutine-frames") => {
+            "degraded coverage: cpp20_sync_wait_does_not_destroy_a_condvar_in_use runs \
+             without TSan on this host (build.rs degraded it after its own run of this \
+             probe recorded the race)"
+                .to_owned()
+        }
+        Some("built-without-tsan") => {
+            "degraded coverage: cpp20_sync_wait_does_not_destroy_a_condvar_in_use runs \
+             without TSan on this host (no usable ThreadSanitizer runtime)"
+                .to_owned()
+        }
+        Some("built") => {
+            "coverage: cpp20_sync_wait_does_not_destroy_a_condvar_in_use was built WITH \
+             TSan because the build-time run of this probe did not record the race; \
+             expect it to halt on this compiler's coroutine-frame race"
+                .to_owned()
+        }
+        other => format!(
+            "coverage: cpp20_sync_wait_does_not_destroy_a_condvar_in_use build status is {}",
+            other.unwrap_or("unknown")
+        ),
+    }
+}
+
+/// Write a notice a passing test must still surface.
+///
+/// libtest captures `println!`/`eprintln!` from a passing test and discards
+/// it unless `--nocapture` is given, so an acknowledged toolchain would pass
+/// silently. A direct write to the `Stderr` handle bypasses that hook.
+/// Gated like its only caller, the toolchain probe test.
+#[cfg(all(unix, ovstorage_cpp20))]
+fn report_to_stderr(message: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{message}");
+}
+
+fn acknowledged_unsupported_toolchain_report(
+    compiler: &str,
+    evidence: &str,
+    sync_wait_status: Option<&str>,
+) -> String {
+    // The coverage line is shared with the unacknowledged fatal text, so the
+    // clause that only makes sense under an acknowledgement is added here.
+    let mut coverage = sync_wait_coverage_line(sync_wait_status);
+    if sync_wait_status == Some("built") {
+        coverage.push_str(", which this acknowledgement does not cover");
+    }
+    format!(
+        "ACKNOWLEDGED UNSUPPORTED TOOLCHAIN\n  \
+         compiler: {compiler}\n  \
+         evidence: {evidence}\n  \
+         upstream: GCC PR c++/127320 \
+         (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=127320)\n  \
+         {coverage}\n  \
+         retirement: drop {ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN_ENV}=1 when this test \
+         passes without it"
+    )
+}
+
+/// The evidence sentence for a run that reached the recorded-verdict path: the
+/// race was observed by this run, by `build.rs`'s run, or both. Factual only;
+/// what the outcome MEANS for the suite is the caller's sentence, because the
+/// same evidence backs both the acknowledged pass and the fatal failure.
+fn recorded_race_evidence(rerun: CoroutineProbeRun) -> String {
+    match rerun {
+        CoroutineProbeRun::Completed {
+            reported_known_race: true,
+            ..
+        } => "The probe halted on a ThreadSanitizer data race in its racy loop.".to_owned(),
+        CoroutineProbeRun::Completed {
+            exit_code: Some(0), ..
+        } => "This run of the probe exited cleanly. The build-time run of the SAME probe \
+              did not: it reported the race, and `build.rs` has already degraded the \
+              sync_wait regression on the strength of that. The interleaving is \
+              scheduler-dependent, so one clean run does not retract it."
+            .to_owned(),
+        // The classifier has already ruled every other outcome fatal (2 is the
+        // self-check, 1 without the marker is an unrelated report, a signal or
+        // any other code is abnormal termination, a hang is fatal), so only 0
+        // and 1-with-the-marker can reach the recorded-verdict path.
+        other => unreachable!(
+            "{other:?} reached the recorded-verdict path; classify_coroutine_probe \
+             should have made it fatal"
+        ),
+    }
+}
+
+/// What `build.rs` recorded when it built and ran the probe.
+#[derive(Clone, Copy, Debug)]
+struct ProbeBuild<'a> {
+    /// `OVSTORAGE_C_SOURCE_CORO_FRAME_PROBE_STATUS`: how far the probe got.
+    status: Option<&'a str>,
+    /// `OVSTORAGE_C_SOURCE_TOOLCHAIN_CORO_FRAMES`: the build-time verdict.
+    verdict: Option<&'a str>,
+    /// `OVSTORAGE_C_SOURCE_SYNC_WAIT_RACE_STATUS`: how sync_wait was built.
+    sync_wait_status: Option<&'a str>,
+}
+
+impl ProbeBuild<'static> {
+    /// The facts `build.rs` exported for this build, read in exactly one place
+    /// so `probe_build_reads_the_variables_build_rs_exports` can pin which
+    /// variable feeds which field: status and verdict are both short strings,
+    /// and swapping them would silently change what the notice keys on.
+    fn recorded() -> Self {
+        ProbeBuild {
+            status: option_env!("OVSTORAGE_C_SOURCE_CORO_FRAME_PROBE_STATUS"),
+            verdict: option_env!("OVSTORAGE_C_SOURCE_TOOLCHAIN_CORO_FRAMES"),
+            sync_wait_status: option_env!("OVSTORAGE_C_SOURCE_SYNC_WAIT_RACE_STATUS"),
+        }
+    }
+}
+
+/// Which notice, if any, the toolchain probe test must surface for a
+/// non-fatal disposition. Pure over its inputs so the emission decision is
+/// table-tested: an acknowledged toolchain must be LOUD, and a `RaceFree` run
+/// with the switch set must say whether it could have seen the race at all.
+fn toolchain_probe_notice(
+    disposition: CoroutineProbeDisposition,
+    acknowledged: bool,
+    require_tsan: bool,
+    build: ProbeBuild<'_>,
+    compiler: &str,
+    evidence: &str,
+) -> Option<String> {
+    match disposition {
+        CoroutineProbeDisposition::AcknowledgedUnsupportedToolchain => Some(
+            acknowledged_unsupported_toolchain_report(compiler, evidence, build.sync_wait_status),
+        ),
+        CoroutineProbeDisposition::RaceFree
+            if acknowledgement_applies(acknowledged, require_tsan) =>
+        {
+            // `RaceFree` is the absence of an observation, not a finding. The
+            // removal advice needs a POSITIVE one: a probe built WITH
+            // ThreadSanitizer (status) whose build-time run actually concluded
+            // race-free (verdict). `build.rs` exports the two separately and can
+            // reach status `built` with verdict `unknown` after a run it refused
+            // to conclude on; a host in that state, or one that cannot run a
+            // TSan binary, must not be told to drop a switch it may need.
+            if build.status == Some("built") && build.verdict == Some("race-free") {
+                Some(format!(
+                    "{ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN_ENV}=1 is unnecessary on this \
+                     race-free compiler ({compiler}) and should be removed"
+                ))
+            } else {
+                Some(format!(
+                    "{ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN_ENV}=1 is set, but this run could \
+                     not observe the coroutine-frame race (the probe was built without \
+                     ThreadSanitizer, or build.rs's own run of it produced no verdict), \
+                     so whether this compiler ({compiler}) needs the acknowledgement is \
+                     NOT established here. Decide on evidence from a host that can run \
+                     a TSan binary."
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Toolchain coverage: this compiler must emit coroutine frames that can be
 /// resumed from another thread without racing the frame's own bookkeeping.
 ///
@@ -1131,6 +1787,15 @@ fn run_driver(binary: &str, timeout: std::time::Duration) -> Option<DriverRun> {
 /// the same two bytes. ThreadSanitizer reports that INSIDE the awaiting
 /// coroutine, which reads exactly like a defect in the wrapper. Pinning it here,
 /// with no ovstorage in the picture, makes the difference legible.
+///
+/// A local affected host can set
+/// `OVSTORAGE_ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN=1` to acknowledge only this
+/// diagnosed compiler race and let this test report that unsupported-toolchain
+/// result without failing. A recorded race still decides when a valid re-run
+/// happens not to reproduce it. Invalid probe outcomes remain fatal, and
+/// `OVSTORAGE_REQUIRE_TSAN=1` disables the acknowledgement; `build.rs` rejects
+/// setting both switches to `1`, and refuses the acknowledgement outright when
+/// `GITHUB_ACTIONS` or `CI` is set, so no CI job can carry it.
 #[test]
 #[cfg(all(unix, ovstorage_cpp20))]
 fn cpp20_toolchain_coroutine_frames_are_race_free() {
@@ -1164,11 +1829,33 @@ fn cpp20_toolchain_coroutine_frames_are_race_free() {
     let recorded = option_env!("OVSTORAGE_C_SOURCE_TOOLCHAIN_CORO_FRAMES").unwrap_or("unknown");
 
     let timeout = std::time::Duration::from_secs(300);
-    let Some(run) = run_driver(binary, timeout) else {
+    let run = run_driver(binary, timeout);
+    let rerun = match run.as_ref() {
+        Some(run) => CoroutineProbeRun::Completed {
+            exit_code: run.status.code(),
+            reported_known_race: run.reported_the_coroutine_frame_race(),
+        },
+        None => CoroutineProbeRun::Hung,
+    };
+    let acknowledged = require_env(ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN_ENV);
+    let require_tsan = require_env(REQUIRE_TSAN_ENV);
+    let recorded_racy = recorded == "racy";
+    let disposition = classify_coroutine_probe(recorded_racy, rerun, acknowledged, require_tsan);
+    // When `build.rs`'s own run recorded the race, a broken re-run must not read
+    // as a retraction: that verdict is retained and already degraded sync_wait.
+    let retained_verdict = if recorded_racy {
+        "\n  build.rs's own run of this probe DID record the race and degraded the \
+         sync_wait regression on the strength of it; this re-run is inconclusive, \
+         not a retraction."
+    } else {
+        ""
+    };
+    let Some(run) = run else {
+        debug_assert_eq!(disposition, CoroutineProbeDisposition::Hung);
         panic!(
             "the coroutine-frame toolchain probe hung for {}s — its worker stopped \
              resuming the handles handed to it, which is neither a race-free nor a \
-             racy verdict",
+             racy verdict{retained_verdict}",
             timeout.as_secs(),
         );
     };
@@ -1193,69 +1880,86 @@ fn cpp20_toolchain_coroutine_frames_are_race_free() {
     // same fact as "the toolchain is affected" and must not be reported as one.
     // That is the same taxonomy `build_coroutine_frame_probe` uses for its
     // `Unknown`, and the two must not reach opposite verdicts from one run.
-    if recorded != "racy" {
-        match run.status.code() {
-            Some(0) => return,
-            // Fall through to the finding: this run observed the race — but
-            // only if the report is actually this probe's. Exit 1 is what TSan
-            // uses for anything it reports, so an unrelated race or a runtime
-            // failure lands here too, and neither is a finding about coroutine
-            // frames.
-            Some(1) if run.reported_the_coroutine_frame_race() => {}
-            Some(1) => panic!(
-                "the coroutine-frame toolchain probe exited 1, but what \
-                 ThreadSanitizer reported is not the coroutine-frame race, so this run \
-                 made NO finding about this compiler ({compiler}):\n{}\n\
-                 Expected the control loop's completion marker on stdout and a `data \
-                 race` of size 2 in `publishes_during_the_ramp` on stderr. Something \
-                 else was reported — an unrelated race, or a sanitizer runtime failure. \
-                 Nothing here says whether this toolchain's coroutine frames are \
-                 race-free.",
-                run.transcript(),
-            ),
-            // 2 is the probe's own self-check, deliberately kept off 1 so a
-            // broken probe can never be read as a toolchain verdict.
-            Some(2) => panic!(
-                "the coroutine-frame toolchain probe failed its OWN self-check, so it \
-                 made no finding about this compiler ({compiler}):\n{}\n\
-                 Some of its coroutine bodies were never resumed. Fix the probe — this \
-                 says nothing about whether the toolchain is affected.",
-                run.transcript(),
-            ),
-            other => panic!(
-                "the coroutine-frame toolchain probe terminated abnormally ({other:?}), so \
-                 it made NO finding about this compiler ({compiler}):\n{}\n\
-                 A signal or an undefined exit code is not a verdict. Nothing here says \
-                 whether this toolchain's coroutine frames are race-free.",
-                run.transcript(),
-            ),
+    let build = ProbeBuild::recorded();
+    match disposition {
+        // The two passing dispositions. Whether they say anything, and what,
+        // is decided by `toolchain_probe_notice` so the decision is testable;
+        // this arm only carries the notice to a place libtest cannot swallow.
+        CoroutineProbeDisposition::RaceFree
+        | CoroutineProbeDisposition::AcknowledgedUnsupportedToolchain => {
+            let evidence =
+                if disposition == CoroutineProbeDisposition::AcknowledgedUnsupportedToolchain {
+                    recorded_race_evidence(rerun)
+                } else {
+                    String::new()
+                };
+            if let Some(notice) = toolchain_probe_notice(
+                disposition,
+                acknowledged,
+                require_tsan,
+                build,
+                compiler,
+                &evidence,
+            ) {
+                report_to_stderr(&notice);
+            }
+            return;
+        }
+        CoroutineProbeDisposition::KnownRace => {}
+        CoroutineProbeDisposition::UnrelatedFailure => panic!(
+            "the coroutine-frame toolchain probe exited 1, but what \
+             ThreadSanitizer reported is not the coroutine-frame race, so this run \
+             made NO finding about this compiler ({compiler}):\n{}\n\
+             Expected the control loop's completion marker on stdout and a `data \
+             race` of size 2 in `publishes_during_the_ramp` on stderr. Something \
+             else was reported — an unrelated race, or a sanitizer runtime failure. \
+             Nothing here says whether this toolchain's coroutine frames are \
+             race-free.{retained_verdict}",
+            run.transcript(),
+        ),
+        // 2 is the probe's own self-check, deliberately kept off 1 so a
+        // broken probe can never be read as a toolchain verdict.
+        CoroutineProbeDisposition::SelfCheckFailure => panic!(
+            "the coroutine-frame toolchain probe failed its OWN self-check, so it \
+             made no finding about this compiler ({compiler}):\n{}\n\
+             Some of its coroutine bodies were never resumed. Fix the probe — this \
+             says nothing about whether the toolchain is affected.{retained_verdict}",
+            run.transcript(),
+        ),
+        CoroutineProbeDisposition::AbnormalTermination => panic!(
+            "the coroutine-frame toolchain probe terminated abnormally ({:?}), so \
+             it made NO finding about this compiler ({compiler}):\n{}\n\
+             A signal or an undefined exit code is not a verdict. Nothing here says \
+             whether this toolchain's coroutine frames are race-free.{retained_verdict}",
+            run.status.code(),
+            run.transcript(),
+        ),
+        CoroutineProbeDisposition::Hung => {
+            unreachable!("a hung run is handled before a DriverRun is unwrapped")
         }
     }
-    // Reaching here means the race was observed — by this run, by the build
-    // script's run, or both. Say which, rather than describing a report that
-    // may not be in the transcript above.
-    let evidence = match run.status.code() {
-        _ if run.reported_the_coroutine_frame_race() => {
-            "The probe halted on a ThreadSanitizer data race in its racy loop.".to_owned()
+    // KnownRace: the race was observed — by this run, by the build script's
+    // run, or both. Say which, rather than describing a report that may not be
+    // in the transcript above. The consequence sentence belongs only here: an
+    // unacknowledged clean re-run passing while the sync_wait coverage stays
+    // off is the failure this check exists to prevent, whereas the same
+    // evidence under an acknowledgement is the recorded, accepted outcome.
+    let evidence = recorded_race_evidence(rerun);
+    let clean_rerun_note = match rerun {
+        CoroutineProbeRun::Completed {
+            exit_code: Some(0),
+            reported_known_race: false,
+        } => {
+            " Passing here while that coverage stays off is the failure this check \
+              exists to prevent."
         }
-        Some(0) => "This run of the probe exited cleanly. The build-time run of the SAME \
-                    probe did not: it reported the race, and `build.rs` has already \
-                    degraded the sync_wait regression on the strength of that. The \
-                    interleaving is scheduler-dependent, so one clean run does not \
-                    retract it — and passing here while that coverage stays off is the \
-                    failure this check exists to prevent."
-            .to_owned(),
-        other => format!(
-            "This run of the probe made no finding of its own — it exited {other:?} without \
-             reporting the coroutine-frame race. The recorded verdict stands on the \
-             build-time run of the SAME probe, which did report it and is what made \
-             `build.rs` degrade the sync_wait regression."
-        ),
+        _ => "",
     };
+    let sync_wait_coverage = sync_wait_coverage_line(build.sync_wait_status);
     panic!(
         "this compiler ({compiler}) does not emit race-free coroutine frames.\n\n\
              \x20 WHAT THE PROBE OBSERVED\n{}\n  \
-             {evidence}\n\n  \
+             {evidence}{clean_rerun_note}\n\n  \
              Its first loop publishes after the ramp has returned — that control \
              runs clean, ruling out \"resuming a coroutine on another thread is \
              inherently racy\" as the explanation. Its second loop hands the SAME \
@@ -1274,17 +1978,419 @@ fn cpp20_toolchain_coroutine_frames_are_race_free() {
              includes no ovstorage header. Coroutine code that can resume on \
              another thread before its ramp returns is affected, whoever wrote \
              it.\n\n\
+             \x20 UPSTREAM\n  \
+             Reported as GCC PR c++/127320 \
+             (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=127320). Check it for \
+             the fixing release before moving the CI pin.\n\n\
              \x20 CONSEQUENCE\n  \
              Beyond the formal undefined behaviour: when the two decrements are \
              lost against each other the refcount never reaches zero and nobody \
-             frees the frame, so affected coroutines LEAK their frames.\n\n\
+             frees the frame, so affected coroutines LEAK their frames; when both \
+             sides re-read zero they both free it, a double free (seen at -O0).\n\n\
              \x20 WORKAROUND\n  \
-             Build the C++ wrapper with GCC 13/14 or Clang 17+. Note that \
-             `cpp20_sync_wait_does_not_destroy_a_condvar_in_use` runs without \
-             ThreadSanitizer on this toolchain as a result, so its condvar \
-             coverage is degraded until the compiler is changed.",
+             Build the C++ wrapper with GCC 13/14 or Clang 17+.\n  \
+             {sync_wait_coverage}\n  \
+             On a local affected host, set \
+             {ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN_ENV}=1 to acknowledge ONLY this \
+             diagnosed compiler race. The acknowledgement is refused in CI and \
+             when {REQUIRE_TSAN_ENV}=1.",
         run.transcript(),
     );
+}
+
+const ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN_ENV: &str = "OVSTORAGE_ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN";
+/// Same spelling as `REQUIRE_TSAN_ENV` in `build.rs`, which owns the
+/// build-time contradiction gate; both switches are read through `require_env`.
+/// Gated like its only reader, the toolchain probe test, so the Windows build
+/// (where that test is compiled out) does not see a dead constant.
+#[cfg(all(unix, ovstorage_cpp20))]
+const REQUIRE_TSAN_ENV: &str = "OVSTORAGE_REQUIRE_TSAN";
+
+fn acknowledgement_applies(acknowledged: bool, require_tsan: bool) -> bool {
+    acknowledged && !require_tsan
+}
+
+#[test]
+fn unsupported_toolchain_acknowledgement_classifier_table() {
+    use CoroutineProbeDisposition as Disposition;
+    use CoroutineProbeRun as Run;
+
+    let cases = [
+        (
+            "a recorded race remains acknowledged when the rerun is clean",
+            true,
+            Run::Completed {
+                exit_code: Some(0),
+                reported_known_race: false,
+            },
+            true,
+            false,
+            Disposition::AcknowledgedUnsupportedToolchain,
+        ),
+        (
+            "the rerun's own race report can be acknowledged",
+            false,
+            Run::Completed {
+                exit_code: Some(1),
+                reported_known_race: true,
+            },
+            true,
+            false,
+            Disposition::AcknowledgedUnsupportedToolchain,
+        ),
+        (
+            "a recorded and rerun race can be acknowledged",
+            true,
+            Run::Completed {
+                exit_code: Some(1),
+                reported_known_race: true,
+            },
+            true,
+            false,
+            Disposition::AcknowledgedUnsupportedToolchain,
+        ),
+        (
+            "an unrelated exit one stays fatal after a recorded race",
+            true,
+            Run::Completed {
+                exit_code: Some(1),
+                reported_known_race: false,
+            },
+            true,
+            false,
+            Disposition::UnrelatedFailure,
+        ),
+        (
+            "the probe self-check stays fatal after a recorded race",
+            true,
+            Run::Completed {
+                exit_code: Some(2),
+                reported_known_race: false,
+            },
+            true,
+            false,
+            Disposition::SelfCheckFailure,
+        ),
+        (
+            "abnormal termination stays fatal after a recorded race",
+            true,
+            Run::Completed {
+                exit_code: None,
+                reported_known_race: false,
+            },
+            true,
+            false,
+            Disposition::AbnormalTermination,
+        ),
+        (
+            "a hang stays fatal after a recorded race",
+            true,
+            Run::Hung,
+            true,
+            false,
+            Disposition::Hung,
+        ),
+        (
+            "required TSan refuses the acknowledgement",
+            true,
+            Run::Completed {
+                exit_code: Some(0),
+                reported_known_race: false,
+            },
+            true,
+            true,
+            Disposition::KnownRace,
+        ),
+        (
+            "a known race without acknowledgement fails",
+            false,
+            Run::Completed {
+                exit_code: Some(1),
+                reported_known_race: true,
+            },
+            false,
+            false,
+            Disposition::KnownRace,
+        ),
+        (
+            "a recorded race without acknowledgement fails even when the rerun is clean",
+            true,
+            Run::Completed {
+                exit_code: Some(0),
+                reported_known_race: false,
+            },
+            false,
+            false,
+            Disposition::KnownRace,
+        ),
+        (
+            "a clean toolchain passes even when acknowledgement is set",
+            false,
+            Run::Completed {
+                exit_code: Some(0),
+                reported_known_race: false,
+            },
+            true,
+            false,
+            Disposition::RaceFree,
+        ),
+    ];
+
+    for (name, recorded_racy, rerun, acknowledgement, require_tsan, expected) in cases {
+        assert_eq!(
+            classify_coroutine_probe(recorded_racy, rerun, acknowledgement, require_tsan),
+            expected,
+            "{name}"
+        );
+    }
+}
+
+/// The acknowledged report and the notices must survive libtest's capture of a
+/// passing test's output, which is the one property `report_to_stderr` exists
+/// for. The pure notice tables cannot see how a string is emitted, so this
+/// re-runs the probe test as a child of this same binary, WITHOUT
+/// `--nocapture`, with the switch set and required TSan cleared, and reads
+/// what reached the child's stderr. Replacing `report_to_stderr`'s body with
+/// `eprintln!` fails this test and nothing else.
+#[test]
+#[cfg(all(unix, ovstorage_cpp20))]
+fn an_acknowledged_probe_run_reaches_stderr_under_libtest_capture() {
+    if !matches!(
+        option_env!("OVSTORAGE_C_SOURCE_CORO_FRAME_PROBE_STATUS"),
+        Some("built") | Some("built-without-tsan")
+    ) {
+        eprintln!("skipping: the probe test itself skips on this build, so it emits nothing");
+        return;
+    }
+    let exe = std::env::current_exe().expect("the test binary knows its own path");
+    let output = std::process::Command::new(exe)
+        .args(["cpp20_toolchain_coroutine_frames_are_race_free", "--exact"])
+        .env(ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN_ENV, "1")
+        .env_remove(REQUIRE_TSAN_ENV)
+        .output()
+        .expect("re-exec the test binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        // A fatal disposition in the child (for example this host's TSan
+        // runtime aborting) panics loudly on its own; that path is not what
+        // this test pins, and there is no passing run to assert about.
+        eprintln!("the child probe run did not pass, so emission is not asserted:\n{stderr}");
+        return;
+    }
+    let markers = [
+        "ACKNOWLEDGED UNSUPPORTED TOOLCHAIN",
+        "is unnecessary on this race-free compiler",
+        "is NOT established here",
+    ];
+    assert!(
+        markers.iter().any(|marker| stderr.contains(marker)),
+        "a passing acknowledged run printed no notice to stderr, so libtest swallowed it:\n{stderr}"
+    );
+}
+
+/// Pins the wiring the notice table cannot see: which exported variable
+/// reaches which `ProbeBuild` field. On a Linux build the status and verdict
+/// vocabularies never coincide (`built`/`built-without-tsan` versus
+/// `race-free`/`racy`/`unknown`), so swapping the two initialisers fails here.
+#[test]
+fn probe_build_reads_the_variables_build_rs_exports() {
+    let build = ProbeBuild::recorded();
+    assert_eq!(
+        build.status,
+        option_env!("OVSTORAGE_C_SOURCE_CORO_FRAME_PROBE_STATUS")
+    );
+    assert_eq!(
+        build.verdict,
+        option_env!("OVSTORAGE_C_SOURCE_TOOLCHAIN_CORO_FRAMES")
+    );
+    assert_eq!(
+        build.sync_wait_status,
+        option_env!("OVSTORAGE_C_SOURCE_SYNC_WAIT_RACE_STATUS")
+    );
+}
+
+#[test]
+fn toolchain_probe_notice_table() {
+    use CoroutineProbeDisposition as Disposition;
+    // (name, disposition, acknowledged, require_tsan, probe status,
+    //  build-time verdict, expected fragment or None)
+    let cases = [
+        (
+            "an acknowledged toolchain is loud",
+            Disposition::AcknowledgedUnsupportedToolchain,
+            true,
+            false,
+            Some("built"),
+            Some("racy"),
+            Some("ACKNOWLEDGED UNSUPPORTED TOOLCHAIN"),
+        ),
+        (
+            "a TSan-built clean run with a race-free verdict says the switch is unnecessary",
+            Disposition::RaceFree,
+            true,
+            false,
+            Some("built"),
+            Some("race-free"),
+            Some("is unnecessary on this race-free compiler"),
+        ),
+        (
+            "a TSan-built run whose build-time verdict is unknown settles nothing",
+            Disposition::RaceFree,
+            true,
+            false,
+            Some("built"),
+            Some("unknown"),
+            Some("is NOT established here"),
+        ),
+        (
+            "a clean run that could not see the race settles nothing",
+            Disposition::RaceFree,
+            true,
+            false,
+            Some("built-without-tsan"),
+            Some("unknown"),
+            Some("is NOT established here"),
+        ),
+        (
+            "an unknown probe status is treated as unable to see the race",
+            Disposition::RaceFree,
+            true,
+            false,
+            None,
+            None,
+            Some("is NOT established here"),
+        ),
+        (
+            "a clean run without the switch is silent",
+            Disposition::RaceFree,
+            false,
+            false,
+            Some("built"),
+            Some("race-free"),
+            None,
+        ),
+        (
+            "required TSan silences the switch's advice as well",
+            Disposition::RaceFree,
+            true,
+            true,
+            Some("built"),
+            Some("race-free"),
+            None,
+        ),
+        (
+            "a known race has no notice; it panics instead",
+            Disposition::KnownRace,
+            false,
+            false,
+            Some("built"),
+            Some("racy"),
+            None,
+        ),
+        (
+            "a fatal outcome has no notice; it panics instead",
+            Disposition::SelfCheckFailure,
+            true,
+            false,
+            Some("built"),
+            Some("racy"),
+            None,
+        ),
+    ];
+    for (name, disposition, acknowledged, require_tsan, status, verdict, expected) in cases {
+        let build = ProbeBuild {
+            status,
+            verdict,
+            sync_wait_status: Some("built-without-tsan-racy-coroutine-frames"),
+        };
+        let notice = toolchain_probe_notice(
+            disposition,
+            acknowledged,
+            require_tsan,
+            build,
+            "g++ (GCC) 15.3.0",
+            "evidence",
+        );
+        match expected {
+            Some(fragment) => {
+                let notice = notice.unwrap_or_else(|| panic!("{name}: expected a notice"));
+                assert!(notice.contains(fragment), "{name}: {notice}");
+            }
+            None => assert_eq!(notice, None, "{name}"),
+        }
+    }
+}
+
+#[test]
+fn unsupported_toolchain_acknowledgement_emits_the_result() {
+    let disposition = classify_coroutine_probe(
+        false,
+        CoroutineProbeRun::Completed {
+            exit_code: Some(1),
+            reported_known_race: true,
+        },
+        true,
+        false,
+    );
+    assert_eq!(
+        disposition,
+        CoroutineProbeDisposition::AcknowledgedUnsupportedToolchain
+    );
+
+    // The ordinary affected-host shape: build.rs recorded the race, this
+    // re-run happened to be clean, the switch is set. The report must carry
+    // the retained verdict without calling its own passing outcome a failure.
+    let clean_rerun = CoroutineProbeRun::Completed {
+        exit_code: Some(0),
+        reported_known_race: false,
+    };
+    let recorded = classify_coroutine_probe(true, clean_rerun, true, false);
+    let report = toolchain_probe_notice(
+        recorded,
+        true,
+        false,
+        ProbeBuild {
+            status: Some("built-without-tsan"),
+            verdict: Some("racy"),
+            sync_wait_status: Some("built-without-tsan-racy-coroutine-frames"),
+        },
+        "g++ (Ubuntu 15.2.0) 15.2.0",
+        &recorded_race_evidence(clean_rerun),
+    )
+    .expect("an acknowledged toolchain must report");
+    assert!(report.starts_with("ACKNOWLEDGED UNSUPPORTED TOOLCHAIN\n"));
+    assert!(report.contains("one clean run does not retract it"));
+    assert!(!report.contains("the failure this check exists to prevent"));
+
+    let degraded = acknowledged_unsupported_toolchain_report(
+        "g++ (Ubuntu 15.2.0) 15.2.0",
+        "the standalone probe reported the known race",
+        Some("built-without-tsan-racy-coroutine-frames"),
+    );
+    assert!(degraded.starts_with("ACKNOWLEDGED UNSUPPORTED TOOLCHAIN\n"));
+    assert!(degraded.contains("compiler: g++ (Ubuntu 15.2.0) 15.2.0"));
+    assert!(degraded.contains("degraded coverage:"));
+    assert!(degraded.contains("GCC PR c++/127320"));
+    assert!(degraded.contains(ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN_ENV));
+
+    // The disposition above is the rerun-only race: `build.rs` saw no race, so
+    // the sync_wait regression was built WITH TSan. The report must say so
+    // rather than claim degraded coverage.
+    let with_tsan = acknowledged_unsupported_toolchain_report(
+        "g++ (GCC) 15.3.0",
+        "the re-run reported the known race",
+        Some("built"),
+    );
+    assert!(!with_tsan.contains("degraded coverage:"));
+    assert!(with_tsan.contains("built WITH TSan"));
+
+    let no_runtime = acknowledged_unsupported_toolchain_report(
+        "g++ (GCC) 15.3.0",
+        "the build-time run recorded the known race",
+        Some("built-without-tsan"),
+    );
+    assert!(no_runtime.contains("degraded coverage:"));
+    assert!(no_runtime.contains("no usable ThreadSanitizer runtime"));
 }
 
 /// An `OVSTORAGE_REQUIRE_*` switch is on only when set to exactly `1`.

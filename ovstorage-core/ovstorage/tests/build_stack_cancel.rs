@@ -43,6 +43,11 @@ const GIVE_UP: Duration = Duration::from_secs(10);
 
 struct WedgeBackend {
     wedged: AtomicBool,
+    /// Answers the root re-query with an error instead of wedging, so a
+    /// post-commit catch-up FAILS promptly rather than waiting out its bound.
+    /// Armed at the commit like `wedged`, so construction still succeeds.
+    fails_after_commit: bool,
+    failing: AtomicBool,
 }
 
 #[async_trait]
@@ -64,6 +69,12 @@ impl Layer for WedgeBackend {
         _cx: &Extensions,
         _cancel: Option<CancellationToken>,
     ) -> Result<(RootInfoSnapshot, Option<RootInfoUpdateStream>)> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(ovstorage::Error::new(
+                ovstorage::ErrorCode::Transient,
+                "root re-query failed",
+            ));
+        }
         if self.wedged.load(Ordering::SeqCst) {
             // Never answers, and never observes the token either — a foreign
             // child whose only exit is the caller giving up on it.
@@ -102,7 +113,11 @@ impl Layer for WedgeBackend {
     ) -> Result<Connection> {
         // Commit, then wedge: the catch-up the Router runs next is the wait
         // under test, and it only exists because a mutation landed.
-        self.wedged.store(true, Ordering::SeqCst);
+        if self.fails_after_commit {
+            self.failing.store(true, Ordering::SeqCst);
+        } else {
+            self.wedged.store(true, Ordering::SeqCst);
+        }
         Ok(Connection {
             id: ConnectionId(WEDGE_KIND.to_string()),
             backend_kind: WEDGE_KIND.to_string(),
@@ -113,11 +128,17 @@ impl Layer for WedgeBackend {
             auth_state: ConnectionAuthState::Anonymous,
             last_probed: None,
             user_metadata: UserMetadata::new(),
+            owning_target: None,
         })
     }
 }
 
-struct WedgeFactory;
+struct WedgeFactory {
+    /// Built backends answer the root re-query with an error rather than
+    /// wedging, so a catch-up failure can be exercised without waiting out the
+    /// child-root-query bound.
+    failing: bool,
+}
 
 #[async_trait]
 impl BackendFactory for WedgeFactory {
@@ -133,6 +154,8 @@ impl BackendFactory for WedgeFactory {
     ) -> Result<LayerHandle> {
         Ok(Arc::new(WedgeBackend {
             wedged: AtomicBool::new(false),
+            fails_after_commit: self.failing,
+            failing: AtomicBool::new(false),
         }))
     }
 }
@@ -187,7 +210,7 @@ fn wedging_stack_config() -> StackConfig {
 fn wedge_factories() -> Vec<LoadedLayerFactory> {
     vec![
         LoadedLayerFactory::Router(Arc::new(RouterFactoryImpl)),
-        LoadedLayerFactory::Backend(Arc::new(WedgeFactory)),
+        LoadedLayerFactory::Backend(Arc::new(WedgeFactory { failing: false })),
     ]
 }
 
@@ -228,5 +251,44 @@ async fn cancelling_the_host_token_exits_a_wedged_connection_apply() {
         elapsed < PROMPT,
         "the build took {elapsed:?}; a cancelled wait must return promptly, well under the \
          child-root-query bound"
+    );
+}
+
+/// The other `CommitAmbiguous`, and the one a host must NOT survive.
+///
+/// A declared connection whose post-commit catch-up fails is registered, wanted,
+/// and merely unpublished — and with an `updates: false` child nothing
+/// republishes it and no rebuild is scheduled, so a build that reported success
+/// would hand back a Stack answering `NoRoute` for a connection the operator
+/// declared, for the life of the process.
+///
+/// Its sibling — a refusal whose rollback failed — IS survivable, because that
+/// connection can never route and the host cannot repair it; the builder tells
+/// them apart by the `next_action` the refusing Layer sets, not by the code they
+/// share. This asserts the unmarked one still travels.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_catch_up_is_not_tolerated_by_the_stack_build() {
+    let result = ovstorage::host::build_stack_with_cancel(
+        &wedging_stack_config(),
+        vec![
+            LoadedLayerFactory::Router(Arc::new(RouterFactoryImpl)),
+            LoadedLayerFactory::Backend(Arc::new(WedgeFactory { failing: true })),
+        ],
+        None,
+    )
+    .await;
+
+    let error = result
+        .err()
+        .expect("a connection the graph cannot route must not be reported as applied");
+    assert_eq!(
+        error.code(),
+        ovstorage::ErrorCode::CommitAmbiguous,
+        "the mutation committed and the table did not follow: {error}",
+    );
+    assert_ne!(
+        error.next_action(),
+        Some(ovstorage::NEXT_ACTION_REFUSED_LEFTOVER),
+        "this is a reconcile failure, not a refusal whose leftover cannot route",
     );
 }

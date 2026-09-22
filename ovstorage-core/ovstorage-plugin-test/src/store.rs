@@ -4,22 +4,30 @@
 //! In-memory bytes store + per-method counters.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::SystemTime;
 
-use ovstorage_plugin::{BackendItemInfo, ChecksumSet, ObjectInfo, ObjectKind, Url, UserMetadata};
+use ovstorage_plugin::{
+    BackendItemInfo, ChecksumSet, EtagStrength, ObjectInfo, ObjectKind, Url, UserMetadata,
+};
+use sha2::{Digest, Sha256};
 
 /// Stored bytes + metadata for stat/read/list.
 #[derive(Clone, Debug)]
 pub struct StoredObject {
-    pub bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
+    /// Content identity computed once when the immutable payload is stored.
+    etag: String,
     pub mtime: SystemTime,
     pub user_metadata: UserMetadata,
 }
 
 impl StoredObject {
     pub fn new(bytes: Vec<u8>) -> Self {
+        let etag = format!("sha256:{:x}", Sha256::digest(&bytes));
         Self {
-            bytes,
+            bytes: bytes.into(),
+            etag,
             mtime: SystemTime::now(),
             user_metadata: UserMetadata::default(),
         }
@@ -30,15 +38,20 @@ impl StoredObject {
         self
     }
 
-    pub fn etag(&self) -> String {
-        format!("etag-{}", self.bytes.len())
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn etag(&self) -> &str {
+        &self.etag
     }
 
     pub fn info(&self, address: Url) -> ObjectInfo {
         ObjectInfo {
+            etag_strength: EtagStrength::Strong,
             address,
             kind: ObjectKind::File,
-            etag: Some(self.etag()),
+            etag: Some(self.etag.clone()),
             version: None,
             size: Some(self.bytes.len() as u64),
             mtime: Some(self.mtime),
@@ -51,13 +64,15 @@ impl StoredObject {
                 Some(self.user_metadata.clone())
             },
             modified_by: None,
+            versioned_address: None,
         }
     }
 
     pub fn item_info(&self) -> BackendItemInfo {
         BackendItemInfo {
+            etag_strength: EtagStrength::Strong,
             kind: ObjectKind::File,
-            etag: Some(self.etag()),
+            etag: Some(self.etag.clone()),
             version: None,
             size: Some(self.bytes.len() as u64),
             mtime: Some(self.mtime),
@@ -70,6 +85,7 @@ impl StoredObject {
                 Some(self.user_metadata.clone())
             },
             modified_by: None,
+            versioned_address: None,
         }
     }
 }
@@ -257,9 +273,37 @@ mod tests {
     }
 
     #[test]
-    fn stored_object_etag_includes_size() {
+    fn stored_object_etag_changes_for_equal_length_content() {
+        let first = StoredObject::new(b"hello".to_vec());
+        let second = StoredObject::new(b"world".to_vec());
+        assert_ne!(first.etag(), second.etag());
+    }
+
+    #[test]
+    fn stored_object_etags_are_declared_strong() {
         let obj = StoredObject::new(b"hello".to_vec());
         let etag = obj.etag();
-        assert!(etag.contains("5"));
+        let info = obj.info(Url::parse("test://store/object.bin").unwrap());
+        let item = obj.item_info();
+        assert_eq!(info.etag.as_deref(), Some(etag));
+        assert_eq!(info.etag_strength, EtagStrength::Strong);
+        assert_eq!(item.etag.as_deref(), Some(etag));
+        assert_eq!(item.etag_strength, EtagStrength::Strong);
+    }
+
+    #[test]
+    fn metadata_updates_do_not_change_cached_content_identity() {
+        let mut obj = StoredObject::new(b"payload".to_vec());
+        let etag = obj.etag().to_string();
+        obj.user_metadata.insert("color".into(), "blue".into());
+
+        assert_eq!(obj.etag(), etag);
+        assert_eq!(obj.bytes(), b"payload");
+        assert_eq!(
+            obj.info(Url::parse("test://store/object.bin").unwrap())
+                .etag
+                .as_deref(),
+            Some(etag.as_str())
+        );
     }
 }

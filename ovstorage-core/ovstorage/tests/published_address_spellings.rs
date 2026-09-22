@@ -71,13 +71,30 @@ enum Refused {
     /// a different node. This is the **returned**-address contract; a
     /// configuration address's path is normalized on purpose.
     Node,
+    /// `ovstorage_layer::generated_rule_may_answer` — the query carries a key
+    /// outside the shared carried-query allowlist (`versionId` / `versionid` /
+    /// `generation` / `revision`, the version selectors `CARRIED_QUERY_KEYS`
+    /// names).
+    /// A presigned or SAS URL authenticates itself with its query, so neither a
+    /// generated alias rule nor the anonymous scheme fallback answers it, and
+    /// the docs publish that as a `NoRoute`. The address still LOADS: the row
+    /// pins the gate, not a parse failure.
+    QueryGate,
+    /// `ovstorage_layer::is_instance_metadata_url` — the host is a cloud
+    /// instance-metadata endpoint. Judged on the host as written, exactly and
+    /// never by suffix, before any socket opens toward a host the operator
+    /// did not configure. The address LOADS; the row pins the predicate.
+    InstanceMetadata,
 }
 
 struct Published {
     raw: &'static str,
     source: Source,
     role: Role,
-    /// `None` when the spelling is published as one that works.
+    /// `None` when the spelling is published as one the address layer accepts.
+    /// A backend may still refuse it on a rule of its own — `s3:///key` names
+    /// no bucket and answers `InvalidArgument` — which is a different layer's
+    /// answer and not one a row can speak for; see the module doc.
     refused: Option<Refused>,
 }
 
@@ -101,10 +118,15 @@ const fn no(raw: &'static str, source: Source, role: Role, rule: Refused) -> Pub
     }
 }
 
+// Every bound document lives under `docs/public/`: that is the tree the public
+// source export ships, so a row that cited a contributor-only document would
+// leave the exported crate's tests unable to compile.
 const FILE_MD: &str = "docs/public/plugin-storage/plugin-file.md";
 const HTTP_MD: &str = "docs/public/plugin-storage/plugin-http.md";
 const S3_MD: &str = "docs/public/plugin-storage/plugin-s3.md";
 const GCS_MD: &str = "docs/public/plugin-storage/plugin-gcs.md";
+const AZURE_MD: &str = "docs/public/plugin-storage/plugin-azure.md";
+const HUGGINGFACE_MD: &str = "docs/public/plugin-storage/plugin-huggingface.md";
 const OPENDAL_MD: &str = "docs/public/plugin-storage/plugin-opendal.md";
 const CONFORMANCE_MD: &str = "docs/public/plugin-storage/CONFORMANCE.md";
 const CONFIGURATION_MD: &str = "docs/public/configuration.md";
@@ -114,6 +136,7 @@ const RUST_MD: &str = "docs/public/library-rust/README.md";
 const CPP_MD: &str = "docs/public/library-cpp/README.md";
 const PYTHON_MD: &str = "docs/public/library-python/README.md";
 const PLUGIN_DEV_MD: &str = "docs/public/plugin-development/README.md";
+const AUTHZ_MD: &str = "docs/public/authz-policy/README.md";
 
 /// The text of every document a row cites, bound at compile time.
 const DOC_TEXT: &[(&str, &str)] = &[
@@ -132,6 +155,14 @@ const DOC_TEXT: &[(&str, &str)] = &[
     (
         GCS_MD,
         include_str!("../../../docs/public/plugin-storage/plugin-gcs.md"),
+    ),
+    (
+        AZURE_MD,
+        include_str!("../../../docs/public/plugin-storage/plugin-azure.md"),
+    ),
+    (
+        HUGGINGFACE_MD,
+        include_str!("../../../docs/public/plugin-storage/plugin-huggingface.md"),
     ),
     (
         OPENDAL_MD,
@@ -168,6 +199,10 @@ const DOC_TEXT: &[(&str, &str)] = &[
     (
         PLUGIN_DEV_MD,
         include_str!("../../../docs/public/plugin-development/README.md"),
+    ),
+    (
+        AUTHZ_MD,
+        include_str!("../../../docs/public/authz-policy/README.md"),
     ),
 ];
 
@@ -233,6 +268,29 @@ const CORPUS: &[Published] = &[
         Source::Doc(CONFORMANCE_MD),
         Role::Request,
     ),
+    // The generated-aliases section publishes the pair a grant must name on
+    // BOTH sides of alias resolution: the canonical form and the ordinary
+    // cloud URL a caller may hold.
+    ok(
+        "azure://account/container",
+        Source::Doc(CONFIGURATION_MD),
+        Role::Config,
+    ),
+    ok(
+        "https://account.blob.core.windows.net/container",
+        Source::Doc(CONFIGURATION_MD),
+        Role::Config,
+    ),
+    ok(
+        "hf://models/acme/demo/",
+        Source::Doc(CONFIGURATION_MD),
+        Role::Config,
+    ),
+    ok(
+        "https://huggingface.co/acme/demo/",
+        Source::Doc(CONFIGURATION_MD),
+        Role::Config,
+    ),
     ok("gs://bucket/", Source::Doc(GCS_MD), Role::Config),
     ok("gs://bucket/pub%20x", Source::Doc(GCS_MD), Role::Request),
     ok(
@@ -249,6 +307,216 @@ const CORPUS: &[Published] = &[
         "s3://b/pub%2520x",
         Source::Doc(PLUGIN_DEV_MD),
         Role::Request,
+    ),
+    // ---- anonymous fallback: scheme roots and what reaches them ----------
+    // The bare scheme root a granted backend layer publishes. It loads, it is
+    // a ROOT (it contains itself and covers its hostless subtree, which is
+    // what `every_accepted_spelling_still_routes` asks of a Config row), and
+    // by prefix it routes nothing else: `s3:///` has `host_str() == None` and
+    // is an ancestor of no hosted address. What it does for `s3://bucket/key`
+    // is the route table's second tier, not a containment fact, and
+    // `a_scheme_root_covers_its_hostless_subtree_and_no_hosted_address` pins
+    // both halves of that.
+    ok("s3:///", Source::Doc(CONFIGURATION_MD), Role::Config),
+    ok("gs:///", Source::Doc(CONFIGURATION_MD), Role::Config),
+    ok("azure:///", Source::Doc(CONFIGURATION_MD), Role::Config),
+    // The spelling an operator writes for the same scope: `prefix = "s3://"`
+    // loads as `s3:///`, lists the hidden root, and grants nothing on any
+    // bucket.
+    ok("s3://", Source::Doc(AUTHZ_MD), Role::Config),
+    // `http` and `https` cannot be spelled hostless — `Url::parse("http://")`
+    // fails on the empty host — so their roots use the placeholder host under
+    // the TLD RFC 6761 reserves never to resolve. The public docs print the
+    // `https` spelling; the `http` twin is pinned against the layer's own
+    // publisher in
+    // `a_scheme_root_covers_its_hostless_subtree_and_no_hosted_address`.
+    ok(
+        "https://anonymous-fallback.invalid/",
+        Source::Doc(PLUGIN_DEV_MD),
+        Role::Config,
+    ),
+    // Hostless roots WITHOUT the marker are ordinary prefix roots, and a
+    // marked root that names a bucket is an ordinary prefix root too.
+    ok("file:///", Source::Doc(PLUGIN_DEV_MD), Role::Config),
+    ok("mem:///", Source::Doc(PLUGIN_DEV_MD), Role::Config),
+    ok("s3://bucket/", Source::Doc(PLUGIN_DEV_MD), Role::Config),
+    // The bucket- and container-scoped prefixes the policy examples pin: a
+    // rule on one covers that bucket and nothing beside it, not `s3:///`.
+    ok("s3://public-bucket/", Source::Doc(AUTHZ_MD), Role::Config),
+    ok("gs://public-bucket/", Source::Doc(GCS_MD), Role::Config),
+    ok(
+        "azure://account/container/",
+        Source::Doc(CONFIGURATION_MD),
+        Role::Config,
+    ),
+    // Fallback-served requests. A version pin is a carried query key and
+    // routes; the credential-bearing queries are the `QueryGate` rows below.
+    ok("s3://public-bucket/key", Source::Doc(S3_MD), Role::Request),
+    ok(
+        "s3://public-bucket/key?versionId=7",
+        Source::Doc(S3_MD),
+        Role::Request,
+    ),
+    ok(
+        "gs://public-bucket/key?generation=123",
+        Source::Doc(GCS_MD),
+        Role::Request,
+    ),
+    ok(
+        "azure://account/container/key",
+        Source::Doc(AZURE_MD),
+        Role::Request,
+    ),
+    ok(
+        "azure://account/container/key?versionid=7",
+        Source::Doc(AZURE_MD),
+        Role::Request,
+    ),
+    ok(
+        "azure://account/alpha/one.usd",
+        Source::Doc(AZURE_MD),
+        Role::Request,
+    ),
+    ok(
+        "azure://account/beta/two.usd",
+        Source::Doc(AZURE_MD),
+        Role::Request,
+    ),
+    // The origin-only form the fallback's INFO line prints; it loads as the
+    // bucket root.
+    ok("s3://bucket-name", Source::Doc(BROKER_MD), Role::Request),
+    ok("file:///unrouted", Source::Doc(PYTHON_MD), Role::Request),
+    // Published as `InvalidArgument` — but from the BACKEND, which derives a
+    // bucket, account or container from the address and finds none. The
+    // address layer loads every one of these and the scheme root covers them
+    // (a first-tier hit, which is why the backend has to refuse every
+    // empty-authority address and not only the bare root). A narrowing of
+    // the address rules must not quietly take that refusal over: the docs say
+    // which layer answers, and these rows hold it there.
+    ok("s3:///key", Source::Doc(PLUGIN_DEV_MD), Role::Request),
+    ok("gs:///key", Source::Doc(GCS_MD), Role::Request),
+    ok(
+        "azure:///container/key",
+        Source::Doc(AZURE_MD),
+        Role::Request,
+    ),
+    ok("azure://account/", Source::Doc(AZURE_MD), Role::Request),
+    // Published as `NoRoute` under a granted layer — a ROUTING answer, not a
+    // refusal. The fallback is scheme-exact and generates no alias, so the
+    // `s3+minio` spelling and the ordinary cloud URLs are addresses nothing
+    // happens to route; the address layer has no quarrel with any of them,
+    // and a configured connection or an explicit route serves each.
+    ok(
+        "s3+minio://public-bucket/key",
+        Source::Doc(S3_MD),
+        Role::Request,
+    ),
+    ok(
+        "https://public-bucket.s3.amazonaws.com/key",
+        Source::Doc(CONFIGURATION_MD),
+        Role::Request,
+    ),
+    ok(
+        "https://storage.googleapis.com/public-bucket/key",
+        Source::Doc(GCS_MD),
+        Role::Request,
+    ),
+    ok(
+        "https://account.blob.core.windows.net/container/key",
+        Source::Doc(AZURE_MD),
+        Role::Request,
+    ),
+    // ---- huggingface: the canonical root and its generated spellings ------
+    // One connection serves one repository; the Hub's own URL for it is a
+    // generated alias spelling of the `hf://` root, so the doc publishes the
+    // pair on both sides of the rewrite — models at the site root, datasets
+    // and spaces under their plural — on every origin the plugin accepts.
+    ok(
+        "hf://models/acme/demo/",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Config,
+    ),
+    ok(
+        "https://huggingface.co/acme/demo/",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Request,
+    ),
+    ok(
+        "http://huggingface.co/acme/demo/",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Request,
+    ),
+    ok(
+        "https://www.huggingface.co/acme/demo/",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Request,
+    ),
+    ok(
+        "http://www.huggingface.co/acme/demo/",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Request,
+    ),
+    ok(
+        "https://hf.co/acme/demo/",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Request,
+    ),
+    ok(
+        "http://hf.co/acme/demo/",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Request,
+    ),
+    ok(
+        "https://huggingface.co/datasets/acme/demo/",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Request,
+    ),
+    ok(
+        "https://huggingface.co/spaces/acme/demo/",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Request,
+    ),
+    ok(
+        "http://127.0.0.1:8080/acme/demo/",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Request,
+    ),
+    // The `?revision=` pin is a carried selector: it rides through the
+    // generated rule and the pinned child addresses the plugin hands back
+    // dereference again through the same spelling.
+    ok(
+        "https://huggingface.co/acme/demo/config.json?revision=main",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Request,
+    ),
+    ok(
+        "hf://models/acme/demo/config.json?revision=main",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Request,
+    ),
+    // Published as spellings the address layer has no quarrel with, whose
+    // answer comes from another layer: a Hub web-view path is read as an
+    // in-repository path (the backend's `NotFound`), and a repository id in
+    // another case matches no rule (the alias layer's `NoRoute`). A row pins
+    // that each still loads and routes, which is all a corpus of spellings
+    // can speak for.
+    ok(
+        "https://huggingface.co/acme/demo/blob/main/config.json",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Request,
+    ),
+    ok(
+        "https://huggingface.co/Acme/Demo/",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Request,
+    ),
+    // The site origin an `http` connection might be rooted at: a
+    // configuration address the doc contrasts with the deeper generated
+    // repository rule, which outranks it.
+    ok(
+        "https://huggingface.co/",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Config,
     ),
     // ---- http(s) ---------------------------------------------------------
     ok(
@@ -406,6 +674,43 @@ const CORPUS: &[Published] = &[
         Role::Request,
         Refused::Node,
     ),
+    // A query that authenticates the request never reaches the anonymous
+    // fallback: re-serving it anonymously would discard the authority the
+    // caller presented. The gate is the carried-query allowlist (`versionId` /
+    // `versionid` / `generation` / `revision`): a version pin is a selector,
+    // not a credential, and rides through as the accepted rows above publish,
+    // while a signature key trips it.
+    no(
+        "azure://account/container/key?sig=abc",
+        Source::Doc(AZURE_MD),
+        Role::Request,
+        Refused::QueryGate,
+    ),
+    no(
+        "gs://public-bucket/key?X-Goog-Signature=abc",
+        Source::Doc(GCS_MD),
+        Role::Request,
+        Refused::QueryGate,
+    ),
+    // The gate is an allowlist, not a credential detector: a Hub download
+    // link's `?download=true` is no credential, and the generated rule still
+    // stands aside because it is not a version selector either.
+    no(
+        "https://huggingface.co/acme/demo/resolve/main/config.json?download=true",
+        Source::Doc(HUGGINGFACE_MD),
+        Role::Request,
+        Refused::QueryGate,
+    ),
+    // The host the broker guide's published refusal names. It parses — an
+    // operator's configured `endpoint` at this host is honoured with a
+    // warning — and is refused wherever the process did not get the host from
+    // its operator: a fallback-derived origin, a redirect destination.
+    no(
+        "http://169.254.169.254",
+        Source::Doc(BROKER_MD),
+        Role::Request,
+        Refused::InstanceMetadata,
+    ),
 ];
 
 fn doc_text(path: &str) -> &'static str {
@@ -492,6 +797,13 @@ fn every_published_spelling_still_loads() {
                     }
                     Refused::Authority => !ovstorage_layer::parsing_preserves_authority(raw),
                     Refused::Node => !ovstorage_layer::parsing_preserves_node(raw),
+                    // Both gates judge a PARSED address, so a spelling that
+                    // stopped parsing would fail here rather than pass as
+                    // "refused somehow".
+                    Refused::QueryGate => address::parse(raw)
+                        .is_ok_and(|url| !ovstorage_layer::generated_rule_may_answer(&url)),
+                    Refused::InstanceMetadata => address::parse(raw)
+                        .is_ok_and(|url| ovstorage_layer::is_instance_metadata_url(&url)),
                 };
                 assert!(
                     tripped,
@@ -552,6 +864,100 @@ fn every_accepted_spelling_still_routes() {
         routed += 1;
     }
     assert!(routed >= 35, "the corpus went thin: {routed} routed rows");
+}
+
+/// A scheme root is a root that routes, by prefix, exactly its hostless
+/// subtree — and no hosted address.
+///
+/// `every_accepted_spelling_still_routes` shows `s3:///` covers `s3:///child`,
+/// which is true and is the smaller half. The claim the anonymous-fallback
+/// design rests on is the other half: `s3:///` has `host_str() == None`, and
+/// `is_ancestor_or_self` requires host equality before it looks at a path, so
+/// publishing the scheme root as an ordinary prefix root does nothing for
+/// `s3://bucket/key`. That is why the fallback is a second tier of the route
+/// table rather than a catch-all root — and the same guard is what keeps
+/// `file:///` from claiming `file://host/share`. A containment change that
+/// let a hostless prefix cover a hosted address would make every unmarked
+/// hostless root a catch-all, so it is asserted here in both directions.
+///
+/// The rows above pin the spellings the docs print; this pins that they are
+/// the spellings the layer publishes, through `scheme_fallback_root`.
+#[test]
+fn a_scheme_root_covers_its_hostless_subtree_and_no_hosted_address() {
+    let parse = |raw: &str| address::parse(raw).unwrap_or_else(|e| panic!("`{raw}`: {e:?}"));
+    for scheme in ovstorage_layer::ANONYMOUS_FALLBACK_AVAILABLE_SCHEMES {
+        let root = parse(&format!("{scheme}:///"));
+        assert_eq!(root.host_str(), None, "`{scheme}:///` must be hostless");
+        // `prefix = "s3://"` loads as the scope `s3:///`: one node, two
+        // spellings.
+        let bare = parse(&format!("{scheme}://"));
+        assert_eq!(
+            ovstorage_layer::node_key(&bare),
+            ovstorage_layer::node_key(&root),
+            "`{scheme}://` and `{scheme}:///` must name one node"
+        );
+        // The hostless subtree is a first-tier hit under the root, which is
+        // why a backend must refuse every empty-authority address and not
+        // only the bare one.
+        let hostless = parse(&format!("{scheme}:///key"));
+        assert!(
+            address::is_ancestor_or_self(&root, &hostless),
+            "`{scheme}:///` must cover `{scheme}:///key`"
+        );
+        // A hosted address is not under the scheme root in the prefix sense,
+        // in either direction.
+        let hosted = parse(&format!("{scheme}://bucket/key"));
+        assert!(
+            !address::is_ancestor_or_self(&root, &hosted),
+            "`{scheme}:///` must not cover `{scheme}://bucket/key`; the fallback is a \
+             second tier because it does not"
+        );
+        let bucket = parse(&format!("{scheme}://bucket/"));
+        assert!(
+            !address::is_ancestor_or_self(&bucket, &root),
+            "a rule on `{scheme}://bucket/` must not cover the scheme root"
+        );
+        // The published spelling is the one the layer publishes.
+        let published = ovstorage_layer::scheme_fallback_root(
+            scheme,
+            "test",
+            ovstorage_layer::Capabilities::empty(),
+            None,
+        )
+        .expect("the scheme is in the closed fallback set");
+        assert_eq!(
+            published.root, root,
+            "`{scheme}:///` is the fallback root's spelling"
+        );
+        assert!(ovstorage_layer::is_scheme_fallback_root(&published));
+    }
+    // The schemes the `url` crate refuses to spell hostless publish the
+    // placeholder root instead — and the corpus carries that spelling because
+    // the bare one does not load at all.
+    for scheme in ["http", "https"] {
+        assert!(
+            address::parse(&format!("{scheme}://")).is_err(),
+            "`{scheme}://` has an empty host and must not parse; if it does, the \
+             placeholder root is no longer needed and the docs say otherwise"
+        );
+        let published = ovstorage_layer::scheme_fallback_root(
+            scheme,
+            "test",
+            ovstorage_layer::Capabilities::empty(),
+            None,
+        )
+        .expect("the scheme is in the closed fallback set");
+        assert_eq!(
+            published.root,
+            parse(&format!("{scheme}://anonymous-fallback.invalid/")),
+            "`{scheme}://anonymous-fallback.invalid/` is the fallback root's spelling"
+        );
+    }
+    // The guard is load-bearing elsewhere.
+    assert!(
+        !address::is_ancestor_or_self(&parse("file:///"), &parse("file://host/share")),
+        "`file:///` must not claim `file://host/share`"
+    );
 }
 
 /// Buffer a `ReadResult`'s content: the file backend returns a

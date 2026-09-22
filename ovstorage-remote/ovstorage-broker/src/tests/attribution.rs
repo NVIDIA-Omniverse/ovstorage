@@ -6,20 +6,26 @@ use ovstorage::UpdateMetadataOptions;
 use ovstorage_authz::{ATTRIBUTION_KEY_MODIFIED_BY, AttributionStrategy};
 use ovstorage_authz_context::{AuthCredential, Transport};
 
-/// Build a brokered file backend rooted at a fresh temp dir; returns
-/// the broker, the prefix to write under, and the temp dir for cleanup.
-async fn brokered_file_with_strategy(
-    strategy: AttributionStrategy,
-) -> (Broker, Url, std::path::PathBuf) {
-    let root = unique_temp_dir();
-    std::fs::create_dir_all(&root).unwrap();
-    let prefix = address_for_path(&root);
+/// Build a broker over the `test` backend — a kind that declares user-metadata
+/// support, so the broker composes its attribution wrapper on that branch —
+/// with `strategy`; returns the broker and the prefix to write under.
+///
+/// Every object name used through this fixture is distinct across tests, since
+/// the in-memory `test` store is per-root and the root is shared.
+async fn brokered_test_with_strategy(strategy: AttributionStrategy) -> (Broker, Url) {
+    // The `full` preset advertises a native metadata patch, which the
+    // `update_metadata` re-stamp test exercises.
+    let mut config = HashMap::new();
+    config.insert(
+        "test_caps".into(),
+        ovstorage::ConfigValue::String("full".into()),
+    );
     let broker = BrokerStackFixture::new()
-        .file(&root)
+        .test_backend(config)
         .attribution_strategy(strategy)
         .build_broker()
         .await;
-    (broker, prefix, root)
+    (broker, Url::parse("test://demo/").unwrap())
 }
 
 /// A stable non-anonymous uid for a test principal name. The allow-all test
@@ -59,8 +65,7 @@ fn context_for(principal_id: &str) -> RequestContext {
 
 #[tokio::test]
 async fn user_metadata_strategy_stamps_writer_into_typed_field() {
-    let (broker, prefix, root) =
-        brokered_file_with_strategy(AttributionStrategy::UserMetadata).await;
+    let (broker, prefix) = brokered_test_with_strategy(AttributionStrategy::UserMetadata).await;
     let object = address::join_relative(&prefix, "alice.txt").unwrap();
     let ctx = context_for("alice@example.com");
 
@@ -90,13 +95,11 @@ async fn user_metadata_strategy_stamps_writer_into_typed_field() {
             .unwrap_or(true),
         "broker leaked the reserved attribution key into user_metadata"
     );
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
 async fn client_supplied_reserved_key_is_silently_stripped_and_overwritten() {
-    let (broker, prefix, root) =
-        brokered_file_with_strategy(AttributionStrategy::UserMetadata).await;
+    let (broker, prefix) = brokered_test_with_strategy(AttributionStrategy::UserMetadata).await;
     let object = address::join_relative(&prefix, "spoofed.txt").unwrap();
 
     let mut user_meta = HashMap::new();
@@ -130,13 +133,11 @@ async fn client_supplied_reserved_key_is_silently_stripped_and_overwritten() {
     let visible = info.user_metadata.expect("regular key survives");
     assert_eq!(visible.get("regular").map(String::as_str), Some("kept"));
     assert!(!visible.contains_key(ATTRIBUTION_KEY_MODIFIED_BY));
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
 async fn passthrough_strategy_does_not_stamp_or_strip() {
-    let (broker, prefix, root) =
-        brokered_file_with_strategy(AttributionStrategy::Passthrough).await;
+    let (broker, prefix) = brokered_test_with_strategy(AttributionStrategy::Passthrough).await;
     let object = address::join_relative(&prefix, "passthrough.txt").unwrap();
 
     // Simulate an upstream-broker stamp arriving in user_metadata.
@@ -167,12 +168,15 @@ async fn passthrough_strategy_does_not_stamp_or_strip() {
         )
         .await
         .unwrap();
-    // Passthrough means: plugin's native value flows through unmodified
-    // (plugin-file resolves the file's owning uid to a username, so this
-    // is non-empty and reflects the OS-level writer, not the broker's
-    // authn'd principal). Crucially the upstream broker's stamp under
-    // user_metadata is preserved verbatim — that's what
-    // `UserMetadata → Passthrough` chains rely on.
+    // Passthrough means: the backend's native `modified_by` flows through
+    // unmodified — the `test` backend knows no writer, so it stays unset rather
+    // than becoming the broker's authenticated principal. Crucially the
+    // upstream broker's stamp under user_metadata is preserved verbatim — that's
+    // what `UserMetadata → Passthrough` chains rely on.
+    assert_eq!(
+        info.modified_by, None,
+        "passthrough must not stamp the broker's principal"
+    );
     let user_meta = info.user_metadata.expect("upstream stamp present");
     assert_eq!(
         user_meta
@@ -181,13 +185,11 @@ async fn passthrough_strategy_does_not_stamp_or_strip() {
         Some("alice-from-upstream"),
         "passthrough must preserve upstream broker's stamp verbatim"
     );
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
 async fn update_metadata_re_stamps_with_current_writer() {
-    let (broker, prefix, root) =
-        brokered_file_with_strategy(AttributionStrategy::UserMetadata).await;
+    let (broker, prefix) = brokered_test_with_strategy(AttributionStrategy::UserMetadata).await;
     let object = address::join_relative(&prefix, "two-writers.txt").unwrap();
 
     broker
@@ -248,6 +250,89 @@ async fn update_metadata_re_stamps_with_current_writer() {
         Some("touched-by-bob")
     );
     assert!(!visible.contains_key(ATTRIBUTION_KEY_MODIFIED_BY));
+}
+
+/// The `file` backend stores no user metadata, so the broker composes no
+/// attribution wrapper over its branch and a brokered write to it carries no
+/// stamp: the reserved key never reaches the backend, and `stat` surfaces an
+/// empty `user_metadata`. (`modified_by` on this backend is the on-disk owner,
+/// resolved by the backend itself; it is not what the attribution overlay
+/// would have stamped.)
+#[tokio::test]
+async fn file_branch_is_unattributed() {
+    let root = unique_temp_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let prefix = address_for_path(&root);
+    let composed = BrokerStackFixture::new()
+        .file(&root)
+        .attribution_strategy(AttributionStrategy::UserMetadata)
+        .build()
+        .await;
+
+    // Composition: the file branch is the bare backend layer, and no
+    // attribution layer in the built graph wraps it. The auth-free inner stack
+    // is the one `build_stack` composed from the declared graph; the listener
+    // auth layer attached over it carries no spec of its own.
+    let spec = composed.health_stack.spec();
+    let layers: Vec<(&str, &str, Option<&str>, &[String])> = spec
+        .layers
+        .iter()
+        .map(|layer| {
+            (
+                layer.name.as_str(),
+                layer.kind.as_str(),
+                layer.inner.as_deref(),
+                layer.children.as_slice(),
+            )
+        })
+        .collect();
+    let router = spec
+        .layers
+        .iter()
+        .find(|layer| layer.name == "router")
+        .unwrap_or_else(|| panic!("the broker graph forks at a router: {layers:?}"));
+    assert_eq!(
+        router.children,
+        vec!["file".to_string()],
+        "the router's file child is the backend layer itself: {layers:?}"
+    );
+    assert!(
+        !spec
+            .layers
+            .iter()
+            .any(|layer| layer.kind == ovstorage_authz::ATTRIBUTION_KIND
+                && layer.inner.as_deref() == Some("file")),
+        "no attribution layer may wrap the file branch: {layers:?}"
+    );
+
+    // Behaviour: the write succeeds and nothing was stamped.
+    let broker = Broker::from_composed(composed);
+    let object = address::join_relative(&prefix, "unstamped.txt").unwrap();
+    broker
+        .write(
+            &context_for("alice"),
+            object.clone(),
+            Body::Bytes(b"plain".to_vec()),
+            WriteOptions::default(),
+        )
+        .await
+        .unwrap();
+    let info = broker
+        .stat(&context_for("anyone"), object, StatOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        info.user_metadata
+            .as_ref()
+            .is_none_or(|metadata| metadata.is_empty()),
+        "a file object carries no user metadata, reserved key included: {:?}",
+        info.user_metadata
+    );
+    assert_ne!(
+        info.modified_by.as_deref(),
+        Some(resolved_id("alice").as_str()),
+        "the broker's principal is not stamped onto a file object"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -10,7 +10,8 @@ use futures::StreamExt;
 use ovstorage::ext::LayerExt;
 use ovstorage::{
     AccessOps, BodyStream, ByteRange, CancellationToken, ChangeEvent, ChangeKind, ConfigValue,
-    Error, ErrorCode, IfDestExists, ObjectInfo, ReadOptions, Stack, StateConfig, Url, address,
+    EMPTY_LAYER_KIND, Error, ErrorCode, IfDestExists, ObjectInfo, ReadOptions, Stack, StackSpec,
+    StateConfig, Url, address,
 };
 use ovstorage_cache::{Cache, CacheConfig};
 
@@ -22,6 +23,17 @@ pub(crate) enum OutputFormat {
     #[default]
     Human,
     Table,
+}
+
+/// Whether `spec` is the host's unconfigured `EmptyLayer` fallback.
+///
+/// Match the root layer's kind, not its name: a configured graph may
+/// legitimately name a real-kind root layer `empty`.
+pub(crate) fn stack_is_unconfigured(spec: &StackSpec) -> bool {
+    spec.layers
+        .iter()
+        .find(|layer| layer.name == spec.root)
+        .is_some_and(|layer| layer.kind == EMPTY_LAYER_KIND)
 }
 
 pub(crate) async fn stream_read_to_writer<W: Write>(
@@ -127,6 +139,11 @@ pub(crate) fn cache_config_resolved(
 
 pub(crate) fn print_info(info: &ObjectInfo) {
     println!("address={}", info.address);
+    // A URL carries no raw newline, so like the address line it needs no
+    // escaping to stay one key=value line.
+    if let Some(pin) = &info.versioned_address {
+        println!("versioned_address={pin}");
+    }
     if let Some(size) = info.size {
         println!("size={size}");
     }

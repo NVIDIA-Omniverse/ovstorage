@@ -49,6 +49,34 @@ struct RestConfig {
     /// there is no write disclosure here for it to govern.
     #[serde(default)]
     redirect_credential_disclosure: RedirectDisclosureConfig,
+    /// Which cloud schemes an address that no configured connection serves may
+    /// fall back to, attempted anonymously by the backend layer of that kind.
+    ///
+    /// Empty by default: an unrouted `s3://`, `gs://` or `azure://` address
+    /// answers `NoRoute`. A granted scheme lets the address route to the
+    /// scheme's backend, which attaches no credential at all and serves reads
+    /// only. This is a property of the deployment rather than of any
+    /// connection — a gateway fetch runs from this gateway's network position
+    /// and reaches whatever that position reaches — which is why it is an
+    /// operator setting here rather than a rule. It grants routability, never
+    /// authority: the listener's auth layer evaluates every address first.
+    ///
+    /// The broker spells this key the same way and means the same thing by it.
+    /// The graph must declare the backend layer of each granted scheme's kind
+    /// and route it from the router, or startup refuses.
+    #[serde(default)]
+    anonymous_fallback_schemes: Vec<CloudFallbackScheme>,
+    /// Whether an `http://` or `https://` address that no connection serves may
+    /// be fetched anonymously from this gateway's network position.
+    ///
+    /// A separate switch from the cloud schemes because an http fallback is an
+    /// arbitrary origin rather than a public bucket. An anonymous http fetch is
+    /// streamed by the gateway, never surfaced as a `307`: there is no
+    /// connection whose redirect policy could apply. Cloud instance-metadata
+    /// endpoints are refused regardless. `allow` is refused at startup in this
+    /// release.
+    #[serde(default)]
+    anonymous_http_fallback: AnonymousHttpFallbackConfig,
     /// Where the credential substrate lives on disk.
     ///
     /// ```toml
@@ -99,6 +127,77 @@ enum RedirectDisclosureConfig {
 
 impl RedirectDisclosureConfig {
     fn discloses(self) -> bool {
+        matches!(self, Self::Allow)
+    }
+}
+
+impl RestConfig {
+    /// The schemes the operator granted an anonymous fallback for, as the set
+    /// [`ovstorage::host::stamp_anonymous_fallback`] consumes: the cloud
+    /// schemes verbatim, plus `http` and `https` together when
+    /// `anonymous_http_fallback` allows them.
+    fn anonymous_fallback_set(&self) -> std::collections::BTreeSet<String> {
+        let mut schemes: std::collections::BTreeSet<String> = self
+            .anonymous_fallback_schemes
+            .iter()
+            .map(|scheme| scheme.as_scheme().to_string())
+            .collect();
+        if self.anonymous_http_fallback.allows() {
+            schemes.insert("http".to_string());
+            schemes.insert("https".to_string());
+        }
+        schemes
+    }
+}
+
+/// A cloud scheme an operator may grant an anonymous fallback for. The twin of
+/// the broker's enum of the same name.
+///
+/// ```toml
+/// anonymous_fallback_schemes = []            # default; an unrouted address is NoRoute
+/// # anonymous_fallback_schemes = ["s3", "gs"] # public buckets on those schemes are readable
+/// ```
+///
+/// A closed set, so a typo is a startup error rather than a grant that
+/// silently never applies. `http` and `https` have their own key.
+#[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CloudFallbackScheme {
+    S3,
+    Gs,
+    Azure,
+}
+
+impl CloudFallbackScheme {
+    /// The URL scheme this grant covers, as the route table spells it.
+    fn as_scheme(self) -> &'static str {
+        match self {
+            Self::S3 => "s3",
+            Self::Gs => "gs",
+            Self::Azure => "azure",
+        }
+    }
+}
+
+/// Whether an unrouted `http://` or `https://` address may be fetched
+/// anonymously from this gateway's network position.
+///
+/// ```toml
+/// anonymous_http_fallback = "refuse"  # default; an unrouted http address is NoRoute
+/// # anonymous_http_fallback = "allow" # refused at startup in this release
+/// ```
+#[derive(Copy, Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AnonymousHttpFallbackConfig {
+    /// An `http`/`https` address no connection serves answers `NoRoute`.
+    #[default]
+    Refuse,
+    /// Such an address may be fetched anonymously by the `http` backend layer.
+    Allow,
+}
+
+impl AnonymousHttpFallbackConfig {
+    fn allows(self) -> bool {
         matches!(self, Self::Allow)
     }
 }
@@ -348,6 +447,7 @@ async fn build_gateway_stack_from_config(
         .auth_dir(auth_root)
         .attribution_strategy(attribution_strategy)
         .redirect_disclosure(cfg.redirect_credential_disclosure.discloses())
+        .anonymous_fallback(cfg.anonymous_fallback_set())
         .stack_config(cfg.ovstorage.clone())
         .require_configured_stack()
         .listener_auth(cfg.server.auth.clone(), "rest");
@@ -516,6 +616,99 @@ mod tests {
         );
     }
 
+    /// The operator-facing wire for the anonymous fallback on the gateway:
+    /// shipped TOML -> `RestConfig` -> `anonymous_fallback_set()`. The
+    /// companion of the broker's test of the same shape: both keys ship
+    /// closed and both are top-level, so a grant written below `[server]`
+    /// would nest there and silently stay closed.
+    #[test]
+    fn shipped_rest_config_anonymous_fallback_is_closed_and_top_level() {
+        let shipped = include_str!("../ovstorage-rest.toml");
+        let cfg = parse(shipped);
+        assert!(
+            cfg.anonymous_fallback_schemes.is_empty(),
+            "the shipped default grants no cloud scheme"
+        );
+        assert_eq!(
+            cfg.anonymous_http_fallback,
+            AnonymousHttpFallbackConfig::Refuse,
+            "the shipped default refuses the http fallback"
+        );
+        assert!(cfg.anonymous_fallback_set().is_empty());
+
+        let granted = shipped.replace(
+            "anonymous_fallback_schemes = []",
+            "anonymous_fallback_schemes = [\"azure\", \"s3\"]",
+        );
+        assert_ne!(
+            granted, shipped,
+            "the shipped file must carry the key for this substitution to mean anything"
+        );
+        let cfg = parse(&granted);
+        assert_eq!(
+            cfg.anonymous_fallback_schemes,
+            vec![CloudFallbackScheme::Azure, CloudFallbackScheme::S3],
+            "a top-level anonymous_fallback_schemes must reach RestConfig"
+        );
+        assert_eq!(
+            cfg.anonymous_fallback_set(),
+            ["azure", "s3"].into_iter().map(String::from).collect()
+        );
+
+        let allowed = shipped.replace(
+            "anonymous_http_fallback = \"refuse\"",
+            "anonymous_http_fallback = \"allow\"",
+        );
+        assert_ne!(allowed, shipped, "the substitution must have applied");
+        let cfg = parse(&allowed);
+        assert!(cfg.anonymous_http_fallback.allows());
+        assert_eq!(
+            cfg.anonymous_fallback_set(),
+            ["http", "https"].into_iter().map(String::from).collect(),
+            "the http key grants both spellings together; the stamp is what refuses them"
+        );
+    }
+
+    /// The cloud scheme list is a closed enum: a typo, or `http` (which has
+    /// its own key), is a parse error rather than a grant that silently never
+    /// applies.
+    #[test]
+    fn an_unknown_rest_anonymous_fallback_scheme_is_rejected() {
+        let shipped = include_str!("../ovstorage-rest.toml");
+        for bad_scheme in ["s4", "http"] {
+            let bad = shipped.replace(
+                "anonymous_fallback_schemes = []",
+                &format!("anonymous_fallback_schemes = [\"{bad_scheme}\"]"),
+            );
+            assert_ne!(bad, shipped, "the substitution must have applied");
+            let error = toml::from_str::<RestConfig>(&bad)
+                .expect_err("a scheme the enum does not name must be rejected");
+            assert!(
+                error.to_string().contains("anonymous_fallback_schemes"),
+                "the error must name the key the operator got wrong, got: {error}"
+            );
+        }
+    }
+
+    /// Same for the http switch: `refuse` is the safe direction, so a typo
+    /// landing there silently would leave an operator believing they had
+    /// configured something.
+    #[test]
+    fn an_unknown_rest_anonymous_http_fallback_value_is_rejected() {
+        let shipped = include_str!("../ovstorage-rest.toml");
+        let bad = shipped.replace(
+            "anonymous_http_fallback = \"refuse\"",
+            "anonymous_http_fallback = \"permit\"",
+        );
+        assert_ne!(bad, shipped, "the substitution must have applied");
+        let error = toml::from_str::<RestConfig>(&bad)
+            .expect_err("an unrecognised http fallback value must be rejected");
+        assert!(
+            error.to_string().contains("anonymous_http_fallback"),
+            "the error must name the key the operator got wrong, got: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn rest_config_without_server_auth_fails_closed() {
         // No `[server].auth` ⇒ the gateway refuses to build (fail-closed),
@@ -645,14 +838,11 @@ inner = "redirect_follower"
 inner = "router"
 follow_reads = false
 
+# The `file` backend carries no user metadata, so its branch is the bare
+# backend layer: the host composes no attribution wrapper over it, and a config
+# declaring one here is refused at startup.
 [ovstorage.layers.router]
-children = ["attribution_file"]
-
-# Declared explicitly rather than left to the host, so this fixture exercises an
-# operator config that names its own attribution layer in the supported place.
-[ovstorage.layers.attribution_file]
-kind = "attribution"
-inner = "file"
+children = ["file"]
 
 [ovstorage.layers.file]
 kind = "file"
@@ -799,15 +989,16 @@ auth = "anonymous"
 
         let config = StackConfig::from_toml_str(&substituted).unwrap();
         assert_eq!(config.root.as_deref(), Some("alias"));
-        // Attribution is a router branch, not the root: the shipped `file`
-        // branch carries it, so the router's child is the wrapper.
-        assert_eq!(
-            config.layers["router"].children,
-            vec!["attribution_file".to_string()]
-        );
-        assert_eq!(
-            config.layers["attribution_file"].inner.as_deref(),
-            Some("file")
+        // The shipped `file` branch carries no attribution wrapper: `file`
+        // stores no user metadata, so the router's child is the backend layer
+        // itself and the graph declares no `attribution` layer at all.
+        assert_eq!(config.layers["router"].children, vec!["file".to_string()]);
+        assert!(
+            !config
+                .layers
+                .values()
+                .any(|table| table.kind.as_deref() == Some("attribution")),
+            "the shipped gateway graph declares no attribution layer"
         );
 
         // REST-critical: the follower must NOT follow reads, so a backend read

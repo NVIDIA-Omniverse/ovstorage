@@ -3,10 +3,13 @@
 
 #![doc = include_str!("../README.md")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
+use futures::{Stream, StreamExt};
 use ovstorage_plugin::subscription::WatchCoalescer;
 use ovstorage_plugin::*;
 use ovstorage_plugin::{
@@ -25,6 +28,7 @@ mod auth;
 mod convert;
 mod driver;
 mod error_body;
+mod fallback;
 mod layer;
 
 /// Display wrapper that strips query params and fragment from a URL before logging.
@@ -64,12 +68,27 @@ const RESULT_CAPTURE_BODY_BYTES: u32 = 64 * 1024;
 /// real length is settled at end-of-stream.
 const GCS_MAX_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
 
-/// IAM probe endpoint; note `Iam` infix — `testPermissions` 404s.
-const TEST_IAM_PERMISSIONS_PATH: &str = "iam/testIamPermissions";
+/// Continuation tokens retained by the unbudgeted streaming walk.
+///
+/// Buffered GCS listing has no token guard today. The streaming path cannot
+/// retain every token because its page count is deliberately unbounded, so it
+/// remembers a small recent window to reject nearby cycles without making
+/// residency grow with the number of pages consumed.
+const LIST_STREAM_TOKEN_WINDOW: usize = 32;
 
-/// User-metadata key under which `WriteOptions::message` is persisted on
-/// backends without native commit-annotation support.
-const OV_MESSAGE_KEY: &str = "x-ov-message";
+struct GcsListPage {
+    items: Vec<ObjectInfo>,
+    next_page_token: Option<String>,
+}
+
+type GcsListPageStream = Pin<Box<dyn Stream<Item = Result<GcsListPage>> + Send + 'static>>;
+
+/// IAM probe endpoint. The JSON API *method* is named `testIamPermissions`, but
+/// its REST URL path segment is `iam/testPermissions` — no `Iam` infix. The
+/// docs page is titled `testIamPermissions` while the request line under it
+/// reads `GET .../b/<bucket>/iam/testPermissions`; using the method name in the
+/// path 404s.
+const TEST_IAM_PERMISSIONS_PATH: &str = "iam/testPermissions";
 
 /// The static backend descriptor; converted to the v2 `LayerKindDescriptor`
 /// via `descriptor_to_layer_kind` at the factory/layer surface.
@@ -130,10 +149,10 @@ pub(crate) fn kind_descriptor() -> StorageBackendKindDescriptor {
             credential_schema: vec![
                 CredentialField {
                     key: "service_account_key".into(),
-                    display_name: "Service account key".into(),
+                    display_name: "Credentials JSON".into(),
                     default: None,
                     help: Some(
-                        "Optional service-account JSON for deployments that do not use ADC".into(),
+                        "Inline ADC JSON (service_account, authorized_user, external_account, or impersonated_service_account) for deployments that do not use an ADC file".into(),
                     ),
                     advanced: false,
                 },
@@ -144,25 +163,29 @@ pub(crate) fn kind_descriptor() -> StorageBackendKindDescriptor {
                         "~/.config/gcloud/application_default_credentials.json".into(),
                     ),
                     help: Some(
-                        "Path to a gcloud ADC JSON file (service-account or authorized-user)".into(),
+                        "Path to an ADC JSON file (service_account, authorized_user, external_account, or impersonated_service_account)".into(),
                     ),
                     advanced: false,
                 },
             ],
             credential_methods: vec![
                 CredentialMethod {
+                    // Key kept stable for existing configs; the display text
+                    // follows the field, which accepts all four ADC types.
                     key: "service_account_key".into(),
-                    display_name: "Service account key (JSON)".into(),
+                    display_name: "Credentials JSON (ADC)".into(),
                     fields: vec!["service_account_key".into()],
-                    help: Some("Paste a service-account JSON keyfile.".into()),
+                    help: Some(
+                        "Paste an ADC JSON credential: service_account, authorized_user, external_account, or impersonated_service_account.".into(),
+                    ),
                     advanced: false,
                 },
                 CredentialMethod {
                     key: "gcloud_adc_file".into(),
-                    display_name: "User credentials from gcloud ADC file".into(),
+                    display_name: "Credentials from ADC file".into(),
                     fields: vec!["file_path".into()],
                     help: Some(
-                        "Reads the ADC JSON file written by `gcloud auth application-default login`.".into(),
+                        "Reads an ADC JSON file — `gcloud auth application-default login` output (optionally with `--impersonate-service-account`), or a workload-identity `external_account` file.".into(),
                     ),
                     advanced: false,
                 },
@@ -173,6 +196,7 @@ pub(crate) fn kind_descriptor() -> StorageBackendKindDescriptor {
         }
 }
 
+#[derive(Clone)]
 pub struct GcsBackend {
     config: GcsConnectionConfig,
     http: reqwest::Client,
@@ -181,6 +205,148 @@ pub struct GcsBackend {
     /// (any prefix, any principal) merge onto ONE Pub/Sub pull consumer per
     /// connection, fanning events out prefix-filtered per subscriber.
     watch_coalescer: Arc<WatchCoalescer>,
+}
+
+struct GcsListWalkState {
+    backend: GcsBackend,
+    target: GcsObjectRef,
+    opts: ListOptions,
+    cancel: Option<CancellationToken>,
+    listed_marker_name: String,
+    page_token: Option<String>,
+    remaining: Option<u32>,
+    done: bool,
+}
+
+/// Pull-driven page flattener for GCS object listings.
+///
+/// At most one converted service response and the preceding page's marker
+/// addresses are retained. Continuation-cycle detection uses a fixed-size
+/// window so state stays bounded even when a consumer walks an arbitrarily
+/// large prefix.
+struct GcsListStream {
+    pages: GcsListPageStream,
+    current_items: std::vec::IntoIter<ObjectInfo>,
+    /// Concrete directory markers from the immediately preceding native
+    /// page. GCS can split a marker and its matching common prefix across one
+    /// page boundary; retaining only that page-sized set keeps the stream
+    /// bounded while preferring the concrete entry.
+    previous_page_marker_addresses: HashSet<String>,
+    pending_next_page_token: Option<Option<String>>,
+    continuation: Option<String>,
+    recent_tokens: VecDeque<String>,
+    requested_prefix: Url,
+    cancel: Option<CancellationToken>,
+    done: bool,
+}
+
+impl GcsListStream {
+    fn new(
+        pages: GcsListPageStream,
+        requested_prefix: Url,
+        cancel: Option<CancellationToken>,
+    ) -> Self {
+        Self {
+            pages,
+            current_items: Vec::new().into_iter(),
+            previous_page_marker_addresses: HashSet::new(),
+            pending_next_page_token: None,
+            continuation: None,
+            recent_tokens: VecDeque::new(),
+            requested_prefix,
+            cancel,
+            done: false,
+        }
+    }
+
+    fn repeated_token_error(&self) -> Error {
+        Error::new(
+            ErrorCode::Transient,
+            format!(
+                "GCS list of '{}' could not be completed: the service reissued a continuation \
+                 token it had already handed back, so the listing cannot be advanced; refusing \
+                 to return a partial listing that callers could mistake for complete",
+                RedactedUrl(&self.requested_prefix)
+            ),
+        )
+    }
+}
+
+impl Stream for GcsListStream {
+    type Item = Result<ObjectInfo>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if self.done {
+                return Poll::Ready(None);
+            }
+            if self
+                .cancel
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                self.done = true;
+                return Poll::Ready(Some(Err(Error::new(
+                    ErrorCode::Cancelled,
+                    "list_stream cancelled",
+                ))));
+            }
+            if let Some(item) = self.current_items.next() {
+                return Poll::Ready(Some(Ok(item)));
+            }
+
+            if let Some(next_page_token) = self.pending_next_page_token.take() {
+                match next_page_token {
+                    Some(token) => {
+                        let no_progress = self.continuation.as_deref() == Some(token.as_str());
+                        let recent_cycle = self.recent_tokens.iter().any(|seen| seen == &token);
+                        if no_progress || recent_cycle {
+                            self.done = true;
+                            return Poll::Ready(Some(Err(self.repeated_token_error())));
+                        }
+                        if self.recent_tokens.len() == LIST_STREAM_TOKEN_WINDOW {
+                            self.recent_tokens.pop_front();
+                        }
+                        self.recent_tokens.push_back(token.clone());
+                        self.continuation = Some(token);
+                    }
+                    None => {
+                        self.done = true;
+                        return Poll::Ready(None);
+                    }
+                }
+            }
+
+            match self.pages.as_mut().poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(mut page))) => {
+                    let marker_addresses = page
+                        .items
+                        .iter()
+                        .filter(|item| item.kind == ObjectKind::DirectoryMarker)
+                        .map(|item| item.address.as_str().to_string())
+                        .collect();
+                    page.items.retain(|item| {
+                        item.kind != ObjectKind::DirectoryInferred
+                            || !self
+                                .previous_page_marker_addresses
+                                .contains(item.address.as_str())
+                    });
+                    self.previous_page_marker_addresses = marker_addresses;
+                    self.current_items = page.items.into_iter();
+                    self.pending_next_page_token = Some(page.next_page_token);
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(None) => {
+                    self.done = true;
+                    return Poll::Ready(None);
+                }
+            }
+        }
+    }
 }
 
 /// `bearer_auth` variant that no-ops on an empty token so anonymous and
@@ -327,7 +493,7 @@ impl GcsBackend {
             .query(&[
                 (
                     "fields",
-                    "bucket,name,etag,generation,metageneration,size,updated,timeCreated,md5Hash,crc32c,storageClass,contentType,contentEncoding,temporaryHold,eventBasedHold,retentionExpirationTime,metadata",
+                    "bucket,name,etag,generation,metageneration,size,updated,timeCreated,md5Hash,crc32c,storageClass,contentType,contentEncoding,contentLanguage,contentDisposition,cacheControl,customTime,temporaryHold,eventBasedHold,retentionExpirationTime,metadata",
                 ),
             ])
             .maybe_bearer_auth(token);
@@ -400,9 +566,12 @@ impl GcsBackend {
                 match self.fetch_object(&object).await {
                     Ok(found) => {
                         let parsed = parse_object(&found)?;
-                        let mut info = materialize_info(&target.resolved_address, parsed);
+                        let mut info =
+                            materialize_versioned_info(&target.resolved_address, parsed)?;
                         if object.object.ends_with('/') {
+                            // A directory kind carries no pin.
                             info.kind = ObjectKind::DirectoryMarker;
+                            info.versioned_address = None;
                         }
                         return Ok(info);
                     }
@@ -420,8 +589,10 @@ impl GcsBackend {
                     match self.fetch_object(&marker_object).await {
                         Ok(found) => {
                             let parsed = parse_object(&found)?;
-                            let mut info = materialize_info(&target.resolved_address, parsed);
+                            let mut info =
+                                materialize_versioned_info(&target.resolved_address, parsed)?;
                             info.kind = ObjectKind::DirectoryMarker;
+                            info.versioned_address = None;
                             return Ok(info);
                         }
                         Err(err) if err.code() == ErrorCode::NotFound => {}
@@ -550,7 +721,11 @@ impl GcsBackend {
                             RedirectCredential::Request,
                         )))
                     }
-                    CredentialSource::User(_) => {
+                    // No RSA private key to V4-sign with, so these read
+                    // through the plugin rather than by signed redirect.
+                    CredentialSource::User(_)
+                    | CredentialSource::ExternalAccount(_)
+                    | CredentialSource::Impersonated(_) => {
                         let info = parse_object(&self.fetch_object(&object).await?)?;
                         let info = materialize_info(&target.resolved_address, info);
                         // Whole-object reads stream; range reads buffer
@@ -721,12 +896,13 @@ impl GcsBackend {
         // is `session_url`, issued by GCS in the resumable-initiate `Location`
         // header: it names the object by itself and cannot be recomputed from
         // the address, so unlike the other adopters this plugin has nothing to
-        // derive. What is left is a comparison, and on the broker's
-        // client-driven route both sides of it arrive from the same remote
-        // caller — a caller presenting a genuine session for another object can
-        // rewrite `target_address` to match. It is kept because it does catch a
-        // real mismatch on the routes where a follower produced the batch, and
-        // costs nothing.
+        // derive. What is left is a comparison. A direct SPI caller or an
+        // unsealed host can present a genuine session for another object and
+        // rewrite `target_address` to match. The broker's client-driven route
+        // HMAC-binds these continuation bytes to the request address and
+        // refuses that rewrite before dispatch, but the SPI provides no such
+        // guarantee. This check remains because it catches a real mismatch on
+        // follower and non-broker routes, and costs nothing.
         if continuation.target_address != target.resolved_address.as_str() {
             return Err(Error::new(
                 ErrorCode::InvalidArgument,
@@ -740,9 +916,11 @@ impl GcsBackend {
             .unwrap_or("");
         // Exact equality on path/host: `starts_with` would let
         // `.../sessionXXX` match a sibling `.../sessionXXXextra`. Like the
-        // check above this is an internal-consistency assertion: both sides
-        // come out of the same batch, so on the client-driven route it
-        // establishes only that the caller was self-consistent.
+        // check above this is an internal-consistency assertion. On an
+        // unsealed client-driven route both sides come from the caller. The
+        // broker seal authenticates the continuation's copy but not the
+        // separate redirect list, so this comparison also catches a changed
+        // list there.
         if trim_session_query(redirect_url) != trim_session_query(&continuation.session_url) {
             return Err(Error::new(
                 ErrorCode::InvalidArgument,
@@ -847,6 +1025,192 @@ impl GcsBackend {
         .await
     }
 
+    /// Build the shared lazy GCS object-list page walk.
+    ///
+    /// Each poll past a yielded page issues at most one further request. Page
+    /// conversion preserves GCS's established emission order: `items` first,
+    /// followed by `prefixes`, with marker/prefix duplicates removed within
+    /// that page. A converted response is the only variably-sized state held
+    /// by the walk.
+    async fn list_pages(
+        &self,
+        prefix: ResolvedTarget,
+        opts: ListOptions,
+        cancel: Option<CancellationToken>,
+    ) -> Result<GcsListPageStream> {
+        // Make cancellation before open observable before constructing the
+        // first request. The same token is raced around every later page fetch.
+        race_cancel(cancel.as_ref(), async { Ok(()) }).await?;
+        let target = self.parse_target(&prefix, false)?;
+        let listed_marker_name = if target.object.is_empty() {
+            String::new()
+        } else if target.object.ends_with('/') {
+            target.object.clone()
+        } else {
+            format!("{}/", target.object)
+        };
+        let state = GcsListWalkState {
+            backend: self.clone(),
+            target,
+            opts,
+            cancel,
+            listed_marker_name,
+            page_token: None,
+            remaining: None,
+            done: false,
+        };
+        let state = GcsListWalkState {
+            page_token: state.opts.page_token.clone(),
+            remaining: state.opts.max_results,
+            ..state
+        };
+
+        Ok(Box::pin(futures::stream::try_unfold(
+            state,
+            |mut state| async move {
+                if state.done {
+                    return Ok(None);
+                }
+
+                let mut query: Vec<(String, String)> = Vec::new();
+                if !state.target.object.is_empty() {
+                    query.push((
+                        "prefix".to_string(),
+                        address::directory_key(&state.target.object),
+                    ));
+                }
+                if !state.opts.recursive {
+                    query.push(("delimiter".to_string(), "/".to_string()));
+                }
+                if let Some(token) = state.page_token.as_ref() {
+                    query.push(("pageToken".to_string(), token.clone()));
+                }
+                if let Some(limit) = state.remaining {
+                    query.push(("maxResults".to_string(), limit.to_string()));
+                }
+
+                let listing = race_cancel(state.cancel.as_ref(), async {
+                    let token = state.backend.bearer_token().await?;
+                    let request = state
+                        .backend
+                        .http
+                        .get(state.backend.list_url(&state.target.bucket))
+                        .query(&query)
+                        .maybe_bearer_auth(token);
+                    let response = state.backend.send(request).await?;
+                    decode_json::<GcsList>(response).await
+                })
+                .await?;
+
+                let mut items = Vec::new();
+                let mut emitted: u32 = 0;
+                let mut marker_addresses = std::collections::HashSet::new();
+                for object in &listing.items {
+                    let Some(name) = object.name.as_deref() else {
+                        continue;
+                    };
+                    if !state.listed_marker_name.is_empty() && name == state.listed_marker_name {
+                        continue;
+                    }
+                    let is_marker =
+                        name.ends_with('/') && object.size.as_deref().unwrap_or("0") == "0";
+                    if is_marker {
+                        let Ok(address) =
+                            address::join_relative(&state.backend.config.address_root, name)
+                        else {
+                            // The name cannot be spelled as a URI path, so any
+                            // address built for it would resolve to a different
+                            // object. Omit the entry and keep the page.
+                            tracing::warn!(
+                                target: "ovstorage.gcs.backend",
+                                plugin = "gcs",
+                                key = %name,
+                                "gcs: object name is not addressable as a URI path; omitted from listing",
+                            );
+                            continue;
+                        };
+                        marker_addresses.insert(address.as_str().to_string());
+                        items.push(ObjectInfo {
+                            etag_strength: EtagStrength::Unspecified,
+                            address,
+                            kind: ObjectKind::DirectoryMarker,
+                            etag: None,
+                            version: None,
+                            size: None,
+                            mtime: None,
+                            checksums: ChecksumSet::default(),
+                            effective_permissions: None,
+                            system_metadata: None,
+                            user_metadata: None,
+                            modified_by: None,
+                            versioned_address: None,
+                        });
+                        emitted += 1;
+                        continue;
+                    }
+                    let parsed = parse_object(object)?;
+                    let Ok(address) =
+                        address::join_relative(&state.backend.config.address_root, name)
+                    else {
+                        tracing::warn!(
+                            target: "ovstorage.gcs.backend",
+                            plugin = "gcs",
+                            key = %name,
+                            "gcs: object name is not addressable as a URI path; omitted from listing",
+                        );
+                        continue;
+                    };
+                    items.push(materialize_versioned_info(&address, parsed)?);
+                    emitted += 1;
+                }
+                for prefix_value in &listing.prefixes {
+                    let Ok(address) =
+                        address::join_relative(&state.backend.config.address_root, prefix_value)
+                    else {
+                        tracing::warn!(
+                            target: "ovstorage.gcs.backend",
+                            plugin = "gcs",
+                            key = %prefix_value,
+                            "gcs: common prefix is not addressable as a URI path; omitted from listing",
+                        );
+                        continue;
+                    };
+                    if marker_addresses.contains(address.as_str()) {
+                        continue;
+                    }
+                    items.push(inferred_directory_info(&address));
+                    emitted += 1;
+                }
+
+                if let Some(limit) = state.remaining {
+                    state.remaining = Some(limit.saturating_sub(emitted));
+                    if state.remaining == Some(0) {
+                        state.done = true;
+                    }
+                }
+                let next_page_token = listing.next_page_token.filter(|next| !next.is_empty());
+                if !state.done {
+                    match next_page_token.as_ref() {
+                        Some(next) => state.page_token = Some(next.clone()),
+                        None => state.done = true,
+                    }
+                }
+
+                Ok(Some((
+                    GcsListPage {
+                        items,
+                        next_page_token,
+                    },
+                    state,
+                )))
+            },
+        )))
+    }
+
+    /// Materialize one prefix by draining the shared GCS page walk.
+    ///
+    /// This retains GCS's existing native paging, max-results, and emission
+    /// semantics. `list_stream` is the bounded-residency surface.
     pub async fn list(
         &self,
         prefix: ResolvedTarget,
@@ -859,139 +1223,49 @@ impl GcsBackend {
             plugin = "gcs",
             object.address = %RedactedUrl(&prefix.resolved_address),
         );
+        let cancel_for_race = cancel.clone();
         race_cancel(
-            cancel.as_ref(),
+            cancel_for_race.as_ref(),
             async move {
-                let target = self.parse_target(&prefix, false)?;
+                let mut pages = self.list_pages(prefix, opts, cancel).await?;
                 let mut items: Vec<ObjectInfo> = Vec::new();
-                let mut page_token = opts.page_token.clone();
-                let mut remaining = opts.max_results;
-                loop {
-                    let mut query: Vec<(String, String)> = Vec::new();
-                    if !target.object.is_empty() {
-                        query.push((
-                            "prefix".to_string(),
-                            address::directory_key(&target.object),
-                        ));
-                    }
-                    if !opts.recursive {
-                        query.push(("delimiter".to_string(), "/".to_string()));
-                    }
-                    if let Some(token) = page_token.as_ref() {
-                        query.push(("pageToken".to_string(), token.clone()));
-                    }
-                    if let Some(limit) = remaining {
-                        query.push(("maxResults".to_string(), limit.to_string()));
-                    }
-                    let token = self.bearer_token().await?;
-                    let request = self
-                        .http
-                        .get(self.list_url(&target.bucket))
-                        .query(&query)
-                        .maybe_bearer_auth(token);
-                    let response = self.send(request).await?;
-                    let listing: GcsList = decode_json(response).await?;
-                    let listed_marker_name = if target.object.is_empty() {
-                        String::new()
-                    } else if target.object.ends_with('/') {
-                        target.object.clone()
-                    } else {
-                        format!("{}/", target.object)
-                    };
-                    let mut emitted: u32 = 0;
-                    let mut marker_addresses = std::collections::HashSet::new();
-                    for object in &listing.items {
-                        let Some(name) = object.name.as_deref() else {
-                            continue;
-                        };
-                        if !listed_marker_name.is_empty() && name == listed_marker_name {
-                            continue;
-                        }
-                        let is_marker =
-                            name.ends_with('/') && object.size.as_deref().unwrap_or("0") == "0";
-                        if is_marker {
-                            let Ok(address) =
-                                address::join_relative(&self.config.address_root, name)
-                            else {
-                                // The name cannot be spelled as a URI path, so
-                                // any address built for it would resolve to a
-                                // different object. Omit the entry and keep the
-                                // page: invisible beats mis-addressed, and
-                                // failing the page would hide every sibling
-                                // too.
-                                tracing::warn!(
-                                    target: "ovstorage.gcs.backend",
-                                    plugin = "gcs",
-                                    key = %name,
-                                    "gcs: object name is not addressable as a URI path; omitted from listing",
-                                );
-                                continue;
-                            };
-                            marker_addresses.insert(address.as_str().to_string());
-                            items.push(ObjectInfo {
-                                address,
-                                kind: ObjectKind::DirectoryMarker,
-                                etag: None,
-                                version: None,
-                                size: None,
-                                mtime: None,
-                                checksums: ChecksumSet::default(),
-                                effective_permissions: None,
-                                system_metadata: None,
-                                user_metadata: None,
-                                modified_by: None,
-                            });
-                            emitted += 1;
-                            continue;
-                        }
-                        let parsed = parse_object(object)?;
-                        let Ok(address) = address::join_relative(&self.config.address_root, name)
-                        else {
-                            tracing::warn!(
-                                target: "ovstorage.gcs.backend",
-                                plugin = "gcs",
-                                key = %name,
-                                "gcs: object name is not addressable as a URI path; omitted from listing",
-                            );
-                            continue;
-                        };
-                        items.push(materialize_info(&address, parsed));
-                        emitted += 1;
-                    }
-                    for prefix_value in &listing.prefixes {
-                        let Ok(address) =
-                            address::join_relative(&self.config.address_root, prefix_value)
-                        else {
-                            tracing::warn!(
-                                target: "ovstorage.gcs.backend",
-                                plugin = "gcs",
-                                key = %prefix_value,
-                                "gcs: common prefix is not addressable as a URI path; omitted from listing",
-                            );
-                            continue;
-                        };
-                        if marker_addresses.contains(address.as_str()) {
-                            continue;
-                        }
-                        items.push(inferred_directory_info(&address));
-                        emitted += 1;
-                    }
-                    if let Some(limit) = remaining {
-                        remaining = Some(limit.saturating_sub(emitted));
-                        if remaining == Some(0) {
-                            break;
-                        }
-                    }
-                    match listing.next_page_token {
-                        Some(next) if !next.is_empty() => page_token = Some(next),
-                        _ => break,
-                    }
+                while let Some(page) = pages.next().await {
+                    items.extend(page?.items);
                 }
                 Ok(items)
             }
             .instrument(span),
         )
         .await
+    }
+
+    /// Stream a GCS listing in the service's native emission order.
+    ///
+    /// Non-recursive pages emit `items` before `prefixes`, which is not a
+    /// global byte sort and is preserved verbatim. Recursive requests omit the
+    /// delimiter, so GCS returns byte-sorted object items only, satisfying the
+    /// incremental flat-fold precondition. The next page is fetched only after
+    /// the consumer polls past the current page.
+    pub async fn list_stream(
+        &self,
+        prefix: ResolvedTarget,
+        opts: ListOptions,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ovstorage_plugin::ListStream> {
+        if opts.max_results.is_some() || opts.page_token.is_some() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+        let requested_prefix = prefix.resolved_address.clone();
+        let stream_cancel = cancel.clone();
+        let pages = self.list_pages(prefix, opts, cancel).await?;
+        Ok(Box::pin(GcsListStream::new(
+            pages,
+            requested_prefix,
+            stream_cancel,
+        )))
     }
 
     pub async fn list_versions(
@@ -1048,7 +1322,7 @@ impl GcsBackend {
                         };
                         let parsed = parse_object(entry)?;
                         let address = generation_address(&target.resolved_address, &generation)?;
-                        versions.push(materialize_info(&address, parsed));
+                        versions.push(materialize_versioned_info(&address, parsed)?);
                         if let Some(limit) = opts.max_results
                             && versions.len() as u32 >= limit
                         {
@@ -1098,7 +1372,7 @@ impl GcsBackend {
                     )
                 })?;
                 let address = generation_address(&target.resolved_address, &value)?;
-                Ok(materialize_info(&address, parsed))
+                materialize_versioned_info(&address, parsed)
             }
             .instrument(span),
         )
@@ -1365,20 +1639,11 @@ impl GcsBackend {
             async move {
                 require_version_only_if_match(opts.if_match.as_deref())?;
                 let object = self.parse_target(&target, true)?;
-                let mut metadata: serde_json::Map<String, serde_json::Value> =
-                    serde_json::Map::new();
-                for (key, value) in &opts.user_metadata_set {
-                    metadata.insert(key.clone(), serde_json::Value::String(value.clone()));
-                }
-                for key in &opts.user_metadata_remove {
-                    metadata.insert(key.clone(), serde_json::Value::Null);
-                }
-                if let Some(message) = opts.message.as_deref().filter(|m| !m.is_empty()) {
-                    metadata.insert(
-                        OV_MESSAGE_KEY.into(),
-                        serde_json::Value::String(message.to_string()),
-                    );
-                }
+                let metadata = update_metadata_patch_map(
+                    &opts.user_metadata_set,
+                    &opts.user_metadata_remove,
+                    opts.message.as_deref(),
+                );
                 let mut body = serde_json::Map::new();
                 body.insert("metadata".into(), serde_json::Value::Object(metadata));
                 let token = self.bearer_token().await?;
@@ -1550,18 +1815,7 @@ impl GcsBackend {
             "name".into(),
             serde_json::Value::String(object.object.clone()),
         );
-        let mut metadata_map = serde_json::Map::new();
-        if let Some(user_metadata) = opts.user_metadata.as_ref() {
-            for (key, value) in user_metadata {
-                metadata_map.insert(key.clone(), serde_json::Value::String(value.clone()));
-            }
-        }
-        if let Some(message) = opts.message.as_deref().filter(|m| !m.is_empty()) {
-            metadata_map.insert(
-                OV_MESSAGE_KEY.into(),
-                serde_json::Value::String(message.to_string()),
-            );
-        }
+        let metadata_map = upload_metadata_map(&opts);
         if !metadata_map.is_empty() {
             metadata_payload.insert("metadata".into(), serde_json::Value::Object(metadata_map));
         }
@@ -1620,18 +1874,7 @@ impl GcsBackend {
             "name".into(),
             serde_json::Value::String(object.object.clone()),
         );
-        let mut metadata_map = serde_json::Map::new();
-        if let Some(user_metadata) = opts.user_metadata.as_ref() {
-            for (key, value) in user_metadata {
-                metadata_map.insert(key.clone(), serde_json::Value::String(value.clone()));
-            }
-        }
-        if let Some(message) = opts.message.as_deref().filter(|m| !m.is_empty()) {
-            metadata_map.insert(
-                OV_MESSAGE_KEY.into(),
-                serde_json::Value::String(message.to_string()),
-            );
-        }
+        let metadata_map = upload_metadata_map(&opts);
         if !metadata_map.is_empty() {
             metadata_payload.insert("metadata".into(), serde_json::Value::Object(metadata_map));
         }
@@ -1755,18 +1998,7 @@ impl GcsBackend {
             "name".into(),
             serde_json::Value::String(object.object.clone()),
         );
-        let mut metadata_map = serde_json::Map::new();
-        if let Some(user_metadata) = opts.user_metadata.as_ref() {
-            for (key, value) in user_metadata {
-                metadata_map.insert(key.clone(), serde_json::Value::String(value.clone()));
-            }
-        }
-        if let Some(message) = opts.message.as_deref().filter(|m| !m.is_empty()) {
-            metadata_map.insert(
-                OV_MESSAGE_KEY.into(),
-                serde_json::Value::String(message.to_string()),
-            );
-        }
+        let metadata_map = upload_metadata_map(&opts);
         if !metadata_map.is_empty() {
             metadata_payload.insert("metadata".into(), serde_json::Value::Object(metadata_map));
         }
@@ -1847,7 +2079,16 @@ impl GcsBackend {
                     .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
                     .header("content-range", content_range);
                 request = if buffer.is_empty() {
-                    request.body(Vec::<u8>::new())
+                    // Empty finalize PUT: the total was an exact multiple of
+                    // the chunk size, so the last data chunk already went out
+                    // as a non-final `/*` chunk and this call only carries
+                    // `bytes */{total}`. reqwest/hyper omit `Content-Length`
+                    // for a zero-length body, but the GCS front end rejects a
+                    // bodyless PUT with `411 Length Required` — set it
+                    // explicitly.
+                    request
+                        .header(reqwest::header::CONTENT_LENGTH, "0")
+                        .body(Vec::<u8>::new())
                 } else {
                     request.body(std::mem::take(&mut buffer))
                 };
@@ -1918,6 +2159,11 @@ impl GcsBackend {
             .query(&query)
             .maybe_bearer_auth(token)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            // Directory markers are zero-byte objects. As with the empty
+            // resumable-finalize PUT above, reqwest/hyper omit `Content-Length`
+            // for a zero-length body and the GCS front end answers
+            // `411 Length Required` to a bodyless POST — set it explicitly.
+            .header(reqwest::header::CONTENT_LENGTH, "0")
             .body(Vec::<u8>::new());
         let response = self.send(request).await?;
         let object_resource: GcsObject = decode_json(response).await?;
@@ -1947,20 +2193,25 @@ impl GcsBackend {
         dst: &GcsObjectRef,
         opts: &CopyOptions,
     ) -> Result<ParsedObject> {
-        let message_payload = opts
-            .message
-            .as_deref()
-            .filter(|m| !m.is_empty())
-            .map(|message| {
-                let mut metadata_map = serde_json::Map::new();
-                metadata_map.insert(
-                    OV_MESSAGE_KEY.into(),
-                    serde_json::Value::String(message.to_string()),
-                );
-                let mut body = serde_json::Map::new();
-                body.insert("metadata".into(), serde_json::Value::Object(metadata_map));
-                serde_json::Value::Object(body)
-            });
+        // A rewrite body replaces the destination's editable metadata
+        // wholesale, while an empty body makes GCS copy the source's. An
+        // annotation therefore travels beside the source object's editable
+        // fields, read first, rather than in place of them. The read and the
+        // rewrite are two calls, so the rewrite is pinned to the generation
+        // the read returned: a source overwritten in between then rewrites
+        // the generation the body describes (or fails when that generation is
+        // gone) rather than stamping the old metadata onto new bytes. A
+        // caller's own pin takes precedence, and the read honours it too.
+        let (message_payload, snapshot_generation) =
+            match opts.message.as_deref().filter(|m| !m.is_empty()) {
+                Some(message) => {
+                    let source = self.fetch_object(src).await?;
+                    let body = rewrite_metadata_body(&source, message);
+                    (Some(body), source.generation)
+                }
+                None => (None, None),
+            };
+        let source_generation = src.generation_selector().or(snapshot_generation);
         let mut rewrite_token: Option<String> = None;
         loop {
             let token = self.bearer_token().await?;
@@ -1991,8 +2242,8 @@ impl GcsBackend {
                     request = request.query(&[("ifGenerationMatch", generation.as_str())]);
                 }
             }
-            if let Some(generation) = src.generation_selector() {
-                request = request.query(&[("sourceGeneration", generation.as_str())]);
+            if let Some(generation) = source_generation.as_deref() {
+                request = request.query(&[("sourceGeneration", generation)]);
             }
             if let Some(token) = rewrite_token.as_ref() {
                 request = request.query(&[("rewriteToken", token.as_str())]);
@@ -2148,6 +2399,7 @@ fn read_redirect(
         // generation-shaped; HTTP `ETag` is a separate value that would
         // be rejected as a precondition token.
         etag_header: Some("x-goog-generation".into()),
+        etag_strength: EtagStrength::Strong,
         version_header: Some("x-goog-generation".into()),
         size_header: Some("content-length".into()),
         mtime_header: Some("last-modified".into()),
@@ -2185,6 +2437,94 @@ fn read_redirect(
     }
 }
 
+/// The `metadata` object for an upload: the caller's user metadata, plus
+/// `opts.message` stashed under [`MESSAGE_METADATA_KEY`] when the caller's map
+/// leaves that key unset. The caller's own entry under the key stands: user
+/// metadata is persisted, the per-operation annotation is droppable.
+fn upload_metadata_map(opts: &WriteOptions) -> serde_json::Map<String, serde_json::Value> {
+    let mut metadata_map = serde_json::Map::new();
+    if let Some(user_metadata) = opts.user_metadata.as_ref() {
+        for (key, value) in user_metadata {
+            metadata_map.insert(key.clone(), serde_json::Value::String(value.clone()));
+        }
+    }
+    if let Some(message) = opts.message.as_deref().filter(|m| !m.is_empty())
+        && !metadata_map.contains_key(MESSAGE_METADATA_KEY)
+    {
+        metadata_map.insert(
+            MESSAGE_METADATA_KEY.into(),
+            serde_json::Value::String(message.to_string()),
+        );
+    }
+    metadata_map
+}
+
+/// The request body of a `copy` or `rename` rewrite that carries a message.
+/// A non-empty rewrite body replaces the destination's editable metadata
+/// wholesale, where an empty one makes GCS copy the source's, so the body
+/// carries every editable field an empty body would have copied: content
+/// type, encoding, language, disposition, cache control, custom time and
+/// storage class when the source has them, and the source's user metadata
+/// with the annotation under [`MESSAGE_METADATA_KEY`] replacing any the
+/// source carried. A copy has no caller map, so the source's keys are the
+/// ones that must survive. ACLs, holds and retention are outside an empty
+/// body's copy as well and stay out of this one.
+fn rewrite_metadata_body(source: &GcsObject, message: &str) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    for (field, value) in [
+        ("contentType", &source.content_type),
+        ("contentEncoding", &source.content_encoding),
+        ("contentLanguage", &source.content_language),
+        ("contentDisposition", &source.content_disposition),
+        ("cacheControl", &source.cache_control),
+        ("customTime", &source.custom_time),
+        ("storageClass", &source.storage_class),
+    ] {
+        if let Some(value) = value {
+            body.insert(field.into(), serde_json::Value::String(value.clone()));
+        }
+    }
+    let mut metadata_map = serde_json::Map::new();
+    for (key, value) in &source.metadata {
+        metadata_map.insert(key.clone(), serde_json::Value::String(value.clone()));
+    }
+    metadata_map.insert(
+        MESSAGE_METADATA_KEY.into(),
+        serde_json::Value::String(message.to_string()),
+    );
+    body.insert("metadata".into(), serde_json::Value::Object(metadata_map));
+    serde_json::Value::Object(body)
+}
+
+/// The `metadata` object of an `update_metadata` PATCH: `remove` entries as
+/// JSON `null` (how the JSON API deletes a key), then `set` entries as strings,
+/// so a key named in both is set, as on S3 and Azure; then `message` under
+/// [`MESSAGE_METADATA_KEY`] unless `set` carries that key. A `set` entry under
+/// the key stands; otherwise the message replaces whatever the object holds
+/// under it, a removal of the key in the same call included.
+fn update_metadata_patch_map(
+    set: &HashMap<String, String>,
+    remove: &[String],
+    message: Option<&str>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut metadata = serde_json::Map::new();
+    for key in remove {
+        metadata.insert(key.clone(), serde_json::Value::Null);
+    }
+    for (key, value) in set {
+        metadata.insert(key.clone(), serde_json::Value::String(value.clone()));
+    }
+    if !set.contains_key(MESSAGE_METADATA_KEY)
+        && let Some(message) = message.filter(|m| !m.is_empty())
+    {
+        metadata.insert(
+            MESSAGE_METADATA_KEY.into(),
+            serde_json::Value::String(message.to_string()),
+        );
+    }
+    metadata
+}
+
 fn apply_write_preconditions(query: &mut Vec<(String, String)>, opts: &WriteOptions) {
     match &opts.if_dest {
         IfDestExists::Overwrite => {}
@@ -2199,6 +2539,7 @@ fn apply_write_preconditions(query: &mut Vec<(String, String)>, opts: &WriteOpti
 
 fn materialize_info(addr: &Url, parsed: ParsedObject) -> ObjectInfo {
     ObjectInfo {
+        etag_strength: parsed.etag_strength,
         address: addr.clone(),
         // GCS is flat; per-object infos carry no directory shape.
         kind: ObjectKind::File,
@@ -2219,11 +2560,35 @@ fn materialize_info(addr: &Url, parsed: ParsedObject) -> ObjectInfo {
             Some(parsed.user_metadata)
         },
         modified_by: None,
+        versioned_address: None,
     }
+}
+
+/// [`materialize_info`] plus the generation pin, for the read-side callers
+/// (`stat`, `list`, `list_versions`, `get_latest_version`). `generation`
+/// rides on every object resource those calls receive, so the pin is free
+/// and populated whatever the caller's `versioned_address` flag says.
+/// Write-completion callers keep [`materialize_info`], whose results carry
+/// no pin.
+///
+/// `generation_address` rebuilds the query from the generation alone, so a
+/// caller pin echoes as its canonical spelling and a `list_versions` /
+/// `get_latest_version` address, already pinned, equals its own pin.
+fn materialize_versioned_info(addr: &Url, parsed: ParsedObject) -> Result<ObjectInfo> {
+    let versioned_address = parsed
+        .version
+        .as_deref()
+        .map(|generation| generation_address(addr, generation))
+        .transpose()?;
+    Ok(ObjectInfo {
+        versioned_address,
+        ..materialize_info(addr, parsed)
+    })
 }
 
 fn inferred_directory_info(addr: &Url) -> ObjectInfo {
     ObjectInfo {
+        etag_strength: Default::default(),
         address: addr.clone(),
         kind: ObjectKind::DirectoryInferred,
         etag: None,
@@ -2235,11 +2600,13 @@ fn inferred_directory_info(addr: &Url) -> ObjectInfo {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
 fn backend_item_info(parsed: ParsedObject) -> BackendItemInfo {
     BackendItemInfo {
+        etag_strength: parsed.etag_strength,
         // Object entries only; subdirectory entries come from common-prefix paths.
         kind: ObjectKind::File,
         etag: parsed.etag,
@@ -2259,6 +2626,7 @@ fn backend_item_info(parsed: ParsedObject) -> BackendItemInfo {
             Some(parsed.user_metadata)
         },
         modified_by: None,
+        versioned_address: None,
     }
 }
 
@@ -2424,7 +2792,7 @@ fn build_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(HTTP_USER_AGENT)
         .timeout(Duration::from_secs(30))
-        // Redirects are still followed exactly as before; the policy only
+        // Redirects are followed; the policy only
         // OBSERVES them, recording the hop that costs the request its bearer so
         // the promotion rule can decline to judge an answer the credential did
         // not earn. reqwest drops `Authorization` when host or port changes
@@ -2504,6 +2872,28 @@ impl GcsConnectionConfig {
             pubsub_endpoint,
             pubsub_subscription,
             pubsub_pull_max,
+        })
+    }
+
+    /// The per-bucket config the anonymous `gs://` scheme fallback
+    /// synthesizes for a bucket no connection serves.
+    ///
+    /// It is an ordinary connection config in every respect that matters
+    /// downstream — the bucket is validated exactly as a configured one is, the
+    /// address root is `gs://{bucket}/`, and `parse_target` keeps its bucket
+    /// pin — so the backend built from it behaves like a configured anonymous
+    /// connection minus the connection. No Pub/Sub is ever attached: a
+    /// fallback refuses `watch_directory` before it would need one.
+    pub(crate) fn anonymous_for_bucket(bucket: &str, endpoint: Option<String>) -> Result<Self> {
+        validate_bucket(bucket)?;
+        let address_root = address::parse(&format!("gs://{bucket}/"))?;
+        Ok(Self {
+            bucket: bucket.to_string(),
+            address_root,
+            endpoint: endpoint.map(|address| address.trim_end_matches('/').to_string()),
+            pubsub_endpoint: None,
+            pubsub_subscription: None,
+            pubsub_pull_max: 100,
         })
     }
 }
@@ -2794,6 +3184,7 @@ fn gcs_capabilities(config: &GcsConnectionConfig) -> Capabilities {
         supports_atomic_rename: false,
         has_real_directories: false,
         supports_list: true,
+        supports_list_stream: true,
         wants_list_backed_stat: true,
         supports_recursive_list: true,
         supports_create_directory: true,
@@ -2934,6 +3325,8 @@ ovstorage_plugin::ovstorage_layer_plugin!(backend, GcsLayerFactory::default);
 
 #[cfg(test)]
 mod tests {
+    use futures::TryStreamExt as _;
+
     use super::*;
     fn request(bucket: &str) -> ConnectionRequest {
         let mut config = HashMap::new();
@@ -3022,6 +3415,7 @@ mod tests {
     async fn add_connection_reports_native_capabilities() {
         let caps = layer_root_caps(&request("asset-bucket")).await;
         assert!(caps.supports_native_metadata_patch);
+        assert!(caps.supports_list_stream);
         assert!(!caps.supports_watch_directory);
     }
 
@@ -3099,6 +3493,62 @@ mod tests {
         assert_eq!(directory_marker_name(""), "/");
         assert_eq!(directory_marker_name("foo"), "foo/");
         assert_eq!(directory_marker_name("foo/"), "foo/");
+    }
+
+    #[test]
+    fn materialized_generation_is_strong_and_inferred_directory_is_unspecified() {
+        let object: GcsObject =
+            serde_json::from_str(r#"{"name":"dir/file.txt","generation":"1700000000000001"}"#)
+                .unwrap();
+        let parsed = parse_object(&object).unwrap();
+        let address = address::parse("gs://asset-bucket/dir/file.txt").unwrap();
+        let info = materialize_info(&address, parsed);
+        assert_eq!(info.etag.as_deref(), Some("1700000000000001"));
+        assert_eq!(info.etag_strength, EtagStrength::Strong);
+
+        let parsed = parse_object(&object).unwrap();
+        let item = backend_item_info(parsed);
+        assert_eq!(item.etag.as_deref(), Some("1700000000000001"));
+        assert_eq!(item.etag_strength, EtagStrength::Strong);
+
+        let directory =
+            inferred_directory_info(&address::parse("gs://asset-bucket/dir/sub/").unwrap());
+        assert_eq!(directory.etag, None);
+        assert_eq!(directory.etag_strength, EtagStrength::Unspecified);
+    }
+
+    #[test]
+    fn materialize_versioned_info_pins_the_generation_and_respells_a_caller_pin() {
+        let object: GcsObject =
+            serde_json::from_str(r#"{"name":"dir/file.txt","generation":"42"}"#).unwrap();
+        let address = address::parse("gs://asset-bucket/dir/file.txt").unwrap();
+        let info = materialize_versioned_info(&address, parse_object(&object).unwrap()).unwrap();
+        assert_eq!(info.address, address);
+        assert_eq!(
+            info.versioned_address.as_ref().map(Url::as_str),
+            Some("gs://asset-bucket/dir/file.txt?generation=42")
+        );
+
+        // A caller pin is honoured by the selector and echoed as the
+        // canonical spelling: the query is rebuilt from the generation
+        // alone, so extra pairs and the fragment do not travel.
+        let pinned =
+            address::parse("gs://asset-bucket/dir/file.txt?generation=42&x=y#frag").unwrap();
+        let info = materialize_versioned_info(&pinned, parse_object(&object).unwrap()).unwrap();
+        assert_eq!(info.address, pinned);
+        assert_eq!(
+            info.versioned_address.as_ref().map(Url::as_str),
+            Some("gs://asset-bucket/dir/file.txt?generation=42")
+        );
+
+        // No generation, no pin; and the write-side `materialize_info`
+        // never pins even when a generation is present.
+        let bare: GcsObject = serde_json::from_str(r#"{"name":"dir/file.txt"}"#).unwrap();
+        let info = materialize_versioned_info(&address, parse_object(&bare).unwrap()).unwrap();
+        assert_eq!(info.versioned_address, None);
+        let info = materialize_info(&address, parse_object(&object).unwrap());
+        assert_eq!(info.version.as_deref(), Some("42"));
+        assert_eq!(info.versioned_address, None);
     }
 
     #[test]
@@ -3196,6 +3646,214 @@ mod tests {
         );
         // The classification and position still make the failure diagnosable.
         assert!(err.message().contains("Data"), "{}", err.message());
+    }
+
+    fn source_object(json: serde_json::Value) -> GcsObject {
+        serde_json::from_value(json).expect("a GCS object resource")
+    }
+
+    /// A copy with a message carries the source's keys beside the annotation:
+    /// the rewrite body replaces the destination's metadata wholesale, so
+    /// leaving them out would drop them.
+    #[test]
+    fn rewrite_metadata_body_carries_the_sources_keys_beside_the_message() {
+        let source = source_object(serde_json::json!({"metadata": {"label": "hero"}}));
+        let body = rewrite_metadata_body(&source, "copy note");
+        let metadata = body["metadata"].as_object().expect("metadata object");
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata["label"], serde_json::Value::String("hero".into()));
+        assert_eq!(
+            metadata[MESSAGE_METADATA_KEY],
+            serde_json::Value::String("copy note".into())
+        );
+    }
+
+    /// The copy's annotation replaces the one the source carried; a copy has
+    /// no caller map, so there is no caller entry to defer to.
+    #[test]
+    fn rewrite_metadata_body_replaces_the_inherited_annotation() {
+        let source = source_object(serde_json::json!({
+            "metadata": {"label": "hero", MESSAGE_METADATA_KEY: "old note"}
+        }));
+        let body = rewrite_metadata_body(&source, "copy note");
+        let metadata = body["metadata"].as_object().expect("metadata object");
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(
+            metadata[MESSAGE_METADATA_KEY],
+            serde_json::Value::String("copy note".into())
+        );
+    }
+
+    /// The body carries every editable field an empty body would have copied,
+    /// so an annotated copy keeps the source's content type, encoding,
+    /// language, disposition, cache control, custom time and storage class.
+    #[test]
+    fn rewrite_metadata_body_carries_the_sources_editable_fields() {
+        let source = source_object(serde_json::json!({
+            "contentType": "text/plain",
+            "contentEncoding": "gzip",
+            "contentLanguage": "en",
+            "contentDisposition": "attachment; filename=\"a.txt\"",
+            "cacheControl": "no-store",
+            "customTime": "2026-01-02T03:04:05Z",
+            "storageClass": "NEARLINE",
+            "temporaryHold": true,
+            "metadata": {"label": "hero"}
+        }));
+        let body = rewrite_metadata_body(&source, "copy note");
+        let fields = body.as_object().expect("body object");
+        assert_eq!(fields["contentType"], "text/plain");
+        assert_eq!(fields["contentEncoding"], "gzip");
+        assert_eq!(fields["contentLanguage"], "en");
+        assert_eq!(
+            fields["contentDisposition"],
+            "attachment; filename=\"a.txt\""
+        );
+        assert_eq!(fields["cacheControl"], "no-store");
+        assert_eq!(fields["customTime"], "2026-01-02T03:04:05Z");
+        assert_eq!(fields["storageClass"], "NEARLINE");
+        assert!(
+            !fields.contains_key("temporaryHold"),
+            "holds are outside an empty body's copy and stay out of this one; got {fields:#?}"
+        );
+        assert_eq!(fields["metadata"]["label"], "hero");
+        assert_eq!(fields["metadata"][MESSAGE_METADATA_KEY], "copy note");
+    }
+
+    /// A field the source does not carry is left out rather than sent as
+    /// `null`, so a source with no custom metadata yields the single-entry
+    /// body.
+    #[test]
+    fn rewrite_metadata_body_omits_fields_the_source_lacks() {
+        let source = source_object(serde_json::json!({"name": "src.bin"}));
+        let body = rewrite_metadata_body(&source, "copy note");
+        let fields = body.as_object().expect("body object");
+        assert_eq!(fields.len(), 1, "only the metadata member; got {fields:#?}");
+        assert_eq!(fields["metadata"][MESSAGE_METADATA_KEY], "copy note");
+    }
+
+    #[test]
+    fn upload_metadata_map_stashes_the_message_under_an_unset_key() {
+        let mut user_metadata = HashMap::new();
+        user_metadata.insert("owner".to_string(), "alice".to_string());
+        let map = upload_metadata_map(&WriteOptions {
+            user_metadata: Some(user_metadata),
+            message: Some("commit note".into()),
+            ..WriteOptions::default()
+        });
+        assert_eq!(map.len(), 2, "{map:?}");
+        assert_eq!(
+            map.get("owner"),
+            Some(&serde_json::Value::String("alice".into()))
+        );
+        assert_eq!(
+            map.get(MESSAGE_METADATA_KEY),
+            Some(&serde_json::Value::String("commit note".into()))
+        );
+    }
+
+    #[test]
+    fn upload_metadata_map_keeps_the_callers_entry_under_the_key() {
+        let mut user_metadata = HashMap::new();
+        user_metadata.insert(MESSAGE_METADATA_KEY.to_string(), "caller".to_string());
+        let map = upload_metadata_map(&WriteOptions {
+            user_metadata: Some(user_metadata),
+            message: Some("real".into()),
+            ..WriteOptions::default()
+        });
+        assert_eq!(map.len(), 1, "{map:?}");
+        assert_eq!(
+            map.get(MESSAGE_METADATA_KEY),
+            Some(&serde_json::Value::String("caller".into()))
+        );
+    }
+
+    #[test]
+    fn upload_metadata_map_is_empty_without_metadata_or_message() {
+        for message in [None, Some(String::new())] {
+            let map = upload_metadata_map(&WriteOptions {
+                message: message.clone(),
+                ..WriteOptions::default()
+            });
+            assert!(map.is_empty(), "message {message:?}: {map:?}");
+        }
+    }
+
+    #[test]
+    fn update_metadata_patch_map_keeps_the_callers_set_entry_over_the_message() {
+        let mut set = HashMap::new();
+        set.insert(MESSAGE_METADATA_KEY.to_string(), "caller".to_string());
+        let map = update_metadata_patch_map(&set, &[], Some("real"));
+        assert_eq!(map.len(), 1, "{map:?}");
+        assert_eq!(
+            map.get(MESSAGE_METADATA_KEY),
+            Some(&serde_json::Value::String("caller".into()))
+        );
+    }
+
+    /// A PATCH entry under the key replaces whatever the object holds there,
+    /// so the message alone overwrites an earlier annotation.
+    #[test]
+    fn update_metadata_patch_map_sets_the_message_under_the_key() {
+        let mut set = HashMap::new();
+        set.insert("owner".to_string(), "alice".to_string());
+        let map = update_metadata_patch_map(&set, &[], Some("real"));
+        assert_eq!(map.len(), 2, "{map:?}");
+        assert_eq!(
+            map.get("owner"),
+            Some(&serde_json::Value::String("alice".into()))
+        );
+        assert_eq!(
+            map.get(MESSAGE_METADATA_KEY),
+            Some(&serde_json::Value::String("real".into()))
+        );
+    }
+
+    /// Removing the key in the same call does not keep the message off the
+    /// object: the message's string entry wins over the removal's `null`.
+    #[test]
+    fn update_metadata_patch_map_lands_the_message_when_the_same_call_removes_the_key() {
+        let map = update_metadata_patch_map(
+            &HashMap::new(),
+            &[MESSAGE_METADATA_KEY.to_string()],
+            Some("real"),
+        );
+        assert_eq!(map.len(), 1, "{map:?}");
+        assert_eq!(
+            map.get(MESSAGE_METADATA_KEY),
+            Some(&serde_json::Value::String("real".into()))
+        );
+    }
+
+    /// A key named in both `set` and `remove` of one patch is set, as on S3
+    /// and Azure: the `set` string outranks the removal's `null`.
+    #[test]
+    fn update_metadata_patch_map_sets_a_key_the_same_call_also_removes() {
+        let mut set = HashMap::new();
+        set.insert("tag".to_string(), "kept".to_string());
+        let map = update_metadata_patch_map(&set, &["tag".to_string()], None);
+        assert_eq!(map.len(), 1, "{map:?}");
+        assert_eq!(
+            map.get("tag"),
+            Some(&serde_json::Value::String("kept".into()))
+        );
+    }
+
+    #[test]
+    fn update_metadata_patch_map_nulls_a_removed_key_without_a_message() {
+        for message in [None, Some("")] {
+            let map = update_metadata_patch_map(
+                &HashMap::new(),
+                &[MESSAGE_METADATA_KEY.to_string()],
+                message,
+            );
+            assert_eq!(map.len(), 1, "message {message:?}: {map:?}");
+            assert_eq!(
+                map.get(MESSAGE_METADATA_KEY),
+                Some(&serde_json::Value::Null),
+                "message {message:?}"
+            );
+        }
     }
 
     #[test]
@@ -3323,6 +3981,11 @@ mod tests {
             Some("x-goog-generation"),
             "redirect must extract etag from x-goog-generation so it round-trips to ifGenerationMatch",
         );
+        assert_eq!(
+            redirect.response_parsing.etag_strength,
+            EtagStrength::Strong,
+            "a GCS generation promises byte identity and remains cacheable after redirect following",
+        );
         // The HTTP-level ETag is retained for diagnostics under
         // system_metadata, where the non-redirect path also keeps it.
         assert!(
@@ -3355,9 +4018,14 @@ mod tests {
 
     #[test]
     fn test_iam_permissions_path_is_correct_gcs_endpoint() {
-        // Regression pin: GCS uses `testIamPermissions`, not `testPermissions`.
+        // Regression pin: the JSON API *method* is named `testIamPermissions`,
+        // but its REST URL path segment is `iam/testPermissions` (no `Iam`).
+        // The docs page title says testIamPermissions; the request line below
+        // it reads `GET .../b/<bucket>/iam/testPermissions`. The method-name
+        // path 404s — caught only by the live suite, because this very
+        // assertion had frozen the bug.
         // https://cloud.google.com/storage/docs/json_api/v1/buckets/testIamPermissions
-        assert_eq!(TEST_IAM_PERMISSIONS_PATH, "iam/testIamPermissions");
+        assert_eq!(TEST_IAM_PERMISSIONS_PATH, "iam/testPermissions");
         let url = format!(
             "https://storage.googleapis.com/storage/v1/b/{}/{}",
             urlencoding::encode("my-bucket"),
@@ -3365,7 +4033,7 @@ mod tests {
         );
         assert_eq!(
             url,
-            "https://storage.googleapis.com/storage/v1/b/my-bucket/iam/testIamPermissions"
+            "https://storage.googleapis.com/storage/v1/b/my-bucket/iam/testPermissions"
         );
     }
 
@@ -3381,7 +4049,13 @@ mod tests {
     }
 
     fn make_backend(bucket: &str) -> Arc<GcsBackend> {
-        let req = request(bucket);
+        make_backend_at(bucket, "https://storage.googleapis.com")
+    }
+
+    fn make_backend_at(bucket: &str, endpoint: &str) -> Arc<GcsBackend> {
+        let mut req = request(bucket);
+        req.config
+            .insert("endpoint".into(), ConfigValue::String(endpoint.to_string()));
         let config = GcsConnectionConfig::from_request(&req).unwrap();
         let http = build_http_client().unwrap();
         let auth = Authenticator::new(&req.credentials, http.clone()).unwrap();
@@ -3393,6 +4067,197 @@ mod tests {
             backend_id: BackendId("gcs:test".into()),
             resolved_address: address::parse(addr).unwrap(),
         }
+    }
+
+    async fn spawn_list_responses(
+        bodies: Vec<String>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let recorded_hits = hits.clone();
+        tokio::spawn(async move {
+            let mut responses: VecDeque<String> = bodies.into();
+            while let Some(body) = responses.pop_front() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 8192];
+                let _ = socket.read(&mut request).await;
+                recorded_hits.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        (endpoint, hits)
+    }
+
+    /// The slash-form object fetched by `stat` is tagged `DirectoryMarker`,
+    /// and a directory kind carries no pin even though the object resource
+    /// has a generation.
+    #[tokio::test]
+    async fn stat_directory_marker_override_clears_the_generation_pin() {
+        let marker = serde_json::json!({
+            "bucket": "bkt", "name": "team/", "size": "0", "etag": "m", "generation": "7"
+        })
+        .to_string();
+        let (endpoint, _hits) = spawn_list_responses(vec![marker]).await;
+        let backend = make_backend_at("bkt", &endpoint);
+        let info = backend
+            .stat(make_target("gs://bkt/team/"), StatOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(info.kind, ObjectKind::DirectoryMarker);
+        assert_eq!(info.version.as_deref(), Some("7"));
+        assert_eq!(info.versioned_address, None);
+    }
+
+    #[tokio::test]
+    async fn list_stream_matches_buffered_fold_and_fetches_pages_on_demand() {
+        use std::sync::atomic::Ordering;
+
+        let first_page = serde_json::json!({
+            "items": [
+                {"bucket": "bkt", "name": "team/", "size": "0", "etag": "m"},
+                {"bucket": "bkt", "name": "team/file.txt", "size": "5", "etag": "f"}
+            ],
+            "prefixes": ["docs/"],
+            "nextPageToken": "NEXT"
+        })
+        .to_string();
+        let second_page = serde_json::json!({
+            "items": [
+                {"bucket": "bkt", "name": "z.txt", "size": "1", "etag": "z"}
+            ]
+        })
+        .to_string();
+        let (endpoint, hits) = spawn_list_responses(vec![
+            first_page.clone(),
+            second_page.clone(),
+            first_page,
+            second_page,
+        ])
+        .await;
+        let backend = make_backend_at("bkt", &endpoint);
+        let prefix = address::parse("gs://bkt/").unwrap();
+
+        let buffered = backend
+            .list(make_target(prefix.as_str()), ListOptions::default(), None)
+            .await
+            .unwrap();
+        let buffered = fold_markers_and_infer_subdir_kinds(&prefix, buffered, false, false);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        let stream = backend
+            .list_stream(make_target(prefix.as_str()), ListOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "opening the stream must not fetch its first page"
+        );
+        let mut stream = Box::pin(IncrementalListFold::new(stream, &prefix, false, false));
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.address.as_str(), "gs://bkt/team/");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        let mut streamed = vec![first];
+        while let Some(item) = stream.next().await {
+            streamed.push(item.unwrap());
+        }
+        assert_eq!(streamed, buffered);
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn list_stream_deduplicates_marker_and_common_prefix_across_page_boundary() {
+        use std::sync::atomic::Ordering;
+
+        let marker_page = serde_json::json!({
+            "items": [
+                {"bucket": "bkt", "name": "docs/", "size": "0", "etag": "marker"}
+            ],
+            "nextPageToken": "NEXT"
+        })
+        .to_string();
+        let prefix_page = serde_json::json!({
+            "items": [
+                {"bucket": "bkt", "name": "z.txt", "size": "1", "etag": "z"}
+            ],
+            "prefixes": ["docs/"]
+        })
+        .to_string();
+        let (endpoint, hits) = spawn_list_responses(vec![marker_page, prefix_page]).await;
+        let backend = make_backend_at("bkt", &endpoint);
+
+        let streamed = backend
+            .list_stream(make_target("gs://bkt/"), ListOptions::default(), None)
+            .await
+            .expect("open list stream")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("drain list stream");
+
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            streamed
+                .iter()
+                .filter(|item| item.address.as_str() == "gs://bkt/docs/")
+                .count(),
+            1,
+            "the concrete marker must suppress the matching next-page prefix"
+        );
+        assert_eq!(streamed[0].kind, ObjectKind::DirectoryMarker);
+        assert_eq!(streamed[1].address.as_str(), "gs://bkt/z.txt");
+    }
+
+    #[tokio::test]
+    async fn list_stream_cancellation_while_draining_final_page_is_terminal() {
+        use std::sync::atomic::Ordering;
+
+        let page = serde_json::json!({
+            "items": [
+                {"bucket": "bkt", "name": "one.txt", "size": "1", "etag": "one"},
+                {"bucket": "bkt", "name": "two.txt", "size": "1", "etag": "two"}
+            ]
+        })
+        .to_string();
+        let (endpoint, hits) = spawn_list_responses(vec![page]).await;
+        let backend = make_backend_at("bkt", &endpoint);
+        let cancel = CancellationToken::new();
+        let mut stream = backend
+            .list_stream(
+                make_target("gs://bkt/"),
+                ListOptions::default(),
+                Some(cancel.clone()),
+            )
+            .await
+            .expect("open list stream");
+
+        let first = stream
+            .next()
+            .await
+            .expect("first item")
+            .expect("first item succeeds");
+        assert_eq!(first.address.as_str(), "gs://bkt/one.txt");
+        cancel.cancel();
+        let error = stream
+            .next()
+            .await
+            .expect("terminal cancellation")
+            .expect_err("cancelled stream must not drain the fetched page");
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert!(stream.next().await.is_none());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     fn write_redirect_batch_with(
@@ -3514,9 +4379,11 @@ mod tests {
     /// What *does* get through is substitution **plus modification**: rewriting
     /// `target_address` to the authorized address, which
     /// `continue_write_cannot_detect_a_fully_rewritten_continuation` pins. The
-    /// two tests together state the boundary exactly — this plugin stops the
-    /// unforgeable-substitution case and not the forged one, because nothing in
-    /// the SPI makes the blob tamper-evident.
+    /// two tests together state the plugin boundary exactly — this plugin stops
+    /// the unforgeable-substitution case and not the forged one, because the
+    /// SPI does not make the blob tamper-evident. The broker's client-driven
+    /// route adds an address-bound HMAC seal and refuses the forged case before
+    /// this plugin runs.
     #[tokio::test]
     async fn continue_write_refuses_a_genuine_unmodified_continuation_for_another_object() {
         let backend = make_backend("asset-bucket");
@@ -3554,7 +4421,10 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
     }
 
-    /// Characterization, not a guarantee: the case this plugin cannot close.
+    /// Plugin-level characterization, not a broker-route guarantee: the case
+    /// this plugin cannot close when called directly or through an unsealed
+    /// host. The broker's client-driven route rejects the rewritten
+    /// continuation at its boundary before dispatch.
     ///
     /// A caller holding a genuine resumable session for `other.txt` presents it
     /// against the authorized address `file.txt`, having rewritten the recorded

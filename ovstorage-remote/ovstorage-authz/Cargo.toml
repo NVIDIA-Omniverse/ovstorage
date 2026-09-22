@@ -13,6 +13,7 @@ ovstorage = { workspace = true }
 ovstorage-plugin = { workspace = true }
 ovstorage-authz-context = { workspace = true }
 async-trait = "0.1.83"
+futures = "0.3.32"
 tracing = "0.1.44"
 
 [dev-dependencies]

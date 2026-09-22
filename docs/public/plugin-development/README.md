@@ -49,7 +49,7 @@ compiles `auth_credential.c`, `plugin_values.c`, `plat.c`, and `utf8.c` from the
 shipped source distribution into its own cdylib, so
 `ovstorage_plugin_auth_credential_decode` and `_free` bind within the plugin.
 Rust plugins receive the same helper implementation by linking the
-`ovstorage-plugin` crate. ABI-v15 exact matching keeps the helper's wire and
+`ovstorage-plugin` crate. Exact Layer ABI matching keeps the helper's wire and
 value layouts aligned with the loading host.
 
 ## Layer shape — vtables, manifest, init
@@ -81,11 +81,17 @@ contract between a host process and a loaded Layer plugin.
   `check_access`, plus local management surfaces for connections,
   aliases, visibility, and authentication. The Rust type vocabulary
   they speak in is documented under § Type vocabulary below.
-- **Host responsibilities** live in the library or broker: route
-  resolution, alias expansion, cache lookup and herd collapse, cache
-  commit / eviction, redirect execution, retry and backoff policy,
-  secret persistence, broker authorization, observability, and
-  conversion between plugin-facing values and public API shapes.
+- **Host responsibilities** live in the library or broker, and a
+  backend plugin does not implement them: route resolution, alias
+  expansion, cache lookup and herd collapse, cache commit / eviction,
+  local materialization of a remote object, redirect execution,
+  retry and backoff policy, `copy` / `rename` fallback composed from
+  read plus write plus delete, secret persistence, broker
+  authorization, observability, and conversion between plugin-facing
+  values and public API shapes. Each of those is a row in
+  [plugin-storage § Layer ownership registry](../plugin-storage/OWNERSHIP.md),
+  which names the owning wrapper Layer and the slots a backend leaves
+  at the `Layer` trait default.
 - **`Layer` methods** are what plugins implement. The Rust trait is
   `#[async_trait]`; object and connection operations receive a typed
   `Request<T>` plus `cancel: Option<CancellationToken>`. Synchronous
@@ -103,9 +109,11 @@ be choosing which object a `delete_directory` destroys. Use
 `address::directory_key` on the decoded key; a backend that lists on the
 key verbatim returns the contents of `docsx` for a listing of `docs`,
 which is a disclosure and cannot be undone. Public `stat` is input-guided, but the host may answer an
-unversioned exact-object `stat` from a cached or freshly fetched
-one-level parent `Layer::list` entry when the route supports
-one-level list and sets `wants_list_backed_stat`. If that
+unversioned exact-object `stat` with both cost flags clear from a
+cached or freshly fetched one-level parent `Layer::list` entry when
+the route supports one-level list and sets `wants_list_backed_stat`
+(a `stat` with a cost flag set is answered only from a cached listing
+whose recorded flags cover it). If that
 list-backed path is unavailable or does not contain the object,
 `stat("foo")` dispatches `Layer::stat` for exact `foo`, and only
 if that returns `NotFound` does the host issue `Layer::stat` for
@@ -151,7 +159,9 @@ pub struct ObjectInfo {
     pub address:               Url,
     pub kind:                  ObjectKind,
     pub etag:                  Option<String>,
+    pub etag_strength:         EtagStrength,
     pub version:               Option<String>,
+    pub versioned_address:     Option<Url>,                // this version's pin; None when unversioned or not asked
     pub size:                  Option<u64>,                // None for directories
     pub mtime:                 Option<SystemTime>,         // None for DirectoryInferred
     pub checksums:             ChecksumSet,
@@ -159,6 +169,12 @@ pub struct ObjectInfo {
     pub system_metadata:       Option<SystemMetadata>,
     pub user_metadata:         Option<UserMetadata>,
     pub modified_by:           Option<String>,
+}
+
+pub enum EtagStrength {
+    Unspecified,         // undeclared zero value; consumers treat as Weak
+    Strong,              // equal tokens promise byte-identical content
+    Weak,                // valid precondition, not proof of byte identity
 }
 
 pub enum ObjectKind {
@@ -259,7 +275,12 @@ Ownership and invariants:
   for that address.
   `ObjectInfo.system_metadata` is backend-owned and read-only;
   `ObjectInfo.user_metadata` is caller-owned and mutable only
-  through `write` and `update_metadata`.
+  through `write` and `update_metadata`. Every backend that stores
+  user metadata accepts a key matching `[a-z_][a-z0-9_]*`, wider
+  names are backend-specific,
+  and the `ovstorage_` prefix inside that subset is reserved for
+  host-attested keys — see
+  [User-metadata keys](../plugin-storage/CONFORMANCE.md#user-metadata-keys).
 - `ObjectInfo.kind` discriminates files from directories. The three
   directory variants encode persistence and post-delete behavior:
   `Directory` is a native directory inode (persists independently of
@@ -293,7 +314,8 @@ The full vocabulary:
 
 ```text
 pub struct StatOptions {
-    pub full_metadata: bool,
+    pub full_metadata:     bool,
+    pub versioned_address: bool,                            // cost knob: return the pinned address even if it costs a lookup
 }
 
 pub struct ReadOptions {
@@ -333,6 +355,7 @@ pub struct ListOptions {
     pub max_results:   Option<u32>,
     pub page_token:    Option<String>,
     pub full_metadata: bool,
+    pub versioned_address: bool,                        // cost knob: return the pinned address even if it costs a lookup
 }
 
 pub struct ListVersionsOptions {
@@ -367,14 +390,14 @@ different directory-rollup events when recursion is enabled.
 
 | Field | Op | Plugin contract |
 |---|---|---|
-| `if_match` | read / delete / update_metadata | If `Some(etag)`, only operate on bytes that match the caller's opaque etag token for that same address. The etag is opaque to the Layer — its internal structure is the plugin's choice. The `file` plugin synthesizes `"size:N,mtime:Tms"`; cloud plugins use the backend-supplied ETag or equivalent validator; the Omniverse Storage Service uses `ResourceIdentity.encoded_identity`. Version IDs/generations stay in `ObjectInfo.version` and version-pinned addresses, not in precondition fields. For reads, prefer a server-side precondition (HTTP `If-Match`, an etag-keyed/identity-keyed read RPC); when the wire doesn't carry one, fetch metadata and compare client-side. |
+| `if_match` | read / delete / update_metadata | If `Some(etag)`, only operate on bytes that match the caller's opaque etag token for that same address. The token is opaque to the Layer; `ObjectInfo.etag_strength` separately declares whether equality proves byte identity. The `file` plugin synthesizes `"size:N,mtime:T"` and declares it `Weak`; cloud plugins use the backend-supplied ETag or equivalent validator; the Omniverse Storage Service uses `ResourceIdentity.encoded_identity`. Producers of HTTP-derived etags use `normalize_wire_etag` to remove quotes and `W/` from the token. An explicit `W/` declares `Weak`; only a nonempty, syntactically valid quoted entity-tag declares `Strong`; and a bare or malformed unmarked value declares `Unspecified`. Consumers treat `Unspecified` as `Weak` for trust decisions. Version IDs/generations stay in `ObjectInfo.version` and version-pinned addresses, not in precondition fields. For reads, prefer a server-side precondition when the wire can enforce that validator; otherwise fetch metadata and compare normalized tokens client-side. The byte cache keys content only on `Strong`. |
 | `if_source` | copy / rename | If `Some(etag)`, only copy or rename source bytes matching the caller's opaque etag token for that same source address. Maps to backend source-side conditional headers or identity slots (S3 `x-amz-copy-source-if-match`, Azure `x-ms-source-if-match`, GCS `ifSourceGenerationMatch`, Storage API `source_resource_identity`). |
 | `if_dest` | write / copy / rename | `IfDestExists::Overwrite` replaces any existing destination. `IfDestExists::Fail` refuses when the destination exists; plugins that advertise `Capabilities.supports_no_overwrite_write = true` MUST honor this with `AlreadyExists`, others MUST return `Unsupported`. `IfDestExists::MatchEtag(etag)` refuses unless the destination's current etag matches; plugins that advertise `Capabilities.supports_if_match_write = true` MUST honor this, others MUST return `Unsupported`. The host does not pre-check. |
 | `range` (read) | read | Plugin MUST apply the range. For `ReadResult::Stream` and `ReadResult::Bytes`, slice the bytes the plugin is producing. For `ReadResult::Redirect`, the host injects `Range:` headers on the redirect request before following — plugins return the redirect unchanged. For `ReadResult::LocalDelegate`, the host handles the slice. |
 | `max_bytes` (read) | read | Host-side cap on buffered read size. Plugins MAY ignore it; the host applies it to the returned stream/bytes. |
 | `size_hint` (write) | write | Hint for routing decisions (e.g., inline vs. multipart). Not a contract; backends may treat it as advisory. |
-| `user_metadata` (write / update_metadata) | mutating | Plugin MUST persist if its backend supports user metadata, and MUST reject a non-empty map with `Unsupported` when its backend cannot store one — never report success having dropped it, or a caller's `--metadata foo=bar` disappears without notice. Where support is a per-connection property (the OpenDAL adapter's driver capability), decide per call rather than per plugin. If your backend records metadata out of band, after the object commits, that is a second durability stage and CONFORMANCE's *Publish-before-durable* → *Multi-stage durability* governs it: surface a failure of that stage even though the bytes have landed, so the caller knows to re-issue the patch. The built-in `file` backend surfaces such a failure from its user-metadata sidecar; the Omniverse storage service client discards them, and its page records that deviation. See CONFORMANCE, `write, write_stream, write_redirect, continue_write` → *Edge cases*, and *Publish-before-durable*. |
-| `message` (write / copy / rename / update_metadata) | mutating | Plugin SHOULD attach as a per-operation annotation if the backend supports one (e.g., a version commit message); drop silently otherwise. |
+| `user_metadata` (write / update_metadata) | mutating | Plugin MUST persist if its backend supports user metadata, and MUST reject a non-empty map with `Unsupported` when its backend cannot store one — never report success having dropped it, or a caller's `--metadata foo=bar` disappears without notice. Where support is a per-connection property (the OpenDAL adapter's driver capability), decide per call rather than per plugin. If your backend records metadata out of band, after the object commits, that is a second durability stage and CONFORMANCE's *Publish-before-durable* → *Multi-stage durability* governs it: surface a failure of that stage even though the bytes have landed, so the caller knows to re-issue the patch. The Omniverse storage service client is the in-tree backend with such a second stage: it commits the object, then stashes the caller's keys through its metadata service, and surfaces a caller key that does not land as `PartialCompletion` — while discarding a failure confined to the host's reserved keys, a deviation its page records. The built-in `file` backend is an example of the other branch: it stores no user metadata and refuses a non-empty map with `Unsupported`. See CONFORMANCE, `write, write_stream, write_redirect, continue_write` → *Edge cases*, and *Publish-before-durable*. |
+| `message` (write / copy / rename / update_metadata) | mutating | Plugin SHOULD attach as a per-operation annotation if the backend supports one (e.g., a version commit message); otherwise store it as user metadata under the shared `MESSAGE_METADATA_KEY` (`x_ov_message`), or discard it explicitly with a code comment — see CONFORMANCE, *What about `opts.message`?*. |
 
 Silently ignoring any of the MUST fields is a bug — a caller's
 `if_match` precondition that the plugin ignores will let stale reads
@@ -423,12 +446,21 @@ contract does not expose a recursive subtree-delete.
 Version selection lives in the `Url`, not in a separate side value
 type. A backend that supports historical reads uses its native address
 syntax (`?versionId=...`, `?generation=...`, Nucleus checkpoint query
-forms, and so on) as the durable pin. `list_versions` and
-`get_latest_version` return `ObjectInfo` values whose
-`ObjectInfo.address` is already pinned to the version being described.
-The dispatcher only projects the route prefix between backend and
-caller namespaces; it does not synthesize or interpret a sidecar
-field.
+forms, and so on) as the pin. `ObjectInfo.versioned_address` carries
+that pin for the version an `ObjectInfo` describes: `list_versions` and
+`get_latest_version` return it equal to `ObjectInfo.address`, which is
+already pinned; `stat` and `list` return it when the backend has the id
+in hand or when the caller sets the `versioned_address` cost flag on
+`StatOptions` / `ListOptions`; a `stat` of an address that already
+carries an immutable pin echoes it; every directory kind, every
+non-versioning backend, and every `write` / `update_metadata` /
+`create_directory` result returns `None`. The dispatcher projects the
+route prefix of `address` and `versioned_address` between backend and
+caller namespaces and does not interpret the pin. A pin is not an
+identity: it is refused as a mutation target
+(`reject_pinned_for_mutation`), grants no capability, and resolves only
+as long as the backend's retention and the stack's alias rules keep it
+addressable.
 
 ### `ChangeKind` and `WatchDirectoryCursor`
 
@@ -452,7 +484,9 @@ pub struct StorageBackendKindDescriptor {
     pub description:            Option<String>,
     pub config_schema:          Vec<ConfigField>,
     pub credential_schema:      Vec<CredentialField>,
-    pub capabilities:           Capabilities,
+    /// Named credential entry-points referencing `credential_schema` keys;
+    /// empty means the host walks every credential field individually.
+    pub credential_methods:     Vec<CredentialMethod>,
     pub icon:                   Option<Vec<u8>>,
     pub supports_runtime_add:   bool,
     pub supports_user_metadata: bool,
@@ -467,6 +501,9 @@ pub struct ConfigField {
     pub help:         Option<String>,
     pub example:      Option<String>,
     pub group:        Option<String>,
+    /// Hidden from interactive flows that only surface common fields; still
+    /// parsed from TOML and honored at runtime.
+    pub advanced:     bool,
 }
 
 pub enum ConfigFieldKind { Url, Text, Integer, Bool, Enum { source: EnumSource }, Path }
@@ -475,17 +512,20 @@ pub enum EnumSource     { Static(Vec<String>), Discovered }
 pub struct CredentialField {
     pub key:          String,
     pub display_name: String,
-    pub kind:         CredentialFieldKind,
-    pub required:     bool,
+    /// Literal text, or a `${NAME}` reference resolved from the process
+    /// environment at TOML-load time.
+    pub default:      Option<String>,
     pub help:         Option<String>,
+    /// Hidden from flows that only surface common fields.
+    pub advanced:     bool,
 }
 
-pub enum CredentialFieldKind {
-    Secret,
-    OAuthFlow { provider: String },
-    FileUpload,
-    MtlsCertPair,
-    SystemIdentity,
+pub struct CredentialMethod {
+    pub key:          String,
+    pub display_name: String,
+    pub fields:       Vec<String>,
+    pub help:         Option<String>,
+    pub advanced:     bool,
 }
 
 pub enum ConfigValue {
@@ -526,6 +566,7 @@ pub struct Connection {
     pub auth_state:        ConnectionAuthState,
     pub last_probed:       Option<SystemTime>,
     pub user_metadata:     UserMetadata,
+    pub owning_target:     Option<String>,
 }
 
 pub enum ConnectionSource {
@@ -665,7 +706,10 @@ broker client for its direct-endpoint addresses — anything that is not
 `npipe:/…` —
 which have no OAuth surface and take whatever credential bring-up resolved. A
 layer with no connection-auth driver at all — `file`, `http` — answers it from
-the `Layer` leaf default, which is the same code.
+the `Layer` leaf default, which is the same code. `huggingface` sits between
+the two: its driver's `interactive` answers `Unsupported`, but the layer keeps
+the leaf default for `authenticate_connection` — the simpler honest spelling
+of the same answer.
 
 Answer this column **before** any capability check. Whether a backend has an
 interactive flow is a property of the backend, not of what the host can drive,
@@ -761,6 +805,14 @@ was promised and the numbers an operator reads both stop being true. Keeping it
 in one place is what makes a total bound expressible at all, and it is why
 policy retry is a composed Layer rather than something each plugin implements.
 
+`RetryWrapper::list_stream` has two delivery-safe retry phases under that one
+policy owner: opening the stream, then establishing its first item when the
+consumer polls. Each phase receives the configured `max_attempts`; the stream
+opened by the first phase counts as the first attempt of the second, so the
+combined bound is `2 * max_attempts - 1` inner opens. No retry occurs after the
+first item is delivered. Size `max_attempts` for that combined bound when a
+backend defers its first page request until polling.
+
 Two other kinds of re-attempt are not that, and are not forbidden by it. A
 protocol may require an indivisible internal retry for one operation to complete
 safely, as above. And the plugin SDK's `ConnectionSet::with_recovery` runs a
@@ -812,6 +864,211 @@ return any `ErrorCode` value that preserves recovery semantics. The
 host's lifecycle layer (auth refresh, re-instantiate-on-`IncompatibleType`,
 retry on `Transient`) reads the code and reacts; the message field
 carries human context.
+
+## Addressing a connection: finding the layer that owns it
+
+A `ConnectionKey` is `(target, id)`, where `target` is a **graph-unique layer
+instance name**. A `Connection` reports both halves: `owning_target` is the
+target a connection op must address to reach `id`. So a caller holding a
+connection — a listing, a snapshot from `list_connections`, a route conflict —
+can address it directly, without recovering the owner first.
+
+**Who fills it.** The layer that owns the connection sets it, at the moment it
+builds the row. That is the only party with the answer rather than an inference,
+and stamping it at construction is what carries it through everything downstream:
+a `ConnectionSet` clones the stored row, so the snapshot and every
+`ConnectionChange` frame inherit it for free.
+
+Two host-side tiers sit under that, and neither overwrites a value a layer
+reported:
+
+- **A loaded plugin's rows** are filled by the host from the plugin's sole
+  `owned_targets` entry, where it declares exactly one.
+- **A `Router`'s fan-out** fills from the child that produced the row, again
+  only where that child owns a single target. The Router is the one place that
+  both knows which child answered and holds the `target -> child` table the
+  answer has to agree with.
+
+**`None` means the row could not be attributed here — never that it has no
+owner.** Stated as a rule rather than a list of shapes, because the list goes
+stale every time a mechanism is added: **the host attributes a row only for a
+layer declaring exactly one owned target, and the Router replaces or clears a
+name it routes to a different child.** A row is `None` wherever neither the
+layer nor those two tiers produced a name — which today covers a composite that
+declined to attribute its own rows, a layer declaring *zero* owned targets, a
+native leaf outside a Router that simply does not stamp, and a misreport the
+Router could not correct.
+
+**Attribute your own rows, and do not rely on the host fill to do it for you.**
+The fill is keyed on `owned_targets()` reporting exactly one entry, and that is
+a narrower question than "can this layer be addressed". If your `owned_targets`
+is gated on anything else — the in-tree broker-client and services-client layers
+return empty unless `supports_runtime_add` is set, while still answering
+`remove_connection` and `authenticate_connection` keyed on their own name — then
+the host has nothing to fill from and your rows arrive unattributed unless you
+stamp them.
+
+**What to put in it: the name a connection op must address to reach this row.**
+That is the field's definition, and it is what your `remove_connection`,
+`update_connection_credentials` and `authenticate_connection` slots gate on.
+Usually it is one of your `owned_targets()` entries; where those two answer
+different questions, as above, the addressable name is the correct one. A
+composite sets the internal child's name, never its outer host name.
+
+**A wrong answer is caught only where the graph can see it is wrong.** A name
+this Router routes to a *different* child is replaced with the one that reaches
+you — which it can do only where you declare **exactly one** owned target, since
+that is the one case with a knowable substitute. Declare any other number,
+several *or none*, and the row is cleared instead. Either way a `warn` goes to
+`ovstorage.router` and the row shows a corrected target or an empty column
+rather than reaching your slot.
+
+A name this Router does not route at all is passed through untouched, because
+`owned_targets` may legitimately be narrower than what you answer for. **Under a
+Router that name is still unaddressable, and the refusal is the Router's rather
+than yours:** every connection op routes by `route_target` first, and that table
+is built only from `owned_targets`, so a key naming a target outside it is
+answered `target layer not found` before your slot is called. The diagnosis is
+graph-level, not local. Through a plain wrapper chain — no Router between the
+caller and you — the lifecycle ops forward down the chain and your slot does see
+the key, which is where a stamped name outside `owned_targets` earns its
+keep.
+
+**Do not recover a target from a proxy.** Each of the obvious ones is lossy in a
+different direction, and each has produced a wrong answer in practice:
+
+- **`display_name`** is free-form, may be absent, and a backend may default one
+  the caller never supplied. Comparing against it fails for the ordinary
+  unnamed case and matches synthesized names it should not.
+- **`backend_kind`** is a kind, not an instance. A graph with two layers of one
+  kind — a router over two HTTP tenants — has no answer, so any resolution
+  built on it is not merely imprecise, it is unreachable on the graphs that
+  matter most.
+
+### Recovering a target for an unattributed row
+
+Where `owning_target` is `None`, the two mechanisms below recover it, chosen by
+what the caller actually holds. Both are the fallback for that one shape, and
+the rules that make the second of them safe are scoped to it.
+
+**1. Address in hand — derive it.** When the caller has the address the
+operation is about (repairing a route conflict, acting on a prefix an operator
+typed), ask the graph:
+
+- [`Layer::root_info_for(url)`] gives the serving `RootInfo`, whose
+  `connection_id` is the connection. **Guard the answer with node equality**
+  (`address::same_node(&root.root, url)`): lookup is longest-prefix, so a
+  broader root that merely *contains* the address comes back as a hit, and it
+  belongs to a different connection. Acting on it would mutate a tenant that
+  was working.
+- **`RootInfo::owning_target` gives the target — the same answer, not a second
+  one.** The id and the layer holding it are two facts about one route, so
+  reading both from the `RootInfo` above is what keeps them consistent: a live
+  route change cannot race two lookups into pairing one backend's id with
+  another backend's target.
+- [`Layer::owning_target_for(url)`] is the **fallback**, for a backend that
+  reports a connection but publishes no `owning_target` on its roots. Do not
+  prefer it. It is not the same as `RootInfo::layer_kind`, and where it bottoms
+  out in the `Layer` default it applies a leaf rule — `leaf_owning_target`: the
+  sole `owned_targets` entry, else `name()` — so a loaded **composite** backend
+  reporting several owned targets answers with its outer host-layer name, which
+  no `route_target` can find. A key built on that fails `NotFound` against a
+  graph that holds the connection. This is why connection attribution uses
+  `sole_owning_target` instead, which declines rather than guessing: a
+  `RootInfo` carries the address it is about and a caller has this fallback, and
+  a connection parked in `AwaitingAuth` has neither.
+
+This resolves for a connection in **any** auth state, but only where the layer
+publishes roots unconditionally. Where it does not, use the second mechanism.
+
+**2. Id in hand — discover it, by attempting the operation.** When the caller
+has only the id — removing a connection, re-driving authentication — there may
+be no address to derive from, because a parked or refused connection may publish
+no root. Enumerate [`Layer::owned_targets()`], attempt the real operation against
+each candidate `ConnectionKey`, and treat `ErrorCode::NotFound` as "not mine, try
+the next".
+
+**Prefer mechanism 1 wherever it applies, and treat this as the last resort it
+is.** Every rule below exists because this probes for ownership by side effect
+rather than reading it: the operation is what asks the question, so a layer that
+starts work before checking whether it holds the key has already acted on
+somebody else's connection, and no answer the scan gets afterwards can take that
+back.
+
+**The scan is sound only while the id names one connection in the graph, and
+that is not guaranteed.** A connection id is unique only *within* its owning
+target — that is the contract, and it is what makes `(target, id)` the identity
+rather than `id` alone. Most backends mint ids through
+`ovstorage_plugin::routing::fresh_id`, which stamps a process-global counter and
+so collides with nothing; but a layer may take a caller-supplied id instead, and
+the in-tree alias layer does exactly that, so two layers can genuinely both hold
+`rule`. A scan across such a pair would act on whichever `owned_targets()`
+yielded first, which is not the connection the caller resolved.
+
+So a caller must check before scanning: **count how many connections in the
+listing carry the id — every one of them, attributed or not — and scan only if
+the answer is one.** Where it is not, the exact derivation above is the only
+permissible answer, and where that is also unavailable the honest outcome is to
+tell the operator the id cannot be told apart — not to remove or re-authenticate
+a namesake.
+
+**An attributed namesake does not drop out of that count**, and the reason is
+that the scan enumerates *targets*, not rows. It walks
+[`Layer::owned_targets()`] and attempts the operation against each, so the field
+telling two rows apart does not take either one's target off that list.
+
+The count is therefore **deliberately conservative**: it refuses on some graphs
+where a scan would have been harmless, because deciding otherwise means knowing
+which namesakes the scan will actually reach, and a caller holding a listing
+does not know that. Excluding an attributed namesake would leave a graph holding
+an attributed, live `http_b/rule` alongside an unattributed composite row also
+answering to `rule` — the count comes back one, the scan runs, reaches `http_b`,
+and drives an interactive sign-in against a tenant nobody addressed. The
+opposite case exists too and is why the rule is stated as conservatism rather
+than as a fact about targets: a layer that stamps its own rows while declaring
+*no* owned targets is not on the scan's path at all, so counting it costs a
+refusal that was not needed. Erring that way is the cheap direction.
+
+Three rules keep the scan honest:
+
+- **`NotFound` advances it.** That is the answer this contract asks for, and the
+  one a scan can act on.
+- **Only a `NotFound` raised *before* the operation began.** For a streaming
+  operation like `authenticate_connection`, a `NotFound` from a flow already in
+  progress means something else entirely; retrying that against a sibling would
+  drive a second flow over a failure that had nothing to do with ownership.
+- **`Unsupported` advances it too, but is remembered.** It is not evidence
+  either way: the `Layer` default for an unimplemented slot answers it *without
+  reading the key*, so a layer that has no interactive flow at all says the same
+  thing for a connection it has never seen as for one it holds. A scan that took
+  it as final would stop at whichever such layer came first and report "this
+  backend has no interactive flow" about a backend it never asked. So keep it as
+  the fallback answer, let a later candidate that genuinely owns the connection
+  win, and return the remembered one only if none does.
+- **Every other error ends the scan.** A layer that fails with some other code
+  got far enough to fail meaningfully, and continuing past it would bury a real
+  diagnosis under a final `NotFound`.
+
+What this means for a plugin: **answer `NotFound` for a `ConnectionKey` you do
+not hold, and answer it before doing anything else.** A layer that instead
+starts work degrades every connection in the graph, not only its own — a scan
+cannot undo a flow it should never have driven. Answering a *different* code is
+survivable for `Unsupported`, because the host treats that as inconclusive for
+the reason above, but nothing else is: the scan stops there.
+
+**Nothing enforces that**, so the reach of the obligation is what limits the
+damage. The host cannot check it — the whole point of the `Unsupported` rule is
+that a layer may answer without reading the key, so "did you look first?" is not
+observable from outside — and a layer that gets it wrong passes its own tests,
+because in isolation there is no sibling to damage. **Reporting `owning_target`
+is what keeps a scan from being aimed at you in the first place**, and it is the
+better half of the answer for a plugin author: attribute your own rows, and a
+caller addresses you directly instead of asking every layer in turn. Where you
+cannot — and a composite that genuinely cannot attribute a row is the case —
+implement `remove_connection`, `authenticate_connection` or any other keyed
+connection verb with a test that asserts `NotFound` for an id you never
+registered, on a fresh instance that has done no work. That is the only place
+this obligation is checkable.
 
 ## URL canonicalization
 
@@ -1073,6 +1330,7 @@ pub struct HttpRequest {
 
 pub struct ResponseParsing {
     pub etag_header:               Option<String>,      // default "etag"
+    pub etag_strength:             EtagStrength,        // declaration for a custom etag_header; default Unspecified
     pub version_header:            Option<String>,      // e.g. "x-amz-version-id", "x-ms-version-id", "x-goog-generation"
     pub size_header:               Option<String>,      // default "content-length"
     pub mtime_header:              Option<String>,      // default "last-modified"
@@ -1135,6 +1393,21 @@ pub struct RedirectResultBatch {
 }
 ```
 
+When `etag_header` names the standard HTTP `ETag` header, the follower derives
+strength from the wire entity-tag and ignores `etag_strength`: a valid
+nonempty quoted value is `Strong`, an explicit `W/` value is `Weak`, and a bare
+or malformed unmarked value is `Unspecified`. For any other header, the value
+stays opaque and the plugin must set `etag_strength`
+from the backend's actual equality promise. The follower carries a custom
+header value verbatim, including surrounding quotes or a literal `W/` prefix;
+it does not apply HTTP entity-tag normalization to that value. Leave its
+strength `Unspecified` when the backend's promise is unknown. For example, GCS
+declares its numeric `x-goog-generation` header `Strong`.
+Mid-stream resume uses any nonempty projected validator and requires the
+resumed response to repeat the configured header value. `etag_strength` does
+not gate this textual resume check. A standard HTTP `ETag`, when present, is
+captured independently and sent as the resume request's `If-Match`.
+
 A simple S3 PUT collapses into two Layer calls: `write` returns
 `Redirects { state, [put_request] }`, the host runs the request,
 calls `continue_write(state, [response])`, and the plugin returns
@@ -1181,31 +1454,40 @@ others. Keep the staged shape wherever you have a choice, and where you do not,
 say so in the plugin's own documentation rather than leaving a reader to assume
 the guarantee holds.
 
-**Everything `continue_write` receives except the address is reported by the
-caller, not observed by you** — the results, the redirect batch echoed with
-them, and the continuation blob inside it. That caller is a redirect follower
-inside a host stack on one route, and a remote client on the other; the broker
-has both, because its own `write` path follows redirects in process. Check the
+**At the Layer boundary, everything `continue_write` receives except the
+address is reported input, not an observation you made** — the results, the
+redirect batch echoed with them, and the continuation blob inside it. The
+reporter is a redirect follower inside a host stack on one route and a remote
+client on the other; the broker has both, because its own `write` path follows
+redirects in process. Check the
 cardinality yourself, because no follower route checks it, and expect any status
 to arrive: only the broker's `continue_write` RPC refuses one outside 200..300,
-and its cardinality check compares two counts the same caller supplied. Nothing
-else is validated, and no signature binds the continuation to the operation you
-issued it for.
+and its cardinality check compares two counts the same caller supplied. On a
+follower route, no signature binds the continuation to the operation you issued
+it for. The broker's client-driven RPC is the exception: it verifies an
+HMAC-SHA256 envelope binding the continuation bytes to the request address and
+strips the envelope before Stack dispatch. That host-boundary seal does not
+cover redirect results, prevent same-address replay, bind a principal, or
+extend to follower routes and non-broker hosts; the Layer SPI itself still
+provides no continuation integrity.
 
 The address is the only authenticated part of the call, because authorization is
 decided on it. **Derive the object you act on from the address** rather than
 taking it from the continuation. Where the provider's handle makes that
 impossible, keep whatever comparison you have but say in the code that it is
-defence in depth rather than presenting it as the control — on the broker's
-client-driven route both sides of a comparison come from the same caller.
-Acting on whatever object the blob names lets the caller pick its own
-authorization. Values the address cannot supply — a
+defence in depth rather than presenting it as the control. The broker seal
+protects its client-driven route, but a direct SPI caller or another host can
+still supply both sides of a comparison. Acting on whatever object the blob
+names lets an unsealed caller pick its own authorization. Values the address
+cannot supply — a
 server-issued session handle, the preconditions of the original write — have to
-travel in the blob, so treat those as caller-chosen rather than as facts.
-Beyond that, none of these values may be evidence about connection auth state,
-credential validity, quota, principal identity, or metrics. The full rule is
-*Everything `continue_write` receives except the address is caller-supplied
-input* in [CONFORMANCE.md](../plugin-storage/CONFORMANCE.md).
+travel in the blob. The broker seal authenticates them as part of the batch it
+issued for that address, but on an unsealed route they remain caller-chosen
+rather than facts. Beyond that, none of these values may be evidence about
+connection auth state, credential validity, quota, principal identity, or
+metrics. The full rule is *At the Layer boundary, treat everything
+`continue_write` receives except the address as reported input* in
+[CONFORMANCE.md](../plugin-storage/CONFORMANCE.md).
 
 Reads stay one Layer call. `read` returns `ReadResult` directly; the
 host inspects the variant and acts. There is no `continue_read`.
@@ -1246,14 +1528,36 @@ each other's events — MUST self-coalesce via the SDK `WatchCoalescer` and pass
 the `watch-concurrent-cross-prefix-no-split` conformance scenario. The
 coalescer collapses live subscriptions sharing one connection onto a single
 recursive, metadata-inclusive physical watch and filters each subscriber. It is
-principal-blind: subscriptions key only on the connection/prefix, never on the
-principal, and it enforces no per-principal watcher limit (a per-principal limit,
-if any, belongs at a central chokepoint, not in each backend's coalescer). A
-call with a `since` cursor requests replay: a resumable backend may
+principal-blind: it never interprets a principal itself, and it does not enforce
+admission quotas. An adopter whose physical watch is authorized only when it is
+opened and cannot reauthorize during its lifetime MUST fence coalescing keys at
+credential-identity changes. The broker-client does this by cancelling and
+replacing its per-connection registry when that generation changes and by
+keying within the generation by resolved prefix. S3 instead reauthorizes each
+receive request from its shared live credential cell, so its coalescing key may
+remain stable across in-place credential rotation. GCS authenticates each pull
+or acknowledgement through its immutable connection authenticator; an identity
+change requires removing and re-adding the connection, which drops that
+connection's coalescer. Neither provider leaves an authorize-once physical
+watch alive across an identity change.
+The broker daemon supplies that central chokepoint with its broker-native
+`watch_limit` Layer, enforcing
+per-principal and process-total limits across all of its connections and
+backends. (The REST gateway's embedded Stack is outside that broker-only
+chokepoint.) A call with a `since` cursor requests replay: a resumable backend may
 serve it from a dedicated seek reader with real replay, while a non-resumable
 competing-consumer backend coalesces onto the live stream and prepends a single
 initial `Lapsed`. Either way a `since` subscription never attaches behind an
 existing live consumer that could truncate its replay.
+
+The broker-client also adopts `WatchCoalescer` as a transport adapter: each
+broker connection coalesces non-resumable subscriptions with the same resolved
+prefix onto one recursive, metadata-inclusive gRPC watch and filters that
+superset for each logical subscriber. A `since` cursor on this non-resumable
+path produces the coalescer's initial `Lapsed`. If the selected broker root
+advertises `watch_directory_resumable = true`, the client bypasses coalescing
+and opens a dedicated gRPC stream with the caller's options and cursor
+unchanged.
 
 Cache `watch_invalidation` opens one identity-free logical subscription per
 advertised root because cache invalidation is address-wide, independent of any
@@ -1288,6 +1592,11 @@ equivalent URL parsing.
   version-pinned backend address for that version. The library
   projects only the route prefix; the version pin remains part of the
   address.
+- **`versioned_address`** — on any projected `ObjectInfo`, and on the
+  address-less `update_metadata` / `create_directory` results, the pin
+  is a full backend address and is projected exactly like `address`:
+  route prefix replaced, query preserved. It must lie inside the same
+  resolved scope as `address`.
 - **`watch_directory`** — each `BackendChangeEvent::Object` carries a
   full backend address in the watched resolved prefix and is projected
   the same way as `list`.
@@ -1298,6 +1607,94 @@ backend violated the Layer contract.
 
 `address_roots` and `watch_address_roots` are **not** differential.
 They return absolute addresses, not route-prefix-relative fragments.
+
+### Publishing a scheme fallback root
+
+A connection-owning backend may serve an address on its scheme that no
+connection routes — `s3://bucket/key` with no connection for `bucket` —
+by publishing one extra `RootInfo` per granted scheme: a **scheme
+fallback root**. The route table consults it only after every prefix
+misses, so the root says "an address on this scheme that nothing else
+routes may be attempted here, anonymously". `ovstorage_plugin::fallback`
+carries the contract. Build the root with `scheme_fallback_root` rather
+than by hand, and read the operator's grant with
+`decode_anonymous_fallback` after `split_anonymous_fallback_keys` has
+separated the `anonymous_fallback*` keys from the connection keys your
+factory would otherwise seed a static connection from; refuse a
+connection request that carries one of those keys, because a layer key
+on a connection would be ignored while the operator believed it took
+effect.
+
+The root is recognized by marker **and** shape, and both halves are
+required:
+
+- `user_metadata["org.omniverse.ovstorage/scheme-fallback"]` is
+  `"anonymous"`, matched exactly. An alias presentation patch cannot
+  set or remove this key.
+- The address is the bare scheme, `{scheme}:///` — `s3:///`, `gs:///`,
+  `azure:///` — with path `/` and no query. A scheme the `url` crate
+  refuses to spell hostless (`http`, `https`) uses the reserved
+  placeholder host instead, `https://anonymous-fallback.invalid/`,
+  under a TLD RFC 6761 guarantees never resolves.
+- `visibility: Hidden`, `visible: false`, `connection_id: None`,
+  `owning_target: None`, source `Static { Programmatic }`. The root is
+  a routing fact, not a place a user browses to, and no connection
+  exists for it to name.
+
+A hostless root **without** the marker is not a catch-all. `file:///`
+and `mem:///` are ordinary roots whose prefix relation already answers
+every address under them, and the table treats them as it treats any
+prefix root. A **marked** root that names a bucket (`s3://bucket/`) is
+not a fallback either: it serves its prefix through the first tier and
+the marker on it is inert.
+
+**The two-tier `RouteTable` contract.** `RouteTable::lookup` runs the
+longest-prefix scan first; only on a miss, and only when the address's
+query carries no credential (`generated_rule_may_answer` is the gate: a
+presigned or SAS URL authenticates itself, and an anonymous attempt
+would discard the authority the caller presented), does it return the
+marked root registered for `url.scheme()`. A second-tier hit is **not**
+a prefix hit: `relative_suffix(url, &root.root)` is `None` for it, so
+never compute a suffix from a hit — derive the bucket, account or
+container from the address itself. `RouteTable::lookup_prefix` exposes
+the first tier alone, for the question "who serves this exact node";
+the host Router's collision check reads it, and the `same_node` guard
+in § Recovering a target discards a scheme root for the incumbent
+check on its own. Because the type is shared by the Router, every
+plugin's internal table and the brokered client, all of them gain the
+tier at once: a marked root reaches the same backend whether the
+address arrives at the Router or directly at the layer that published
+it. A hostless address on the scheme (`s3:///`, `s3:///key`) is a
+first-tier hit under the root; refuse every such address with
+`InvalidArgument`, because it names no bucket. An address carrying a
+credential-bearing query never takes the tier, so no slot sees one
+through it.
+
+A fallback root advertises only the bits its slots honour without
+touching the wire. Pass your capabilities through
+`read_only_capabilities` — `scheme_fallback_root` applies it again
+whatever you pass — so every write, delete, copy, rename, directory
+mutation, metadata patch and watch bit is false and only the read side
+(list, list_stream, recursive list, versions, access check, and the
+shape facts) survives. `scheme_fallback_root` leaves
+`range_read_strategy` at its default because it does not know your
+backend; when your connection roots advertise `Native` ranged reads,
+set the same on the returned root, so `root_info_for` answers one
+strategy for a fallback-served address and for a configured one on the
+same store. Then self-gate: every mutating slot and
+`watch_directory` on a fallback-reached address returns
+`fallback_mutation_refused(scheme, &node_root)` — typed `Unsupported`,
+naming the bucket root a connection would be added for and never the
+caller's path — before any body is read or request sent, and `copy`
+and `rename` check both ends. Build the client with no credential source
+at all, judge every derived outbound host with
+`refuse_instance_metadata` before building it, answer `root_info_for`
+on a fallback-reached address with the scheme root verbatim, register
+no `Connection`, and evict the cached client for a node when an
+explicit connection for that node installs.
+`ovstorage_plugin::fallback_cache::FallbackCache` is the bounded,
+single-flight, budgeted cache the in-tree backends hold those clients
+in; its budget answers `ResourceExhausted`.
 
 ## C-ABI surface
 
@@ -1362,16 +1759,19 @@ is no separate file to drift, lose, or forge.
 - `Capabilities` are immutable for the lifetime of a `Backend`
   instance.
 - `WriteRedirectBatch.continuation` is an opaque, plugin-owned
-  continuation blob. The host echoes it byte-for-byte to
+  continuation blob. The host returns its exact bytes to
   `continue_write`, may persist it only for the lifetime of the
-  in-flight operation, and must not inspect or log it. That is the
-  host's obligation, not a property a plugin may assume held: the
-  blob returns over the same unchecked path as the redirect results,
-  so derive the object you act on from the request address instead of
-  decoding it out of the blob, and treat what the address cannot
-  supply as caller-chosen. See *Everything
-  `continue_write` receives except the address is caller-supplied
-  input* in [CONFORMANCE.md](../plugin-storage/CONFORMANCE.md).
+  in-flight operation, and must not inspect or log its contents. A
+  host may transparently authenticate the opaque bytes at its boundary:
+  the broker's client-driven RPC wraps them in an address-bound HMAC
+  envelope and strips it before Layer dispatch. Follower routes and
+  non-broker hosts provide no such SPI guarantee, and redirect results
+  remain unchecked input. Derive the object you act on from the request
+  address instead of decoding it out of the blob, and treat what the
+  address cannot supply as caller-chosen on an unsealed route. See *At
+  the Layer boundary, treat everything `continue_write` receives except
+  the address as reported input* in
+  [CONFORMANCE.md](../plugin-storage/CONFORMANCE.md).
 - Redirect `HttpRequest.method` is drawn from a fixed allowlist,
   matched exactly and in uppercase: a `ReadRedirect` may use `GET`
   or `HEAD`; a `WriteRedirect` may use `PUT`, `POST`, or `PATCH`.
@@ -1535,23 +1935,33 @@ The bits, stable across the project:
 
 **Write**
 - `writes_are_atomic` (an overwrite is all-or-nothing from the reader's perspective; partial writes are never visible)
+- `supports_write` (buffered single-shot `write` is implemented)
+- `supports_write_stream` (`write_stream` is implemented)
+- `supports_write_redirect` (`write_redirect`, and by implication `continue_write`, is implemented)
 - `supports_copy` (availability: `Layer::copy` can be attempted on this root, natively or by emulation above it)
 - `supports_server_side_copy` (the backend can execute `Layer::copy` without the host streaming bytes through itself)
+- `supports_delete` (`delete` is implemented)
 
 **Naming**
 - `supports_rename` (availability: `Layer::rename` can be attempted on this root, natively or by emulation above it)
 - `supports_server_side_rename` (the backend can execute `Layer::rename` as a backend operation)
 - `supports_atomic_rename` (cross-prefix `rename` is atomic and crash-safe)
 - `has_real_directories` (the backend has actual directory inodes that exist independently of contained objects)
+- `supports_create_directory` (`create_directory` is implemented)
+- `supports_delete_directory` (`delete_directory` is implemented)
 
 **Listing**
 - `supports_list` (the backend can serve `ListOptions { recursive: false, .. }`)
+- `supports_list_stream` (the layer implements bounded `list_stream` directly rather than using the buffered compatibility adapter)
 - `wants_list_backed_stat` (the host may use one-level `list` as an object-`stat` accelerator on this route)
 - `supports_recursive_list` (the backend can serve `ListOptions { recursive: true, .. }`)
 - `populates_subdirectory_metadata` (whether directory-kind `ObjectInfo` metadata fields ever carry useful data on this route)
 
 **Address roots**
-- `address_roots_are_dynamic` (the plugin's `address_roots` answer can change between calls and the plugin implements `watch_address_roots` meaningfully)
+- Address roots are published through `list_address_roots` as a snapshot and an optional update stream; changing roots is not a capability claim.
+
+**Range reads**
+- `RangeReadStrategy::MaterializeOnly` tells callers that random access requires host materialization. It is caller-side advice about the composed Stack, not a backend capability claim.
 
 **Versions**
 - `supports_version_listing` (the backend can serve `list_versions`)
@@ -1586,7 +1996,7 @@ an opaque `String → String` map whose keys are plugin-chosen and
 whose semantics are entirely the backend's.
 
 **Typed fields on `ObjectInfo`** (in addition to `address`, `kind`,
-`etag`, `version`, `size`, `mtime`):
+`etag`, `etag_strength`, `version`, `versioned_address`, `size`, `mtime`):
 
 - **`checksums: ChecksumSet`** — backend-supplied content hashes.
   The plugin populates one entry per algorithm the backend actually
@@ -1731,8 +2141,9 @@ A plugin is a `cdylib` (`.so` / `.dylib` / `.dll`) loaded via
    through the resulting `LayerVTableV1`.
 
 The loader accepts only an exact match on the Layer ABI version the host was
-built with — 14 in ovstorage 0.2.1. A direct load of an
-incompatible manifest or init result returns `ErrorCode::IncompatibleType`;
+built with — 19 in the current source tree and 15 in ovstorage 0.2.1. A direct
+load of an incompatible manifest or init result returns
+`ErrorCode::IncompatibleType`;
 directory discovery skips that artifact and continues loading compatible
 neighbors. `ErrorCode::PluginRejected` is reserved for host policy, including
 an opted-out `test_only` plugin.
@@ -1763,7 +2174,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-ovstorage-plugin = "0.2"
+ovstorage-plugin = "0.3"
 async-trait      = "0.1"
 ```
 
@@ -1900,24 +2311,26 @@ The generated `PluginInitResultV1` repeats the manifest's
 plugins do not advertise a compatibility band, and a plugin cannot
 declare support for more than one ABI version.
 
-The Layer ABI version is a constant — 14 as of ovstorage 0.2.1, the
-version that adds the `LayerKindDescriptor.auth_capable` listener-auth
-discriminator (the typed `AUTH_CREDENTIAL` decode helpers are additive SDK
-surface, not an ABI change) — and the per-version history in the generated
-`ovstorage_plugin.h` header doc block is authoritative. Read the constant
-rather than a number quoted in prose, including this page's. **The two
+The Layer ABI version is a constant — 19 in the current source tree, the
+version that adds the version-pinned address to object and list metadata and
+the matching cost flags to the stat and list options, and pins the
+reserved-namespace and annotation-key spellings a plugin links. The ovstorage
+0.2.1 artifacts use ABI 15. The per-version history in
+the generated `ovstorage_plugin.h` header doc block is authoritative. Read the
+constant rather than a number quoted in prose, including this page's. **The two
 surfaces spell it differently**, which is worth knowing before you go looking:
 Rust has `OVSTORAGE_PLUGIN_ABI_V2_VERSION`, while the generated header emits
 `#define OVSTORAGE_PLUGIN_ABI_VERSION`, with no `V2`. The floor is
 `OVSTORAGE_PLUGIN_ABI_V2_FLOOR` in Rust and
-`OvStoragePlugin_OVSTORAGE_PLUGIN_ABI_V2_FLOOR` in the header, and is 5 in
-ovstorage 0.2.1. The header's prose keeps the Rust spellings, so grepping it
+`OvStoragePlugin_OVSTORAGE_PLUGIN_ABI_V2_FLOOR` in the header, and remains 5.
+The header's prose keeps the Rust spellings, so grepping it
 turns up both — the `#define` lines are the ones a compiler sees.
 
 Note that the ABI version number, the `v2` in these constant names, and the
 ovstorage package version are three separate things. `v2` names the ABI
-*family*; 14 is the version within it; 0.2.1 is the release. A plugin author
-reasoning about compatibility cares only about the version number.
+*family*; the current source tree uses version 19 within it, while the 0.2.1
+release uses version 15. A plugin author reasoning about compatibility cares
+only about the version number.
 
 **When a change needs a version bump.** The default is that it does. One narrow
 case is exempt, and it is exempt only when *all* of its conditions hold. Check
@@ -1968,7 +2381,11 @@ porting checklist either.
 - **A trailing field in a struct with no reserved tail.** `ReadOptions` gained
   `max_bytes` at the end and bumped anyway, because there was no reserved
   budget to spend. "At the tail" is not the exemption; "into reserved slots"
-  is.
+  is. The optional versioned address on `ObjectInfo` and `BackendItemInfo`
+  is the same shape and bumps for the same reason. The matching flag on the
+  `struct_size`-prefixed `StatOptions` / `ListOptions` lands in padding those
+  structs already carry, so `struct_size` cannot see it and the exact-match
+  version check is the only guard.
 - **A field whose type changes.** Re-typing the `Extensions` entries swapped one
   two-word representation for another, moving nothing — the bytes simply mean
   something else. (The ABI version that carried this also carried a layout
@@ -2047,7 +2464,7 @@ inferred version band.
 
 The plugin C ABI freezes at **ABI 1.0** — a milestone of the ABI's own
 versioning, not the ovstorage 1.0 release — and once that ships, a break is an
-**ABI 2.0**. Neither number tracks the package version, which is 0.2.1 today.
+**ABI 2.0**. Neither number tracks the package version.
 Until that freeze, the ABI version simply increments.
 Three layered defenses authors must understand:
 

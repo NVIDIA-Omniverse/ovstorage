@@ -19,7 +19,7 @@ composition, canonicalization, and dispatch already live at the Layer boundary.
 
 ```toml
 [dependencies]
-ovstorage = "0.2"
+ovstorage = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 url = "2"
 ```
@@ -133,6 +133,29 @@ Some helper names intentionally overlap typed `Layer` methods. Where both
 traits are in scope, use UFCS (`LayerExt::stat(...)` or `Layer::stat(...)`) to
 select the intended form.
 
+### Metadata cost knobs and versioned addresses
+
+`full_metadata` and `versioned_address` are cost knobs, not inclusion lists.
+Leaving one clear says "spend no extra round-trips on this"; setting it says
+"I will pay". A backend that already has the value in hand returns it either
+way, so an absent field means "the backend has none" only when you asked, and
+a present field does not mean you asked. With `versioned_address` set, a
+versioning backend returns the pinned address for every object it versions;
+an absent `versioned_address` under the flag means the backend does not
+version this object.
+
+Set `StatOptions::versioned_address` or `ListOptions::versioned_address` to
+ask, and read `ObjectInfo::versioned_address: Option<Url>`: the backend's own
+pin spelling for the version the `ObjectInfo` describes (S3 `?versionId=`,
+Azure `?versionid=`, GCS `?generation=`, Hugging Face `?revision=`, Nucleus
+`?<branch>&<checkpoint>`, the Omniverse Storage Service's `resource_address`
+verbatim), projected into your namespace like every other address.
+`list_versions` and `get_latest_version` return it equal to `address`;
+directory entries carry `None`. A pin is not an identity: a read at it serves
+these bytes for as long as the backend retains the version, a mutation
+through it is refused with `InvalidArgument`, and it grants nothing the
+unpinned address does not.
+
 ## Address and routing contract
 
 The Stack boundary canonicalizes every address-bearing request before the root
@@ -181,6 +204,12 @@ wrapper policy, not implicit behavior of `Stack`; include a `retry` Layer when
 the deployment wants it. Cancellation is cooperative through
 `tokio_util::sync::CancellationToken`.
 
+For `list_stream`, the retry Layer budgets stream opening and first-item
+establishment separately. Both phases use `max_attempts`, with the initially
+opened stream counting as the first attempt of the second phase; at most
+`2 * max_attempts - 1` inner stream opens occur. The first-item phase starts
+only when the consumer polls, and no retry occurs after an item is delivered.
+
 Use `LayerExt::read_stream` for bounded-memory reads. `read_bytes` buffers and
 enforces `ReadOptions.max_bytes`. `Body::Stream` stays streaming through the
 Layer and plugin seams and is not replayable by retry wrappers after
@@ -224,6 +253,19 @@ an object-scoped one are indistinguishable on the wire, so it cannot be
 inferred from the redirect. A host that means to disclose such redirects
 anyway sets `disclose_redirect_credentials` on the layer, which defaults to
 refusing.
+
+An address no root covers answers `NoRoute`: no configured route matches the
+address and no anonymous fallback is granted for its scheme. A library host
+that wants public `s3://`, `gs://` or `azure://` addresses no connection serves
+to be readable anyway grants the fallback per scheme by setting
+`anonymous_fallback = ["s3"]` on that backend layer directly, as it sets
+`disclose_redirect_credentials`; the broker and REST gateway stamp the key from
+their own top-level setting instead. A granted read attaches no credential of
+any kind, every mutation through it answers `Unsupported`, and the layer
+publishes one hidden `s3:///` root (`gs:///`, `azure:///`) that
+`list_address_roots` reports with `visible: false` and `ovstorage doctor`
+shows. See [configuration](../configuration.md) for the key, its bounds and
+what a fallback refuses.
 
 ## Related references
 

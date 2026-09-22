@@ -188,6 +188,7 @@ async fn collect_one_directory(
                     max_results: Some(1000),
                     page_token,
                     full_metadata: false,
+                    versioned_address: false,
                 },
                 None,
             )

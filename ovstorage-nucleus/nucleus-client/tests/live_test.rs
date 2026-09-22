@@ -111,7 +111,7 @@ async fn test_write_and_read_roundtrip() {
                     path: path.clone(),
                     branch: None,
                 },
-                Some(content.to_vec()),
+                Some(content.as_slice()),
                 None,
                 Some(true),
                 None,

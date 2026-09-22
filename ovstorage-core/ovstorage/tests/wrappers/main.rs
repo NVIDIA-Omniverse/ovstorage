@@ -6,7 +6,10 @@
 //! redirect following plus write-redirect orchestration; the
 //! `ByteCacheWrapper` / `MetadataCacheWrapper` caches (hit/range/conditional
 //! reads, write-through, materialize, and invalidation across the mutating ops
-//! and the direct `continue_write` API); the `AliasWrapper` (address
+//! and the direct `continue_write` API); the `HubCacheWrapper` cache-aside
+//! lookup over an in-process fake hub (hit/miss/revalidation, the
+//! cross-process races, hub-down pass-through, the extension trap, and the
+//! streaming tee invariant); the `AliasWrapper` (address
 //! rewrite and reverse projection, visibility, alias-root synthesis) and
 //! `CopyRenameFallbackWrapper` (cross-root copy/rename fallback); and the `Stack`
 //! URL-canonicalization boundary. Each test composes the wrapper(s) above a
@@ -19,6 +22,7 @@ mod common;
 mod alias;
 mod byte_cache;
 mod copy_rename_fallback;
+mod hub_cache;
 mod metadata_cache;
 mod redirect_follower;
 mod retry;

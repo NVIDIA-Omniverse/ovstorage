@@ -3,7 +3,7 @@
 
 //! Native S3 / S3-compatible object/data operations (ABI-v2 Layer backend).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -11,6 +11,7 @@ use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, MetadataDirective, RequestPayer};
+use futures::{Stream, StreamExt as _};
 use tracing::{Instrument as _, debug, info, warn};
 
 use ovstorage_plugin::ReadRedirect;
@@ -20,15 +21,22 @@ use ovstorage_plugin::{
 };
 use ovstorage_plugin::{
     AccessOps, CancellationToken, Capabilities, ChecksumAlgorithm, ChecksumSet,
-    DeleteDirectoryOptions, DeleteOptions, Error, ErrorCode, ErrorContext, HttpRequest,
-    IfDestExists, ListOptions, ListVersionsOptions, MtimeFormat, ObjectInfo, ObjectKind,
-    RedirectBodySource, RedirectCredential, RedirectResultBatch, RedirectScope, ResolvedTarget,
-    ResponseParsing, Result, ResultCapture, SecretBundle, StatOptions, SystemMetadata, Url,
-    UserMetadata, VersionListOrder, WriteOptions, WriteRedirect, WriteRedirectBatch, WriteResult,
-    address, race_cancel, reject_pinned_for_mutation,
+    DeleteDirectoryOptions, DeleteOptions, Error, ErrorCode, ErrorContext, EtagStrength,
+    HttpRequest, IfDestExists, ListOptions, ListVersionsOptions, MESSAGE_METADATA_KEY, MtimeFormat,
+    ObjectInfo, ObjectKind, RedirectBodySource, RedirectCredential, RedirectResultBatch,
+    RedirectScope, ResolvedTarget, ResponseParsing, Result, ResultCapture, SecretBundle,
+    StatOptions, SystemMetadata, Url, UserMetadata, VersionListOrder, WriteOptions, WriteRedirect,
+    WriteRedirectBatch, WriteResult, address, normalize_optional_wire_etag, normalize_wire_etag,
+    race_cancel, reject_pinned_for_mutation,
 };
 
 const PINNED_VERSION_KEYS: &[&str] = &["versionId"];
+
+/// An S3 error document fits well under 1 KiB. Successful PUT and UploadPart
+/// responses have empty bodies, so capture is failure-only in practice.
+/// Leak-safety is owned by `map_error_status` in `errors.rs`, which reduces the
+/// body to a sanitized `<Code>` token before building any message.
+const REDIRECT_ERROR_BODY_CAPTURE_BYTES: u32 = 1024;
 
 /// How many entries one `list` may accumulate before it refuses to continue.
 ///
@@ -100,6 +108,45 @@ const LIST_ITEM_CEILING: usize = LIST_ITEM_BUDGET + S3_MAX_KEYS_PER_PAGE as usiz
 /// term in the memory the walk holds.
 const S3_MAX_KEYS_PER_PAGE: u32 = 1_000;
 
+/// Continuation tokens retained by the unbudgeted streaming walk.
+///
+/// The buffered path retains every token because its page budget bounds that
+/// set. A consumer-driven stream has no page budget, so it remembers only a
+/// small recent window and separately rejects an immediate no-progress token.
+const LIST_STREAM_TOKEN_WINDOW: usize = 32;
+
+struct S3ListPage {
+    items: Vec<ObjectInfo>,
+    next_continuation_token: Option<String>,
+    is_truncated: bool,
+}
+
+type S3ListPageStream = std::pin::Pin<Box<dyn Stream<Item = Result<S3ListPage>> + Send + 'static>>;
+
+/// Namespace of the page token the versioned walk mints.
+///
+/// `ListObjectsV2` continuation tokens are base64 and cannot contain `:`, so
+/// the prefix alone tells the two walks' tokens apart; a token replayed under
+/// the other flag is refused instead of being sent to an API whose markers
+/// mean something else.
+const VERSIONED_LIST_TOKEN_PREFIX: &str = "versions:";
+
+/// What one page walk owns for its lifetime, whichever listing API drives it.
+///
+/// Built once by [`S3Backend::list_pages`] after the shared preamble so the
+/// two walks cannot drift on how they name the bucket root or read the prefix.
+struct ListWalk {
+    /// The prefix as sent to S3: the requested key as a directory key, empty
+    /// for the bucket root.
+    prefix_key: String,
+    bucket_root: Url,
+    requested_prefix: Url,
+    config: S3Config,
+    client: aws_sdk_s3::Client,
+    anonymous: Option<AnonymousShape>,
+    region_mismatch: Arc<Mutex<Option<RegionMismatch>>>,
+}
+
 /// Apply the connection's requester-pays flag to an S3 request builder.
 /// Requester-pays is all-or-nothing per request, so centralising the flag
 /// keeps a future data-plane op from silently omitting it — a missing
@@ -114,6 +161,37 @@ macro_rules! apply_request_payer {
             $builder
         }
     };
+}
+
+impl ListWalk {
+    /// Whether a `CommonPrefixes` entry of a `ListObjectVersions` response
+    /// names a subtree that `ListObjectsV2` would also report.
+    ///
+    /// S3 folds every version and delete marker under the delimiter into a
+    /// common prefix, so a subtree whose objects are all deleted, or that
+    /// holds only non-current versions, arrives looking exactly like a live
+    /// one. One `ListObjectsV2` request for a single key under the prefix
+    /// settles it; it carries no delimiter so a key nested at any depth
+    /// counts. `KeyCount` is read first because a conforming store spells it;
+    /// `Contents` covers a store that leaves it out.
+    async fn prefix_has_current_object(&self, prefix_key: &str) -> Result<bool> {
+        let mut request = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.config.bucket)
+            .prefix(prefix_key)
+            .max_keys(1);
+        request = apply_request_payer!(request, self.config);
+        let output = request.send().await.map_err(|err| {
+            map_unsigned_store_error(
+                "s3 list (prefix probe)",
+                err,
+                self.anonymous.as_ref(),
+                &self.region_mismatch,
+            )
+        })?;
+        Ok(output.key_count().is_some_and(|count| count > 0) || !output.contents().is_empty())
+    }
 }
 
 /// Pull the legacy `(if_match_etag, no_overwrite)` pair out of the new
@@ -145,7 +223,11 @@ use crate::config::{
 };
 use crate::convert::require_etag_only_if_match;
 use crate::credentials::AwsCredentials;
-use crate::errors::{map_anonymous_refusal, map_error_status, map_sdk_error};
+use crate::errors::{
+    AnonymousShape, RegionMismatch, bucket_region_from_error, is_valid_region_token,
+    map_anonymous_refusal, map_error_status, map_sdk_error, map_sdk_error_for,
+    region_mismatch_from_error,
+};
 
 /// Display wrapper that strips query params and fragment from a URL before logging.
 /// Signed URLs embed credentials in query strings; this prevents accidental leakage.
@@ -327,7 +409,12 @@ pub(crate) fn anonymous_capabilities() -> Capabilities {
 pub struct S3Backend {
     config: S3Config,
     credentials: Arc<Mutex<Option<AwsCredentials>>>,
-    is_anonymous: bool,
+    /// `None` on a credentialed connection. Otherwise the request leaves
+    /// unsigned, and the shape says which of the two ways it came to: an
+    /// anonymous connection or the scheme fallback. Read by
+    /// [`crate::errors::map_anonymous_refusal`] to name the remedy an
+    /// operator can follow.
+    anonymous: Option<AnonymousShape>,
     /// The connection's AWS SDK S3 client: signing when the connection is
     /// credentialed, unsigned when it is anonymous. Reached through
     /// [`S3Backend::unsigned_capable_client`] by operations a public bucket can serve, and
@@ -345,6 +432,14 @@ pub struct S3Backend {
     /// operation before promoting a parked connection on that operation's
     /// acceptance.
     refusals: RefusalEpoch,
+    /// The store's latest word, on a data-path `301`, that this backend is
+    /// built for a region that does not serve its bucket. Written by
+    /// [`Self::map_store_error`]; read through [`Self::region_mismatch`] by
+    /// the anonymous `s3://` fallback, which learned the region itself and
+    /// relearns it from this. A connection backend records it too and nobody
+    /// reads it: its region is the operator's setting, and the `301` mapping
+    /// already tells the operator what to set.
+    region_mismatch: Arc<Mutex<Option<RegionMismatch>>>,
 }
 
 impl S3Backend {
@@ -372,11 +467,12 @@ impl S3Backend {
         let watch_coalescer = ovstorage_plugin::subscription::WatchCoalescer::new();
         Ok(Self {
             credentials,
-            is_anonymous: false,
+            anonymous: None,
             s3_client,
             sqs_client,
             watch_coalescer,
             refusals,
+            region_mismatch: Arc::new(Mutex::new(None)),
             config,
         })
     }
@@ -398,11 +494,28 @@ impl S3Backend {
     /// was never usable; it now fails at `add_connection`, which is where the
     /// credentialed constructor has always failed on it.
     pub fn anonymous(config: S3Config) -> Result<Self> {
+        Self::unsigned(config, AnonymousShape::Connection)
+    }
+
+    /// The anonymous `s3://` fallback's backend for one bucket no connection
+    /// serves: [`Self::anonymous`] in every respect but the remedy its
+    /// refusals name. There is no connection to remove and re-add, so a store
+    /// refusal sends the operator to add one for the bucket root.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::anonymous`].
+    pub(crate) fn fallback(config: S3Config) -> Result<Self> {
+        let root = config.address_root.clone();
+        Self::unsigned(config, AnonymousShape::Fallback { root })
+    }
+
+    fn unsigned(config: S3Config, shape: AnonymousShape) -> Result<Self> {
         let watch_coalescer = ovstorage_plugin::subscription::WatchCoalescer::new();
         let s3_client = build_anonymous_s3_client(&config, build_http_client())?;
         Ok(Self {
             credentials: Arc::new(Mutex::new(None)),
-            is_anonymous: true,
+            anonymous: Some(shape),
             s3_client,
             sqs_client: None,
             watch_coalescer,
@@ -410,6 +523,7 @@ impl S3Backend {
             // `PromotionEvidence` interceptor, and nothing it sends is signed,
             // so there is no credential for the store to refuse.
             refusals: RefusalEpoch::default(),
+            region_mismatch: Arc::new(Mutex::new(None)),
             config,
         })
     }
@@ -419,7 +533,7 @@ impl S3Backend {
     }
 
     pub(crate) fn is_anonymous(&self) -> bool {
-        self.is_anonymous
+        self.anonymous.is_some()
     }
 
     /// How many times the store has refused this connection's credential. A
@@ -427,6 +541,17 @@ impl S3Backend {
     /// unchanged after — "did a refusal land while I ran?", whoever provoked it.
     pub(crate) fn refusal_epoch(&self) -> u64 {
         self.refusals.get()
+    }
+
+    /// The store's verdict, if a data-path `301` has delivered one, that this
+    /// backend's bucket lives in a region other than the one it is built for.
+    /// It is a fact about the backend and stays set: the region a client was
+    /// built for does not change.
+    pub(crate) fn region_mismatch(&self) -> Option<RegionMismatch> {
+        self.region_mismatch
+            .lock()
+            .expect("region mismatch mutex poisoned")
+            .clone()
     }
 
     pub fn store_credentials(&self, credentials: AwsCredentials) {
@@ -440,7 +565,7 @@ impl S3Backend {
         &self,
         _bundle: Option<&SecretBundle>,
     ) -> Result<AwsCredentials> {
-        if self.is_anonymous {
+        if self.is_anonymous() {
             return Ok(AwsCredentials::empty());
         }
         if let Some(creds) = self
@@ -536,7 +661,7 @@ impl S3Backend {
     /// what this position delivers, is that nothing is decoded, buffered or
     /// sent first.
     pub(crate) fn reject_anonymous_mutation(&self) -> Result<()> {
-        if self.is_anonymous {
+        if self.is_anonymous() {
             return Err(Error::new(
                 ErrorCode::Unsupported,
                 "this S3 connection is anonymous; ovstorage issues no unsigned \
@@ -556,17 +681,13 @@ impl S3Backend {
     /// The anonymity is read here rather than passed in at each call site so a
     /// future unsigned-capable operation cannot forget it — a plain
     /// `map_sdk_error` would report the store's refusal of an unsigned request
-    /// as a credential problem.
+    /// as a credential problem. `list` streams past the `&self` borrow and
+    /// calls [`map_unsigned_store_error`] with clones of the same two fields.
     fn map_store_error<E>(&self, context: &str, err: aws_sdk_s3::error::SdkError<E>) -> Error
     where
         E: std::fmt::Debug + aws_sdk_s3::error::ProvideErrorMetadata,
     {
-        let mapped = map_sdk_error(context, err);
-        if self.is_anonymous {
-            map_anonymous_refusal(mapped)
-        } else {
-            mapped
-        }
+        map_unsigned_store_error(context, err, self.anonymous.as_ref(), &self.region_mismatch)
     }
 
     fn parse_object_target(&self, target: &ResolvedTarget) -> Result<S3AddressParts> {
@@ -627,6 +748,36 @@ impl S3Backend {
     }
 }
 
+/// The mapping behind [`S3Backend::map_store_error`], as a free function so the
+/// `list` page stream — which outlives the `&self` borrow and captures clones
+/// of the backend's fields — applies exactly the same one.
+///
+/// Three things happen here, in order. A `301` is recorded in
+/// `region_mismatch` before the error is consumed, because the verdict is
+/// only readable off the raw response. The SDK error is then classified with
+/// the region remedy worded for `shape`. Last, on an anonymous backend, a
+/// `401`/`403` is restated as a refusal of an unsigned request.
+fn map_unsigned_store_error<E>(
+    context: &str,
+    err: aws_sdk_s3::error::SdkError<E>,
+    shape: Option<&AnonymousShape>,
+    region_mismatch: &Mutex<Option<RegionMismatch>>,
+) -> Error
+where
+    E: std::fmt::Debug + aws_sdk_s3::error::ProvideErrorMetadata,
+{
+    if let Some(verdict) = region_mismatch_from_error(&err) {
+        *region_mismatch
+            .lock()
+            .expect("region mismatch mutex poisoned") = Some(verdict);
+    }
+    let mapped = map_sdk_error_for(context, err, shape);
+    match shape {
+        Some(shape) => map_anonymous_refusal(mapped, shape),
+        None => mapped,
+    }
+}
+
 /// The S3 object/data operations used by the native Layer slots.
 /// `crate::layer::S3Layer` delegates its operation slots here.
 impl S3Backend {
@@ -666,6 +817,7 @@ impl S3Backend {
                         FlatDirectoryProbe::Marker(info) => return Ok(*info),
                         FlatDirectoryProbe::Inferred => {
                             return Ok(ObjectInfo {
+                                etag_strength: Default::default(),
                                 address: target.resolved_address.clone(),
                                 kind: ObjectKind::DirectoryInferred,
                                 etag: None,
@@ -677,6 +829,7 @@ impl S3Backend {
                                 system_metadata: None,
                                 user_metadata: None,
                                 modified_by: None,
+                                versioned_address: None,
                             });
                         }
                         FlatDirectoryProbe::Missing => {}
@@ -687,9 +840,17 @@ impl S3Backend {
                     format!("S3 object '{}' not found", parts.key),
                 ));
             };
-            let mut info = object_info_from_head_output(&target.resolved_address, &output);
+            let mut info = object_info_from_head_output(&target.resolved_address, &output)?;
             if trailing_slash {
+                // A directory kind is never pinned, whatever version id the
+                // marker object carries.
                 info.kind = ObjectKind::DirectoryMarker;
+                info.versioned_address = None;
+            } else if let Some(pin) = s3_version_pin(version_id.as_deref()) {
+                // The caller's selector is what the HEAD answered for, so it
+                // is the pin reported, with the precedence `get_latest_version`
+                // gives it.
+                info.versioned_address = Some(s3_version_address(&target.resolved_address, pin)?);
             }
             Ok(info)
         })
@@ -722,7 +883,7 @@ impl S3Backend {
             let now = SystemTime::now();
             let expires_at = now + Duration::from_secs(DEFAULT_PRESIGN_TTL_SECS as u64);
 
-            let request = if self.is_anonymous {
+            let request = if self.is_anonymous() {
                 // Anonymous (public-bucket) read: a plain, unsigned object URL.
                 self.anonymous_read_request(&parts.key, version_id.as_deref(), &opts)?
             } else {
@@ -768,7 +929,7 @@ impl S3Backend {
                 // Same branch that built `request` above: the anonymous URL is
                 // unsigned and carries nothing, the credentialed one is a SigV4
                 // query presign over this key, this method and this TTL.
-                credential: if self.is_anonymous {
+                credential: if self.is_anonymous() {
                     RedirectCredential::None
                 } else {
                     RedirectCredential::Request
@@ -831,6 +992,10 @@ impl S3Backend {
             "s3 write_redirect",
             PINNED_VERSION_KEYS,
         )?;
+        // The annotation rides in the metadata that is signed into the
+        // presigned PUT or set on `CreateMultipartUpload`, as on a buffered
+        // write.
+        let opts = with_message_stashed(opts);
         // S3 write_redirect emits a presigned PUT (or a multipart batch) with
         // a fixed advertised `Content-Length`. Without a known upload size we
         // can't supply that length; substituting `S3_PUTOBJECT_MAX_BYTES`
@@ -935,9 +1100,11 @@ impl S3Backend {
         self.reject_anonymous_mutation()?;
         let mut continuation = MultipartContinuation::decode(&redirects.continuation)?;
         // Derive the object from the authorized address rather than reading it
-        // out of the continuation: on the broker's client-driven route the whole
-        // batch, blob included, arrives from the remote caller, while the address
-        // is what authorization was decided on.
+        // out of the continuation. The broker's client-driven RPC authenticates
+        // the blob and its address binding, but the Layer SPI supplies no such
+        // integrity: a direct SPI caller or an unsealed host can rewrite the
+        // blob, and follower routes carry no SPI-level guarantee. The address is
+        // what authorization was decided on for every route.
         //
         // The derived key is threaded to every commit and abort below as its own
         // argument rather than written back into the decoded continuation. That
@@ -969,9 +1136,12 @@ impl S3Backend {
             if !is_success(result.status_code) {
                 return Err(map_error_status(result.status_code, &result.captured_body));
             }
-            let etag = header_value(&result.captured_headers, "etag")
-                .map(|value| value.trim_matches('"').to_string());
+            let (etag, etag_strength) = normalize_optional_wire_etag(header_value(
+                &result.captured_headers,
+                "etag",
+            ));
             let info = ObjectInfo {
+                etag_strength,
                 address: target.resolved_address,
                 kind: ObjectKind::File,
                 etag,
@@ -983,6 +1153,7 @@ impl S3Backend {
                 system_metadata: None,
                 user_metadata: None,
                 modified_by: None,
+                versioned_address: None,
             };
             return Ok(ovstorage_plugin::WriteStep::Done(WriteResult { info }));
         }
@@ -1000,7 +1171,7 @@ impl S3Backend {
                 return Err(map_error_status(result.status_code, &result.captured_body));
             }
             let etag = match header_value(&result.captured_headers, "etag")
-                .map(|value| value.trim_matches('"').to_string())
+                .map(|value| normalize_wire_etag(value).0)
             {
                 Some(etag) => etag,
                 None => {
@@ -1061,6 +1232,9 @@ impl S3Backend {
             "s3 write_stream",
             PINNED_VERSION_KEYS,
         )?;
+        // The annotation rides in the multipart upload's metadata, as on a
+        // buffered write.
+        let opts = with_message_stashed(opts);
         // Before the buffering loop takes ~8 MiB of the caller's body. This is
         // the one slot whose address parse happens later, in `stream_write`, so
         // a malformed address here answers `Unsupported` where the other nine
@@ -1136,78 +1310,314 @@ impl S3Backend {
         .await
     }
 
-    /// List one prefix, walking S3's paging to the end of it.
+    /// Build the shared lazy page walk over one prefix.
     ///
-    /// **The whole listing is materialized in memory before anything is
-    /// returned**, and the caller should size that before asking. `Vec<ObjectInfo>`
-    /// is the return type, so there is no streaming seam here to use instead;
-    /// budget roughly half a kilobyte per entry once the address, etag and the
-    /// per-item system-metadata map are counted, and one sequential round trip
-    /// per up to 1000 entries — the service page size, which `CommonPrefixes`
-    /// count toward as well. A recursive list of a bucket root is a request
-    /// for every object in the bucket, at once — millions of keys is gigabytes
-    /// and thousands of serial requests.
+    /// `ListOptions::versioned_address` selects the API: `ListObjectsV2` by
+    /// default, `ListObjectVersions` when set, because only the latter carries
+    /// the version id that pins each file. Both walks share one page
+    /// conversion, so their items differ only in `versioned_address`, and both
+    /// hand `list` and `list_stream` the same `S3ListPage` shape.
     ///
-    /// Two things make that acceptable rather than merely tolerated. `S3Layer::list`
-    /// asks for the full set by construction — it clears `max_results` and
-    /// `page_token` and paginates host-side — so a short answer is read as a
-    /// complete one, and the alternative to walking is not "less memory" but
-    /// "wrong results". And the default `ListOptions` is non-recursive, so the
-    /// `stat` path that reaches here through the metadata cache is bounded by
-    /// one directory's fan-out rather than by the bucket.
+    /// Each poll past a yielded page issues at most one further request. Page
+    /// conversion preserves S3's response order: keys first, followed by
+    /// `CommonPrefixes`. Marker/common-prefix dedup retains only the current
+    /// and immediately previous page's marker addresses, which covers the only
+    /// boundary on which adjacent S3 key ranges can split the pair while
+    /// keeping streaming state bounded. Buffered `list` separately retains
+    /// whole-walk marker addresses, preserving its behavior even if a
+    /// nonconforming store separates a marker from its matching common prefix
+    /// by more than one page.
     ///
-    /// A direct `S3Backend` caller that wants a bound has one: pass
-    /// `max_results`, which stops the walk after a single request. It buys a
-    /// bound and nothing else — this function returns `Vec<ObjectInfo>` and no
-    /// continuation token, so there is no way to ask for the next page. A
-    /// caller that needs both a bound and the rest of the prefix has to drive
-    /// `ListObjectsV2` itself. Nobody arriving through `S3Layer::list` takes
-    /// that branch: it hard-sets `max_results` and `page_token` to `None`, and
-    /// the host's own page token is a decimal index from `paginate_list_items`,
-    /// a different token space.
+    /// The versioned walk costs more per item. S3 counts every version and
+    /// delete marker under the prefix against `MaxKeys`, so a response carries
+    /// fewer current items than the page size asked for, possibly none, and a
+    /// heavily versioned prefix takes more responses to complete. Each common
+    /// prefix a delimited page emits costs one further `ListObjectsV2` probe;
+    /// `list_pages_versioned` says why. It also needs `s3:ListBucketVersions`,
+    /// a separate grant from the `s3:ListBucket` its probes use; a store that
+    /// refuses it fails the listing, because a `ListObjectsV2` fallback could
+    /// not answer what was asked.
+    async fn list_pages(
+        &self,
+        prefix: ResolvedTarget,
+        opts: ListOptions,
+        cancel: Option<CancellationToken>,
+    ) -> Result<S3ListPageStream> {
+        // Make a token cancelled before open observable before any request is
+        // constructed. Per-request races below carry the same open-time token
+        // through the lifetime of the returned stream.
+        race_cancel(cancel.as_ref(), async { Ok(()) }).await?;
+        let parts = self.parse_target(&prefix)?;
+        self.resolve_credentials(None)?;
+        // A token names the walk that minted it, and neither walk can resume
+        // from the other's: a V2 continuation token is opaque to
+        // `ListObjectVersions`, and a key/version marker pair is not a
+        // continuation token.
+        if let Some(token) = opts.page_token.as_deref() {
+            let minted_versioned = token.starts_with(VERSIONED_LIST_TOKEN_PREFIX);
+            if minted_versioned != opts.versioned_address {
+                return Err(Error::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "S3 list page token was minted with versioned_address={minted_versioned} \
+                         and replayed with versioned_address={}; a listing continues under the \
+                         options it started with",
+                        opts.versioned_address
+                    ),
+                ));
+            }
+        }
+
+        let walk = ListWalk {
+            // `directory_key` rather than the key verbatim: `x` and `x/`
+            // name one node, and a verbatim listing prefix matches every sibling
+            // whose name merely starts with this one's.
+            prefix_key: address::directory_key(&parts.key),
+            bucket_root: address::parse(&format!("s3://{}/", self.config.bucket))?,
+            requested_prefix: prefix.resolved_address,
+            config: self.config.clone(),
+            client: self.unsigned_capable_client().clone(),
+            anonymous: self.anonymous.clone(),
+            region_mismatch: Arc::clone(&self.region_mismatch),
+        };
+        Ok(if opts.versioned_address {
+            Self::list_pages_versioned(walk, opts, cancel)
+        } else {
+            Self::list_pages_current(walk, opts, cancel)
+        })
+    }
+
+    /// The `ListObjectsV2` walk: the default, and all an unpinned listing needs.
+    fn list_pages_current(
+        walk: ListWalk,
+        opts: ListOptions,
+        cancel: Option<CancellationToken>,
+    ) -> S3ListPageStream {
+        Box::pin(async_stream::try_stream! {
+            let ListWalk {
+                prefix_key,
+                bucket_root,
+                requested_prefix,
+                config,
+                client,
+                anonymous,
+                region_mismatch,
+            } = walk;
+            let ctx = ListPageContext {
+                bucket_root: &bucket_root,
+                requested_prefix: &requested_prefix,
+                prefix_key: &prefix_key,
+            };
+            let mut continuation = opts.page_token.clone();
+            let mut previous_page_marker_addresses = HashSet::<String>::new();
+            loop {
+                let mut request = client.list_objects_v2().bucket(&config.bucket);
+                if !prefix_key.is_empty() {
+                    request = request.prefix(&prefix_key);
+                }
+                if !opts.recursive {
+                    request = request.delimiter("/");
+                }
+                // Asked for on every request; see `list`'s doc comment for the
+                // term it narrows and the one it cannot.
+                let page_size = opts
+                    .max_results
+                    .map_or(S3_MAX_KEYS_PER_PAGE, |n| n.min(S3_MAX_KEYS_PER_PAGE));
+                request = request.max_keys(page_size as i32);
+                if let Some(token) = continuation.as_ref() {
+                    request = request.continuation_token(token);
+                }
+                request = apply_request_payer!(request, config);
+                let output = race_cancel(cancel.as_ref(), async {
+                    request.send().await.map_err(|err| {
+                        map_unsigned_store_error(
+                            "s3 list",
+                            err,
+                            anonymous.as_ref(),
+                            &region_mismatch,
+                        )
+                    })
+                }).await?;
+
+                let (page_items, marker_addresses) = convert_list_page(
+                    &ctx,
+                    output.contents().iter().map(ListedKey::from),
+                    output.common_prefixes(),
+                    &previous_page_marker_addresses,
+                )?;
+
+                let next_continuation_token = output
+                    .next_continuation_token()
+                    .filter(|token| !token.is_empty())
+                    .map(str::to_string);
+                let is_truncated = output.is_truncated() == Some(true);
+                drop(output);
+                previous_page_marker_addresses = marker_addresses;
+                yield S3ListPage {
+                    items: page_items,
+                    next_continuation_token: next_continuation_token.clone(),
+                    is_truncated,
+                };
+
+                if opts.max_results.is_some() {
+                    break;
+                }
+                match next_continuation_token {
+                    Some(token) => continuation = Some(token),
+                    None => break,
+                }
+            }
+        })
+    }
+
+    /// The `ListObjectVersions` walk behind `ListOptions::versioned_address`.
     ///
-    /// # Why the walk exists
+    /// Only the entry S3 marks `IsLatest` is what `ListObjectsV2` would have
+    /// listed, so those are the only `Version` entries converted. A key whose
+    /// newest entry is a delete marker has no such version and drops out here
+    /// exactly as V2 omits it; the response's `DeleteMarker` list is never
+    /// consulted.
     ///
-    /// `ListObjectsV2` answers at most 1000 keys per request, so one response
-    /// is a page and not the listing. `S3Layer::list` asks for the full set and
-    /// paginates host-side, and the metadata cache's `find_in_page` treats an
-    /// absent entry in a page with no next token as an authoritative
-    /// `NotFound` — so a caller above this reads a short answer as a complete
-    /// one, and an object past the first page reads as missing. Following
-    /// `NextContinuationToken` to the end is what makes "complete" true.
+    /// `CommonPrefixes` convert as in the V2 walk but carry no `IsLatest`: S3
+    /// folds every version and delete marker under the delimiter into them,
+    /// so a subtree whose objects are all deleted, or that holds only
+    /// non-current versions, arrives as a prefix V2 would not report. Each
+    /// inferred directory the page would emit is therefore verified with one
+    /// `ListObjectsV2` request for a single key under it and dropped when
+    /// nothing current answers, so the flagged and unflagged listings agree
+    /// on which directories exist. A marker-backed directory is a real object
+    /// that passed the `IsLatest` filter and is not probed. The probes run one
+    /// at a time, so a page that emits N inferred directories costs 1 + N
+    /// requests; a recursive walk has no common prefixes and pays nothing.
+    /// They also need `s3:ListBucket` alongside `s3:ListBucketVersions`.
     ///
-    /// So an unbounded call never answers `Ok` with less than the whole prefix
-    /// (a `max_results` call is the deliberate exception above).
+    /// The page token is the response's `NextKeyMarker`/`NextVersionIdMarker`
+    /// pair under [`VERSIONED_LIST_TOKEN_PREFIX`], so the cycle guards in
+    /// `list` and `flatten_list_pages` see one string per page as they do for
+    /// V2.
+    fn list_pages_versioned(
+        walk: ListWalk,
+        opts: ListOptions,
+        cancel: Option<CancellationToken>,
+    ) -> S3ListPageStream {
+        Box::pin(async_stream::try_stream! {
+            let ctx = ListPageContext {
+                bucket_root: &walk.bucket_root,
+                requested_prefix: &walk.requested_prefix,
+                prefix_key: &walk.prefix_key,
+            };
+            let mut continuation = opts.page_token.clone();
+            let mut previous_page_marker_addresses = HashSet::<String>::new();
+            loop {
+                let mut request = walk.client.list_object_versions().bucket(&walk.config.bucket);
+                if !walk.prefix_key.is_empty() {
+                    request = request.prefix(&walk.prefix_key);
+                }
+                if !opts.recursive {
+                    request = request.delimiter("/");
+                }
+                // The same page size the V2 walk asks for, but S3 counts every
+                // version and delete marker against it, so a page may carry
+                // far fewer current items than this.
+                let page_size = opts
+                    .max_results
+                    .map_or(S3_MAX_KEYS_PER_PAGE, |n| n.min(S3_MAX_KEYS_PER_PAGE));
+                request = request.max_keys(page_size as i32);
+                if let Some(token) = continuation.as_deref() {
+                    let (key_marker, version_id_marker) = decode_versions_token(token)?;
+                    request = request.key_marker(key_marker);
+                    if let Some(version_id_marker) = version_id_marker {
+                        request = request.version_id_marker(version_id_marker);
+                    }
+                }
+                request = apply_request_payer!(request, walk.config);
+                let output = race_cancel(cancel.as_ref(), async {
+                    request.send().await.map_err(|err| {
+                        map_unsigned_store_error(
+                            "s3 list (versions)",
+                            err,
+                            walk.anonymous.as_ref(),
+                            &walk.region_mismatch,
+                        )
+                    })
+                }).await?;
+
+                let latest = output
+                    .versions()
+                    .iter()
+                    .filter(|version| version.is_latest() == Some(true))
+                    .map(ListedKey::from);
+                let (converted, marker_addresses) = convert_list_page(
+                    &ctx,
+                    latest,
+                    output.common_prefixes(),
+                    &previous_page_marker_addresses,
+                )?;
+
+                // Every inferred directory here came from `CommonPrefixes`, the
+                // one part of the response the `IsLatest` filter cannot vet.
+                // Dropping one leaves `marker_addresses` alone, since only
+                // marker objects populate it, so a dropped prefix cannot
+                // resurface on the next page. The address round-trips to the
+                // key the way every other operation on a listed item does.
+                let mut page_items = Vec::with_capacity(converted.len());
+                for item in converted {
+                    if item.kind == ObjectKind::DirectoryInferred {
+                        let prefix_key = address::key_utf8(&item.address)?;
+                        let has_current = race_cancel(
+                            cancel.as_ref(),
+                            walk.prefix_has_current_object(&prefix_key),
+                        )
+                        .await?;
+                        if !has_current {
+                            continue;
+                        }
+                    }
+                    page_items.push(item);
+                }
+
+                let is_truncated = output.is_truncated() == Some(true);
+                let next_continuation_token = output
+                    .next_key_marker()
+                    .filter(|key_marker| is_truncated && !key_marker.is_empty())
+                    .map(|key_marker| {
+                        encode_versions_token(key_marker, output.next_version_id_marker())
+                    });
+                drop(output);
+                previous_page_marker_addresses = marker_addresses;
+                yield S3ListPage {
+                    items: page_items,
+                    next_continuation_token: next_continuation_token.clone(),
+                    is_truncated,
+                };
+
+                if opts.max_results.is_some() {
+                    break;
+                }
+                match next_continuation_token {
+                    Some(token) => continuation = Some(token),
+                    None => break,
+                }
+            }
+        })
+    }
+
+    /// Materialize one prefix by draining the shared S3 page walk.
     ///
-    /// # What the budgets do and do not bound
+    /// The buffered Layer contract treats a tokenless return as complete, so
+    /// this method walks to the end unless `max_results` deliberately requests
+    /// one native page. It retains the full continuation-token set and applies
+    /// the fixed cumulative item/page budgets. `list_stream` is the bounded-
+    /// residency surface for callers that do not need buffered pagination.
     ///
-    /// The budgets are checked after a response is folded in and on the edge
-    /// that would fetch another, so one response is the term they cannot see
-    /// and a walk the store has already completed is not refused for finishing
-    /// over budget — up to `LIST_ITEM_CEILING`, which is the one bound that
-    /// applies however complete the answer claims to be.
-    /// Every request therefore asks for S3's own
-    /// 1000-key maximum and `max_results` may only narrow it — without that,
-    /// an `S3Layer` call (which clears `max_results`) sent no `MaxKeys` at all
-    /// and left the size of each response entirely to the store.
-    ///
-    /// That narrows the term; it does not bound it. `MaxKeys` is a request
-    /// parameter, and a store that ignores it is exactly the kind of store
-    /// these budgets exist to defend against — a non-conforming peer can still
-    /// answer with one arbitrarily large page, which is buffered, parsed and
-    /// folded whole before any check runs. Peak memory is the entry budget plus
-    /// one response, bounded for a conforming store and not for a hostile one.
-    /// Bounding it there needs a streaming parse, which the SDK does not give
-    /// us.
-    /// A store that cannot be followed, and a listing over this backend's
-    /// per-call budgets, both end in an error instead — `Transient` for the
-    /// first, `Internal` for the second, because a budget is this backend's own
-    /// fixed bound rather than anything the store did wrong — the entry budget
-    /// bounds the memory the process would otherwise exhaust — and a fixed
-    /// bound is reached identically on every attempt, so it must not be in a
-    /// retryable bucket.
-    /// Neither is linked here because both are private; see `LIST_ITEM_BUDGET`
-    /// and `refuse_partial_listing` in this module.
+    /// Under `versioned_address` the native page comes from
+    /// `ListObjectVersions`, whose `MaxKeys` counts every version and delete
+    /// marker: `max_results` bounds the response, not the items returned, so
+    /// one page may carry fewer current items than requested, and the response
+    /// budget is reached with fewer items on a heavily versioned prefix. Each
+    /// inferred directory a delimited page emits also costs one `ListObjectsV2`
+    /// probe, so such a page takes 1 + N requests for N common prefixes; the
+    /// response budget counts pages, not probes.
     pub async fn list(
         &self,
         prefix: ResolvedTarget,
@@ -1220,265 +1630,145 @@ impl S3Backend {
             plugin = "s3",
             object.address = %RedactedUrl(&prefix.resolved_address),
         );
+        let cancel_for_race = cancel.clone();
         race_cancel(
-            cancel.as_ref(),
+            cancel_for_race.as_ref(),
             async move {
-                let parts = self.parse_target(&prefix)?;
-                self.resolve_credentials(None)?;
-                // `directory_key` rather than the key verbatim: `x` and `x/`
-                // name one node, and a verbatim listing prefix matches every
-                // sibling whose name merely starts with this one's.
-                let prefix_key = address::directory_key(&parts.key);
-                let bucket_root = address::parse(&format!("s3://{}/", self.config.bucket))?;
-                let mut items: Vec<ObjectInfo> = Vec::new();
-                let mut marker_addresses = std::collections::HashSet::new();
-                let mut continuation = opts.page_token.clone();
-                // Every token this walk has followed, seeded with the caller's
-                // so a store that hands its own starting token straight back is
-                // caught on the first response rather than the second.
-                let mut seen_tokens: std::collections::HashSet<String> =
-                    continuation.iter().cloned().collect();
+                let mut page_stream = self
+                    .list_pages(prefix.clone(), opts.clone(), cancel.clone())
+                    .await?;
+                let mut items = Vec::new();
+                // Every token this walk has followed, seeded with the caller's so
+                // a store that hands its own starting token straight back is caught
+                // on the first response rather than the second.
+                let mut seen_tokens: HashSet<String> = opts.page_token.iter().cloned().collect();
+                // Buffered listing already has a fixed cumulative item budget,
+                // so retain every concrete marker address seen by the walk. The
+                // shared page generator intentionally keeps only a two-page
+                // window for bounded streaming; this set preserves the buffered
+                // walk's wider marker/common-prefix dedup contract.
+                let mut marker_addresses = HashSet::<String>::new();
                 let mut pages: usize = 0;
-                loop {
+
+                while let Some(page) = page_stream.next().await {
+                    let page = page?;
                     pages += 1;
-                let mut request = self
-                    .unsigned_capable_client()
-                    .list_objects_v2()
-                    .bucket(&self.config.bucket);
-                if !prefix_key.is_empty() {
-                    request = request.prefix(&prefix_key);
-                }
-                if !opts.recursive {
-                    request = request.delimiter("/");
-                }
-                // Asked for on every request; see the doc comment for the term
-                // it narrows and the one it cannot.
-                let page_size = opts
-                    .max_results
-                    .map_or(S3_MAX_KEYS_PER_PAGE, |n| n.min(S3_MAX_KEYS_PER_PAGE));
-                request = request.max_keys(page_size as i32);
-                if let Some(token) = continuation.as_ref() {
-                    request = request.continuation_token(token);
-                }
-                request = apply_request_payer!(request, self.config);
-                let output = request
-                    .send()
-                    .await
-                    .map_err(|err| self.map_store_error("s3 list", err))?;
-                for object in output.contents() {
-                    let Some(key) = object.key() else {
-                        continue;
-                    };
-                    if key == prefix_key {
-                        continue;
-                    }
-                    let Ok(address) = address::join_relative(&bucket_root, key) else {
-                        // The key cannot be named by a URI path, so any address
-                        // built for it would resolve to a different object.
-                        // Omit the entry and keep the page: invisible beats
-                        // mis-addressed, and failing the page would hide every
-                        // sibling too.
-                        tracing::warn!(
-                            target: "ovstorage.s3.backend",
-                            plugin = "s3",
-                            key = %key,
-                            "s3: object key is not addressable as a URI path; omitted from listing",
-                        );
-                        continue;
-                    };
-                    let _ = address::relative_suffix(&address, &prefix.resolved_address).ok_or_else(
-                        || {
-                            Error::new(
-                                ErrorCode::Internal,
-                                format!(
-                                    "S3 returned object key '{}' outside requested prefix '{}'",
-                                    key,
-                                    RedactedUrl(&prefix.resolved_address)
-                                ),
-                            )
-                        },
-                    )?;
-                    let mtime = object.last_modified().and_then(datetime_to_system_time);
-                    let etag = object
-                        .e_tag()
-                        .map(|value| value.trim_matches('"').to_string());
-                    let size = object.size().and_then(|n| u64::try_from(n).ok());
-                    let mut system_metadata: SystemMetadata = SystemMetadata::new();
-                    if let Some(class) = object.storage_class() {
-                        system_metadata.insert("x-amz-storage-class".into(), class.as_str().into());
-                    }
-                    let kind = if key.ends_with('/') && size.unwrap_or(0) == 0 {
-                        ObjectKind::DirectoryMarker
-                    } else {
-                        ObjectKind::File
-                    };
-                    if kind == ObjectKind::DirectoryMarker {
-                        marker_addresses.insert(address.as_str().to_string());
-                    }
-                    items.push(ObjectInfo {
-                        address,
-                        kind,
-                        etag,
-                        version: None,
-                        size: (kind == ObjectKind::File).then_some(size).flatten(),
-                        mtime,
-                        checksums: ChecksumSet::default(),
-                        effective_permissions: None,
-                        system_metadata: (!system_metadata.is_empty()).then_some(system_metadata),
-                        user_metadata: None,
-                        modified_by: None,
-                    });
-                }
-                for prefix_entry in output.common_prefixes() {
-                    let Some(prefix_str) = prefix_entry.prefix() else {
-                        continue;
-                    };
-                    let Ok(address) = address::join_relative(&bucket_root, prefix_str) else {
-                        tracing::warn!(
-                            target: "ovstorage.s3.backend",
-                            plugin = "s3",
-                            key = %prefix_str,
-                            "s3: common prefix is not addressable as a URI path; omitted from listing",
-                        );
-                        continue;
-                    };
-                    // If S3 reports the same slash key as both a real zero-byte
-                    // marker object and a CommonPrefix, keep the marker. The
-                    // marker is the concrete directory representation and
-                    // carries etag/mtime metadata the inferred prefix lacks.
-                    if marker_addresses.contains(address.as_str()) {
-                        continue;
-                    }
-                    let _ = address::relative_suffix(&address, &prefix.resolved_address).ok_or_else(
-                        || {
-                            Error::new(
-                                ErrorCode::Internal,
-                                format!(
-                                    "S3 returned common prefix '{}' outside requested prefix '{}'",
-                                    prefix_str,
-                                    RedactedUrl(&prefix.resolved_address)
-                                ),
-                            )
-                        },
-                    )?;
-                    // S3 has no explicit directory entity; tag CommonPrefixes as `DirectoryInferred`.
-                    items.push(ObjectInfo {
-                        address,
-                        kind: ObjectKind::DirectoryInferred,
-                        etag: None,
-                        version: None,
-                        size: None,
-                        mtime: None,
-                        checksums: ChecksumSet::default(),
-                        effective_permissions: None,
-                        system_metadata: None,
-                        user_metadata: None,
-                        modified_by: None,
-                    });
-                }
-                // Checked on every path out of a folded page — before the
-                // bounded-request break as well, since a store that ignores
-                // `MaxKeys` overruns a bounded caller just as easily. Past the
-                // ceiling the RESPONSE is the exhaustion, and neither
-                // completeness nor a caller's bound makes it safe to hand on.
-                // See `LIST_ITEM_CEILING`.
-                if items.len() > LIST_ITEM_CEILING {
-                    return Err(refuse_partial_listing(
-                        ErrorCode::Internal,
-                        &prefix.resolved_address,
-                        &format!(
-                            "one response carried the listing past this backend's \
+                    marker_addresses.extend(
+                        page.items
+                            .iter()
+                            .filter(|item| item.kind == ObjectKind::DirectoryMarker)
+                            .map(|item| item.address.as_str().to_string()),
+                    );
+                    items.extend(page.items.into_iter().filter(|item| {
+                        item.kind != ObjectKind::DirectoryInferred
+                            || !marker_addresses.contains(item.address.as_str())
+                    }));
+
+                    // Checked on every path out of a folded page — before the
+                    // bounded-request break as well, since a store that ignores
+                    // `MaxKeys` overruns a bounded caller just as easily.
+                    if items.len() > LIST_ITEM_CEILING {
+                        return Err(refuse_partial_listing(
+                            ErrorCode::Internal,
+                            &prefix.resolved_address,
+                            &format!(
+                                "one response carried the listing past this backend's \
                              {LIST_ITEM_CEILING}-entry ceiling; the store answered with \
                              far more than the {S3_MAX_KEYS_PER_PAGE} keys per response it \
                              was asked for"
-                        ),
-                    ));
-                }
-                // A bounded request keeps its single-page meaning and stops
-                // here, token or no token: the caller asked for one page and a
-                // short answer is what it asked for.
-                if opts.max_results.is_some() {
-                    break;
-                }
-                // The walk ends in exactly one of two ways: the store offers no
-                // further token and did not claim truncation, which is a
-                // complete listing — or it does something this loop cannot
-                // safely continue from, which is an ERROR and not a short
-                // listing. See `refuse_partial_listing` for why that distinction
-                // is the whole point.
-                match output.next_continuation_token() {
-                    Some(token) if !token.is_empty() => {
-                        // A token already issued means the store is not
-                        // advancing. `seen_tokens` rather than "differs from the
-                        // previous one" because a cycle can be longer than one
-                        // step: A → B → A defeats a single-step comparison and
-                        // loops for ever.
-                        if !seen_tokens.insert(token.to_string()) {
-                            return Err(refuse_partial_listing(
-                                ErrorCode::Transient,
-                                &prefix.resolved_address,
-                                "the store reissued a continuation token it had already \
+                            ),
+                        ));
+                    }
+                    // A bounded request keeps its single-page meaning and stops
+                    // here, token or no token.
+                    if opts.max_results.is_some() {
+                        break;
+                    }
+
+                    match page.next_continuation_token {
+                        Some(token) => {
+                            // The buffered path deliberately retains the full token
+                            // set; LIST_PAGE_BUDGET bounds it.
+                            if !seen_tokens.insert(token.clone()) {
+                                return Err(refuse_partial_listing(
+                                    ErrorCode::Transient,
+                                    &prefix.resolved_address,
+                                    "the store reissued a continuation token it had already \
                                  handed back, so the listing cannot be advanced",
-                            ));
-                        }
-                        // The budgets sit on the edge that would fetch ANOTHER
-                        // page, so a listing the store has already declared
-                        // complete is returned rather than discarded for being
-                        // one page over. Peak memory is the same either way —
-                        // this page is folded in before the check runs — and a
-                        // walk that intends to continue is caught here, while
-                        // one that cannot be continued at all is caught by the
-                        // arms around this one. The precedence that produces:
-                        // an oversize response outranks everything, since it is
-                        // checked before the match; below it a store's own
-                        // misbehaviour outranks the budgets, since the cycle
-                        // guard runs first. Entries bound memory; responses bound a store
-                        // answering empty pages for ever, which grows no
-                        // entries and so never trips the first.
-                        if items.len() > LIST_ITEM_BUDGET {
-                            return Err(refuse_partial_listing(
-                                ErrorCode::Internal,
-                                &prefix.resolved_address,
-                                &format!(
-                                    "the listing exceeded this backend's \
+                                ));
+                            }
+                            // These checks remain on the edge that would fetch
+                            // ANOTHER page. Their text and precedence are the
+                            // buffered-list contract.
+                            if items.len() > LIST_ITEM_BUDGET {
+                                return Err(refuse_partial_listing(
+                                    ErrorCode::Internal,
+                                    &prefix.resolved_address,
+                                    &format!(
+                                        "the listing exceeded this backend's \
                                      {LIST_ITEM_BUDGET}-entry budget for a single call and \
                                      the store has more to send; narrow the prefix — and if \
                                      this is one directory level with more than \
                                      {LIST_ITEM_CEILING} direct children, there is no narrower \
                                      request and the shape cannot be listed through the Layer"
-                                ),
-                            ));
-                        }
-                        if pages >= LIST_PAGE_BUDGET {
-                            return Err(refuse_partial_listing(
-                                ErrorCode::Internal,
-                                &prefix.resolved_address,
-                                &format!(
-                                    "the listing exceeded this backend's \
+                                    ),
+                                ));
+                            }
+                            if pages >= LIST_PAGE_BUDGET {
+                                return Err(refuse_partial_listing(
+                                    ErrorCode::Internal,
+                                    &prefix.resolved_address,
+                                    &format!(
+                                        "the listing exceeded this backend's \
                                      {LIST_PAGE_BUDGET}-response budget for a single call \
                                      without completing; the store may be paging without \
                                      making progress"
-                                ),
+                                    ),
+                                ));
+                            }
+                        }
+                        None if page.is_truncated => {
+                            return Err(refuse_partial_listing(
+                                ErrorCode::Transient,
+                                &prefix.resolved_address,
+                                "the store reported the listing as truncated but offered no \
+                             continuation token to resume from",
                             ));
                         }
-                        continuation = Some(token.to_string());
+                        None => break,
                     }
-                    _ if output.is_truncated() == Some(true) => {
-                        return Err(refuse_partial_listing(
-                            ErrorCode::Transient,
-                            &prefix.resolved_address,
-                            "the store reported the listing as truncated but offered no \
-                             continuation token to resume from",
-                        ));
-                    }
-                    _ => break,
-                }
                 }
                 Ok(items)
             }
             .instrument(span),
         )
         .await
+    }
+
+    /// Stream an S3 listing in the backend's native emission order.
+    ///
+    /// Recursive requests omit the delimiter, so S3 yields only byte-ordered
+    /// `Contents`, satisfying the incremental flat-fold precondition.
+    /// Non-recursive requests preserve each page's `Contents`-then-
+    /// `CommonPrefixes` order and are therefore not globally byte-sorted.
+    /// The next response is fetched only after the consumer polls past every
+    /// entry in the current response.
+    pub async fn list_stream(
+        &self,
+        prefix: ResolvedTarget,
+        opts: ListOptions,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ovstorage_plugin::ListStream> {
+        if opts.max_results.is_some() || opts.page_token.is_some() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+        let requested_prefix = prefix.resolved_address.clone();
+        let stream_cancel = cancel.clone();
+        let pages = self.list_pages(prefix, opts, cancel).await?;
+        Ok(flatten_list_pages(pages, requested_prefix, stream_cancel))
     }
 
     pub async fn list_versions(
@@ -1525,9 +1815,6 @@ impl S3Backend {
                     .send()
                     .await
                     .map_err(|err| self.map_store_error("s3 list_versions", err))?;
-                let mut base_address = target.resolved_address.clone();
-                base_address.set_query(None);
-                base_address.set_fragment(None);
                 let mut items = Vec::new();
                 for version in output.versions() {
                     if version.key() != Some(parts.key.as_str()) {
@@ -1540,13 +1827,17 @@ impl S3Backend {
                         continue;
                     };
                     let mtime = version.last_modified().and_then(datetime_to_system_time);
-                    let address = address::with_query_pair(&base_address, "versionId", version_id)?;
+                    let address = s3_version_address(&target.resolved_address, version_id)?;
+                    // The item's address already names this one version, unless
+                    // the id is the mutable `null` version, which pins nothing.
+                    let versioned_address =
+                        s3_version_pin(Some(version_id)).map(|_| address.clone());
+                    let (etag, etag_strength) = normalize_optional_wire_etag(version.e_tag());
                     items.push(ObjectInfo {
+                        etag_strength,
                         address,
                         kind: ObjectKind::File,
-                        etag: version
-                            .e_tag()
-                            .map(|value| value.trim_matches('"').to_string()),
+                        etag,
                         version: Some(version_id.to_string()),
                         size: version.size().and_then(|n| u64::try_from(n).ok()),
                         mtime,
@@ -1555,6 +1846,7 @@ impl S3Backend {
                         system_metadata: None,
                         user_metadata: None,
                         modified_by: None,
+                        versioned_address,
                     });
                 }
                 Ok(items)
@@ -1587,18 +1879,21 @@ impl S3Backend {
                         format!("S3 object '{}' not found", parts.key),
                     ));
                 };
-                let info = object_info_from_head_output(&target.resolved_address, &output);
+                let info = object_info_from_head_output(&target.resolved_address, &output)?;
                 let value = pinned.or_else(|| info.version.clone()).ok_or_else(|| {
                     Error::new(
                         ErrorCode::Unsupported,
                         "S3 object is not versioned (no x-amz-version-id on HEAD)",
                     )
                 })?;
-                let mut base_address = target.resolved_address.clone();
-                base_address.set_query(None);
-                base_address.set_fragment(None);
-                let address = address::with_query_pair(&base_address, "versionId", &value)?;
-                Ok(ObjectInfo { address, ..info })
+                let address = s3_version_address(&target.resolved_address, &value)?;
+                Ok(ObjectInfo {
+                    // The address returned already names this one version,
+                    // unless it is the mutable `null` version, which pins nothing.
+                    versioned_address: s3_version_pin(Some(&value)).map(|_| address.clone()),
+                    address,
+                    ..info
+                })
             }
             .instrument(span),
         )
@@ -1636,11 +1931,11 @@ impl S3Backend {
                 .send()
                 .await
                 .map_err(|err| map_sdk_error("s3 create_directory", err))?;
+            let (etag, etag_strength) = normalize_optional_wire_etag(output.e_tag());
             Ok(BackendItemInfo {
+                etag_strength,
                 kind: ObjectKind::DirectoryMarker,
-                etag: output
-                    .e_tag()
-                    .map(|value| value.trim_matches('"').to_string()),
+                etag,
                 version: output.version_id().map(str::to_string),
                 size: Some(0),
                 mtime: None,
@@ -1759,12 +2054,14 @@ impl S3Backend {
                 if let Some(expiration) = output.expiration() {
                     system_metadata.insert("x-amz-expiration".into(), expiration.into());
                 }
+                let (etag, etag_strength) = normalize_optional_wire_etag(
+                    result.and_then(|copy_result| copy_result.e_tag()),
+                );
                 let info = ObjectInfo {
+                    etag_strength,
                     address: dest.resolved_address.clone(),
                     kind: ObjectKind::File,
-                    etag: result
-                        .and_then(|r| r.e_tag())
-                        .map(|value| value.trim_matches('"').to_string()),
+                    etag,
                     version: output.version_id().map(str::to_string),
                     size: None,
                     mtime: result
@@ -1775,6 +2072,7 @@ impl S3Backend {
                     system_metadata: (!system_metadata.is_empty()).then_some(system_metadata),
                     user_metadata: None,
                     modified_by: None,
+                    versioned_address: None,
                 };
                 Ok(ovstorage_plugin::WriteStep::Done(WriteResult { info }))
             }
@@ -1893,15 +2191,12 @@ impl S3Backend {
                 ));
             };
             let existing = user_metadata_from_map(head.metadata()).unwrap_or_default();
-            let mut desired = merge_metadata(
+            let desired = update_metadata_entries(
                 &existing,
                 &opts.user_metadata_set,
                 &opts.user_metadata_remove,
+                opts.message.as_deref(),
             );
-            if let Some(message) = opts.message.as_deref().filter(|m| !m.is_empty()) {
-                desired.retain(|(k, _)| k != "x-ov-message");
-                desired.push(("x-ov-message".to_string(), message.to_string()));
-            }
             // Apply the merged metadata via a self-copy with REPLACE directive.
             let mut metadata_map: HashMap<String, String> = HashMap::new();
             for (key, value) in &desired {
@@ -1924,11 +2219,13 @@ impl S3Backend {
                 .await
                 .map_err(|err| map_sdk_error("s3 update_metadata", err))?;
             let result = output.copy_object_result();
+            let (etag, etag_strength) = normalize_optional_wire_etag(
+                result.and_then(|copy_result| copy_result.e_tag()),
+            );
             Ok(BackendItemInfo {
+                etag_strength,
                 kind: ObjectKind::File,
-                etag: result
-                    .and_then(|r| r.e_tag())
-                    .map(|value| value.trim_matches('"').to_string()),
+                etag,
                 version: output.version_id().map(str::to_string),
                 size: None,
                 mtime: result.and_then(|r| r.last_modified()).and_then(datetime_to_system_time),
@@ -1987,7 +2284,7 @@ impl S3Backend {
             // Provoke the answer and classify by the status — see the doc
             // comment for why the bucket arm differs by connection shape.
             let probe_status: Option<u16> = if parts.key.is_empty() {
-                if self.is_anonymous {
+                if self.is_anonymous() {
                     let mut request = client
                         .list_objects_v2()
                         .bucket(&self.config.bucket)
@@ -2066,7 +2363,7 @@ impl S3Backend {
                     // Reporting them as allowed because a HEAD succeeded would
                     // be a confident wrong answer to the only question this
                     // operation exists to answer.
-                    let denied_ops = if self.is_anonymous {
+                    let denied_ops = if self.is_anonymous() {
                         AccessOps {
                             read: false,
                             write: ops.write,
@@ -2112,6 +2409,89 @@ impl S3Backend {
     /// their not-found fallbacks (e.g. the directory-marker probe). A `HEAD` is
     /// servable unsigned, so an anonymous connection issues it too, and the
     /// bucket policy decides.
+    /// One unsigned `HeadBucket`, asking where this backend's bucket lives.
+    ///
+    /// The anonymous `s3://` fallback sends this from a probe backend built
+    /// for its default region: S3 answers a request that reached the wrong
+    /// region with `301` (or `400` under SigV4), and stamps
+    /// `x-amz-bucket-region` on that refusal and on most others, so the
+    /// bucket's region is read off whatever came back. A header that names a
+    /// region is believed on any status. What an answer without one means
+    /// depends on whether the store judged the bucket at all:
+    ///
+    /// - a `404` is an error — the bucket does not exist, and there is
+    ///   nothing to learn;
+    /// - any other `2xx` or `4xx`, including a `403` for a bucket that
+    ///   grants the anonymous principal no `HeadBucket`, is a verdict about
+    ///   the bucket and is `Ok(None)`: the caller takes the bucket to live in
+    ///   the region the probe reached, and the data-path request that follows
+    ///   reports the bucket's real answer;
+    /// - a `3xx` naming no region is an error as [`map_sdk_error`] classifies
+    ///   it. A redirect says the bucket is served from somewhere else, which
+    ///   is the opposite of "the region the probe reached", so it must not be
+    ///   read as the default; AWS always names the region on its `301`, and a
+    ///   compatible store that does not has told the caller only that it does
+    ///   not know;
+    /// - a `429` or `5xx` is an error as [`map_sdk_error`] classifies it, the
+    ///   same as a transport failure. The store shed the request without
+    ///   judging the bucket, so the answer says nothing about where the
+    ///   bucket lives, and reading it as "the default region" would pin a
+    ///   bucket elsewhere to the wrong region for as long as the caller
+    ///   remembers the verdict.
+    ///
+    /// A value is admitted only through [`is_valid_region_token`], because it
+    /// becomes part of a hostname.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorCode::NotFound`] — S3 answered `404`: no such bucket.
+    /// - [`ErrorCode::Cancelled`] — `cancel` fired.
+    /// - A `3xx` naming no region, a `429` or `5xx`, and transport failures,
+    ///   as [`map_sdk_error`] classifies them.
+    pub(crate) async fn head_bucket_region(
+        &self,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Option<String>> {
+        race_cancel(cancel, async {
+            let request = self
+                .unsigned_capable_client()
+                .head_bucket()
+                .bucket(&self.config.bucket);
+            match request.send().await {
+                Ok(output) => Ok(output
+                    .bucket_region()
+                    .filter(|region| is_valid_region_token(region))
+                    .map(str::to_string)),
+                Err(err) => {
+                    let status = err.raw_response().map(|resp| resp.status().as_u16());
+                    if status == Some(404) {
+                        return Err(Error::new(
+                            ErrorCode::NotFound,
+                            format!("S3 bucket '{}' does not exist", self.config.bucket),
+                        ));
+                    }
+                    if let Some(region) = bucket_region_from_error(&err) {
+                        return Ok(Some(region));
+                    }
+                    match status {
+                        // The store judged the bucket and named no region.
+                        // A `404` never reaches here.
+                        Some(200..=299 | 400..=428 | 430..=499) => Ok(None),
+                        // A redirect naming no region, a shed request, or no
+                        // answer at all: nothing here says where the bucket
+                        // lives.
+                        _ => Err(map_sdk_error_for(
+                            "s3 head_bucket",
+                            err,
+                            self.anonymous.as_ref(),
+                        )),
+                    }
+                }
+            }
+        })
+        .await
+    }
+
     async fn head_object(
         &self,
         key: &str,
@@ -2161,12 +2541,12 @@ impl S3Backend {
             if let Some(class) = marker.storage_class() {
                 system_metadata.insert("x-amz-storage-class".into(), class.as_str().into());
             }
+            let (etag, etag_strength) = normalize_optional_wire_etag(marker.e_tag());
             return Ok(FlatDirectoryProbe::Marker(Box::new(ObjectInfo {
+                etag_strength,
                 address: address.clone(),
                 kind: ObjectKind::DirectoryMarker,
-                etag: marker
-                    .e_tag()
-                    .map(|value| value.trim_matches('"').to_string()),
+                etag,
                 version: None,
                 size: marker.size().and_then(|n| u64::try_from(n).ok()),
                 mtime: marker.last_modified().and_then(datetime_to_system_time),
@@ -2175,6 +2555,7 @@ impl S3Backend {
                 system_metadata: (!system_metadata.is_empty()).then_some(system_metadata),
                 user_metadata: None,
                 modified_by: None,
+                versioned_address: None,
             })));
         }
         let mut descendant_seen = false;
@@ -2277,7 +2658,7 @@ impl S3Backend {
                 let new_etag = err
                     .raw_response()
                     .and_then(|resp| resp.headers().get("etag"))
-                    .map(|value| value.trim_matches('"').to_string());
+                    .map(|value| normalize_wire_etag(value).0);
                 return Err(Error::new(
                     ErrorCode::PreconditionFailed,
                     "S3 PutObject precondition failed",
@@ -2288,12 +2669,12 @@ impl S3Backend {
         };
         let bucket_root = address::parse(&format!("s3://{}/", self.config.bucket))?;
         let resolved = address::join_relative(&bucket_root, key)?;
+        let (etag, etag_strength) = normalize_optional_wire_etag(output.e_tag());
         Ok(ObjectInfo {
+            etag_strength,
             address: resolved,
             kind: ObjectKind::File,
-            etag: output
-                .e_tag()
-                .map(|value| value.trim_matches('"').to_string()),
+            etag,
             version: output.version_id().map(str::to_string),
             size: Some(body.len() as u64),
             // S3 PutObject responses carry no Last-Modified header.
@@ -2309,6 +2690,7 @@ impl S3Backend {
             system_metadata: None,
             user_metadata: opts.user_metadata.clone(),
             modified_by: None,
+            versioned_address: None,
         })
     }
 
@@ -2395,7 +2777,7 @@ impl S3Backend {
             body_source: RedirectBodySource::UserBytes { offset: 0, len },
             result_capture: ResultCapture {
                 headers: vec!["etag".into(), "x-amz-version-id".into()],
-                body_max_bytes: 0,
+                body_max_bytes: REDIRECT_ERROR_BODY_CAPTURE_BYTES,
             },
             expires_at: scope.expires_at,
             scope,
@@ -2458,7 +2840,7 @@ impl S3Backend {
                 },
                 result_capture: ResultCapture {
                     headers: vec!["etag".into(), "x-amz-version-id".into()],
-                    body_max_bytes: 0,
+                    body_max_bytes: REDIRECT_ERROR_BODY_CAPTURE_BYTES,
                 },
                 expires_at: scope.expires_at,
                 scope,
@@ -2539,9 +2921,7 @@ impl S3Backend {
                 "CompleteMultipartUpload",
             )
         })?;
-        let etag = output
-            .e_tag()
-            .map(|value| value.trim_matches('"').to_string());
+        let (etag, etag_strength) = normalize_optional_wire_etag(output.e_tag());
         if etag.is_none() {
             return Err(Error::new(
                 ErrorCode::Internal,
@@ -2551,11 +2931,13 @@ impl S3Backend {
         let bucket_root = address::parse(&format!("s3://{}/", self.config.bucket))?;
         let resolved = address::join_relative(&bucket_root, key)?;
         let total_size: u64 = continuation.parts.iter().map(|p| p.byte_length).sum();
-        // Rebuilt from the continuation the caller echoed back, so this map is
-        // the caller's shape. The reserved attribution key inside it is put
-        // right by the host's attribution overlay, which is the one place every
-        // `continue_write` result passes through; what S3 *persisted* was bound
-        // at `CreateMultipartUpload` and the caller never held it.
+        // Rebuilt from the returned continuation. The broker seal prevents an
+        // edit on its client-driven route, but the Layer also supports unsealed
+        // callers, and no seal binds this value to the principal finalizing the
+        // write. The reserved attribution key is put right by the host's
+        // attribution overlay, which is the one place every `continue_write`
+        // result passes through; what S3 *persisted* was bound at
+        // `CreateMultipartUpload` and the caller never held it.
         let user_metadata: Option<UserMetadata> =
             continuation.user_metadata.as_ref().map(|pairs| {
                 let mut map: HashMap<String, String> = HashMap::new();
@@ -2565,6 +2947,7 @@ impl S3Backend {
                 map
             });
         Ok(ObjectInfo {
+            etag_strength,
             address: resolved,
             kind: ObjectKind::File,
             etag,
@@ -2576,6 +2959,7 @@ impl S3Backend {
             system_metadata: None,
             user_metadata,
             modified_by: None,
+            versioned_address: None,
         })
     }
 
@@ -2768,7 +3152,7 @@ impl S3Backend {
             .map_err(|err| map_sdk_error("s3 upload_part", err))?;
         output
             .e_tag()
-            .map(|value| value.trim_matches('"').to_string())
+            .map(|value| normalize_wire_etag(value).0)
             .ok_or_else(|| {
                 Error::new(
                     ErrorCode::Internal,
@@ -2846,12 +3230,12 @@ impl S3Backend {
     }
 }
 
-/// Bounds a caller-supplied upload id before it reaches a log field. On the
-/// broker's client-driven route the id comes out of the echoed continuation and
-/// `decode` validates only the tag, so an unbounded copy would let a caller
-/// choose the contents and the size of a WARN record it can trigger without any
-/// provider round trip. A prefix is enough to correlate with the provider's own
-/// records.
+/// Bounds an upload id before it reaches a log field. The broker's client-driven
+/// RPC authenticates the continuation, but the Layer SPI does not: a direct SPI
+/// caller or an unsealed host can choose the id because `decode` validates only
+/// the plugin tag. An unbounded copy would then let that caller choose the
+/// contents and size of a WARN record it can trigger without any provider round
+/// trip. A prefix is enough to correlate with the provider's own records.
 struct UploadIdPrefix<'a>(&'a str);
 
 impl std::fmt::Display for UploadIdPrefix<'_> {
@@ -2908,6 +3292,27 @@ fn merge_metadata(
     out
 }
 
+/// The metadata set the self-copy replaces the object's with: `existing` with
+/// `remove` and `set` applied by [`merge_metadata`], then `message` under
+/// [`MESSAGE_METADATA_KEY`] unless `set` spells that key under any ASCII case.
+/// A `set` entry under the key stands; otherwise the message replaces whatever
+/// the object holds under it, a removal of the key in the same call included.
+fn update_metadata_entries(
+    existing: &UserMetadata,
+    set: &HashMap<String, String>,
+    remove: &[String],
+    message: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut desired = merge_metadata(existing, set, remove);
+    if !carries_message_key(set.keys())
+        && let Some(message) = message.filter(|m| !m.is_empty() && is_header_value(m))
+    {
+        desired.retain(|(k, _)| k != MESSAGE_METADATA_KEY);
+        desired.push((MESSAGE_METADATA_KEY.to_string(), message.to_string()));
+    }
+    desired
+}
+
 fn directory_marker_key(prefix_key: &str) -> Result<String> {
     if prefix_key.is_empty() {
         return Err(Error::new(
@@ -2922,20 +3327,47 @@ fn directory_marker_key(prefix_key: &str) -> Result<String> {
     }
 }
 
-/// Stash `opts.message` as the `x-ov-message` user-metadata entry (the
-/// project-wide convention for backends without native commit annotations);
-/// returns `opts` unchanged when the message is absent or empty.
+/// Whether `value` can travel as an HTTP header value: visible ASCII, space,
+/// tab, or bytes above 0x7F. Metadata rides in `x-amz-meta-*` headers here, so a
+/// message outside that set cannot be stored as is, and the annotation is
+/// droppable by contract: the stash declines it rather than turning the call
+/// into a request-construction failure.
+fn is_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte == b'\t' || (0x20..0x7F).contains(&byte) || byte >= 0x80)
+}
+
+/// Stash `opts.message` as the [`MESSAGE_METADATA_KEY`] user-metadata entry (the
+/// project-wide convention for backends without native commit annotations) when
+/// the caller's map leaves that key unset. The caller's own entry stands: user
+/// metadata is persisted, the per-operation annotation is droppable. Returns
+/// `opts` unchanged when the message is absent, empty, or not a header value
+/// per [`is_header_value`].
 fn with_message_stashed(mut opts: WriteOptions) -> WriteOptions {
-    let Some(message) = opts.message.as_deref().filter(|m| !m.is_empty()) else {
+    let Some(message) = opts
+        .message
+        .as_deref()
+        .filter(|m| !m.is_empty() && is_header_value(m))
+    else {
         return opts;
     };
     let mut metadata = opts.user_metadata.take().unwrap_or_default();
-    metadata.insert("x-ov-message".into(), message.to_string());
+    if !carries_message_key(metadata.keys()) {
+        metadata.insert(MESSAGE_METADATA_KEY.into(), message.to_string());
+    }
     opts.user_metadata = Some(metadata);
     opts
 }
 
-/// Conditional + `x-amz-meta-*` headers signed into the presigned URL; follower must echo them verbatim.
+/// Whether a caller-supplied metadata map spells [`MESSAGE_METADATA_KEY`] under
+/// any ASCII case. S3 lower-cases metadata names on the wire, so every spelling
+/// lands on the same stored entry.
+fn carries_message_key<'a>(keys: impl IntoIterator<Item = &'a String>) -> bool {
+    keys.into_iter()
+        .any(|key| key.eq_ignore_ascii_case(MESSAGE_METADATA_KEY))
+}
+
 /// Derive the redirect-scope `physical_url_prefix` (`scheme://authority/`) from
 /// a (presigned or plain) object URL. The host uses this to gate which URLs a
 /// follower may fetch, so it must match the authority the SDK actually signed.
@@ -3007,6 +3439,7 @@ fn read_response_parsing() -> ResponseParsing {
     checksum_headers.insert(ChecksumAlgorithm::md5(), "x-amz-checksum-md5".into());
     ResponseParsing {
         etag_header: Some("etag".into()),
+        etag_strength: EtagStrength::Unspecified,
         version_header: Some("x-amz-version-id".into()),
         size_header: Some("content-length".into()),
         mtime_header: Some("last-modified".into()),
@@ -3166,12 +3599,21 @@ fn user_metadata_from_map(meta: Option<&HashMap<String, String>>) -> Option<User
     Some(metadata)
 }
 
-/// Build an `ObjectInfo` (kind `File`) from a typed `HeadObjectOutput`.
-fn object_info_from_head_output(addr: &Url, out: &HeadObjectOutput) -> ObjectInfo {
-    ObjectInfo {
+/// The `ObjectInfo` (kind `File`) a typed `HeadObjectOutput` describes.
+///
+/// The pin comes free with the response: `x-amz-version-id` is on every HEAD
+/// of a versioned bucket, so it is reported whether or not the caller asked
+/// to pay for it.
+fn object_info_from_head_output(addr: &Url, out: &HeadObjectOutput) -> Result<ObjectInfo> {
+    let (etag, etag_strength) = normalize_optional_wire_etag(out.e_tag());
+    let versioned_address = s3_version_pin(out.version_id())
+        .map(|version_id| s3_version_address(addr, version_id))
+        .transpose()?;
+    Ok(ObjectInfo {
+        etag_strength,
         address: addr.clone(),
         kind: ObjectKind::File,
-        etag: out.e_tag().map(|value| value.trim_matches('"').to_string()),
+        etag,
         version: out.version_id().map(str::to_string),
         size: out.content_length().and_then(|n| u64::try_from(n).ok()),
         mtime: out.last_modified().and_then(datetime_to_system_time),
@@ -3186,70 +3628,96 @@ fn object_info_from_head_output(addr: &Url, out: &HeadObjectOutput) -> ObjectInf
         system_metadata: system_metadata_from_head(out),
         user_metadata: user_metadata_from_map(out.metadata()),
         modified_by: None,
-    }
+        versioned_address,
+    })
 }
 
 /// The error a listing walk ends with when it cannot prove it saw everything.
 ///
-/// This is the whole reason the walk exists, stated as a rule: **a short
-/// listing must never be returned as if it were complete.** `S3Backend::list`
-/// answers a bare `Vec<ObjectInfo>` with no truncation signal in it, so a
-/// caller cannot tell a partial answer from a whole one — and the metadata
-/// cache does not try: `find_in_page` reads a page with no next token as
-/// authoritative and turns an absent entry into `NotFound`. Returning `Ok`
-/// with what was read would therefore convert a misbehaving store into a
-/// confident "that object does not exist", which is exactly the defect the
-/// pagination fix removed. An error is recoverable; a false `NotFound` is not.
+/// Flatten converted S3 pages without reading ahead of the current page.
 ///
-/// The `code` is the caller's, because the two ways a walk ends early are not
-/// the same kind of failure and a caller acts on them differently:
+/// Unlike buffered `list`, this walk has no item or page budget: the consumer
+/// controls progress and cancellation bounds an abandoned or runaway walk.
+/// The continuation guard is correspondingly fixed-size. It catches immediate
+/// no-progress and cycles within the recent window without growing with the
+/// number of pages consumed.
+fn flatten_list_pages(
+    mut pages: S3ListPageStream,
+    requested_prefix: Url,
+    cancel: Option<CancellationToken>,
+) -> ovstorage_plugin::ListStream {
+    Box::pin(async_stream::stream! {
+        let mut continuation = None;
+        let mut recent_tokens = VecDeque::<String>::new();
+
+        'walk: while let Some(page) = pages.next().await {
+            let page = match page {
+                Ok(page) => page,
+                Err(error) => {
+                    yield Err(error);
+                    break;
+                }
+            };
+            let S3ListPage {
+                items,
+                next_continuation_token,
+                is_truncated,
+            } = page;
+
+            for item in items {
+                if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                    yield Err(Error::new(ErrorCode::Cancelled, "list_stream cancelled"));
+                    break 'walk;
+                }
+                yield Ok(item);
+            }
+            if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                yield Err(Error::new(ErrorCode::Cancelled, "list_stream cancelled"));
+                break;
+            }
+
+            match next_continuation_token {
+                Some(token) => {
+                    let no_progress = continuation.as_deref() == Some(token.as_str());
+                    let recent_cycle = recent_tokens.iter().any(|seen| seen == &token);
+                    if no_progress || recent_cycle {
+                        yield Err(refuse_partial_listing(
+                            ErrorCode::Transient,
+                            &requested_prefix,
+                            "the store reissued a continuation token it had already \
+                             handed back, so the listing cannot be advanced",
+                        ));
+                        break;
+                    }
+                    if recent_tokens.len() == LIST_STREAM_TOKEN_WINDOW {
+                        recent_tokens.pop_front();
+                    }
+                    recent_tokens.push_back(token.clone());
+                    continuation = Some(token);
+                }
+                None if is_truncated => {
+                    yield Err(refuse_partial_listing(
+                        ErrorCode::Transient,
+                        &requested_prefix,
+                        "the store reported the listing as truncated but offered no \
+                         continuation token to resume from",
+                    ));
+                    break;
+                }
+                None => break,
+            }
+        }
+    })
+}
+
+/// Build the common refusal for a page walk that cannot safely continue.
 ///
-/// - `Transient` for a store that misbehaved — reissued a token, or claimed
-///   truncation with nothing to resume from. The fault is in the answer, not in
-///   this process, and a retry against a healthy replica or after a restart can
-///   succeed.
-/// - `Internal` for all three local bounds — the two budgets and the ceiling —
-///   which are this backend's own hard limits on what one call may consume
-///   rather than anything the store did wrong. `LIST_ITEM_BUDGET` bounds the
-///   memory the process would otherwise exhaust; `LIST_PAGE_BUDGET` bounds the
-///   round trips and the token set instead of the bytes, for a store whose
-///   pages are empty and so grow no memory at all; `LIST_ITEM_CEILING` bounds
-///   one oversize response.
-///
-/// **What decides it is the retry, and it took three rulings to settle.** The
-/// obvious reading is `ResourceExhausted` — a resource this backend bounds was
-/// exhausted, and gRPC's own definition of that code covers genuine
-/// exhaustion rather than only a quota. But retryability here is exactly bucket
-/// membership by construction (`ovstorage-core/ovstorage-layer/src/errors.rs`,
-/// `ErrorBucket::retryable`), `ResourceExhausted` is in one of the two
-/// retryable buckets, and the shipped broker stack composes `RetryWrapper`
-/// above the router at five attempts. A budget is a **fixed local bound**: the
-/// same request reaches it on every attempt, so each retry re-walks the whole
-/// prefix — up to five full scans and five times the allocation — to fail
-/// identically. There is no code that both says "a resource was exhausted" and
-/// stays out of the retryable buckets, so the choice is between an accurate
-/// name and a survivable cost, and the cost wins.
-///
-/// `Internal` is what the taxonomy already gives for "server-side, not the
-/// caller's fault, not safe to blindly retry", and
-/// `docs/public/plugin-storage/CONFORMANCE.md`'s error-code table now names a
-/// plugin's own hard bound alongside a plugin bug, so this is the code the spec
-/// asks for rather than a local reading of it. The same choice is made by the
-/// two sibling caps in this workspace — the CLI's recursive enumeration and the
-/// MCP dry run, both at 100,000 entries.
-///
-/// `InvalidArgument` is not the alternative: `S3Layer::list` hard-sets
-/// `max_results: None`, so a caller's own `max_results` slices the answer
-/// without bounding the walk. A caller has a remedy — narrow the prefix — but
-/// no parameter. `Unsupported` is worse still: the host reads it as equivalent
-/// to a false capability bit, and `supports_list` is true.
-///
-/// **The real fix is neither code.** Doing 100 requests and 50 MB of work and
-/// then discarding all of it is the defect underneath this; `list` returning
-/// what it has with a continuation token, or streaming, is what removes it.
-/// Both change the Layer/backend pagination contract, so both are filed rather
-/// than built here, and the cap is the stopgap that makes the failure bounded
-/// instead of fatal.
+/// A short buffered listing cannot be returned as complete: callers treat a
+/// tokenless result as authoritative and may infer `NotFound` from absence.
+/// Store pagination faults are `Transient`; fixed local buffered-list budgets
+/// are `Internal` so retry policy does not repeat the same bounded walk. The
+/// streaming surface uses this helper only for store faults and the per-
+/// response ceiling, never for cumulative item or page budgets.
 fn refuse_partial_listing(code: ErrorCode, prefix: &Url, what_happened: &str) -> Error {
     Error::new(
         code,
@@ -3280,9 +3748,1186 @@ fn address_version_id(addr: &Url) -> Option<String> {
     None
 }
 
+/// The address that names exactly one version of `addr`'s object.
+///
+/// Any selector or fragment already on `addr` is replaced rather than
+/// stacked, so the pin has one spelling whichever address it was derived
+/// from.
+fn s3_version_address(addr: &Url, version_id: &str) -> Result<Url> {
+    let mut base = addr.clone();
+    base.set_query(None);
+    base.set_fragment(None);
+    address::with_query_pair(&base, "versionId", version_id)
+}
+
+/// A version id that names an immutable version, or `None`.
+///
+/// S3 reports the literal `null` for the mutable null version of an
+/// unversioned or suspended bucket, on HEAD and in `ListObjectVersions`
+/// alike. `?versionId=null` selects whatever bytes the key holds at read
+/// time, so it pins nothing and is not reported as a pin.
+fn s3_version_pin(version_id: Option<&str>) -> Option<&str> {
+    version_id.filter(|version_id| *version_id != "null")
+}
+
+/// Mint the versioned walk's page token from a response's marker pair.
+///
+/// Both halves are percent-encoded so a key or version id containing `|`
+/// survives the split in [`decode_versions_token`].
+fn encode_versions_token(key_marker: &str, version_id_marker: Option<&str>) -> String {
+    format!(
+        "{VERSIONED_LIST_TOKEN_PREFIX}{}|{}",
+        urlencoding::encode(key_marker),
+        version_id_marker
+            .map(urlencoding::encode)
+            .unwrap_or_default()
+    )
+}
+
+/// Read a token minted by [`encode_versions_token`] back into its
+/// `(key_marker, version_id_marker)` pair.
+fn decode_versions_token(token: &str) -> Result<(String, Option<String>)> {
+    let malformed = || {
+        Error::new(
+            ErrorCode::InvalidArgument,
+            "S3 list page token is not a versioned-listing token",
+        )
+    };
+    let body = token
+        .strip_prefix(VERSIONED_LIST_TOKEN_PREFIX)
+        .ok_or_else(malformed)?;
+    let (key_marker, version_id_marker) = body.split_once('|').unwrap_or((body, ""));
+    let decode = |part: &str| {
+        urlencoding::decode(part)
+            .map(|decoded| decoded.into_owned())
+            .map_err(|_| malformed())
+    };
+    let key_marker = decode(key_marker)?;
+    let version_id_marker = (!version_id_marker.is_empty())
+        .then(|| decode(version_id_marker))
+        .transpose()?;
+    Ok((key_marker, version_id_marker))
+}
+
+/// One listed key, whichever listing API reported it.
+///
+/// `ListObjectsV2` reports `Object` entries and `ListObjectVersions` reports
+/// `ObjectVersion` entries; both carry the fields a listing item needs, and
+/// only the latter carries a version id.
+struct ListedKey<'a> {
+    key: Option<&'a str>,
+    e_tag: Option<&'a str>,
+    size: Option<i64>,
+    last_modified: Option<&'a aws_sdk_s3::primitives::DateTime>,
+    storage_class: Option<&'a str>,
+    version_id: Option<&'a str>,
+}
+
+impl<'a> From<&'a aws_sdk_s3::types::Object> for ListedKey<'a> {
+    fn from(object: &'a aws_sdk_s3::types::Object) -> Self {
+        Self {
+            key: object.key(),
+            e_tag: object.e_tag(),
+            size: object.size(),
+            last_modified: object.last_modified(),
+            storage_class: object.storage_class().map(|class| class.as_str()),
+            version_id: None,
+        }
+    }
+}
+
+impl<'a> From<&'a aws_sdk_s3::types::ObjectVersion> for ListedKey<'a> {
+    fn from(version: &'a aws_sdk_s3::types::ObjectVersion) -> Self {
+        Self {
+            key: version.key(),
+            e_tag: version.e_tag(),
+            size: version.size(),
+            last_modified: version.last_modified(),
+            storage_class: version.storage_class().map(|class| class.as_str()),
+            version_id: version.version_id(),
+        }
+    }
+}
+
+/// What page conversion needs to know about the listing it serves.
+struct ListPageContext<'a> {
+    bucket_root: &'a Url,
+    requested_prefix: &'a Url,
+    /// The prefix as sent to S3; its own marker object is not an entry of the
+    /// listing it names.
+    prefix_key: &'a str,
+}
+
+/// Turn one listing response into `ObjectInfo` items, whichever API produced it.
+///
+/// Emission order is S3's: keys first, then `CommonPrefixes`. The requested
+/// prefix's own marker is skipped; a key that cannot be spelled as a URI path
+/// is omitted with a warning; a key or prefix outside the requested prefix is
+/// refused as `Internal`, because the response does not describe the listing
+/// asked for. A `CommonPrefixes` entry that a concrete marker in this or the
+/// previous page already names is dropped so a directory appears once.
+/// Returns the items and this page's marker addresses for the caller to carry
+/// to the next page.
+fn convert_list_page<'a>(
+    ctx: &ListPageContext<'_>,
+    keys: impl Iterator<Item = ListedKey<'a>>,
+    prefixes: &[aws_sdk_s3::types::CommonPrefix],
+    previous_page_marker_addresses: &HashSet<String>,
+) -> Result<(Vec<ObjectInfo>, HashSet<String>)> {
+    let mut page_items = Vec::new();
+    let mut marker_addresses = HashSet::new();
+    for listed in keys {
+        let Some(key) = listed.key else {
+            continue;
+        };
+        if key == ctx.prefix_key {
+            continue;
+        }
+        let Ok(address) = address::join_relative(ctx.bucket_root, key) else {
+            // The key cannot be named by a URI path, so any address
+            // built for it would resolve to a different object.
+            tracing::warn!(
+                target: "ovstorage.s3.backend",
+                plugin = "s3",
+                key = %key,
+                "s3: object key is not addressable as a URI path; omitted from listing",
+            );
+            continue;
+        };
+        let _ = address::relative_suffix(&address, ctx.requested_prefix).ok_or_else(|| {
+            Error::new(
+                ErrorCode::Internal,
+                format!(
+                    "S3 returned object key '{}' outside requested prefix '{}'",
+                    key,
+                    RedactedUrl(ctx.requested_prefix)
+                ),
+            )
+        })?;
+        let mtime = listed.last_modified.and_then(datetime_to_system_time);
+        let (etag, etag_strength) = normalize_optional_wire_etag(listed.e_tag);
+        let size = listed.size.and_then(|n| u64::try_from(n).ok());
+        let mut system_metadata: SystemMetadata = SystemMetadata::new();
+        if let Some(class) = listed.storage_class {
+            system_metadata.insert("x-amz-storage-class".into(), class.into());
+        }
+        let kind = if key.ends_with('/') && size.unwrap_or(0) == 0 {
+            ObjectKind::DirectoryMarker
+        } else {
+            ObjectKind::File
+        };
+        if kind == ObjectKind::DirectoryMarker {
+            marker_addresses.insert(address.as_str().to_string());
+        }
+        // A directory kind is never pinned, whatever version id the wire
+        // attached to the marker object.
+        let versioned_address = if kind == ObjectKind::File {
+            s3_version_pin(listed.version_id)
+                .map(|version_id| s3_version_address(&address, version_id))
+                .transpose()?
+        } else {
+            None
+        };
+        page_items.push(ObjectInfo {
+            etag_strength,
+            address,
+            kind,
+            etag,
+            // Reported as the store spelled it, `null` included, like HEAD.
+            version: listed.version_id.map(str::to_string),
+            size: (kind == ObjectKind::File).then_some(size).flatten(),
+            mtime,
+            checksums: ChecksumSet::default(),
+            effective_permissions: None,
+            system_metadata: (!system_metadata.is_empty()).then_some(system_metadata),
+            user_metadata: None,
+            modified_by: None,
+            versioned_address,
+        });
+    }
+    for prefix_entry in prefixes {
+        let Some(prefix_str) = prefix_entry.prefix() else {
+            continue;
+        };
+        let Ok(address) = address::join_relative(ctx.bucket_root, prefix_str) else {
+            tracing::warn!(
+                target: "ovstorage.s3.backend",
+                plugin = "s3",
+                key = %prefix_str,
+                "s3: common prefix is not addressable as a URI path; omitted from listing",
+            );
+            continue;
+        };
+        // Prefer a concrete marker reported in this page or across
+        // the immediately adjacent page boundary.
+        if marker_addresses.contains(address.as_str())
+            || previous_page_marker_addresses.contains(address.as_str())
+        {
+            continue;
+        }
+        let _ = address::relative_suffix(&address, ctx.requested_prefix).ok_or_else(|| {
+            Error::new(
+                ErrorCode::Internal,
+                format!(
+                    "S3 returned common prefix '{}' outside requested prefix '{}'",
+                    prefix_str,
+                    RedactedUrl(ctx.requested_prefix)
+                ),
+            )
+        })?;
+        // S3 has no explicit directory entity; tag CommonPrefixes as `DirectoryInferred`.
+        page_items.push(ObjectInfo {
+            etag_strength: EtagStrength::Unspecified,
+            address,
+            kind: ObjectKind::DirectoryInferred,
+            etag: None,
+            version: None,
+            size: None,
+            mtime: None,
+            checksums: ChecksumSet::default(),
+            effective_permissions: None,
+            system_metadata: None,
+            user_metadata: None,
+            modified_by: None,
+            versioned_address: None,
+        });
+    }
+
+    // The response-sized bound both walks share; the buffered `list` applies
+    // its cumulative ceiling separately. A conforming response cannot reach
+    // it because every request asks for at most 1000.
+    if page_items.len() > LIST_ITEM_CEILING {
+        return Err(refuse_partial_listing(
+            ErrorCode::Internal,
+            ctx.requested_prefix,
+            &format!(
+                "one response carried the listing past this backend's \
+                 {LIST_ITEM_CEILING}-entry ceiling; the store answered with \
+                 far more than the {S3_MAX_KEYS_PER_PAGE} keys per response it \
+                 was asked for"
+            ),
+        ));
+    }
+    Ok((page_items, marker_addresses))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    struct ListFixture {
+        endpoint: String,
+        requests: Arc<AtomicUsize>,
+    }
+
+    fn list_body(contents: &[&str], prefixes: &[&str], next: Option<&str>) -> String {
+        let mut body = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Name>bucket</Name><Prefix>assets/</Prefix>",
+        );
+        // `KeyCount` as S3 spells it: the keys and common prefixes of this
+        // response.
+        body.push_str(&format!(
+            "<KeyCount>{}</KeyCount>",
+            contents.len() + prefixes.len()
+        ));
+        body.push_str(if next.is_some() {
+            "<IsTruncated>true</IsTruncated>"
+        } else {
+            "<IsTruncated>false</IsTruncated>"
+        });
+        if let Some(token) = next {
+            body.push_str(&format!(
+                "<NextContinuationToken>{token}</NextContinuationToken>"
+            ));
+        }
+        for key in contents {
+            let size = if key.ends_with('/') { 0 } else { 1 };
+            body.push_str(&format!(
+                "<Contents><Key>{key}</Key>\
+                 <LastModified>2026-01-02T03:04:05.000Z</LastModified>\
+                 <ETag>&quot;etag&quot;</ETag><Size>{size}</Size></Contents>"
+            ));
+        }
+        for prefix in prefixes {
+            body.push_str(&format!(
+                "<CommonPrefixes><Prefix>{prefix}</Prefix></CommonPrefixes>"
+            ));
+        }
+        body.push_str("</ListBucketResult>");
+        body
+    }
+
+    /// A `ListObjectVersions` answer. `versions` are `(key, version_id,
+    /// is_latest)`, `delete_markers` are `(key, is_latest)`, and `next` is the
+    /// `(NextKeyMarker, NextVersionIdMarker)` pair of a truncated page.
+    fn list_versions_body(
+        versions: &[(&str, &str, bool)],
+        delete_markers: &[(&str, bool)],
+        prefixes: &[&str],
+        next: Option<(&str, &str)>,
+    ) -> String {
+        let mut body = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Name>bucket</Name><Prefix>assets/</Prefix>",
+        );
+        body.push_str(if next.is_some() {
+            "<IsTruncated>true</IsTruncated>"
+        } else {
+            "<IsTruncated>false</IsTruncated>"
+        });
+        if let Some((key_marker, version_id_marker)) = next {
+            body.push_str(&format!(
+                "<NextKeyMarker>{key_marker}</NextKeyMarker>\
+                 <NextVersionIdMarker>{version_id_marker}</NextVersionIdMarker>"
+            ));
+        }
+        for (key, version_id, is_latest) in versions {
+            let size = if key.ends_with('/') { 0 } else { 1 };
+            body.push_str(&format!(
+                "<Version><Key>{key}</Key><VersionId>{version_id}</VersionId>\
+                 <IsLatest>{is_latest}</IsLatest>\
+                 <LastModified>2026-01-02T03:04:05.000Z</LastModified>\
+                 <ETag>&quot;etag&quot;</ETag><Size>{size}</Size>\
+                 <StorageClass>STANDARD</StorageClass></Version>"
+            ));
+        }
+        for (key, is_latest) in delete_markers {
+            body.push_str(&format!(
+                "<DeleteMarker><Key>{key}</Key><VersionId>marker</VersionId>\
+                 <IsLatest>{is_latest}</IsLatest>\
+                 <LastModified>2026-01-02T03:04:05.000Z</LastModified></DeleteMarker>"
+            ));
+        }
+        for prefix in prefixes {
+            body.push_str(&format!(
+                "<CommonPrefixes><Prefix>{prefix}</Prefix></CommonPrefixes>"
+            ));
+        }
+        body.push_str("</ListVersionsResult>");
+        body
+    }
+
+    /// `spawn_list_fixture` that also keeps every request it answered, for
+    /// assertions on the wire shape.
+    fn recording_fixture(
+        answer: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> (ListFixture, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_for_fixture = Arc::clone(&seen);
+        let fixture = spawn_list_fixture(move |request| {
+            seen_for_fixture.lock().unwrap().push(request.to_string());
+            answer(request)
+        });
+        (fixture, seen)
+    }
+
+    /// The request line of every request a recording fixture answered.
+    fn request_lines(seen: &Mutex<Vec<String>>) -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.lines().next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// The query of one request line as `(name, value)` pairs, so a test can
+    /// ask for `max-keys=1` without also matching `max-keys=1000`.
+    fn query_pairs(request_line: &str) -> Vec<(String, String)> {
+        request_line
+            .split(' ')
+            .nth(1)
+            .and_then(|target| target.split_once('?'))
+            .map(|(_, query)| {
+                query
+                    .split('&')
+                    .map(|pair| {
+                        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                        (name.to_string(), value.to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Asserts one request line is the prefix probe for `encoded_prefix`: a
+    /// `ListObjectsV2` request for a single key with no delimiter.
+    fn assert_prefix_probe(line: &str, encoded_prefix: &str) {
+        let pairs = query_pairs(line);
+        let has = |name: &str, value: &str| pairs.iter().any(|(n, v)| n == name && v == value);
+        assert!(has("list-type", "2"), "{line}");
+        assert!(has("max-keys", "1"), "{line}");
+        assert!(has("prefix", encoded_prefix), "{line}");
+        assert!(
+            !pairs.iter().any(|(name, _)| name == "delimiter"),
+            "a probe counts keys at any depth: {line}"
+        );
+    }
+
+    fn spawn_list_fixture(answer: impl Fn(&str) -> String + Send + Sync + 'static) -> ListFixture {
+        spawn_status_fixture(move |request| (200, answer(request)))
+    }
+
+    /// `spawn_list_fixture` whose answer also picks the HTTP status, for a
+    /// request the store refuses.
+    fn spawn_status_fixture(
+        answer: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
+    ) -> ListFixture {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind list fixture");
+        let endpoint = format!("http://{}", listener.local_addr().expect("fixture address"));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_thread = requests.clone();
+        let answer = Arc::new(answer);
+        thread::Builder::new()
+            .name("ovs-s3-list-stream-test".into())
+            .spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .expect("set fixture timeout");
+                    let mut raw = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    while let Ok(read) = stream.read(&mut chunk) {
+                        if read == 0 {
+                            break;
+                        }
+                        raw.extend_from_slice(&chunk[..read]);
+                        if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let raw = String::from_utf8_lossy(&raw);
+                    requests_for_thread.fetch_add(1, Ordering::SeqCst);
+                    let (status, body) = answer(&raw);
+                    let reason = match status {
+                        200 => "OK",
+                        500 => "Internal Server Error",
+                        _ => "Error",
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\nConnection: close\r\n\
+                         x-amz-request-id: TESTREQ\r\nContent-Type: application/xml\r\n\
+                         Content-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            })
+            .expect("spawn list fixture");
+        ListFixture { endpoint, requests }
+    }
+
+    fn list_test_backend(endpoint: &str) -> S3Backend {
+        S3Backend::anonymous(S3Config {
+            bucket: "bucket".into(),
+            region: "us-east-1".into(),
+            endpoint: Some(endpoint.into()),
+            profile_name: None,
+            compatibility: crate::config::CompatibilityProfile::Custom,
+            force_path_style: true,
+            force_request_payer: false,
+            sqs_queue_url: None,
+            sqs_max_messages: 10,
+            sqs_wait_seconds: 20,
+            sqs_visibility_timeout: 30,
+            address_root: address::parse("s3://bucket/").expect("test root"),
+        })
+        .expect("anonymous test backend")
+    }
+
+    fn list_test_target() -> ResolvedTarget {
+        ResolvedTarget {
+            backend_id: ovstorage_plugin::BackendId("s3-test".into()),
+            resolved_address: address::parse("s3://bucket/assets/").expect("test prefix"),
+        }
+    }
+
+    async fn stream_addresses(mut stream: ovstorage_plugin::ListStream) -> Result<Vec<String>> {
+        let mut addresses = Vec::new();
+        while let Some(item) = stream.next().await {
+            addresses.push(item?.address.to_string());
+        }
+        Ok(addresses)
+    }
+
+    #[tokio::test]
+    async fn buffered_and_streaming_lists_share_multi_page_order_in_both_modes() {
+        let fixture = spawn_list_fixture(|request| {
+            let second = request.contains("continuation-token=NEXT");
+            let delimited = request.contains("delimiter=%2F");
+            match (delimited, second) {
+                (true, false) => {
+                    list_body(&["assets/team/file.txt"], &["assets/docs/"], Some("NEXT"))
+                }
+                (true, true) => list_body(&["assets/z.usd"], &["assets/x/"], None),
+                (false, false) => list_body(&["assets/a.usd"], &[], Some("NEXT")),
+                (false, true) => list_body(&["assets/b.usd"], &[], None),
+            }
+        });
+        let backend = list_test_backend(&fixture.endpoint);
+
+        for recursive in [false, true] {
+            let options = ListOptions {
+                recursive,
+                ..ListOptions::default()
+            };
+            let buffered = backend
+                .list(list_test_target(), options.clone(), None)
+                .await
+                .expect("buffered list");
+            let buffered: Vec<String> = buffered
+                .into_iter()
+                .map(|item| item.address.to_string())
+                .collect();
+            let streamed = stream_addresses(
+                backend
+                    .list_stream(list_test_target(), options, None)
+                    .await
+                    .expect("open list stream"),
+            )
+            .await
+            .expect("consume list stream");
+            assert_eq!(streamed, buffered, "recursive={recursive}");
+        }
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn buffered_list_retains_whole_walk_marker_dedup() {
+        // A conforming S3 walk places a marker and its matching common prefix
+        // together or across an adjacent page boundary. Keep the buffered
+        // backend's historical behavior even when a nonconforming store puts
+        // an intervening page between them; the bounded stream deliberately
+        // retains only the current and previous page's markers.
+        let fixture = spawn_list_fixture(|request| {
+            if request.contains("continuation-token=FIRST") {
+                list_body(&["assets/unrelated.usd"], &[], Some("SECOND"))
+            } else if request.contains("continuation-token=SECOND") {
+                list_body(&[], &["assets/team/"], None)
+            } else {
+                list_body(&["assets/team/"], &[], Some("FIRST"))
+            }
+        });
+        let backend = list_test_backend(&fixture.endpoint);
+
+        let items = backend
+            .list(list_test_target(), ListOptions::default(), None)
+            .await
+            .expect("buffered list");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].address.as_str(), "s3://bucket/assets/team/");
+        assert_eq!(items[0].kind, ObjectKind::DirectoryMarker);
+        assert_eq!(
+            items[1].address.as_str(),
+            "s3://bucket/assets/unrelated.usd"
+        );
+        assert_eq!(items[1].kind, ObjectKind::File);
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn streaming_list_cycle_guard_fails_transient_mid_stream() {
+        let fixture = spawn_list_fixture(|request| {
+            if request.contains("continuation-token=A") {
+                list_body(&["assets/two.usd"], &[], Some("B"))
+            } else if request.contains("continuation-token=B") {
+                list_body(&["assets/three.usd"], &[], Some("A"))
+            } else {
+                list_body(&["assets/one.usd"], &[], Some("A"))
+            }
+        });
+        let backend = list_test_backend(&fixture.endpoint);
+        let mut stream = backend
+            .list_stream(list_test_target(), ListOptions::default(), None)
+            .await
+            .expect("open list stream");
+
+        for expected in ["one.usd", "two.usd", "three.usd"] {
+            let item = stream
+                .next()
+                .await
+                .expect("stream item")
+                .expect("entry before cycle");
+            assert!(item.address.path().ends_with(expected));
+        }
+        let error = stream
+            .next()
+            .await
+            .expect("cycle error")
+            .expect_err("cycle must fail");
+        assert_eq!(error.code(), ErrorCode::Transient);
+        assert!(error.message().contains("reissued a continuation token"));
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn streaming_list_cancellation_between_pages_prevents_next_request() {
+        let fixture = spawn_list_fixture(|request| {
+            if request.contains("continuation-token=NEXT") {
+                list_body(&["assets/two.usd"], &[], None)
+            } else {
+                list_body(&["assets/one.usd"], &[], Some("NEXT"))
+            }
+        });
+        let backend = list_test_backend(&fixture.endpoint);
+        let cancel = CancellationToken::new();
+        let mut stream = backend
+            .list_stream(
+                list_test_target(),
+                ListOptions::default(),
+                Some(cancel.clone()),
+            )
+            .await
+            .expect("open list stream");
+
+        let first = stream
+            .next()
+            .await
+            .expect("first item")
+            .expect("first page succeeds");
+        assert!(first.address.path().ends_with("one.usd"));
+        cancel.cancel();
+        let error = stream
+            .next()
+            .await
+            .expect("cancellation item")
+            .expect_err("cancelled stream must stop");
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert_eq!(
+            fixture.requests.load(Ordering::SeqCst),
+            1,
+            "cancellation between pages must prevent the second request"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_list_cancellation_while_draining_final_page_is_terminal() {
+        let fixture =
+            spawn_list_fixture(|_| list_body(&["assets/one.usd", "assets/two.usd"], &[], None));
+        let backend = list_test_backend(&fixture.endpoint);
+        let cancel = CancellationToken::new();
+        let mut stream = backend
+            .list_stream(
+                list_test_target(),
+                ListOptions::default(),
+                Some(cancel.clone()),
+            )
+            .await
+            .expect("open list stream");
+
+        let first = stream
+            .next()
+            .await
+            .expect("first item")
+            .expect("first item succeeds");
+        assert!(first.address.path().ends_with("one.usd"));
+        cancel.cancel();
+        let error = stream
+            .next()
+            .await
+            .expect("terminal cancellation")
+            .expect_err("cancelled stream must not drain the fetched page");
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert!(stream.next().await.is_none());
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), 1);
+    }
+
+    fn pin_summary(items: &[ObjectInfo]) -> Vec<(&str, ObjectKind, Option<&str>)> {
+        items
+            .iter()
+            .map(|item| {
+                (
+                    item.address.as_str(),
+                    item.kind,
+                    item.versioned_address.as_ref().map(Url::as_str),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn versioned_list_keeps_only_latest_versions_and_pins_them() {
+        let (fixture, seen) = recording_fixture(|request| {
+            // The probe finds a current object under `assets/docs/`, so the
+            // prefix stays.
+            if request.contains("list-type=2") {
+                return list_body(&["assets/docs/guide.usd"], &[], None);
+            }
+            list_versions_body(
+                &[
+                    ("assets/a.usd", "v2", true),
+                    ("assets/a.usd", "v1", false),
+                    ("assets/b.usd", "v1", false),
+                    ("assets/team/", "m1", true),
+                ],
+                &[("assets/b.usd", true)],
+                &["assets/docs/"],
+                None,
+            )
+        });
+        let backend = list_test_backend(&fixture.endpoint);
+        let options = ListOptions {
+            versioned_address: true,
+            ..ListOptions::default()
+        };
+
+        let buffered = backend
+            .list(list_test_target(), options.clone(), None)
+            .await
+            .expect("versioned list");
+        assert_eq!(
+            pin_summary(&buffered),
+            vec![
+                (
+                    "s3://bucket/assets/a.usd",
+                    ObjectKind::File,
+                    Some("s3://bucket/assets/a.usd?versionId=v2"),
+                ),
+                (
+                    "s3://bucket/assets/team/",
+                    ObjectKind::DirectoryMarker,
+                    None
+                ),
+                (
+                    "s3://bucket/assets/docs/",
+                    ObjectKind::DirectoryInferred,
+                    None
+                ),
+            ],
+            "only the IsLatest version of a key is listed, and a key whose latest \
+             entry is a delete marker is absent"
+        );
+        assert_eq!(
+            buffered[0].version.as_deref(),
+            Some("v2"),
+            "the flagged list carries the version id the wire supplied"
+        );
+
+        let mut stream = backend
+            .list_stream(list_test_target(), options, None)
+            .await
+            .expect("open list stream");
+        let mut streamed = Vec::new();
+        while let Some(item) = stream.next().await {
+            streamed.push(item.expect("streamed item"));
+        }
+        assert_eq!(pin_summary(&streamed), pin_summary(&buffered));
+
+        let lines = request_lines(&seen);
+        let (versions, probes): (Vec<_>, Vec<_>) =
+            lines.iter().partition(|line| line.contains("?versions"));
+        assert_eq!(
+            versions.len(),
+            2,
+            "one versions page per listing, buffered and streamed"
+        );
+        for line in &versions {
+            assert!(line.contains("delimiter=%2F"), "{line}");
+            assert!(line.contains("prefix=assets%2F"), "{line}");
+        }
+        assert_eq!(
+            probes.len(),
+            2,
+            "the common prefix is probed once per listing; the marker-backed \
+             `assets/team/` is a current object and is not"
+        );
+        for line in &probes {
+            assert_prefix_probe(line, "assets%2Fdocs%2F");
+        }
+    }
+
+    #[tokio::test]
+    async fn versioned_list_drops_common_prefixes_without_a_current_object() {
+        // S3 folds delete markers and non-current versions into a common
+        // prefix as readily as live objects, so the response alone cannot tell
+        // the two prefixes apart; the probe can: nothing current answers under
+        // `assets/docs/`, one key does under `assets/team2/`.
+        let (fixture, seen) = recording_fixture(|request| {
+            if !request.contains("list-type=2") {
+                return list_versions_body(
+                    &[("assets/a.usd", "v1", true)],
+                    &[],
+                    &["assets/docs/", "assets/team2/"],
+                    None,
+                );
+            }
+            if request.contains("prefix=assets%2Fdocs%2F") {
+                list_body(&[], &[], None)
+            } else {
+                list_body(&["assets/team2/readme.usd"], &[], None)
+            }
+        });
+        let backend = list_test_backend(&fixture.endpoint);
+        let options = ListOptions {
+            versioned_address: true,
+            ..ListOptions::default()
+        };
+
+        let buffered = backend
+            .list(list_test_target(), options.clone(), None)
+            .await
+            .expect("versioned list");
+        assert_eq!(
+            pin_summary(&buffered),
+            vec![
+                (
+                    "s3://bucket/assets/a.usd",
+                    ObjectKind::File,
+                    Some("s3://bucket/assets/a.usd?versionId=v1"),
+                ),
+                (
+                    "s3://bucket/assets/team2/",
+                    ObjectKind::DirectoryInferred,
+                    None
+                ),
+            ],
+            "a common prefix with nothing current under it is not a directory \
+             the unflagged listing reports, so it is not one here either"
+        );
+
+        let lines = request_lines(&seen);
+        assert_eq!(
+            lines.len(),
+            3,
+            "one versions page, then one probe per prefix in page order"
+        );
+        assert!(lines[0].contains("?versions"), "{}", lines[0]);
+        assert_prefix_probe(&lines[1], "assets%2Fdocs%2F");
+        assert_prefix_probe(&lines[2], "assets%2Fteam2%2F");
+
+        let mut stream = backend
+            .list_stream(list_test_target(), options, None)
+            .await
+            .expect("open list stream");
+        let mut streamed = Vec::new();
+        while let Some(item) = stream.next().await {
+            streamed.push(item.expect("streamed item"));
+        }
+        assert_eq!(pin_summary(&streamed), pin_summary(&buffered));
+        assert_eq!(
+            request_lines(&seen).len(),
+            6,
+            "the streamed walk probes the same prefixes over again"
+        );
+    }
+
+    /// A refusal as S3 spells it, for a probe the store fails.
+    const INTERNAL_ERROR_BODY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+        <Error><Code>InternalError</Code>\
+        <Message>We encountered an internal error. Please try again.</Message>\
+        <RequestId>TESTREQ</RequestId></Error>";
+
+    #[tokio::test]
+    async fn versioned_list_fails_the_page_when_a_prefix_probe_fails() {
+        let fixture = spawn_status_fixture(|request| {
+            if request.contains("list-type=2") {
+                (500, INTERNAL_ERROR_BODY.to_string())
+            } else {
+                (
+                    200,
+                    list_versions_body(
+                        &[("assets/a.usd", "v1", true)],
+                        &[],
+                        &["assets/docs/"],
+                        None,
+                    ),
+                )
+            }
+        });
+        let backend = list_test_backend(&fixture.endpoint);
+        let options = ListOptions {
+            versioned_address: true,
+            ..ListOptions::default()
+        };
+
+        let error = backend
+            .list(list_test_target(), options.clone(), None)
+            .await
+            .expect_err("a prefix the walk cannot verify fails the page");
+        assert_eq!(error.code(), ErrorCode::Transient);
+        let message = error.message();
+        assert!(message.contains("s3 list (prefix probe)"), "{message}");
+        assert!(message.contains("InternalError"), "{message}");
+        assert_eq!(
+            fixture.requests.load(Ordering::SeqCst),
+            2,
+            "the versions page and the probe that failed; nothing is retried"
+        );
+
+        let mut stream = backend
+            .list_stream(list_test_target(), options, None)
+            .await
+            .expect("open list stream");
+        let streamed = stream
+            .next()
+            .await
+            .expect("the failure is the stream's only item")
+            .expect_err("no item of the page is delivered ahead of the failure");
+        assert_eq!(streamed.code(), ErrorCode::Transient);
+        assert!(stream.next().await.is_none());
+    }
+
+    /// A `ListObjectsV2` answer from a store that omits `KeyCount`.
+    const UNCOUNTED_LIST_BODY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+        <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+        <Name>bucket</Name><Prefix>assets/uncounted/</Prefix>\
+        <IsTruncated>false</IsTruncated>\
+        <Contents><Key>assets/uncounted/x.usd</Key>\
+        <LastModified>2026-01-02T03:04:05.000Z</LastModified>\
+        <ETag>&quot;etag&quot;</ETag><Size>1</Size></Contents>\
+        </ListBucketResult>";
+
+    #[tokio::test]
+    async fn prefix_probe_reads_key_count_then_contents() {
+        let (fixture, seen) = recording_fixture(|request| {
+            if request.contains("prefix=assets%2Fempty%2F") {
+                list_body(&[], &[], None)
+            } else if request.contains("prefix=assets%2Funcounted%2F") {
+                UNCOUNTED_LIST_BODY.to_string()
+            } else {
+                list_body(&["assets/full/x.usd"], &[], None)
+            }
+        });
+        let backend = list_test_backend(&fixture.endpoint);
+        let walk = ListWalk {
+            prefix_key: "assets/".into(),
+            bucket_root: address::parse("s3://bucket/").expect("bucket root"),
+            requested_prefix: address::parse("s3://bucket/assets/").expect("prefix"),
+            config: backend.config.clone(),
+            client: backend.unsigned_capable_client().clone(),
+            anonymous: backend.anonymous.clone(),
+            region_mismatch: Arc::clone(&backend.region_mismatch),
+        };
+
+        assert!(
+            !walk
+                .prefix_has_current_object("assets/empty/")
+                .await
+                .expect("probe"),
+            "KeyCount 0 and no Contents"
+        );
+        assert!(
+            walk.prefix_has_current_object("assets/full/")
+                .await
+                .expect("probe"),
+            "KeyCount 1"
+        );
+        assert!(
+            walk.prefix_has_current_object("assets/uncounted/")
+                .await
+                .expect("probe"),
+            "Contents stands in for a KeyCount the store omits"
+        );
+
+        let lines = request_lines(&seen);
+        assert_eq!(lines.len(), 3);
+        assert_prefix_probe(&lines[0], "assets%2Fempty%2F");
+        assert_prefix_probe(&lines[1], "assets%2Ffull%2F");
+        assert_prefix_probe(&lines[2], "assets%2Funcounted%2F");
+    }
+
+    #[tokio::test]
+    async fn versioned_list_follows_key_and_version_markers() {
+        let (fixture, seen) = recording_fixture(|request| {
+            if request.contains("key-marker=") {
+                list_versions_body(&[("assets/b.usd", "v7", true)], &[], &[], None)
+            } else {
+                list_versions_body(
+                    &[("assets/a.usd", "v2", true)],
+                    &[],
+                    &[],
+                    Some(("assets/a.usd", "v2")),
+                )
+            }
+        });
+        let backend = list_test_backend(&fixture.endpoint);
+
+        let items = backend
+            .list(
+                list_test_target(),
+                ListOptions {
+                    recursive: true,
+                    versioned_address: true,
+                    ..ListOptions::default()
+                },
+                None,
+            )
+            .await
+            .expect("versioned list");
+        assert_eq!(
+            pin_summary(&items),
+            vec![
+                (
+                    "s3://bucket/assets/a.usd",
+                    ObjectKind::File,
+                    Some("s3://bucket/assets/a.usd?versionId=v2"),
+                ),
+                (
+                    "s3://bucket/assets/b.usd",
+                    ObjectKind::File,
+                    Some("s3://bucket/assets/b.usd?versionId=v7"),
+                ),
+            ]
+        );
+
+        let lines = request_lines(&seen);
+        assert_eq!(lines.len(), 2);
+        assert!(!lines[0].contains("key-marker="), "{}", lines[0]);
+        assert!(
+            lines[1].contains("key-marker=assets%2Fa.usd"),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[1].contains("version-id-marker=v2"), "{}", lines[1]);
+        for line in &lines {
+            assert!(
+                !line.contains("delimiter="),
+                "a recursive walk sends no delimiter: {line}"
+            );
+        }
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn list_page_token_minted_under_the_other_flag_is_refused() {
+        let fixture = spawn_list_fixture(|_| list_body(&[], &[], None));
+        let backend = list_test_backend(&fixture.endpoint);
+
+        let replayed_as_current = backend
+            .list(
+                list_test_target(),
+                ListOptions {
+                    page_token: Some(encode_versions_token("assets/a.usd", Some("v2"))),
+                    versioned_address: false,
+                    ..ListOptions::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("a versions token cannot continue a V2 walk");
+        assert_eq!(replayed_as_current.code(), ErrorCode::InvalidArgument);
+        let message = replayed_as_current.message();
+        assert!(message.contains("versioned_address=true"), "{message}");
+        assert!(message.contains("versioned_address=false"), "{message}");
+
+        let replayed_as_versioned = backend
+            .list(
+                list_test_target(),
+                ListOptions {
+                    page_token: Some("OPAQUE".into()),
+                    versioned_address: true,
+                    ..ListOptions::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("a V2 token cannot continue a versions walk");
+        assert_eq!(replayed_as_versioned.code(), ErrorCode::InvalidArgument);
+        let message = replayed_as_versioned.message();
+        assert!(message.contains("versioned_address=false"), "{message}");
+        assert!(message.contains("versioned_address=true"), "{message}");
+
+        assert_eq!(
+            fixture.requests.load(Ordering::SeqCst),
+            0,
+            "the refusal happens before any request is sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn null_listed_version_id_is_not_a_pin() {
+        let fixture = spawn_list_fixture(|_| {
+            list_versions_body(&[("assets/a.usd", "null", true)], &[], &[], None)
+        });
+        let backend = list_test_backend(&fixture.endpoint);
+
+        let items = backend
+            .list(
+                list_test_target(),
+                ListOptions {
+                    versioned_address: true,
+                    ..ListOptions::default()
+                },
+                None,
+            )
+            .await
+            .expect("versioned list");
+        assert_eq!(
+            pin_summary(&items),
+            vec![("s3://bucket/assets/a.usd", ObjectKind::File, None)]
+        );
+        assert_eq!(
+            items[0].version.as_deref(),
+            Some("null"),
+            "the opaque version id is still reported as the store spelled it"
+        );
+
+        let versions = backend
+            .list_versions(
+                ResolvedTarget {
+                    backend_id: ovstorage_plugin::BackendId("s3-test".into()),
+                    resolved_address: address::parse("s3://bucket/assets/a.usd").expect("key"),
+                },
+                ListVersionsOptions::default(),
+                None,
+            )
+            .await
+            .expect("list_versions");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(
+            versions[0].address.as_str(),
+            "s3://bucket/assets/a.usd?versionId=null"
+        );
+        assert_eq!(
+            versions[0].versioned_address, None,
+            "the null version's address selects mutable content, so it is not a pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn unflagged_list_reports_no_versioned_address() {
+        let (fixture, seen) = recording_fixture(|_| {
+            list_body(&["assets/team/", "assets/a.usd"], &["assets/docs/"], None)
+        });
+        let backend = list_test_backend(&fixture.endpoint);
+
+        let items = backend
+            .list(list_test_target(), ListOptions::default(), None)
+            .await
+            .expect("list");
+        assert_eq!(
+            pin_summary(&items),
+            vec![
+                (
+                    "s3://bucket/assets/team/",
+                    ObjectKind::DirectoryMarker,
+                    None
+                ),
+                ("s3://bucket/assets/a.usd", ObjectKind::File, None),
+                (
+                    "s3://bucket/assets/docs/",
+                    ObjectKind::DirectoryInferred,
+                    None
+                ),
+            ]
+        );
+
+        let lines = request_lines(&seen);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("list-type=2"), "{}", lines[0]);
+        assert!(!lines[0].contains("versions"), "{}", lines[0]);
+    }
 
     /// The anonymous advertisement, both halves, enumerated against the
     /// credentialed set so a bit added there cannot silently appear or fail to
@@ -3392,6 +5037,87 @@ mod tests {
     }
 
     #[test]
+    fn head_object_etag_declares_normalized_wire_strength() {
+        let address = address::parse("s3://bucket/object").unwrap();
+        let strong = HeadObjectOutput::builder().e_tag("\"strong\"").build();
+        let info = object_info_from_head_output(&address, &strong).expect("head info");
+        assert_eq!(info.etag.as_deref(), Some("strong"));
+        assert_eq!(info.etag_strength, EtagStrength::Strong);
+
+        let weak = HeadObjectOutput::builder().e_tag("W/\"weak\"").build();
+        let info = object_info_from_head_output(&address, &weak).expect("head info");
+        assert_eq!(info.etag.as_deref(), Some("weak"));
+        assert_eq!(info.etag_strength, EtagStrength::Weak);
+
+        let absent = HeadObjectOutput::builder().build();
+        let info = object_info_from_head_output(&address, &absent).expect("head info");
+        assert_eq!(info.etag, None);
+        assert_eq!(info.etag_strength, EtagStrength::Unspecified);
+    }
+
+    #[test]
+    fn head_object_version_id_pins_the_address() {
+        let address = address::parse("s3://bucket/object").unwrap();
+        let pinned = HeadObjectOutput::builder().version_id("abc").build();
+        let info = object_info_from_head_output(&address, &pinned).expect("head info");
+        assert_eq!(info.version.as_deref(), Some("abc"));
+        assert_eq!(
+            info.versioned_address.as_ref().map(Url::as_str),
+            Some("s3://bucket/object?versionId=abc")
+        );
+
+        // A selector already on the address is replaced, not stacked.
+        let selected = address::parse("s3://bucket/object?versionId=old").unwrap();
+        let info = object_info_from_head_output(&selected, &pinned).expect("head info");
+        assert_eq!(
+            info.versioned_address.as_ref().map(Url::as_str),
+            Some("s3://bucket/object?versionId=abc")
+        );
+
+        let absent = HeadObjectOutput::builder().build();
+        let info = object_info_from_head_output(&address, &absent).expect("head info");
+        assert_eq!(info.version, None);
+        assert_eq!(info.versioned_address, None);
+    }
+
+    #[test]
+    fn null_head_version_id_is_not_a_pin() {
+        assert_eq!(s3_version_pin(Some("null")), None);
+        assert_eq!(s3_version_pin(Some("abc")), Some("abc"));
+        assert_eq!(s3_version_pin(None), None);
+
+        let address = address::parse("s3://bucket/object").unwrap();
+        let null_version = HeadObjectOutput::builder().version_id("null").build();
+        let info = object_info_from_head_output(&address, &null_version).expect("head info");
+        assert_eq!(
+            info.version.as_deref(),
+            Some("null"),
+            "the opaque version id is still reported as the store spelled it"
+        );
+        assert_eq!(info.versioned_address, None);
+    }
+
+    #[test]
+    fn versions_token_round_trips_keys_with_pipes() {
+        let token = encode_versions_token("a|b", Some("x|y"));
+        assert!(token.starts_with(VERSIONED_LIST_TOKEN_PREFIX));
+        assert_eq!(
+            decode_versions_token(&token).expect("decode"),
+            ("a|b".to_string(), Some("x|y".to_string()))
+        );
+
+        let token = encode_versions_token("plain/key", None);
+        assert_eq!(
+            decode_versions_token(&token).expect("decode"),
+            ("plain/key".to_string(), None)
+        );
+
+        let error =
+            decode_versions_token("OPAQUE").expect_err("a V2 token is not a versions token");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    }
+
+    #[test]
     fn checksums_from_parts_maps_known_algorithms() {
         let set = checksums_from_parts(Some("deadbeef"), Some("abc123"), None, Some("4242"), None);
         let sha = set.get(&ChecksumAlgorithm::sha256()).unwrap();
@@ -3422,9 +5148,13 @@ mod tests {
     }
 
     fn anonymous_backend(force_request_payer: bool) -> S3Backend {
+        anonymous_backend_in("us-east-1", force_request_payer)
+    }
+
+    fn anonymous_backend_in(region: &str, force_request_payer: bool) -> S3Backend {
         let config = S3Config {
             bucket: "bucket".into(),
-            region: "us-east-1".into(),
+            region: region.into(),
             endpoint: None,
             profile_name: None,
             compatibility: crate::config::CompatibilityProfile::Aws,
@@ -3470,6 +5200,37 @@ mod tests {
         );
     }
 
+    /// A public-bucket read in the China partition has to reach
+    /// `amazonaws.com.cn`. The alias rules accept the `.com.cn` spelling a
+    /// user pastes and rewrite it to `s3://bucket/`; if this path then rebuilt
+    /// the host on the standard suffix, that valid URL would be redirected to
+    /// a hostname that does not exist.
+    #[test]
+    fn anonymous_read_request_uses_the_china_partition_host() {
+        let request = anonymous_backend_in("cn-north-1", false)
+            .anonymous_read_request("dir/key.txt", None, &ReadOptions::default())
+            .expect("anonymous read request");
+        assert_eq!(
+            request.url,
+            "https://bucket.s3.cn-north-1.amazonaws.com.cn/dir/key.txt"
+        );
+    }
+
+    /// And every other partition keeps the standard suffix — GovCloud
+    /// included, which is `us-gov-*` on `amazonaws.com`.
+    #[test]
+    fn anonymous_read_request_keeps_the_standard_suffix_elsewhere() {
+        for region in ["us-west-2", "us-gov-west-1"] {
+            let request = anonymous_backend_in(region, false)
+                .anonymous_read_request("key", None, &ReadOptions::default())
+                .expect("anonymous read request");
+            assert_eq!(
+                request.url,
+                format!("https://bucket.s3.{region}.amazonaws.com/key")
+            );
+        }
+    }
+
     /// `x-amz-request-payer` is honored by S3 only as a request header; as a
     /// query param it is ignored (a requester-pays bucket would `403`).
     #[test]
@@ -3490,5 +5251,233 @@ mod tests {
             "requester-pays must not be placed in the query string: {}",
             request.url
         );
+    }
+
+    /// A message that cannot travel as a header value is dropped, not
+    /// stashed, so the write proceeds without it instead of failing request
+    /// construction; a header-legal non-ASCII message is kept.
+    #[test]
+    fn with_message_stashed_drops_a_message_that_cannot_travel_as_a_header() {
+        let mut user_metadata = UserMetadata::new();
+        user_metadata.insert("owner".into(), "alice".into());
+        let opts = with_message_stashed(WriteOptions {
+            user_metadata: Some(user_metadata.clone()),
+            message: Some("line one\r\nx-amz-meta-injected: yes".into()),
+            ..WriteOptions::default()
+        });
+        assert_eq!(opts.user_metadata, Some(user_metadata.clone()));
+
+        let opts = with_message_stashed(WriteOptions {
+            user_metadata: Some(user_metadata),
+            message: Some("café ☕".into()),
+            ..WriteOptions::default()
+        });
+        assert_eq!(
+            opts.user_metadata
+                .as_ref()
+                .and_then(|m| m.get(MESSAGE_METADATA_KEY))
+                .map(String::as_str),
+            Some("café ☕")
+        );
+    }
+
+    /// On a patch the same rule keeps the object's earlier annotation in
+    /// place: a message that cannot travel as a header neither replaces it
+    /// nor fails the call.
+    #[test]
+    fn update_metadata_entries_keep_the_earlier_annotation_over_an_unstorable_message() {
+        let entries = update_metadata_entries(
+            &stored_annotation("old"),
+            &HashMap::new(),
+            &[],
+            Some("line one\r\nline two"),
+        );
+        let annotations: Vec<&str> = entries
+            .iter()
+            .filter(|(k, _)| k == MESSAGE_METADATA_KEY)
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(annotations, vec!["old"], "{entries:?}");
+    }
+
+    #[test]
+    fn with_message_stashed_fills_an_unset_message_key() {
+        let mut user_metadata = UserMetadata::new();
+        user_metadata.insert("owner".into(), "alice".into());
+        let opts = with_message_stashed(WriteOptions {
+            user_metadata: Some(user_metadata),
+            message: Some("commit note".into()),
+            ..WriteOptions::default()
+        });
+        let metadata = opts.user_metadata.expect("metadata is populated");
+        assert_eq!(metadata.get("owner").map(String::as_str), Some("alice"));
+        assert_eq!(
+            metadata.get(MESSAGE_METADATA_KEY).map(String::as_str),
+            Some("commit note")
+        );
+    }
+
+    #[test]
+    fn with_message_stashed_keeps_the_callers_entry_under_the_key() {
+        let mut user_metadata = UserMetadata::new();
+        user_metadata.insert(MESSAGE_METADATA_KEY.into(), "caller".into());
+        let opts = with_message_stashed(WriteOptions {
+            user_metadata: Some(user_metadata),
+            message: Some("real".into()),
+            ..WriteOptions::default()
+        });
+        let metadata = opts.user_metadata.expect("caller metadata is kept");
+        assert_eq!(metadata.len(), 1, "{metadata:?}");
+        assert_eq!(
+            metadata.get(MESSAGE_METADATA_KEY).map(String::as_str),
+            Some("caller")
+        );
+    }
+
+    /// S3 lower-cases metadata names on the wire, so an upper-cased caller
+    /// spelling of the key is the same stored entry and must win too.
+    #[test]
+    fn with_message_stashed_keeps_a_differently_cased_caller_entry() {
+        let caller_key = MESSAGE_METADATA_KEY.to_ascii_uppercase();
+        let mut user_metadata = UserMetadata::new();
+        user_metadata.insert(caller_key.clone(), "caller".into());
+        let opts = with_message_stashed(WriteOptions {
+            user_metadata: Some(user_metadata),
+            message: Some("real".into()),
+            ..WriteOptions::default()
+        });
+        let metadata = opts.user_metadata.expect("caller metadata is kept");
+        assert_eq!(
+            metadata.len(),
+            1,
+            "no second spelling of the key is added: {metadata:?}"
+        );
+        assert_eq!(
+            metadata.get(&caller_key).map(String::as_str),
+            Some("caller")
+        );
+    }
+
+    #[test]
+    fn with_message_stashed_leaves_the_map_untouched_without_a_message() {
+        for message in [None, Some(String::new())] {
+            let mut user_metadata = UserMetadata::new();
+            user_metadata.insert("owner".into(), "alice".into());
+            let opts = with_message_stashed(WriteOptions {
+                user_metadata: Some(user_metadata.clone()),
+                message: message.clone(),
+                ..WriteOptions::default()
+            });
+            assert_eq!(
+                opts.user_metadata.as_ref(),
+                Some(&user_metadata),
+                "message {message:?}"
+            );
+
+            let opts = with_message_stashed(WriteOptions {
+                message: message.clone(),
+                ..WriteOptions::default()
+            });
+            assert_eq!(opts.user_metadata, None, "message {message:?}");
+        }
+    }
+
+    /// An object's stored metadata as `update_metadata` reads it back, with an
+    /// earlier annotation under the key.
+    fn stored_annotation(value: &str) -> UserMetadata {
+        let mut existing = UserMetadata::new();
+        existing.insert("owner".into(), "alice".into());
+        existing.insert(MESSAGE_METADATA_KEY.into(), value.into());
+        existing
+    }
+
+    fn entry<'a>(entries: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// A `user_metadata_set` entry under the key stands over the message under
+    /// every ASCII case: S3 lower-cases metadata names, so the caller's
+    /// spelling folds onto the one stored entry.
+    #[test]
+    fn update_metadata_entries_keep_the_callers_set_entry_over_the_message() {
+        for caller_key in [
+            MESSAGE_METADATA_KEY.to_string(),
+            MESSAGE_METADATA_KEY.to_ascii_uppercase(),
+        ] {
+            let mut set = HashMap::new();
+            set.insert(caller_key.clone(), "caller".to_string());
+            let entries =
+                update_metadata_entries(&stored_annotation("old"), &set, &[], Some("real"));
+            assert_eq!(entries.len(), 2, "{caller_key}: {entries:?}");
+            assert_eq!(entry(&entries, "owner"), Some("alice"), "{caller_key}");
+            assert_eq!(
+                entry(&entries, MESSAGE_METADATA_KEY),
+                Some("caller"),
+                "{caller_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_metadata_entries_replace_an_earlier_annotation_with_the_message() {
+        let entries = update_metadata_entries(
+            &stored_annotation("old"),
+            &HashMap::new(),
+            &[],
+            Some("real"),
+        );
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entry(&entries, "owner"), Some("alice"));
+        assert_eq!(entry(&entries, MESSAGE_METADATA_KEY), Some("real"));
+    }
+
+    /// Removing the key in the same call does not keep the message off the
+    /// object: the removal clears the earlier annotation, the message lands.
+    #[test]
+    fn update_metadata_entries_land_the_message_when_the_same_call_removes_the_key() {
+        let entries = update_metadata_entries(
+            &stored_annotation("old"),
+            &HashMap::new(),
+            &[MESSAGE_METADATA_KEY.to_string()],
+            Some("real"),
+        );
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entry(&entries, MESSAGE_METADATA_KEY), Some("real"));
+    }
+
+    /// A key named in both `set` and `remove` of one patch is set: `remove`
+    /// applies first, so the `set` entry stands.
+    #[test]
+    fn update_metadata_entries_set_a_key_the_same_call_also_removes() {
+        let mut set = HashMap::new();
+        set.insert("owner".to_string(), "bob".to_string());
+        let entries = update_metadata_entries(
+            &stored_annotation("old"),
+            &set,
+            &["owner".to_string()],
+            None,
+        );
+        assert_eq!(entry(&entries, "owner"), Some("bob"), "{entries:?}");
+        assert_eq!(entries.len(), 2, "{entries:?}");
+    }
+
+    #[test]
+    fn update_metadata_entries_drop_a_removed_annotation_without_a_message() {
+        for message in [None, Some("")] {
+            let entries = update_metadata_entries(
+                &stored_annotation("old"),
+                &HashMap::new(),
+                &[MESSAGE_METADATA_KEY.to_string()],
+                message,
+            );
+            assert_eq!(
+                entries,
+                vec![("owner".to_string(), "alice".to_string())],
+                "message {message:?}"
+            );
+        }
     }
 }

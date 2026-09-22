@@ -147,7 +147,96 @@ pub use request::*;
 ///   v14 producer never wrote as a Rust `bool`: an indeterminate value where
 ///   `true` composes an attribution layer over a backend that declared
 ///   nothing, which is the case this field exists to stop being guessed.
-pub const OVSTORAGE_PLUGIN_ABI_V2_VERSION: u32 = 15;
+/// - v16: [`Connection`] gained `owning_target`, the instance name of the Layer
+///   that owns the connection — the `ConnectionKey.target` a connection op
+///   routes by, and the same fact [`RootInfo::owning_target`] already reports
+///   for a root. A `Connection` otherwise names no target, so a host holding a
+///   row from a loaded COMPOSITE plugin — one reporting several `owned_targets`
+///   — could not say which of that plugin's internal targets holds it, and
+///   discovered ownership by attempting the real operation against each
+///   candidate in turn. That scan is sound only while the id is unique in the
+///   graph, which nothing promises: an id names a connection only within its
+///   owning layer. Reporting the target beside the id makes the two halves of
+///   the key one answer from one call, as `root_info_for` already does.
+///
+///   Appended at the tail, after `user_metadata`, so every prior field keeps
+///   its offset. Unlike [`RootInfo`], `Connection` carries no `_reserved` tail
+///   and no `struct_size` prefix, so the `Optional<Str>` grows it by 24 bytes —
+///   and it is embedded BY VALUE in `Optional<Connection>`, `List<Connection>`
+///   and `AuthEventSucceeded`, so `ConnectionChange` and the auth-event stream
+///   grow with it — measured on x86_64-unknown-linux-gnu against the generated
+///   headers either side of the bump, `ConnectionChange` is 392 bytes at v15
+///   and 416 at v16, and `AuthEvent` 480 and 504. `ConnectionSnapshot` does NOT
+///   grow: it is a `List<Connection>` and a `bool`, and a `List` is a pointer
+///   and a length, so it is 24 bytes on both sides. What changes for it is the
+///   STRIDE of the elements behind that pointer.
+///
+///   No size check guards any of this: `struct_size` lives on the
+///   options and request envelopes and on the vtables, and this bump adds no
+///   vtable slot, so `LayerVTableV1.struct_size` is unchanged and a v15 cdylib
+///   passes every size check there is. The exact `abi_version` match is the
+///   only thing that rejects it, and it is load-bearing rather than
+///   belt-and-braces. What it prevents is a host reading 24 bytes a v15
+///   producer never wrote: `owning_target` past the end of a single
+///   connection's allocation, and — past element 0 of a connection list — every
+///   field of every later element at the wrong stride, including the [`Str`]
+///   pointers the host would then free.
+///
+///   A plugin sets the field to one of its own `owned_targets()` entries; a
+///   composite sets the internal child's name, never its outer host name.
+///   Absent (`present == false`) means the plugin declines to attribute the
+///   row, and the host fills it from the sole `owned_targets` entry where the
+///   plugin declares exactly one. A composite that declines stays unattributed,
+///   because no name it has is a target a route lookup would find. The host
+///   does not validate a reported target against `owned_targets()`: that slot
+///   may legitimately be narrower, and rewriting the row on a mismatch would
+///   make a wrong answer indistinguishable from no answer. It fails later and
+///   locally, as `NotFound` from the plugin's own slot.
+/// - v17: [`LayerVTableV1`] gained the additive terminal `list_stream` slot,
+///   consuming one reserved slot. It returns [`ListEntryStream`], a pull
+///   iterator that yields one [`ObjectInfo`] per `next_fn` call. The
+///   [`CancelTokenFFI`] passed when opening the stream stays live for the
+///   stream's whole lifetime; `next_fn` takes no separate cancel argument and
+///   polls that open-time token.
+/// - v18: [`ObjectInfo`], [`BackendItemInfo`], and [`ResponseParsing`] each
+///   gained a tail-appended `etag_strength`, a one-byte [`EtagStrengthV1`]
+///   declaration plus layout padding. None has a `struct_size` prefix;
+///   `ResponseParsing` is also embedded by value in [`ReadRedirect`]. The
+///   exact-match `abi_version` check is therefore the only guard against
+///   reading a pre-v18 cdylib under the grown layouts, and the loader rejects
+///   every such cdylib at load. The zero value is deliberately `Unspecified`,
+///   the fail-safe, untrusted reading for a producer that made no declaration.
+/// - v19: [`ObjectInfo`] and [`BackendItemInfo`] each gained a tail-appended
+///   `versioned_address: Optional<Str>`, the address that names the served
+///   version of the object (`present == false` when the backend does not
+///   version it or was not asked), and [`StatOptions`] and [`ListOptions`]
+///   each gained a tail-appended `versioned_address: bool`, the caller's
+///   declaration that it will pay for that pin. Neither info struct has a
+///   `struct_size` prefix, and both are embedded by value: `ObjectInfo` in
+///   [`WriteResult`], [`ReadResultBytes`], [`ReadResultStream`] and
+///   [`LocalDelegate`], and as the element behind `List<ObjectInfo>` in
+///   [`ListPage`], [`VersionPage`] and every `list_stream` entry, whose
+///   stride grows by one `Optional<Str>` while the `List` itself stays a
+///   pointer and a length. The two options structs do carry `struct_size`,
+///   but the new `bool` lands in padding both already had, so neither changes
+///   size and `struct_size` cannot see this bump either; a v18 producer's
+///   padding byte would otherwise read as the caller's declaration. The
+///   exact-match `abi_version` check is therefore the only guard on all four
+///   structs, and the loader rejects every pre-v19 cdylib at load.
+///   `present == false` is the zero value, so a producer that never writes
+///   the field answers "no pin" rather than a dangling pointer.
+///   v19 also respells the reserved user-metadata namespace and the
+///   attribution key as `ovstorage_` and `ovstorage_modified_by`, and names the
+///   per-operation annotation key `MESSAGE_METADATA_KEY`, spelled
+///   `x_ov_message`. These are source-level constants a plugin links
+///   statically, so a cdylib built against an earlier version re-asserts
+///   attribution under the namespace it links: on `continue_write` it strips
+///   and re-stamps only its own spelling, and a continuation-supplied
+///   `ovstorage_modified_by` survives for the host to harvest as the attested
+///   writer. The same exact-match check that guards the grown layouts refuses
+///   such a cdylib, so an attributing host never runs over a plugin that
+///   spells the namespace differently.
+pub const OVSTORAGE_PLUGIN_ABI_V2_VERSION: u32 = 19;
 
 /// The v2 (Layer) **family floor**: the first `abi_version` ever assigned
 /// to the Layer ABI line. Loaders route a manifest to the v2 family when

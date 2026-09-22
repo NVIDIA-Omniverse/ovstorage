@@ -13,7 +13,7 @@
 //!
 //! This layer is the trust boundary's overlay: the broker, having just
 //! authenticated Alice, stamps her identity into a reserved key in
-//! `user_metadata` (`ovstorage-modified-by`) on every mutating call that
+//! `user_metadata` (`ovstorage_modified_by`) on every mutating call that
 //! carries caller metadata — `write`, `write_stream`, `write_redirect`
 //! and `update_metadata`. `copy`, `rename` and `create_directory` carry
 //! no `user_metadata` in their options, so there is nothing to stamp.
@@ -91,9 +91,9 @@
 //! ## Threat model
 //! **Scoped to branches that carry this Layer in `UserMetadata` mode,
 //! and to writes whose bytes go through the host.** There, the broker
-//! overwrites whatever the client supplied for `ovstorage-modified-by`,
+//! overwrites whatever the client supplied for `ovstorage_modified_by`,
 //! so a client cannot succeed at spoofing through the broker, and it
-//! strips other `ovstorage-*` keys from the inbound `user_metadata`
+//! strips other `ovstorage_*` keys from the inbound `user_metadata`
 //! (defensive — the namespace is reserved).
 //!
 //! **A redirect write is the exception, and it depends on the backend.**
@@ -232,6 +232,14 @@
 //! `modified_by` as host-vouched only where this host performed the
 //! commit and every branch beneath it sanitizes.
 //!
+//! **An object written under a host that did not reserve `ovstorage_` may
+//! already carry a client-chosen `ovstorage_modified_by`.** Nothing
+//! distinguishes such a stored value from a stamp, so [`unwrap_read`]
+//! harvests it like one, and `modified_by` is host-vouched only for objects
+//! written by an attributing host that reserves this namespace. A deployment
+//! scrubs client-writable `ovstorage_*` keys from older objects, with an
+//! `update_metadata` removal pass, before it enables attribution over them.
+//!
 //! [`unwrap_read`]: AttributionLayer::unwrap_read
 //!
 //! A direct Stack writer that bypasses the broker entirely can write any
@@ -263,13 +271,14 @@ use crate::Principal;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::StreamExt as _;
 use ovstorage::wrappers::ext;
 use ovstorage::{
     BackendItemInfo, CancellationToken, ContinueWriteRequest, CopyRequest, CreateDirectoryRequest,
     Extensions, Layer, LayerConfig, LayerHandle, LayerKindDescriptor, LayerType, ListPage,
-    ListRequest, ListVersionsRequest, LocalDelegate, ReadRequest, ReadResult, Request, StatRequest,
-    UpdateMetadataRequest, VersionPage, WrapperFactory, WriteRedirectBatch, WriteRequest,
-    WriteResult, WriteStep,
+    ListRequest, ListStream, ListVersionsRequest, LocalDelegate, ReadRequest, ReadResult, Request,
+    StatRequest, UpdateMetadataRequest, VersionPage, WrapperFactory, WriteRedirectBatch,
+    WriteRequest, WriteResult, WriteStep,
 };
 
 // The key and its namespace are defined in `ovstorage-layer`, the crate this
@@ -288,7 +297,7 @@ use ovstorage_plugin::{
 /// the original principal end-to-end.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum AttributionStrategy {
-    /// Default. Stamp `ovstorage-modified-by` into `user_metadata`
+    /// Default. Stamp `ovstorage_modified_by` into `user_metadata`
     /// and read it back on stat/list.
     #[default]
     UserMetadata,
@@ -720,6 +729,21 @@ impl Layer for AttributionWrapper {
         Ok(page)
     }
 
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        let overlay = self.overlay.clone();
+        let stream = self.inner.list_stream(request, cancel).await?;
+        Ok(Box::pin(stream.map(move |entry| {
+            entry.map(|mut item| {
+                overlay.unwrap_read(&mut item);
+                item
+            })
+        })))
+    }
+
     async fn list_versions(
         &self,
         request: Request<ListVersionsRequest>,
@@ -823,6 +847,7 @@ mod tests {
             map.insert((*k).to_string(), (*v).to_string());
         }
         ObjectInfo {
+            etag_strength: Default::default(),
             address: ovstorage_plugin::address::parse("file:///tmp/x").unwrap(),
             kind: ovstorage_plugin::ObjectKind::File,
             etag: None,
@@ -834,6 +859,7 @@ mod tests {
             system_metadata: None,
             user_metadata: if map.is_empty() { None } else { Some(map) },
             modified_by: None,
+            versioned_address: None,
         }
     }
 
@@ -849,7 +875,7 @@ mod tests {
         let mut opts = WriteOptions::default();
         layer.stamp_write(&principal("alice"), &mut opts);
 
-        let mut info = info_with_metadata(&[("ovstorage-modified-by", "alice")]);
+        let mut info = info_with_metadata(&[("ovstorage_modified_by", "alice")]);
         layer.unwrap_read(&mut info);
         assert_eq!(info.modified_by.as_deref(), Some("alice"));
         assert!(info.user_metadata.is_none());
@@ -860,8 +886,8 @@ mod tests {
         let layer = AttributionLayer::new(AttributionStrategy::UserMetadata).unwrap();
         let mut opts = WriteOptions::default();
         let mut user_meta = HashMap::new();
-        user_meta.insert("ovstorage-modified-by".to_string(), "bob".to_string());
-        user_meta.insert("ovstorage-some-future-key".to_string(), "x".to_string());
+        user_meta.insert("ovstorage_modified_by".to_string(), "bob".to_string());
+        user_meta.insert("ovstorage_some_future_key".to_string(), "x".to_string());
         user_meta.insert("regular-key".to_string(), "kept".to_string());
         opts.user_metadata = Some(user_meta);
 
@@ -874,10 +900,10 @@ mod tests {
             Some("kept")
         );
         assert_eq!(
-            metadata.get("ovstorage-modified-by").map(String::as_str),
+            metadata.get("ovstorage_modified_by").map(String::as_str),
             Some("alice"),
         );
-        assert!(!metadata.contains_key("ovstorage-some-future-key"));
+        assert!(!metadata.contains_key("ovstorage_some_future_key"));
     }
 
     #[test]
@@ -886,12 +912,12 @@ mod tests {
         let mut opts = UpdateMetadataOptions {
             user_metadata_set: {
                 let mut map = HashMap::new();
-                map.insert("ovstorage-modified-by".to_string(), "spoofed".to_string());
+                map.insert("ovstorage_modified_by".to_string(), "spoofed".to_string());
                 map.insert("normal-key".to_string(), "v".to_string());
                 map
             },
             user_metadata_remove: vec![
-                "ovstorage-modified-by".to_string(),
+                "ovstorage_modified_by".to_string(),
                 "user-asked-to-remove".to_string(),
             ],
             ..Default::default()
@@ -901,7 +927,7 @@ mod tests {
 
         assert_eq!(
             opts.user_metadata_set
-                .get("ovstorage-modified-by")
+                .get("ovstorage_modified_by")
                 .map(String::as_str),
             Some("alice"),
         );
@@ -922,7 +948,7 @@ mod tests {
         let mut opts = WriteOptions::default();
         let mut user_meta = HashMap::new();
         // Simulate an upstream broker's stamp arriving at this passthrough broker.
-        user_meta.insert("ovstorage-modified-by".to_string(), "alice".to_string());
+        user_meta.insert("ovstorage_modified_by".to_string(), "alice".to_string());
         opts.user_metadata = Some(user_meta);
 
         layer.stamp_write(&principal("local-broker-svc"), &mut opts);
@@ -930,7 +956,7 @@ mod tests {
         // Upstream stamp preserved verbatim; local broker did not re-stamp.
         let metadata = opts.user_metadata.unwrap();
         assert_eq!(
-            metadata.get("ovstorage-modified-by").map(String::as_str),
+            metadata.get("ovstorage_modified_by").map(String::as_str),
             Some("alice"),
         );
     }
@@ -938,7 +964,7 @@ mod tests {
     #[test]
     fn passthrough_unwrap_does_not_promote() {
         let layer = AttributionLayer::new(AttributionStrategy::Passthrough).unwrap();
-        let mut info = info_with_metadata(&[("ovstorage-modified-by", "alice")]);
+        let mut info = info_with_metadata(&[("ovstorage_modified_by", "alice")]);
         layer.unwrap_read(&mut info);
         // Passthrough leaves the typed slot alone; client sees raw plugin output.
         assert!(info.modified_by.is_none());
@@ -949,8 +975,8 @@ mod tests {
     fn unwrap_read_strips_other_reserved_keys() {
         let layer = AttributionLayer::new(AttributionStrategy::UserMetadata).unwrap();
         let mut info = info_with_metadata(&[
-            ("ovstorage-modified-by", "alice"),
-            ("ovstorage-future-key", "should-be-hidden"),
+            ("ovstorage_modified_by", "alice"),
+            ("ovstorage_future_key", "should-be-hidden"),
             ("user-key", "visible"),
         ]);
         layer.unwrap_read(&mut info);
@@ -961,7 +987,7 @@ mod tests {
             metadata.get("user-key").map(String::as_str),
             Some("visible")
         );
-        assert!(!metadata.contains_key("ovstorage-future-key"));
+        assert!(!metadata.contains_key("ovstorage_future_key"));
     }
 
     #[test]
@@ -972,6 +998,87 @@ mod tests {
         layer.unwrap_read(&mut info);
         // No broker stamp present; plugin's native value left alone.
         assert_eq!(info.modified_by.as_deref(), Some("plugin-native"));
+    }
+
+    /// A hyphen is outside the reserved namespace, so a hyphenated
+    /// `ovstorage-modified-by` is ordinary user metadata: the harvest neither
+    /// promotes it into `modified_by` nor hides it.
+    #[test]
+    fn unwrap_fields_leaves_a_hyphenated_key_as_ordinary_metadata() {
+        let layer = AttributionLayer::new(AttributionStrategy::UserMetadata).unwrap();
+        let mut user_metadata = Some(HashMap::from([(
+            "ovstorage-modified-by".to_string(),
+            "planted".to_string(),
+        )]));
+        let mut modified_by = None;
+
+        layer.unwrap_fields(&mut user_metadata, &mut modified_by);
+
+        assert_eq!(modified_by, None, "a hyphenated key is not harvested");
+        let metadata = user_metadata.expect("a hyphenated key is not hidden");
+        assert_eq!(
+            metadata.get("ovstorage-modified-by").map(String::as_str),
+            Some("planted")
+        );
+        assert_eq!(metadata.len(), 1);
+    }
+
+    /// The stamp functions leave a caller's hyphenated key where it is — it is
+    /// ordinary metadata — and insert the reserved key beside it.
+    #[test]
+    fn stamps_leave_a_hyphenated_key_beside_the_reserved_one() {
+        let layer = AttributionLayer::new(AttributionStrategy::UserMetadata).unwrap();
+
+        let mut write = WriteOptions {
+            user_metadata: Some(HashMap::from([(
+                "ovstorage-modified-by".to_string(),
+                "planted".to_string(),
+            )])),
+            ..WriteOptions::default()
+        };
+        layer.stamp_write(&principal("alice"), &mut write);
+        let metadata = write.user_metadata.expect("metadata present after stamp");
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(
+            metadata.get("ovstorage-modified-by").map(String::as_str),
+            Some("planted")
+        );
+        assert_eq!(
+            metadata
+                .get(ATTRIBUTION_KEY_MODIFIED_BY)
+                .map(String::as_str),
+            Some("alice")
+        );
+
+        let mut update = UpdateMetadataOptions {
+            user_metadata_set: HashMap::from([(
+                "ovstorage-modified-by".to_string(),
+                "planted".to_string(),
+            )]),
+            user_metadata_remove: vec!["ovstorage-stale".to_string()],
+            ..Default::default()
+        };
+        layer.stamp_update_metadata(&principal("alice"), &mut update);
+        assert_eq!(update.user_metadata_set.len(), 2);
+        assert_eq!(
+            update
+                .user_metadata_set
+                .get("ovstorage-modified-by")
+                .map(String::as_str),
+            Some("planted")
+        );
+        assert_eq!(
+            update
+                .user_metadata_set
+                .get(ATTRIBUTION_KEY_MODIFIED_BY)
+                .map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            update.user_metadata_remove,
+            vec!["ovstorage-stale".to_string()],
+            "a hyphenated removal is an ordinary removal and is kept"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -988,8 +1095,9 @@ mod tests {
     use ovstorage::wrappers::ext;
     use ovstorage::{
         CancellationToken, Extensions, Layer, LayerHandle, LayerKindDescriptor, LayerType,
-        ListPage, ListRequest, LocalDelegate, ReadRequest, ReadResult, RedirectResultBatch,
-        Request, StatRequest, UpdateMetadataRequest, WriteRequest, WriteResult,
+        ListPage, ListRequest, ListStream, LocalDelegate, ReadRequest, ReadResult,
+        RedirectResultBatch, Request, StatRequest, UpdateMetadataRequest, WriteRequest,
+        WriteResult,
     };
 
     /// The reserved value a backend "persisted" and echoes back on reads, so the
@@ -1138,6 +1246,14 @@ mod tests {
                 items: vec![stored_object_info()],
                 next_page_token: None,
             })
+        }
+
+        async fn list_stream(
+            &self,
+            _request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ListStream> {
+            Ok(Box::pin(futures::stream::iter([Ok(stored_object_info())])))
         }
     }
 
@@ -1494,5 +1610,29 @@ mod tests {
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].modified_by.as_deref(), Some(BACKEND_STORED));
         assert!(page.items[0].user_metadata.is_none());
+    }
+
+    #[tokio::test]
+    async fn wrapper_list_stream_unwraps_each_item() {
+        let wrapper = attribution_wrapper(Arc::new(AttrRecordingInner::default()));
+        let items = wrapper
+            .list_stream(
+                principal_request(
+                    "alice",
+                    ListRequest {
+                        prefix: ovstorage::address::parse("file:///tmp/").unwrap(),
+                        options: Default::default(),
+                    },
+                ),
+                None,
+            )
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(items.len(), 1);
+        let info = items.into_iter().next().unwrap().unwrap();
+        assert_eq!(info.modified_by.as_deref(), Some(BACKEND_STORED));
+        assert!(info.user_metadata.is_none());
     }
 }

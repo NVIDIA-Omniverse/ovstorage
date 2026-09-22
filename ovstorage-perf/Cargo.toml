@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-perf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Performance measurement for ovstorage: criterion micro-benchmarks of the
+# hot read path (this crate's `benches/`), the stats + JSON report schema in
+# `src/lib.rs` (pure measurement bookkeeping, consumable without the storage
+# stack), and the live read-perf harness binary. The binary reuses the
+# integration suite's harness wholesale — same env-resolved targets, same
+# staged plugin cdylibs, same REQUIRE/FORBID guard contract — so live perf
+# runs measure exactly the composition applications get.
+# The live measurement binary must ship without test seams: `test-codec` is
+# enabled only for the bench target through the dev-dependency override below.
+[dependencies]
+futures = "0.3.32"
+ovstorage.workspace = true
+ovstorage-integration-tests.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+# The bench target drives the shipped `Stack` + `LayerExt` surface against the
+# in-memory test backend, in two configurations: the plain in-process factory
+# (no FFI) and the same layer behind the forced-foreign ABI codec bridge
+# (`test-codec`), so the criterion delta prices exactly one FFI crossing. The
+# `ovstorage` entry here layers the `test-codec` feature onto the normal
+# dependency for benches (and tests) only.
+[dev-dependencies]
+async-trait = "0.1.89"
+bytes = "1.11.1"
+criterion = { version = "=0.8.2", default-features = false, features = [
+    "async_tokio",
+    "cargo_bench_support",
+] }
+ovstorage = { workspace = true, features = ["test-codec"] }
+ovstorage-plugin-test.workspace = true
+tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
+
+# `bench = false` on the lib and bin targets keeps `cargo bench` from also
+# running their libtest harnesses, which reject criterion-only CLI flags such
+# as `--quick` or `--save-baseline` (the standard criterion setup).
+[lib]
+bench = false
+
+[[bench]]
+harness = false
+name = "stack_read"
+
+[[bin]]
+bench = false
+name = "ovstorage-perf-live"
+path = "src/bin/live.rs"
+
+[lints]
+workspace = true

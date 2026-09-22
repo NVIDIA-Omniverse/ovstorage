@@ -34,16 +34,27 @@ tracing = "0.1.44"
 libc = "0.2.186"
 
 [dev-dependencies]
+# Pinned exactly: bench baselines and CI trend extraction read criterion's
+# on-disk output layout, which is stable in practice but undocumented.
+criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
 fs2 = "0.4.3"
 tempfile = "3.27.0"
 
 [lib]
+# `cargo bench` must not run the libtest lib harness: it rejects
+# criterion-only CLI flags such as `--quick` and `--save-baseline`.
+bench = false
 path = "src/lib.rs"
 
 [features]
 # Exposes deterministic interposition hooks to dependent-crate tests. Production
 # builds leave the hooks and their storage out entirely.
 test-seams = []
+
+# Criterion provides `main`; see the bench's module docs for what it prices.
+[[bench]]
+harness = false
+name = "metadata"
 
 [lints]
 workspace = true

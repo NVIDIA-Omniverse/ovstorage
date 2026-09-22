@@ -12,6 +12,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+use crate::fallback::{
+    ANONYMOUS_FALLBACK_AVAILABLE_SCHEMES, ANONYMOUS_FALLBACK_KEY, ANONYMOUS_FALLBACK_KINDS,
+    ANONYMOUS_FALLBACK_SCHEMES, schemes_for_kind,
+};
 use crate::{
     CancellationToken, EMPTY_LAYER_KIND, EmptyLayerFactory, Error, ErrorCode,
     LayerConnectionRequest, LayerKindDescriptor, LayerSpec, LayerTable, LayerType,
@@ -312,6 +316,657 @@ mod redirect_disclosure_key_tests {
             ovstorage_plugin_http::DISCLOSE_CREDENTIALS_KEY,
             "the host stamps a key the redirect follower does not read, so the \
              operator's disclosure policy silently never reaches it"
+        );
+    }
+}
+
+/// Stamp a host's anonymous fallback grant onto the one backend layer of each
+/// kind that owns a granted scheme.
+///
+/// An address such as `s3://bucket/key` that no configured connection serves
+/// misses every route and dies as `NoRoute`. A granted scheme lets the
+/// backend layer of the owning kind publish a hidden scheme fallback root and
+/// attempt such an address **anonymously**: no credential source is built, so
+/// the process's ambient identity is never spent on an address the operator
+/// did not configure. Whether that is wanted is a property of the deployment
+/// rather than of any connection — a brokered fetch runs from the broker's
+/// network position and reaches whatever that position reaches — so the
+/// broker and the REST gateway carry it as top-level operator keys
+/// (`anonymous_fallback_schemes`, and `anonymous_http_fallback` for `http` and
+/// `https`) and stamp it here onto the backend layer that reads the layer key
+/// [`ANONYMOUS_FALLBACK_KEY`]. A library, CLI or MCP host sets the layer key
+/// directly, like every other layer key.
+///
+/// Only a non-empty grant is written, and only onto a layer whose kind serves a
+/// granted scheme. Every backend factory treats a non-empty layer table as a
+/// static connection seed, so stamping an empty array onto a bare
+/// `[ovstorage.layers.http]` would turn a routable-but-unconnected backend into
+/// a failed connection attempt.
+///
+/// The carrier is resolved against the **routed** graph, not the declaration
+/// table: the layers `root` reaches through `inner` and `children`. The Stack
+/// builder instantiates exactly that set, so a `[ovstorage.layers.s3]` table
+/// the router's `children` omit is never built, and a grant stamped onto it
+/// would publish no fallback root while startup reported success. Such a layer
+/// is refused by name instead, and it is not counted when deciding whether the
+/// kind has one carrier or two.
+///
+/// # Errors
+///
+/// - [`ErrorCode::InvalidArgument`] — a tier-owning layer sets the layer key by
+///   hand. Refusing beats silently overriding: two spellings of one policy that
+///   disagree is a state an operator cannot debug from the outside. Checked
+///   even when nothing is granted.
+/// - [`ErrorCode::InvalidArgument`] — a granted scheme is not a fallback scheme,
+///   or is `http`/`https`, whose fallback is not available in this release. The
+///   refusal is loud so an operator who wrote `allow` learns it did nothing.
+/// - [`ErrorCode::InvalidArgument`] — the graph declares no layer of the kind
+///   that owns a granted scheme, so nothing could carry the grant: a silently
+///   inert grant is the failure an operator would never notice. Or it declares
+///   one that `root` does not reach, which is just as inert and is refused
+///   naming the layer. Or `root` reaches more than one, and two scheme roots
+///   for one scheme shadow each other silently.
+pub fn stamp_anonymous_fallback(
+    mut config: StackConfig,
+    schemes: &BTreeSet<String>,
+) -> Result<StackConfig> {
+    let resolved_kind = |name: &str, table: &LayerTable| -> String {
+        table.kind.as_deref().unwrap_or(name).to_string()
+    };
+
+    // A hand-set layer key on any tier-owning kind is refused before anything
+    // else, and regardless of the grant: with an empty grant the two spellings
+    // would otherwise disagree in the quietest possible way.
+    for (name, table) in &config.layers {
+        if schemes_for_kind(&resolved_kind(name, table)).is_empty() {
+            continue;
+        }
+        if table.config.contains_key(ANONYMOUS_FALLBACK_KEY) {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "layer `{name}` sets `{ANONYMOUS_FALLBACK_KEY}` directly; set the host's \
+                     top-level `anonymous_fallback_schemes` (and `anonymous_http_fallback` for \
+                     http and https) instead, which the host stamps onto the graph"
+                ),
+            ));
+        }
+    }
+
+    for scheme in schemes {
+        if !ANONYMOUS_FALLBACK_SCHEMES.contains(&scheme.as_str()) {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "`anonymous_fallback_schemes` grants `{scheme}`, which is not a fallback \
+                     scheme; the accepted schemes are {}",
+                    ANONYMOUS_FALLBACK_AVAILABLE_SCHEMES.join(", ")
+                ),
+            ));
+        }
+        if !ANONYMOUS_FALLBACK_AVAILABLE_SCHEMES.contains(&scheme.as_str()) {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "http anonymous fallback is not available in this release; keep \
+                 `anonymous_http_fallback = \"refuse\"`",
+            ));
+        }
+    }
+
+    if schemes.is_empty() {
+        return Ok(config);
+    }
+
+    let routed = routed_layer_names(&config);
+    for (kind, served) in ANONYMOUS_FALLBACK_KINDS {
+        let granted: Vec<&str> = served
+            .iter()
+            .copied()
+            .filter(|scheme| schemes.contains(*scheme))
+            .collect();
+        if granted.is_empty() {
+            continue;
+        }
+        let granted_list = granted
+            .iter()
+            .map(|scheme| format!("`{scheme}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut declared: Vec<String> = config
+            .layers
+            .iter()
+            .filter(|(name, table)| resolved_kind(name, table) == *kind)
+            .map(|(name, _)| name.clone())
+            .collect();
+        declared.sort();
+        // Only a layer the root reaches can carry the grant. The builder
+        // instantiates the graph by walking from the root, so a declared layer
+        // nothing routes to is never built: a grant stamped onto it publishes
+        // no fallback root, and startup would report success over a grant that
+        // does nothing. Partitioning also keeps such a layer out of the
+        // one-or-two carrier count, so a disconnected duplicate does not
+        // refuse an otherwise valid routed carrier.
+        let (carriers, unrouted): (Vec<String>, Vec<String>) =
+            declared.into_iter().partition(|name| routed.contains(name));
+        let backtick_list = |names: &[String]| {
+            names
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let carrier = match (carriers.as_slice(), unrouted.as_slice()) {
+            ([], []) => {
+                return Err(Error::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "`anonymous_fallback_schemes` grants {granted_list}, but the graph \
+                         declares no layer of kind `{kind}` to carry it: declare \
+                         `[ovstorage.layers.{kind}]` and add it to the router's `children`"
+                    ),
+                ));
+            }
+            ([], unrouted) => {
+                let (noun, verb) = if unrouted.len() == 1 {
+                    ("layer", "is")
+                } else {
+                    ("layers", "are")
+                };
+                let names = backtick_list(unrouted);
+                return Err(Error::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "`anonymous_fallback_schemes` grants {granted_list}, but {noun} {names} \
+                         of kind `{kind}` {verb} declared and not reachable from the graph's \
+                         root, so the grant would sit inert: add it to the router's `children` \
+                         (or make it the root, or a wrapper's `inner`)"
+                    ),
+                ));
+            }
+            ([one], _) => one,
+            (many, _) => {
+                let names = backtick_list(many);
+                return Err(Error::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "`anonymous_fallback_schemes` grants {granted_list}, but layers {names} \
+                         are all of kind `{kind}`: two scheme fallback roots for one scheme \
+                         shadow each other silently, so declare exactly one `{kind}` layer"
+                    ),
+                ));
+            }
+        };
+        let table = config
+            .layers
+            .get_mut(carrier)
+            .expect("carrier name was taken from this graph");
+        table.config.insert(
+            ANONYMOUS_FALLBACK_KEY.to_string(),
+            toml::Value::Array(
+                granted
+                    .iter()
+                    .map(|scheme| toml::Value::String((*scheme).to_string()))
+                    .collect(),
+            ),
+        );
+    }
+    tracing::info!(schemes = ?schemes, "anonymous fallback granted");
+    Ok(config)
+}
+
+/// The names of every layer the graph's `root` reaches through `inner` and
+/// `children`, transitively.
+///
+/// This is the set the Stack builder instantiates: it walks from the root and
+/// never looks at a declared layer nothing references, so a layer outside this
+/// set is dead configuration however valid its table is. A referenced name the
+/// graph does not declare is skipped rather than reported, because the builder
+/// refuses that graph with its own message; a name already visited is not
+/// re-entered, so a cyclic graph terminates here and is refused there too. A
+/// graph with no `root` reaches nothing.
+fn routed_layer_names(config: &StackConfig) -> BTreeSet<String> {
+    let mut routed = BTreeSet::new();
+    let mut pending: Vec<&str> = config.root.as_deref().into_iter().collect();
+    while let Some(name) = pending.pop() {
+        let Some(table) = config.layers.get(name) else {
+            continue;
+        };
+        if !routed.insert(name.to_string()) {
+            continue;
+        }
+        pending.extend(table.inner.as_deref());
+        pending.extend(table.children.iter().map(String::as_str));
+    }
+    routed
+}
+
+#[cfg(test)]
+mod anonymous_fallback_stamp_tests {
+    use super::*;
+
+    /// A router over one backend layer per `(name, kind)` pair.
+    fn graph(backends: &[(&str, &str)]) -> StackConfig {
+        let declared: Vec<(&str, Option<&str>)> = backends
+            .iter()
+            .map(|(name, kind)| (*name, Some(*kind)))
+            .collect();
+        declared_graph(&declared)
+    }
+
+    /// A router over one backend layer per `(name, kind)` pair, where a `None`
+    /// kind is the short declaration — `[ovstorage.layers.gcs]` with no
+    /// `kind =` line — whose kind resolves from the layer's name.
+    fn declared_graph(backends: &[(&str, Option<&str>)]) -> StackConfig {
+        let mut layers: HashMap<String, LayerTable> = HashMap::new();
+        layers.insert(
+            "router".into(),
+            LayerTable {
+                kind: Some("router".into()),
+                children: backends
+                    .iter()
+                    .map(|(name, _)| (*name).to_string())
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        for (name, kind) in backends {
+            layers.insert(
+                (*name).to_string(),
+                LayerTable {
+                    kind: kind.map(str::to_string),
+                    ..Default::default()
+                },
+            );
+        }
+        StackConfig {
+            root: Some("router".into()),
+            layers,
+            connections: Vec::new(),
+        }
+    }
+
+    /// [`graph`], except that the backends named in `unrouted` stay declared
+    /// but are dropped from the router's `children`: the shape of an operator
+    /// who wrote the `[ovstorage.layers.s3]` table and forgot the second half
+    /// of the fix. `graph` and `declared_graph` cannot express it, because
+    /// they route every declared backend.
+    fn graph_leaving_unrouted(backends: &[(&str, &str)], unrouted: &[&str]) -> StackConfig {
+        let mut config = graph(backends);
+        config
+            .layers
+            .get_mut("router")
+            .expect("graph roots at a router")
+            .children
+            .retain(|child| !unrouted.contains(&child.as_str()));
+        config
+    }
+
+    fn grant(schemes: &[&str]) -> BTreeSet<String> {
+        schemes.iter().map(|scheme| (*scheme).to_string()).collect()
+    }
+
+    fn scheme_array(schemes: &[&str]) -> toml::Value {
+        toml::Value::Array(
+            schemes
+                .iter()
+                .map(|scheme| toml::Value::String((*scheme).to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn stamp_writes_only_non_empty_grants_onto_the_single_layer_of_each_kind() {
+        let config = graph(&[
+            ("s3", "s3"),
+            ("gcs", "gcs"),
+            ("azure", "azure"),
+            ("http", "http"),
+            ("file", "file"),
+        ]);
+        let layers_before = config.layers.len();
+
+        let stamped = stamp_anonymous_fallback(config, &grant(&["s3", "gs"])).expect("stamps");
+
+        assert_eq!(
+            stamped.layers.len(),
+            layers_before,
+            "no layer added or removed"
+        );
+        assert_eq!(
+            stamped.layers["s3"].config.get(ANONYMOUS_FALLBACK_KEY),
+            Some(&scheme_array(&["s3"]))
+        );
+        assert_eq!(
+            stamped.layers["gcs"].config.get(ANONYMOUS_FALLBACK_KEY),
+            Some(&scheme_array(&["gs"]))
+        );
+        // A kind with no granted scheme is left untouched: its factory would
+        // read any key at all as a static connection seed.
+        for name in ["azure", "http", "file", "router"] {
+            assert!(
+                stamped.layers[name].config.is_empty(),
+                "layer `{name}` must carry no stamped key, got {:?}",
+                stamped.layers[name].config
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_grant_writes_nothing_and_still_refuses_a_hand_set_layer_key() {
+        let config = graph(&[("http", "http"), ("s3", "s3"), ("file", "file")]);
+        let stamped = stamp_anonymous_fallback(config.clone(), &BTreeSet::new())
+            .expect("an empty grant is fine");
+        assert_eq!(
+            stamped, config,
+            "an empty grant must leave the graph byte-identical"
+        );
+
+        let mut hand_set = config;
+        hand_set
+            .layers
+            .get_mut("s3")
+            .unwrap()
+            .config
+            .insert(ANONYMOUS_FALLBACK_KEY.into(), scheme_array(&["s3"]));
+        let error = stamp_anonymous_fallback(hand_set, &BTreeSet::new())
+            .expect_err("a hand-set layer key is refused even when nothing is granted");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(error.to_string().contains("layer `s3`"), "got: {error}");
+    }
+
+    #[test]
+    fn a_hand_set_anonymous_fallback_layer_key_is_refused_naming_the_top_level_keys() {
+        let mut config = graph(&[("s3", "s3")]);
+        config
+            .layers
+            .get_mut("s3")
+            .unwrap()
+            .config
+            .insert(ANONYMOUS_FALLBACK_KEY.into(), scheme_array(&["s3"]));
+
+        let error = stamp_anonymous_fallback(config, &grant(&["s3"]))
+            .expect_err("a hand-set layer key must be refused, not silently overridden");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        let message = error.to_string();
+        for needle in [
+            "layer `s3` sets `anonymous_fallback` directly",
+            "anonymous_fallback_schemes",
+            "anonymous_http_fallback",
+        ] {
+            assert!(message.contains(needle), "missing `{needle}` in: {message}");
+        }
+    }
+
+    #[test]
+    fn a_grant_whose_kind_has_no_layer_is_refused_with_the_fix() {
+        let error = stamp_anonymous_fallback(graph(&[("file", "file")]), &grant(&["gs"]))
+            .expect_err("a grant nothing can carry must fail loud rather than sit inert");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        let message = error.to_string();
+        for needle in [
+            "grants `gs`",
+            "no layer of kind `gcs`",
+            "declare `[ovstorage.layers.gcs]`",
+            "router's `children`",
+        ] {
+            assert!(message.contains(needle), "missing `{needle}` in: {message}");
+        }
+    }
+
+    #[test]
+    fn a_grant_whose_kind_has_two_layers_is_refused_naming_them() {
+        let error = stamp_anonymous_fallback(
+            graph(&[("s3_west", "s3"), ("s3_east", "s3"), ("file", "file")]),
+            &grant(&["s3"]),
+        )
+        .expect_err("two roots for one scheme would shadow each other silently");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        let message = error.to_string();
+        for needle in ["`s3_east`", "`s3_west`", "kind `s3`"] {
+            assert!(message.contains(needle), "missing `{needle}` in: {message}");
+        }
+    }
+
+    /// The zero-layer refusal already tells the operator to "add it to the
+    /// router's `children`", and this is the case that promise covers: the
+    /// table is declared and the `children` entry is missing. The builder
+    /// walks from the root, so such a layer is never instantiated, and a grant
+    /// stamped onto it would start cleanly and publish nothing.
+    #[test]
+    fn a_declared_but_unrouted_carrier_is_refused_naming_it() {
+        let config = graph_leaving_unrouted(&[("gcs", "gcs"), ("file", "file")], &["gcs"]);
+        assert!(
+            config.layers.contains_key("gcs")
+                && !config.layers["router"].children.iter().any(|c| c == "gcs"),
+            "the fixture must declare `gcs` and leave it out of the router's children"
+        );
+
+        let error = stamp_anonymous_fallback(config, &grant(&["gs"]))
+            .expect_err("a grant stamped onto a layer the root never reaches would sit inert");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        let message = error.to_string();
+        for needle in [
+            "grants `gs`",
+            "layer `gcs` of kind `gcs` is declared and not reachable",
+            "router's `children`",
+        ] {
+            assert!(message.contains(needle), "missing `{needle}` in: {message}");
+        }
+        assert!(
+            !message.contains("declares no layer"),
+            "the layer is declared, so the zero-layer wording would misdirect: {message}"
+        );
+    }
+
+    /// A stray `[ovstorage.layers.s3_old]` left declared but unrouted is dead
+    /// configuration, not a second scheme root: the builder never instantiates
+    /// it, so it cannot shadow anything. Counting it would refuse a valid
+    /// graph with a message about two carriers when there is only one.
+    #[test]
+    fn a_disconnected_duplicate_does_not_trip_the_two_carrier_refusal() {
+        let config = graph_leaving_unrouted(
+            &[("s3", "s3"), ("s3_old", "s3"), ("file", "file")],
+            &["s3_old"],
+        );
+
+        let stamped = stamp_anonymous_fallback(config, &grant(&["s3"]))
+            .expect("one routed carrier beside an unrouted twin is one carrier");
+        assert_eq!(
+            stamped.layers["s3"].config.get(ANONYMOUS_FALLBACK_KEY),
+            Some(&scheme_array(&["s3"]))
+        );
+        assert!(
+            stamped.layers["s3_old"].config.is_empty(),
+            "the unrouted twin must not be stamped, got {:?}",
+            stamped.layers["s3_old"].config
+        );
+    }
+
+    /// Reachability follows a wrapper's `inner` as well as a router's
+    /// `children`: a backend the router reaches only through a wrapper is
+    /// routed, and a walk that read `children` alone would refuse the shape
+    /// every shipped graph uses.
+    #[test]
+    fn a_carrier_reached_through_a_wrapper_inner_is_found() {
+        let mut layers: HashMap<String, LayerTable> = HashMap::new();
+        layers.insert(
+            "router".into(),
+            LayerTable {
+                kind: Some("router".into()),
+                children: vec!["retry".into(), "file".into()],
+                ..Default::default()
+            },
+        );
+        layers.insert("retry".into(), wrapper_layer("retry", "s3"));
+        layers.insert(
+            "s3".into(),
+            LayerTable {
+                kind: Some("s3".into()),
+                ..Default::default()
+            },
+        );
+        layers.insert(
+            "file".into(),
+            LayerTable {
+                kind: Some("file".into()),
+                ..Default::default()
+            },
+        );
+        let config = StackConfig {
+            root: Some("router".into()),
+            layers,
+            connections: Vec::new(),
+        };
+
+        let stamped = stamp_anonymous_fallback(config, &grant(&["s3"]))
+            .expect("router -> wrapper(inner = s3) -> s3 routes the carrier");
+        assert_eq!(
+            stamped.layers["s3"].config.get(ANONYMOUS_FALLBACK_KEY),
+            Some(&scheme_array(&["s3"]))
+        );
+        for name in ["router", "retry", "file"] {
+            assert!(
+                stamped.layers[name].config.is_empty(),
+                "layer `{name}` must carry no stamped key, got {:?}",
+                stamped.layers[name].config
+            );
+        }
+    }
+
+    /// The refusal's fix offers "make it the root": a graph whose root is the
+    /// backend itself, with no router at all, must therefore be accepted.
+    #[test]
+    fn the_root_itself_can_carry_the_grant() {
+        let mut layers: HashMap<String, LayerTable> = HashMap::new();
+        layers.insert(
+            "s3".into(),
+            LayerTable {
+                kind: Some("s3".into()),
+                ..Default::default()
+            },
+        );
+        let config = StackConfig {
+            root: Some("s3".into()),
+            layers,
+            connections: Vec::new(),
+        };
+
+        let stamped = stamp_anonymous_fallback(config, &grant(&["s3"]))
+            .expect("the root is reachable from itself");
+        assert_eq!(
+            stamped.layers["s3"].config.get(ANONYMOUS_FALLBACK_KEY),
+            Some(&scheme_array(&["s3"]))
+        );
+    }
+
+    /// The short declaration — `[ovstorage.layers.gcs]` with no `kind =` line —
+    /// is the shape the configuration examples use, and it takes the arm of
+    /// the kind resolution no graph above reaches: every one of them spells
+    /// its kind out. A regression that read `kind` alone would stamp nothing
+    /// onto, and refuse nothing about, such a layer while those tests stay
+    /// green.
+    #[test]
+    fn a_kind_less_layer_table_carries_the_grant_under_its_name() {
+        let stamped = stamp_anonymous_fallback(
+            declared_graph(&[("gcs", None), ("file", Some("file"))]),
+            &grant(&["gs"]),
+        )
+        .expect("the kind resolves from the name");
+        assert_eq!(
+            stamped.layers["gcs"].config.get(ANONYMOUS_FALLBACK_KEY),
+            Some(&scheme_array(&["gs"]))
+        );
+        assert!(
+            stamped.layers["file"].config.is_empty(),
+            "got {:?}",
+            stamped.layers["file"].config
+        );
+    }
+
+    #[test]
+    fn a_hand_set_key_on_a_kind_less_layer_table_is_refused_with_an_empty_grant() {
+        let mut config = declared_graph(&[("s3", None)]);
+        config
+            .layers
+            .get_mut("s3")
+            .unwrap()
+            .config
+            .insert(ANONYMOUS_FALLBACK_KEY.into(), scheme_array(&["s3"]));
+
+        let error = stamp_anonymous_fallback(config, &BTreeSet::new())
+            .expect_err("a kind-less tier-owning layer is still a tier-owning layer");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(error.to_string().contains("layer `s3`"), "got: {error}");
+    }
+
+    #[test]
+    fn a_kind_less_layer_table_counts_toward_the_two_layer_refusal() {
+        let error = stamp_anonymous_fallback(
+            declared_graph(&[("s3", None), ("s3_east", Some("s3"))]),
+            &grant(&["s3"]),
+        )
+        .expect_err("a kind-less twin shadows the explicit one just the same");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        let message = error.to_string();
+        assert!(
+            message.contains("layers `s3`, `s3_east` are all of kind `s3`"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn http_and_https_are_refused_in_this_release() {
+        for scheme in ["http", "https"] {
+            let error = stamp_anonymous_fallback(graph(&[("http", "http")]), &grant(&[scheme]))
+                .expect_err("the http tier is not available in this release");
+            assert_eq!(error.code(), ErrorCode::InvalidArgument, "scheme {scheme}");
+            let message = error.to_string();
+            assert!(
+                message.contains("not available in this release")
+                    && message.contains("anonymous_http_fallback = \"refuse\""),
+                "scheme {scheme}: {message}"
+            );
+        }
+        // The refusal is not an artefact of the graph lacking a carrier: the
+        // same grant beside a valid one is refused for the same reason.
+        let error = stamp_anonymous_fallback(
+            graph(&[("http", "http"), ("s3", "s3")]),
+            &grant(&["s3", "https"]),
+        )
+        .expect_err("https is refused even beside a valid grant");
+        assert!(error.to_string().contains("not available in this release"));
+    }
+
+    #[test]
+    fn an_unknown_scheme_is_refused() {
+        let error = stamp_anonymous_fallback(graph(&[("s3", "s3")]), &grant(&["ftp"]))
+            .expect_err("a scheme outside the closed set is refused");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        let message = error.to_string();
+        assert!(
+            message.contains("grants `ftp`") && message.contains("s3, gs, azure"),
+            "got: {message}"
+        );
+    }
+
+    /// The kind table is spelled in the shared contract rather than read off
+    /// the plugin: a host reaches every plugin through `dlopen`, so the http
+    /// crate is a dev-dependency here at most. Nothing but this test ties the
+    /// `http` row of the table to the kind the plugin actually declares, and a
+    /// drift would make a granted http fallback look for a layer that can
+    /// never exist.
+    #[test]
+    fn the_kind_table_matches_the_http_plugin_descriptor() {
+        use crate::BackendFactory as _;
+
+        let kind = ovstorage_plugin_http::HttpBackendLayerFactory::default()
+            .descriptor()
+            .kind;
+        assert_eq!(
+            schemes_for_kind(&kind),
+            ["http", "https"],
+            "the fallback kind table does not know the http plugin's kind `{kind}`, so a \
+             granted http fallback could never find its carrier layer"
         );
     }
 }

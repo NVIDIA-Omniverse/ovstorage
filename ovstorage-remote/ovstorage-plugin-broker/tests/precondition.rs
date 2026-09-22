@@ -77,6 +77,7 @@ fn target(addr: &str) -> ResolvedTarget {
 
 fn placeholder_info(addr: &str) -> ObjectInfo {
     ObjectInfo {
+        etag_strength: Default::default(),
         address: address::parse(addr).expect("placeholder address parses"),
         kind: ObjectKind::File,
         etag: None,
@@ -88,6 +89,7 @@ fn placeholder_info(addr: &str) -> ObjectInfo {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
@@ -208,10 +210,11 @@ impl BrokerClientTransport for RecordingTransport {
         Ok(placeholder_info(address.as_str()))
     }
 
-    async fn watch_directory(
+    async fn watch_directory_with_cancel(
         &self,
         _prefix: Url,
         _opts: WatchDirectoryOptions,
+        _cancel: Option<ovstorage_plugin::CancellationToken>,
     ) -> Result<BrokerClientWatchDirectoryStream> {
         Ok(Box::new(std::iter::empty()))
     }
@@ -482,6 +485,7 @@ async fn list_with_recursive_passes_through() {
         max_results: Some(50),
         page_token: Some("cursor-1".into()),
         full_metadata: true,
+        versioned_address: false,
     };
     backend
         .list(target("https://broker.example.com/dir/"), opts, None)

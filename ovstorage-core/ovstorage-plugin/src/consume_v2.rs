@@ -487,9 +487,7 @@ unsafe fn alias_source_from_ffi(value: ffi::AliasSource) -> Result<AliasSource> 
         },
         ffi::AliasSourceTag::BrokerDelivered => AliasSource::BrokerDelivered {
             broker_principal: unsafe {
-                marshal::primitive::optional_from_ffi(value.broker_principal, |s| {
-                    marshal::primitive::str_from_ffi(s)
-                })?
+                marshal::primitive::optional_str_unset_as_none(value.broker_principal)?
             }
             .unwrap_or_default(),
         },
@@ -501,12 +499,8 @@ unsafe fn alias_state_from_ffi(value: ffi::AliasState) -> Result<AliasState> {
         ffi::AliasStateTag::Live => AliasState::Live,
         ffi::AliasStateTag::Dangling => AliasState::Dangling,
         ffi::AliasStateTag::ChainTooLong => AliasState::ChainTooLong {
-            reason: unsafe {
-                marshal::primitive::optional_from_ffi(value.reason, |s| {
-                    marshal::primitive::str_from_ffi(s)
-                })?
-            }
-            .unwrap_or_default(),
+            reason: unsafe { marshal::primitive::optional_str_unset_as_none(value.reason)? }
+                .unwrap_or_default(),
         },
     })
 }
@@ -529,21 +523,15 @@ unsafe fn route_source_from_ffi(value: ffi::RouteSource) -> Result<RouteSource> 
         },
         ffi::RouteSourceTag::BrokerDelivered => RouteSource::BrokerDelivered {
             broker_principal: unsafe {
-                marshal::primitive::optional_from_ffi(broker_principal, |s| {
-                    marshal::primitive::str_from_ffi(s)
-                })?
+                marshal::primitive::optional_str_unset_as_none(broker_principal)?
             }
             .unwrap_or_default(),
             connection_id: unsafe { decode_connection_id(connection_id)? },
         },
         ffi::RouteSourceTag::Alias => RouteSource::Alias {
             to: {
-                let raw = unsafe {
-                    marshal::primitive::optional_from_ffi(alias_to, |s| {
-                        marshal::primitive::str_from_ffi(s)
-                    })?
-                }
-                .unwrap_or_default();
+                let raw = unsafe { marshal::primitive::optional_str_unset_as_none(alias_to)? }
+                    .unwrap_or_default();
                 Url::parse(&raw).map_err(|e| {
                     Error::new(
                         ErrorCode::InvalidArgument,
@@ -560,11 +548,7 @@ unsafe fn route_source_from_ffi(value: ffi::RouteSource) -> Result<RouteSource> 
 }
 
 unsafe fn decode_connection_id(value: ffi::Optional<ffi::ConnectionId>) -> Result<ConnectionId> {
-    let decoded = unsafe {
-        marshal::primitive::optional_from_ffi(value, |c| {
-            marshal::primitive::str_from_ffi(c.id).map(ConnectionId)
-        })?
-    };
+    let decoded = unsafe { marshal::primitive::optional_connection_id_unset_as_none(value)? };
     Ok(decoded.unwrap_or_else(|| ConnectionId(String::new())))
 }
 
@@ -664,22 +648,60 @@ pub unsafe fn root_info_from_ffi(value: ffi::RootInfo) -> Result<RootInfo> {
     let root_raw = unsafe { marshal::primitive::str_from_ffi(root)? };
     Ok(RootInfo {
         root: root_from_ffi_str(&root_raw)?,
-        display_name: unsafe {
-            marshal::primitive::optional_from_ffi(display_name, |s| {
-                marshal::primitive::str_from_ffi(s)
-            })?
-        },
+        display_name: unsafe { marshal::primitive::optional_str_unset_as_none(display_name)? },
         layer_kind: unsafe { marshal::primitive::str_from_ffi(layer_kind)? },
         connection_id: unsafe {
-            marshal::primitive::optional_from_ffi(connection_id, |c| {
-                marshal::primitive::str_from_ffi(c.id).map(ConnectionId)
-            })?
+            marshal::primitive::optional_connection_id_unset_as_none(connection_id)?
         },
-        owning_target: unsafe {
-            marshal::primitive::optional_from_ffi(owning_target, |s| {
-                marshal::primitive::str_from_ffi(s)
-            })?
-        },
+        // **`present` can outrun the payload, and the two shapes underneath it
+        // are different statements.** `optional_from_ffi` answers `Some`
+        // whenever `present` is set, and `str_from_ffi` maps both a null
+        // pointer and a zero length to an empty `String` — so on their own the
+        // two cannot tell a producer that never wrote this field from one that
+        // wrote it as `""`.
+        //
+        // `present == true, ptr == NULL, len == 0` is the first: exactly the
+        // shape `calloc` already gives a C plugin, so it arrives by omission
+        // rather than by mistake, and it carries no attribution to preserve.
+        // `present == true, ptr != NULL, len == 0` is the second: a target
+        // encoded as the empty string on purpose. `optional_str_unset_as_none`
+        // separates them, here and on the other root-info and operation-result
+        // strings; the wholly-zeroed `Optional` needs no help, since
+        // `present == 0` is already `None`. This field is where the rule is
+        // argued, because it is the one where the wrong answer routes.
+        //
+        // **The two shapes differ in how reachable they are, and the
+        // difference runs the opposite way to what "empty" suggests.**
+        //
+        // The UNSET shape is not reachable from this tree: every shipping
+        // plugin backend leaves `RootInfo.owning_target` as `None` and lets the
+        // host attribute the row, and the two producers that do stamp a name —
+        // the in-process Rust file backend, which never crosses this boundary,
+        // and the C file backend, which refuses an empty instance name — cannot
+        // emit it. Ruling it out here is defence-in-depth for a public ABI.
+        //
+        // The ENCODED-EMPTY shape is reachable by construction. `str_to_ffi`
+        // sends an empty string through `abi_capacity`, which mints a
+        // one-element sentinel for a zero length, so any Rust plugin returning
+        // `Some(String::new())` puts `ptr != NULL, len == 0` on the wire today.
+        // No shipping plugin does so, but nothing stops one, and a decode that
+        // discarded it would be dropping an attribution a producer really made.
+        // `a_deliberately_empty_root_owning_target_survives_the_round_trip`
+        // pins that end to end, encoder included.
+        //
+        // Discriminating rather than testing `is_empty()` matters for what the
+        // code asserts. An empty layer instance name is legal at the graph
+        // level: neither stack builder rejects one, nor does the TOML config
+        // path, and a Router routes target `""` like any other key. The C file
+        // backend's refusal above is its own per-backend guard, not a rule of
+        // the graph, and no other factory carries it. So "present and empty
+        // means absent" would be a false rule that merely happens to be
+        // unreachable. This states something true about the encoding instead.
+        //
+        // `marshal::auth::connection_from_ffi` decodes the same field of
+        // `Connection` through this same helper, so the two decoders of one
+        // concept apply one rule from one definition.
+        owning_target: unsafe { marshal::primitive::optional_str_unset_as_none(owning_target)? },
         capabilities: unsafe { marshal::capabilities::capabilities_from_ffi(capabilities)? },
         range_read_strategy: range_read_strategy_from_ffi(range_read_strategy),
         source: unsafe { route_source_from_ffi(source)? },
@@ -754,9 +776,7 @@ pub unsafe fn list_page_from_ffi(value: ffi::ListPage) -> Result<ListPage> {
             })?
         },
         next_page_token: unsafe {
-            marshal::primitive::optional_from_ffi(value.next_page_token, |s| {
-                marshal::primitive::str_from_ffi(s)
-            })?
+            marshal::primitive::optional_str_unset_as_none(value.next_page_token)?
         },
     })
 }
@@ -773,9 +793,7 @@ pub unsafe fn version_page_from_ffi(value: ffi::VersionPage) -> Result<VersionPa
             })?
         },
         next_page_token: unsafe {
-            marshal::primitive::optional_from_ffi(value.next_page_token, |s| {
-                marshal::primitive::str_from_ffi(s)
-            })?
+            marshal::primitive::optional_str_unset_as_none(value.next_page_token)?
         },
     })
 }
@@ -831,6 +849,162 @@ pub fn change_stream_from_ffi(stream: ffi::BackendChangeStream) -> ChangeStream 
     Box::new(Iter {
         stream,
         done: false,
+    })
+}
+
+/// Blocking iterator over a plugin-emitted `ffi::ListEntryStream`.
+///
+/// The FFI stream is held by value, so its own `Drop` invokes `drop_fn`
+/// exactly once when this iterator is exhausted or abandoned. Both FFI error
+/// steps are terminal on the list surface, matching
+/// [`change_stream_from_ffi`]; the distinction is reserved for update streams,
+/// whose `TransientError` frames are recoverable resync signals.
+struct ListEntryIter {
+    stream: ffi::ListEntryStream,
+    done: bool,
+}
+
+impl Iterator for ListEntryIter {
+    type Item = Result<ObjectInfo>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let mut item = MaybeUninit::<ffi::ObjectInfo>::uninit();
+        let mut error = MaybeUninit::<ffi::Error>::uninit();
+        let step = unsafe {
+            (self.stream.next_fn)(self.stream.state, item.as_mut_ptr(), error.as_mut_ptr())
+        };
+        match step {
+            ffi::StreamStep::Yielded => {
+                Some(unsafe { marshal::metadata::object_info_from_ffi(item.assume_init()) })
+            }
+            ffi::StreamStep::Ended => {
+                self.done = true;
+                None
+            }
+            ffi::StreamStep::Failed | ffi::StreamStep::TransientError => {
+                self.done = true;
+                Some(Err(unsafe {
+                    marshal::error::from_ffi(error.assume_init())
+                }))
+            }
+        }
+    }
+}
+
+// A single queued entry lets the FFI pull overlap with consumer work while
+// bounding the bridge to one buffered ObjectInfo plus the sender's current
+// item. This is deliberately smaller than the long-lived update-stream bridge:
+// listings can be arbitrarily large and their backpressure is contractual.
+/// Rust-only host bridge bound; not part of the generated plugin ABI.
+/// cbindgen:ignore
+const LIST_STREAM_BRIDGE_CAPACITY: usize = 1;
+
+/// Host-only async receiver; the pull-iterator C ABI is represented separately.
+/// cbindgen:ignore
+type ListStreamReceiver = tokio_stream::wrappers::ReceiverStream<Result<ObjectInfo>>;
+/// Host-only injection seam for fallible bridge-thread creation tests.
+/// cbindgen:ignore
+type ListStreamThreadSpawner = fn(ListEntryIter) -> Result<ListStreamReceiver>;
+
+fn spawn_list_stream_thread(iter: ListEntryIter) -> Result<ListStreamReceiver> {
+    let (tx, rx) = tokio::sync::mpsc::channel(LIST_STREAM_BRIDGE_CAPACITY);
+    std::thread::Builder::new()
+        .name("ovs-list-stream".into())
+        .spawn(move || {
+            for item in iter {
+                if tx.blocking_send(item).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(|error| {
+            Error::new(
+                ErrorCode::ResourceExhausted,
+                format!("failed to spawn list-stream bridge thread: {error}"),
+            )
+        })?;
+    Ok(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+/// Lazy async facade over a blocking FFI list iterator.
+///
+/// The first poll starts the dedicated pull thread. Dropping an unpolled
+/// stream drops the FFI iterator in place; dropping a polled stream first
+/// signals the producer through the retained open-time cancellation handle,
+/// which wakes a cooperative `next_fn`, and then closes the bounded receiver.
+/// If the host cannot create the pull thread, the first poll yields a terminal
+/// `ResourceExhausted` error and releases the FFI iterator.
+struct BridgeListStream {
+    state: BridgeListState,
+    cancel: ffi::CancelTokenHandle,
+}
+
+enum BridgeListState {
+    Idle {
+        iter: Option<ListEntryIter>,
+        spawn: ListStreamThreadSpawner,
+    },
+    Draining(ListStreamReceiver),
+    SpawnFailed(Option<Error>),
+}
+
+impl futures::Stream for BridgeListStream {
+    type Item = Result<ObjectInfo>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let BridgeListState::Idle { iter, spawn } = &mut this.state {
+            let iter = iter
+                .take()
+                .expect("list bridge iterator taken exactly once");
+            this.state = match spawn(iter) {
+                Ok(receiver) => BridgeListState::Draining(receiver),
+                Err(error) => BridgeListState::SpawnFailed(Some(error)),
+            };
+        }
+        match &mut this.state {
+            BridgeListState::Draining(rx) => std::pin::Pin::new(rx).poll_next(cx),
+            BridgeListState::SpawnFailed(error) => std::task::Poll::Ready(error.take().map(Err)),
+            BridgeListState::Idle { .. } => {
+                unreachable!("state advanced out of Idle above")
+            }
+        }
+    }
+}
+
+impl Drop for BridgeListStream {
+    fn drop(&mut self) {
+        // `CancelTokenHandle::drop` only tears down the host-side bridge. Fire
+        // the FFI state first so a plugin-side iterator parked in `next_fn`
+        // observes early abandonment and can release its state.
+        self.cancel.cancel_producer();
+    }
+}
+
+fn bridge_list_stream(stream: ffi::ListEntryStream, cancel: ffi::CancelTokenHandle) -> ListStream {
+    bridge_list_stream_with_spawn(stream, cancel, spawn_list_stream_thread)
+}
+
+fn bridge_list_stream_with_spawn(
+    stream: ffi::ListEntryStream,
+    cancel: ffi::CancelTokenHandle,
+    spawn: ListStreamThreadSpawner,
+) -> ListStream {
+    Box::pin(BridgeListStream {
+        state: BridgeListState::Idle {
+            iter: Some(ListEntryIter {
+                stream,
+                done: false,
+            }),
+            spawn,
+        },
+        cancel,
     })
 }
 
@@ -1942,6 +2116,54 @@ macro_rules! v2_unit_op {
 // macro that emits `async fn` inside an `#[async_trait]` impl is not seen
 // by the attribute expansion; the trait methods below forward to these.
 impl ForeignVtableLayer {
+    /// Attribute a row this plugin left unattributed, so a caller holding it can
+    /// build the `ConnectionKey` that reaches it.
+    ///
+    /// THE one home for the connection rule in this file. Every path that
+    /// decodes a `Connection` — the snapshot, the update stream, and the four
+    /// single-connection ops — goes through here, so a consumer keyed by
+    /// `(target, id)` cannot see one connection under two keys depending on
+    /// which path it arrived through.
+    ///
+    /// **`sole_owning_target`, not `leaf_owning_target`.** The `name()` fallback
+    /// is right for a `RootInfo` and wrong here. `owned_targets` reports a
+    /// loaded plugin's INTERNAL names, and a Router's target table is built from
+    /// exactly those, so this layer's outer name is not in it: substituting it
+    /// for a composite would hand back a `Some` that answers `NotFound` at
+    /// `route_target` against a graph that holds the connection. A `RootInfo`
+    /// can absorb that because it carries the address it is about and a caller
+    /// still has `owning_target_for`; a connection parked in `AwaitingAuth`
+    /// publishes no address at all. So a composite that declines to attribute
+    /// its own rows stays `None`, which says "ask the graph" instead of failing
+    /// at use.
+    ///
+    /// A plugin that reported a target is respected, and it is not validated
+    /// against `owned_targets()`: that slot may legitimately be narrower, and
+    /// rewriting the row on a mismatch would make a wrong answer
+    /// indistinguishable from no answer.
+    fn backfill_connection_owner(sole_target: &Option<String>, connection: &mut Connection) {
+        if connection.owning_target.is_none() {
+            connection.owning_target = sole_target.clone();
+        }
+    }
+
+    /// The same fill applied to a change frame. `Removed` carries no
+    /// `Connection` and so carries no target; a consumer resolves it against the
+    /// key it retained from the frame that introduced the row.
+    fn backfill_change_owner(sole_target: &Option<String>, change: &mut ConnectionChange) {
+        match change {
+            ConnectionChange::Added(connection) | ConnectionChange::Updated(connection) => {
+                Self::backfill_connection_owner(sole_target, connection);
+            }
+            ConnectionChange::Snapshot(connections) => {
+                for connection in connections {
+                    Self::backfill_connection_owner(sole_target, connection);
+                }
+            }
+            ConnectionChange::Removed { .. } => {}
+        }
+    }
+
     v2_op!(
         stat_op,
         StatRequest,
@@ -2238,6 +2460,12 @@ impl Layer for ForeignVtableLayer {
         // name, not this loaded layer's outer name, and the two copies of the
         // rule cannot drift. A plugin that reports its own `owning_target` is
         // respected.
+        //
+        // A `Connection` takes the NARROWER rule — `sole_owning_target`, with no
+        // name fallback — and `backfill_connection_owner` says why: a `RootInfo`
+        // carries the address it is about, so a caller handed an unroutable name
+        // still has `owning_target_for` to fall back on, and a connection parked
+        // in `AwaitingAuth` publishes no address and has no such recourse.
         if info.owning_target.is_none() && info.connection_id.is_some() {
             info.owning_target = Some(ovstorage_layer::leaf_owning_target(
                 &self.owned_targets(),
@@ -2396,12 +2624,24 @@ impl Layer for ForeignVtableLayer {
         // on. Dropping it here would make a later `cancel.cancel()` inert while
         // the stream is still live. Same contract as `watch_directory`; when
         // there is no update stream the handle drops here as before.
-        let (snapshot, updates) = res;
+        let (mut snapshot, updates) = res;
+        // Resolved ONCE, and shared by the snapshot and the stream so the two
+        // halves of this plugin's answer agree. `owned_targets` is fixed
+        // manifest/topology metadata under the trait's synchronous no-I/O
+        // contract, so hoisting it here is sound and keeps this from being one
+        // FFI call per frame.
+        let sole_target = ovstorage_layer::sole_owning_target(&self.owned_targets());
+        for connection in &mut snapshot.connections {
+            Self::backfill_connection_owner(&sole_target, connection);
+        }
         let updates = updates.map(|stream| {
-            Box::pin(marshal::change::CancelGuardedStream::new(
-                stream,
-                cancel_handle,
-            )) as ConnectionUpdateStream
+            let guarded = marshal::change::CancelGuardedStream::new(stream, cancel_handle);
+            Box::pin(futures::StreamExt::map(guarded, move |change| {
+                change.map(|mut change| {
+                    Self::backfill_change_owner(&sole_target, &mut change);
+                    change
+                })
+            })) as ConnectionUpdateStream
         });
         Ok((snapshot, updates))
     }
@@ -2497,6 +2737,83 @@ impl Layer for ForeignVtableLayer {
     ) -> Result<ListPage> {
         self.list_op(request, cancel).await
     }
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        if request.input.options.max_results.is_some() || request.input.options.page_token.is_some()
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+
+        // A foreign producer may use its language's default vtable, whose
+        // list_stream slot declines with Unsupported. Keep the original
+        // request so that outcome can take the same buffered compatibility
+        // path as the Rust Layer default.
+        let fallback_request = request.clone();
+        let stream_cancel = cancel.clone();
+        let req_ffi = build_list(request);
+        // Always provide an open-time token, even when the caller supplied
+        // none. The private token is what lets dropping a polled bridge wake a
+        // plugin `next_fn` that is parked waiting for its next page.
+        let cancel_handle = ffi::cancel_token_to_ffi(cancel.unwrap_or_default());
+        let (user_data, call) = self.begin_call::<ffi::ListEntryStream>(Some(&cancel_handle));
+
+        extern "C" fn on_done(
+            status: i32,
+            result: *mut c_void,
+            error: *mut ffi::Error,
+            user_data: *mut c_void,
+        ) {
+            let decode = || {
+                decode_async_result(status, result as *mut ffi::ListEntryStream, error, |r| {
+                    Ok(unsafe { ffi::abi_alloc::abi_unbox(r) })
+                })
+            };
+            // SAFETY: `user_data` is this call's `begin_call` allocation,
+            // carrying a `Result<ffi::ListEntryStream>` sender; completion is
+            // exactly once.
+            unsafe { complete_call::<ffi::ListEntryStream>(user_data, decode) };
+        }
+
+        let vt = self.vt();
+        let extensions = req_ffi.extensions;
+        unsafe {
+            (vt.list_stream)(
+                self.state(),
+                &req_ffi,
+                cancel_handle.as_ffi_ptr(),
+                on_done,
+                user_data,
+            );
+        }
+        std::mem::forget(req_ffi);
+        // Same borrowed-extensions reclaim as `v2_op!`. NULL-safe.
+        unsafe { ffi::ovstorage_plugin_extensions_free(extensions as *mut ffi::Extensions) };
+        match call.complete().await {
+            Ok(stream) => Ok(cancel_list_stream(
+                bridge_list_stream(stream, cancel_handle),
+                stream_cancel,
+            )),
+            Err(error) if error.code() == ErrorCode::Unsupported => {
+                drop(cancel_handle);
+                let page = self.list(fallback_request, stream_cancel.clone()).await?;
+                if page.next_page_token.is_some() {
+                    return Err(Error::new(
+                        ErrorCode::Internal,
+                        "list returned a continuation token the buffered list_stream adapter cannot follow; implement list_stream natively",
+                    ));
+                }
+                let stream = Box::pin(futures::stream::iter(page.items.into_iter().map(Ok)));
+                Ok(cancel_list_stream(stream, stream_cancel))
+            }
+            Err(error) => Err(error),
+        }
+    }
     async fn list_versions(
         &self,
         request: Request<ListVersionsRequest>,
@@ -2530,28 +2847,64 @@ impl Layer for ForeignVtableLayer {
         request: Request<LayerConnectionRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<Connection> {
-        self.probe_op(request, cancel).await
+        let mut connection = self.probe_op(request, cancel).await?;
+        // Filled on the way out for the same reason the snapshot is: a row this
+        // op just returned and the same row from `list_connections` must not
+        // disagree about which target reaches it.
+        Self::backfill_connection_owner(
+            &ovstorage_layer::sole_owning_target(&self.owned_targets()),
+            &mut connection,
+        );
+        Ok(connection)
     }
     async fn add_connection(
         &self,
         request: Request<LayerConnectionRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<Connection> {
-        self.add_connection_op(request, cancel).await
+        let mut connection = self.add_connection_op(request, cancel).await?;
+        // Filled on the way out for the same reason the snapshot is: a row this
+        // op just returned and the same row from `list_connections` must not
+        // disagree about which target reaches it.
+        Self::backfill_connection_owner(
+            &ovstorage_layer::sole_owning_target(&self.owned_targets()),
+            &mut connection,
+        );
+        Ok(connection)
     }
     async fn update_connection_credentials(
         &self,
         request: Request<UpdateConnectionCredentialsRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<Connection> {
-        self.update_connection_credentials_op(request, cancel).await
+        let mut connection = self
+            .update_connection_credentials_op(request, cancel)
+            .await?;
+        // Filled on the way out for the same reason the snapshot is: a row this
+        // op just returned and the same row from `list_connections` must not
+        // disagree about which target reaches it.
+        Self::backfill_connection_owner(
+            &ovstorage_layer::sole_owning_target(&self.owned_targets()),
+            &mut connection,
+        );
+        Ok(connection)
     }
     async fn update_connection_attributes(
         &self,
         request: Request<UpdateConnectionAttributesRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<Connection> {
-        self.update_connection_attributes_op(request, cancel).await
+        let mut connection = self
+            .update_connection_attributes_op(request, cancel)
+            .await?;
+        // Filled on the way out for the same reason the snapshot is: a row this
+        // op just returned and the same row from `list_connections` must not
+        // disagree about which target reaches it.
+        Self::backfill_connection_owner(
+            &ovstorage_layer::sole_owning_target(&self.owned_targets()),
+            &mut connection,
+        );
+        Ok(connection)
     }
 
     async fn watch_directory(
@@ -2663,12 +3016,34 @@ impl Layer for ForeignVtableLayer {
         // Same borrowed-extensions reclaim as `v2_op!`. NULL-safe.
         unsafe { ffi::ovstorage_plugin_extensions_free(extensions as *mut ffi::Extensions) };
         let stream = call.complete().await?;
+        // A `Succeeded` event carries a `Connection`, so it is a fourth path a
+        // row reaches a caller through and it must agree with the other three.
+        // A caller that replaces its cached row with this one would otherwise
+        // lose the target it had — the same connection under two keys depending
+        // on which path delivered it, which is exactly what
+        // `backfill_connection_owner` exists to prevent. Resolved once here,
+        // like the listing's, rather than per event.
+        let sole_target = ovstorage_layer::sole_owning_target(&self.owned_targets());
+        let stream: AuthEventStream = Box::new(stream.map(move |event| match event {
+            Ok(AuthEvent::Succeeded {
+                mut connection,
+                credentials,
+            }) => {
+                Self::backfill_connection_owner(&sole_target, &mut connection);
+                Ok(AuthEvent::Succeeded {
+                    connection,
+                    credentials,
+                })
+            }
+            other => other,
+        }));
         // `cancel_handle` lives as long as the returned stream, so a host
         // cancel keeps reaching the plugin token that stream polls — the wait
         // an interactive auth flow parks on (browser round-trip, device-code
         // poll) is inside the stream, not the call. Dropping the stream drops
         // the handle (aborts the bridge, tears down the subscription). On the
-        // error arm the early return above drops the handle.
+        // error arm the early return above drops the handle. The map above sits
+        // INSIDE this guard so cancellation still reaches the plugin's stream.
         Ok(Box::new(marshal::change::CancelGuardedChangeStream::new(
             stream,
             cancel_handle,
@@ -3088,5 +3463,1298 @@ mod tests {
             1,
             "the adopted change stream's drop_fn must run exactly once",
         );
+    }
+
+    fn root_info_fixture(owning_target: Option<String>) -> RootInfo {
+        RootInfo {
+            root: root_from_ffi_str("file:///data/root/").expect("the fixture root parses"),
+            display_name: None,
+            layer_kind: "file".to_string(),
+            connection_id: Some(ConnectionId("c-1".into())),
+            owning_target,
+            capabilities: Capabilities::empty(),
+            range_read_strategy: RangeReadStrategy::default(),
+            source: RouteSource::ConnectionContributed {
+                connection_id: ConnectionId("c-1".into()),
+            },
+            visible: true,
+            visibility: AddressVisibility::Visible,
+            alias_state: None,
+            icon: None,
+            user_metadata: UserMetadata::new(),
+        }
+    }
+
+    /// A `RootInfo` carrying a target, encoded and decoded, keeps it verbatim,
+    /// and one carrying none still answers `None`.
+    ///
+    /// This is the guard on the emptiness normalisation below: a filter that
+    /// rejected too much would silence an attribution the plugin actually made,
+    /// and every consumer would fall back to deriving the owner. Asserting the
+    /// `Some` case separately means the two failures are told apart. The absent
+    /// case is not the same code path either: an `Optional` that is not present
+    /// carries unspecified bytes, and the decoder must answer `None` rather than
+    /// reading them.
+    #[test]
+    fn a_root_infos_owning_target_survives_the_round_trip() {
+        for target in [Some("files".to_string()), None] {
+            let original = root_info_fixture(target);
+            let back = unsafe {
+                root_info_from_ffi(crate::thunks_v2::root_info_to_ffi(original.clone()))
+                    .expect("the fixture decodes")
+            };
+            assert_eq!(original.owning_target, back.owning_target);
+        }
+    }
+
+    /// An UNSET `owning_target` payload on a `RootInfo` decodes to `None`.
+    ///
+    /// `present == true` with `ptr == NULL, len == 0` is the shape a C plugin
+    /// reaches by omission rather than by mistake: `calloc` gives exactly that,
+    /// so setting `present` on a zero-initialised struct produces it. The
+    /// producer never wrote the field, so there is no attribution to carry, and
+    /// `None` is what the row means.
+    #[test]
+    fn an_unset_root_owning_target_payload_decodes_as_absent() {
+        let mut encoded = crate::thunks_v2::root_info_to_ffi(root_info_fixture(None));
+
+        // The fixture must arrive UNATTRIBUTED, or the overwrite below would not
+        // be what makes the payload unset and the test would be proving
+        // something about the encoder instead.
+        assert!(
+            !encoded.owning_target.present,
+            "an unattributed fixture must encode to an absent Optional",
+        );
+
+        // Overwrite it with the zeroed-but-present shape. The encoder cannot
+        // produce this; a C producer does, which is the point.
+        encoded.owning_target = ffi::Optional::some(ffi::Str {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+        });
+
+        let decoded = unsafe { root_info_from_ffi(encoded).expect("the fixture decodes") };
+        assert_eq!(
+            decoded.owning_target, None,
+            "a payload the producer never wrote is not an attribution",
+        );
+    }
+
+    /// A DELIBERATELY empty `owning_target` survives the ROUND TRIP as
+    /// `Some("")`, through the real encoder rather than a hand-built `Str`.
+    ///
+    /// This is the half that distinguishes discriminating on the encoding from
+    /// testing the decoded length, and it is a shape a Rust producer reaches by
+    /// construction rather than a hypothetical one. `str_to_ffi` routes the
+    /// empty string through `abi_capacity`, which returns a one-element
+    /// sentinel for a zero length, and `abi_alloc_array` aborts rather than
+    /// return NULL — so `Some(String::new())` on a plugin's `RootInfo` encodes
+    /// to `ptr != NULL, len == 0` every time. The encoded assertions below are
+    /// what pins that, so the claim rests on this test rather than on a comment
+    /// somewhere else.
+    ///
+    /// Losing it would matter: an empty layer instance name is legal at the
+    /// graph level (neither stack builder nor the TOML config path rejects one)
+    /// and a Router routes target `""` like any other key.
+    #[test]
+    fn a_deliberately_empty_root_owning_target_survives_the_round_trip() {
+        let encoded = crate::thunks_v2::root_info_to_ffi(root_info_fixture(Some(String::new())));
+
+        // The encoder's own output is the premise: `present`, a non-NULL
+        // pointer, and a zero length. If this ever became the calloc shape the
+        // decode below would be reading the OTHER case and would pass for the
+        // wrong reason.
+        assert!(
+            encoded.owning_target.present,
+            "an attributed fixture must encode to a present Optional",
+        );
+        // SAFETY: `present` was just asserted, so the payload is initialized.
+        let payload = unsafe { &*encoded.owning_target.value.as_ptr() };
+        assert!(
+            !payload.ptr.is_null(),
+            "str_to_ffi must mint the sentinel allocation for an empty string",
+        );
+        assert_eq!(payload.len, 0, "an empty target encodes to a zero length");
+
+        let decoded = unsafe { root_info_from_ffi(encoded).expect("the fixture decodes") };
+        assert_eq!(
+            decoded.owning_target,
+            Some(String::new()),
+            "an empty target the producer encoded on purpose must survive",
+        );
+    }
+
+    /// The present-but-unwritten shape a C producer reaches by `calloc`: the
+    /// encoder cannot produce it, so tests overwrite an absent field with it.
+    fn unset_str() -> ffi::Optional<ffi::Str> {
+        ffi::Optional::some(ffi::Str {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+        })
+    }
+
+    /// The other root-info optional strings follow the `owning_target` rule:
+    /// a payload the producer never wrote decodes to `None`, the way the C
+    /// host delivers NULL for the same bytes. `connection_id` wraps its string
+    /// one struct further in and is decoded by the wrapper's own helper.
+    #[test]
+    fn unset_root_display_name_and_connection_id_payloads_decode_as_absent() {
+        let mut encoded = crate::thunks_v2::root_info_to_ffi(RootInfo {
+            connection_id: None,
+            ..root_info_fixture(None)
+        });
+        assert!(
+            !encoded.display_name.present,
+            "the fixture display name must be absent"
+        );
+        assert!(
+            !encoded.connection_id.present,
+            "the fixture connection id must be absent"
+        );
+
+        encoded.display_name = unset_str();
+        encoded.connection_id = ffi::Optional::some(ffi::ConnectionId {
+            id: ffi::Str {
+                ptr: std::ptr::null_mut(),
+                len: 0,
+            },
+        });
+
+        let decoded = unsafe { root_info_from_ffi(encoded).expect("the fixture decodes") };
+        assert_eq!(decoded.display_name, None);
+        assert_eq!(decoded.connection_id, None);
+    }
+
+    /// The nested route-source and alias-state strings decode into
+    /// non-optional fields, so an unset payload reads as `""` there; the
+    /// decode must still succeed, and the deliberately-empty shape must read
+    /// the same way, so the two hosts agree on what the row says.
+    #[test]
+    fn unset_nested_root_info_strings_decode_without_error() {
+        let mut encoded = crate::thunks_v2::root_info_to_ffi(RootInfo {
+            source: RouteSource::BrokerDelivered {
+                broker_principal: String::new(),
+                connection_id: ConnectionId("c-1".into()),
+            },
+            alias_state: Some(AliasState::ChainTooLong {
+                reason: String::new(),
+            }),
+            ..root_info_fixture(None)
+        });
+        assert!(encoded.source.broker_principal.present);
+        assert!(encoded.alias_state.present);
+
+        // Replace rather than assign so the encoder's sentinel allocations
+        // are released instead of leaked.
+        drop(std::mem::replace(
+            &mut encoded.source.broker_principal,
+            unset_str(),
+        ));
+        // SAFETY: `present` was just asserted, so the payload is initialized.
+        unsafe {
+            drop(std::mem::replace(
+                &mut (*encoded.alias_state.value.as_mut_ptr()).reason,
+                unset_str(),
+            ));
+        }
+
+        let decoded = unsafe { root_info_from_ffi(encoded).expect("the fixture decodes") };
+        assert_eq!(
+            decoded.source,
+            RouteSource::BrokerDelivered {
+                broker_principal: String::new(),
+                connection_id: ConnectionId("c-1".into()),
+            }
+        );
+        assert_eq!(
+            decoded.alias_state,
+            Some(AliasState::ChainTooLong {
+                reason: String::new()
+            })
+        );
+    }
+
+    /// A `next_page_token` the producer never wrote is `None`, so a lister
+    /// stops rather than re-issuing with an empty token; one it encoded as
+    /// empty on purpose survives, so the rule is a discrimination on the
+    /// encoding and not a length test.
+    #[test]
+    fn unset_page_token_payloads_decode_as_absent() {
+        let mut list = crate::thunks_v2::list_page_to_ffi(ListPage {
+            items: vec![],
+            next_page_token: None,
+        });
+        let mut versions = crate::thunks_v2::version_page_to_ffi(VersionPage {
+            items: vec![],
+            next_page_token: None,
+        });
+        assert!(!list.next_page_token.present);
+        assert!(!versions.next_page_token.present);
+
+        list.next_page_token = unset_str();
+        versions.next_page_token = unset_str();
+        let list = unsafe { list_page_from_ffi(list).expect("the page decodes") };
+        let versions = unsafe { version_page_from_ffi(versions).expect("the page decodes") };
+        assert_eq!(list.next_page_token, None);
+        assert_eq!(versions.next_page_token, None);
+
+        let list = crate::thunks_v2::list_page_to_ffi(ListPage {
+            items: vec![],
+            next_page_token: Some(String::new()),
+        });
+        let versions = crate::thunks_v2::version_page_to_ffi(VersionPage {
+            items: vec![],
+            next_page_token: Some(String::new()),
+        });
+        let list = unsafe { list_page_from_ffi(list).expect("the page decodes") };
+        let versions = unsafe { version_page_from_ffi(versions).expect("the page decodes") };
+        assert_eq!(list.next_page_token, Some(String::new()));
+        assert_eq!(versions.next_page_token, Some(String::new()));
+    }
+
+    // -----------------------------------------------------------------
+    // v17 list-stream consumer bridge
+    // -----------------------------------------------------------------
+
+    enum StubListFrame {
+        Item(Box<ObjectInfo>),
+        Error(ffi::StreamStep, Error),
+        BlockUntilCancelled,
+    }
+
+    struct StubLayerState {
+        frames: std::sync::Mutex<Option<std::collections::VecDeque<StubListFrame>>>,
+        layer_drops: Arc<std::sync::atomic::AtomicUsize>,
+        stream_drops: Arc<std::sync::atomic::AtomicUsize>,
+        pulls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for StubLayerState {
+        fn drop(&mut self) {
+            self.layer_drops
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct StubListEntryState {
+        frames: std::collections::VecDeque<StubListFrame>,
+        cancel: Option<ffi::CancelTokenLocal>,
+        stream_drops: Arc<std::sync::atomic::AtomicUsize>,
+        pulls: Arc<std::sync::atomic::AtomicUsize>,
+        terminal: bool,
+    }
+
+    impl Drop for StubListEntryState {
+        fn drop(&mut self) {
+            self.stream_drops
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    unsafe extern "C" fn stub_layer_name(_state: *mut c_void, out: *mut ffi::Str) {
+        unsafe {
+            out.write(marshal::primitive::str_to_ffi(
+                "consume-list-stream-stub".to_string(),
+            ));
+        }
+    }
+
+    unsafe extern "C" fn stub_layer_drop(state: *mut c_void) {
+        unsafe {
+            drop(Box::from_raw(state as *mut StubLayerState));
+        }
+    }
+
+    unsafe extern "C" fn stub_list_entry_drop(state: *mut c_void) {
+        unsafe {
+            drop(Box::from_raw(state as *mut StubListEntryState));
+        }
+    }
+
+    unsafe extern "C" fn stub_list_entry_next(
+        state: *mut c_void,
+        out_item: *mut ffi::ObjectInfo,
+        out_error: *mut ffi::Error,
+    ) -> ffi::StreamStep {
+        let state = unsafe { &mut *(state as *mut StubListEntryState) };
+        if state.terminal {
+            return ffi::StreamStep::Ended;
+        }
+        state
+            .pulls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if state
+            .cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.token().is_cancelled())
+        {
+            state.terminal = true;
+            unsafe {
+                out_error.write(marshal::error::to_ffi(&Error::new(
+                    ErrorCode::Cancelled,
+                    "stub listing cancelled",
+                )));
+            }
+            return ffi::StreamStep::Failed;
+        }
+        match state.frames.pop_front() {
+            Some(StubListFrame::Item(item)) => {
+                unsafe { out_item.write(marshal::metadata::object_info_to_ffi(*item)) };
+                ffi::StreamStep::Yielded
+            }
+            Some(StubListFrame::Error(step, error)) => {
+                unsafe { out_error.write(marshal::error::to_ffi(&error)) };
+                state.terminal = step == ffi::StreamStep::Failed;
+                step
+            }
+            Some(StubListFrame::BlockUntilCancelled) => {
+                while !state
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|cancel| cancel.token().is_cancelled())
+                {
+                    std::thread::park_timeout(std::time::Duration::from_millis(1));
+                }
+                state.terminal = true;
+                unsafe {
+                    out_error.write(marshal::error::to_ffi(&Error::new(
+                        ErrorCode::Cancelled,
+                        "stub listing cancelled",
+                    )));
+                }
+                ffi::StreamStep::Failed
+            }
+            None => {
+                state.terminal = true;
+                ffi::StreamStep::Ended
+            }
+        }
+    }
+
+    unsafe extern "C" fn stub_list_stream_slot(
+        state: *mut c_void,
+        request: *const ffi::ListRequest,
+        cancel: *const ffi::CancelTokenFFI,
+        on_complete: ffi::OnComplete,
+        user_data: *mut c_void,
+    ) {
+        // Adopt the request fields the consumer deliberately forgets. The
+        // extensions pointer remains borrowed and is reclaimed by the host
+        // after this synchronous prologue returns.
+        let request = unsafe { std::ptr::read(request) };
+        let ffi::ListRequest {
+            prefix, options, ..
+        } = request;
+        drop(prefix);
+        drop(options);
+
+        let layer = unsafe { &*(state as *const StubLayerState) };
+        let frames = layer
+            .frames
+            .lock()
+            .expect("stub frames mutex")
+            .take()
+            .expect("stub list_stream opened once");
+        let stream_drops = Arc::clone(&layer.stream_drops);
+        let pulls = Arc::clone(&layer.pulls);
+        let cancel_local = crate::ffi_runtime::local_cancel(cancel);
+        crate::ffi_runtime::spawn_async_stream_thunk(
+            "stub_list_stream",
+            cancel_local,
+            on_complete,
+            user_data,
+            |_cancel_token| Box::pin(async { Ok(()) }),
+            move |(), cancel_guard| {
+                let stream_state = Box::new(StubListEntryState {
+                    frames,
+                    cancel: cancel_guard,
+                    stream_drops,
+                    pulls,
+                    terminal: false,
+                });
+                Some(ffi::abi_alloc::AbiOwned::new(ffi::ListEntryStream {
+                    state: Box::into_raw(stream_state) as *mut c_void,
+                    next_fn: stub_list_entry_next,
+                    drop_fn: stub_list_entry_drop,
+                }))
+            },
+        );
+    }
+
+    struct ListStreamStub {
+        layer: Arc<ForeignVtableLayer>,
+        layer_drops: Arc<std::sync::atomic::AtomicUsize>,
+        stream_drops: Arc<std::sync::atomic::AtomicUsize>,
+        pulls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn list_stream_stub(frames: Vec<StubListFrame>) -> ListStreamStub {
+        let layer_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stream_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pulls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = Box::into_raw(Box::new(StubLayerState {
+            frames: std::sync::Mutex::new(Some(frames.into())),
+            layer_drops: Arc::clone(&layer_drops),
+            stream_drops: Arc::clone(&stream_drops),
+            pulls: Arc::clone(&pulls),
+        })) as *mut c_void;
+
+        // Copy the complete in-tree vtable as inert padding, then replace the
+        // only three slots this hand-built foreign stub exercises. A fresh
+        // address forces the real ForeignVtableLayer path.
+        let mut vtable =
+            unsafe { std::ptr::read(std::ptr::addr_of!(crate::thunks_v2::LAYER_VTABLE)) };
+        vtable.drop = stub_layer_drop;
+        vtable.name = stub_layer_name;
+        vtable.list_stream = stub_list_stream_slot;
+        let vtable = Box::leak(Box::new(vtable));
+        let layer = ForeignVtableLayer::from_handle(ffi::LayerHandle { state, vtable }, None)
+            .expect("import hand-built list-stream vtable");
+        ListStreamStub {
+            layer,
+            layer_drops,
+            stream_drops,
+            pulls,
+        }
+    }
+
+    fn list_stream_request() -> Request<ListRequest> {
+        Request::new(ListRequest {
+            prefix: Url::parse("stub://root/prefix/").expect("fixture URL"),
+            options: ListOptions::default(),
+        })
+    }
+
+    fn list_info(index: usize) -> ObjectInfo {
+        ObjectInfo {
+            etag_strength: EtagStrength::Strong,
+            address: Url::parse(&format!("stub://root/prefix/{index:03}")).expect("fixture URL"),
+            kind: ObjectKind::File,
+            etag: Some(format!("etag-{index}")),
+            version: None,
+            size: Some(index as u64),
+            mtime: None,
+            checksums: ChecksumSet::new(),
+            effective_permissions: None,
+            system_metadata: None,
+            user_metadata: None,
+            modified_by: None,
+            versioned_address: None,
+        }
+    }
+
+    async fn wait_for_count(counter: &std::sync::atomic::AtomicUsize, target: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while counter.load(std::sync::atomic::Ordering::SeqCst) < target {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("counter reached target");
+    }
+
+    // -----------------------------------------------------------------
+    // Rust producer -> v17 thunk -> ForeignVtableLayer round trips
+    // -----------------------------------------------------------------
+
+    fn round_trip_descriptor(kind: &str) -> LayerKindDescriptor {
+        LayerKindDescriptor {
+            kind: kind.to_string(),
+            layer_type: LayerType::Backend,
+            display_name: format!("{kind} test layer"),
+            description: None,
+            config_schema: Vec::new(),
+            credential_schema: Vec::new(),
+            credential_methods: Vec::new(),
+            icon: None,
+            accepts_connections: false,
+            auth_capable: false,
+            supports_user_metadata: false,
+        }
+    }
+
+    fn round_trip_layer(layer: Arc<dyn Layer>) -> Arc<ForeignVtableLayer> {
+        let handle = crate::thunks_v2::export_handle(layer);
+        ForeignVtableLayer::from_handle(handle, None)
+            .expect("import the Rust-produced handle through the foreign vtable adapter")
+    }
+
+    unsafe extern "C" fn unsupported_list_stream_slot(
+        _state: *mut c_void,
+        request: *const ffi::ListRequest,
+        _cancel: *const ffi::CancelTokenFFI,
+        on_complete: ffi::OnComplete,
+        user_data: *mut c_void,
+    ) {
+        // Adopt the request fields exactly as a foreign default thunk does.
+        // Extensions remain borrowed and are reclaimed by the host after this
+        // synchronous prologue returns.
+        let request = unsafe { std::ptr::read(request) };
+        let ffi::ListRequest {
+            prefix, options, ..
+        } = request;
+        drop(prefix);
+        drop(options);
+
+        crate::ffi_runtime::fire_complete_err(
+            Error::new(
+                ErrorCode::Unsupported,
+                "operation is unsupported by this layer",
+            ),
+            on_complete,
+            user_data,
+        );
+    }
+
+    fn round_trip_layer_with_unsupported_list_stream(
+        layer: Arc<dyn Layer>,
+    ) -> Arc<ForeignVtableLayer> {
+        let handle = crate::thunks_v2::export_handle(layer);
+        let state = handle.state;
+        std::mem::forget(handle);
+
+        let mut vtable =
+            unsafe { std::ptr::read(std::ptr::addr_of!(crate::thunks_v2::LAYER_VTABLE)) };
+        vtable.list_stream = unsupported_list_stream_slot;
+        ForeignVtableLayer::from_handle(
+            ffi::LayerHandle {
+                state,
+                vtable: Box::leak(Box::new(vtable)),
+            },
+            None,
+        )
+        .expect("import a foreign layer whose list_stream slot declines")
+    }
+
+    struct ScriptObservation {
+        polls: std::sync::atomic::AtomicUsize,
+        polled: tokio::sync::Notify,
+        dropped: std::sync::atomic::AtomicBool,
+        drop_notified: tokio::sync::Notify,
+    }
+
+    impl ScriptObservation {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                polls: std::sync::atomic::AtomicUsize::new(0),
+                polled: tokio::sync::Notify::new(),
+                dropped: std::sync::atomic::AtomicBool::new(false),
+                drop_notified: tokio::sync::Notify::new(),
+            })
+        }
+
+        async fn wait_for_polls(&self, target: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let notified = self.polled.notified();
+                    if self.polls.load(std::sync::atomic::Ordering::SeqCst) >= target {
+                        return;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("scripted source reached the expected poll gate");
+        }
+
+        async fn wait_for_drop(&self) {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let notified = self.drop_notified.notified();
+                    if self.dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("scripted source was dropped promptly");
+        }
+    }
+
+    struct ScriptDropGuard(Arc<ScriptObservation>);
+
+    impl Drop for ScriptDropGuard {
+        fn drop(&mut self) {
+            self.0
+                .dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.0.drop_notified.notify_waiters();
+        }
+    }
+
+    struct ScriptedListLayer {
+        entries: Arc<Vec<ObjectInfo>>,
+        observation: Arc<ScriptObservation>,
+    }
+
+    impl ScriptedListLayer {
+        fn new(count: usize, observation: Arc<ScriptObservation>) -> Self {
+            Self {
+                entries: Arc::new((0..count).map(list_info).collect()),
+                observation,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Layer for ScriptedListLayer {
+        fn name(&self) -> &str {
+            "ffi-round-trip-script"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            round_trip_descriptor(self.name())
+        }
+
+        async fn list(
+            &self,
+            _request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ListPage> {
+            Ok(ListPage {
+                items: self.entries.as_ref().clone(),
+                next_page_token: None,
+            })
+        }
+
+        async fn list_stream(
+            &self,
+            _request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ListStream> {
+            let entries = Arc::clone(&self.entries);
+            let observation = Arc::clone(&self.observation);
+            let drop_guard = ScriptDropGuard(Arc::clone(&observation));
+            let mut index = 0;
+            Ok(Box::pin(futures::stream::poll_fn(move |_cx| {
+                let _keep_drop_guard_in_stream = &drop_guard;
+                if index == entries.len() {
+                    return std::task::Poll::Ready(None);
+                }
+                let item = entries[index].clone();
+                index += 1;
+                observation
+                    .polls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                observation.polled.notify_waiters();
+                std::task::Poll::Ready(Some(Ok(item)))
+            })))
+        }
+    }
+
+    struct BufferedOnlyRoundTripLayer {
+        entries: Vec<ObjectInfo>,
+        next_page_token: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl Layer for BufferedOnlyRoundTripLayer {
+        fn name(&self) -> &str {
+            "ffi-round-trip-buffered-only"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            round_trip_descriptor(self.name())
+        }
+
+        async fn list(
+            &self,
+            _request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ListPage> {
+            Ok(ListPage {
+                items: self.entries.clone(),
+                next_page_token: self.next_page_token.clone(),
+            })
+        }
+    }
+
+    struct CountedListEntryState {
+        inner: ffi::ListEntryStream,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    unsafe extern "C" fn counted_list_entry_next(
+        state: *mut c_void,
+        out_item: *mut ffi::ObjectInfo,
+        out_error: *mut ffi::Error,
+    ) -> ffi::StreamStep {
+        let state = unsafe { &mut *(state as *mut CountedListEntryState) };
+        unsafe { (state.inner.next_fn)(state.inner.state, out_item, out_error) }
+    }
+
+    unsafe extern "C" fn counted_list_entry_drop(state: *mut c_void) {
+        let state = unsafe { Box::from_raw(state as *mut CountedListEntryState) };
+        state
+            .drops
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(state);
+    }
+
+    struct CountedOpenCall {
+        on_complete: ffi::OnComplete,
+        user_data: *mut c_void,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    extern "C" fn counted_list_stream_opened(
+        status: i32,
+        result: *mut c_void,
+        error: *mut ffi::Error,
+        user_data: *mut c_void,
+    ) {
+        let call = unsafe { Box::from_raw(user_data as *mut CountedOpenCall) };
+        if status != ffi::FFI_STATUS_OK {
+            (call.on_complete)(status, result, error, call.user_data);
+            return;
+        }
+        let inner = unsafe { ffi::abi_alloc::abi_unbox(result.cast::<ffi::ListEntryStream>()) };
+        let state = Box::new(CountedListEntryState {
+            inner,
+            drops: call.drops,
+        });
+        let stream = ffi::ListEntryStream {
+            state: Box::into_raw(state).cast(),
+            next_fn: counted_list_entry_next,
+            drop_fn: counted_list_entry_drop,
+        };
+        (call.on_complete)(
+            status,
+            ffi::abi_alloc::abi_box(stream).cast(),
+            error,
+            call.user_data,
+        );
+    }
+
+    struct CountedLayerState {
+        inner: *mut c_void,
+        stream_drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    unsafe extern "C" fn counted_layer_name(state: *mut c_void, out: *mut ffi::Str) {
+        let state = unsafe { &*(state as *const CountedLayerState) };
+        unsafe { (crate::thunks_v2::LAYER_VTABLE.name)(state.inner, out) };
+    }
+
+    unsafe extern "C" fn counted_layer_drop(state: *mut c_void) {
+        let state = unsafe { Box::from_raw(state as *mut CountedLayerState) };
+        unsafe { (crate::thunks_v2::LAYER_VTABLE.drop)(state.inner) };
+    }
+
+    unsafe extern "C" fn counted_list_stream_slot(
+        state: *mut c_void,
+        request: *const ffi::ListRequest,
+        cancel: *const ffi::CancelTokenFFI,
+        on_complete: ffi::OnComplete,
+        user_data: *mut c_void,
+    ) {
+        let state = unsafe { &*(state as *const CountedLayerState) };
+        let call = Box::new(CountedOpenCall {
+            on_complete,
+            user_data,
+            drops: Arc::clone(&state.stream_drops),
+        });
+        unsafe {
+            (crate::thunks_v2::LAYER_VTABLE.list_stream)(
+                state.inner,
+                request,
+                cancel,
+                counted_list_stream_opened,
+                Box::into_raw(call).cast(),
+            )
+        };
+    }
+
+    fn counted_round_trip_layer(
+        layer: Arc<dyn Layer>,
+        stream_drops: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Arc<ForeignVtableLayer> {
+        let handle = crate::thunks_v2::export_handle(layer);
+        let inner = handle.state;
+        std::mem::forget(handle);
+        let state = Box::new(CountedLayerState {
+            inner,
+            stream_drops,
+        });
+        let mut vtable =
+            unsafe { std::ptr::read(std::ptr::addr_of!(crate::thunks_v2::LAYER_VTABLE)) };
+        vtable.name = counted_layer_name;
+        vtable.drop = counted_layer_drop;
+        vtable.list_stream = counted_list_stream_slot;
+        let vtable = Box::leak(Box::new(vtable));
+        ForeignVtableLayer::from_handle(
+            ffi::LayerHandle {
+                state: Box::into_raw(state).cast(),
+                vtable,
+            },
+            None,
+        )
+        .expect("import the drop-counted Rust-produced handle")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rust_produced_list_stream_matches_buffered_list_across_v17() {
+        use futures::StreamExt as _;
+
+        let observation = ScriptObservation::new();
+        let layer = round_trip_layer(Arc::new(ScriptedListLayer::new(
+            384,
+            Arc::clone(&observation),
+        )));
+        let buffered = layer
+            .list(list_stream_request(), None)
+            .await
+            .expect("buffered list across the ABI");
+        let streamed = layer
+            .list_stream(list_stream_request(), None)
+            .await
+            .expect("streamed list across the ABI")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .expect("all streamed entries decode");
+
+        assert_eq!(streamed, buffered.items);
+        observation.wait_for_drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_rust_produced_list_stream_is_terminal_and_stops_source_polls() {
+        use futures::StreamExt as _;
+
+        let observation = ScriptObservation::new();
+        let layer = round_trip_layer(Arc::new(ScriptedListLayer::new(
+            384,
+            Arc::clone(&observation),
+        )));
+        let cancel = CancellationToken::new();
+        let mut stream = layer
+            .list_stream(list_stream_request(), Some(cancel.clone()))
+            .await
+            .expect("streamed list across the ABI");
+
+        for expected in 0..17 {
+            let item = stream
+                .next()
+                .await
+                .expect("script has another entry")
+                .expect("entry before cancellation");
+            assert_eq!(item, list_info(expected));
+        }
+        cancel.cancel();
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match stream.next().await {
+                    Some(Ok(_queued_before_cancel)) => continue,
+                    Some(Err(error)) => return error,
+                    None => panic!("cancellation ended the stream without a Cancelled frame"),
+                }
+            }
+        })
+        .await
+        .expect("cancellation reaches the consumer promptly");
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert!(stream.next().await.is_none(), "cancellation is terminal");
+        observation.wait_for_drop().await;
+        let polls_when_stopped = observation.polls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            polls_when_stopped < 384,
+            "cancellation must stop the scripted source before exhaustion"
+        );
+        assert_eq!(
+            observation.polls.load(std::sync::atomic::Ordering::SeqCst),
+            polls_when_stopped,
+            "a dropped scripted source cannot be polled after cancellation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_preempts_a_prefetched_foreign_end_of_stream() {
+        use futures::StreamExt as _;
+
+        let observation = ScriptObservation::new();
+        let layer = round_trip_layer(Arc::new(ScriptedListLayer::new(
+            1,
+            Arc::clone(&observation),
+        )));
+        let cancel = CancellationToken::new();
+        let mut stream = layer
+            .list_stream(list_stream_request(), Some(cancel.clone()))
+            .await
+            .expect("streamed list across the ABI");
+
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .expect("one entry")
+                .expect("valid entry"),
+            list_info(0)
+        );
+        observation.wait_for_drop().await;
+        cancel.cancel();
+
+        let error = stream
+            .next()
+            .await
+            .expect("cancellation preempts an unobserved EOF")
+            .expect_err("cancellation is terminal");
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert!(stream.next().await.is_none(), "cancellation is terminal");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_foreign_consumer_bounds_end_to_end_source_residency() {
+        use futures::StreamExt as _;
+
+        let observation = ScriptObservation::new();
+        let layer = round_trip_layer(Arc::new(ScriptedListLayer::new(
+            384,
+            Arc::clone(&observation),
+        )));
+        let mut stream = layer
+            .list_stream(list_stream_request(), None)
+            .await
+            .expect("streamed list across the ABI");
+        let first = stream
+            .next()
+            .await
+            .expect("first scripted entry")
+            .expect("first entry decodes");
+        assert_eq!(first, list_info(0));
+
+        // One item has reached the caller. Each capacity-one ABI channel may
+        // retain one item, and each of its senders may own one parked item.
+        // Waiting on the poll notification is the gate proving the pipeline
+        // reached that bound; the consumer remains parked until the assertion.
+        let residency_bound = 1
+            + LIST_STREAM_BRIDGE_CAPACITY
+            + crate::thunks_v2::list_entry_channel_capacity_for_test()
+            + 2;
+        observation.wait_for_polls(residency_bound).await;
+        assert_eq!(
+            observation.polls.load(std::sync::atomic::Ordering::SeqCst),
+            residency_bound,
+            "the composed capacity-one bridges retain only their queues and parked sends"
+        );
+
+        let mut count = 1;
+        while let Some(item) = stream.next().await {
+            item.expect("remaining entry decodes");
+            count += 1;
+        }
+        assert_eq!(count, 384, "resuming the consumer drains every entry");
+        observation.wait_for_drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn buffered_only_layer_default_serves_v17_round_trip_slot() {
+        use futures::StreamExt as _;
+
+        let expected: Vec<_> = (0..257).map(list_info).collect();
+        let layer = round_trip_layer(Arc::new(BufferedOnlyRoundTripLayer {
+            entries: expected.clone(),
+            next_page_token: None,
+        }));
+        let actual = layer
+            .list_stream(list_stream_request(), None)
+            .await
+            .expect("default list_stream opens across the ABI")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .expect("default-adapted entries decode");
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsupported_foreign_list_stream_adapts_the_buffered_list_slot() {
+        use futures::StreamExt as _;
+
+        let expected: Vec<_> = (0..257).map(list_info).collect();
+        let layer =
+            round_trip_layer_with_unsupported_list_stream(Arc::new(BufferedOnlyRoundTripLayer {
+                entries: expected.clone(),
+                next_page_token: None,
+            }));
+        let actual = layer
+            .list_stream(list_stream_request(), None)
+            .await
+            .expect("foreign Unsupported list_stream adapts list")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .expect("buffered fallback entries decode");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsupported_foreign_list_stream_refuses_a_partial_buffered_list() {
+        let layer =
+            round_trip_layer_with_unsupported_list_stream(Arc::new(BufferedOnlyRoundTripLayer {
+                entries: vec![list_info(0)],
+                next_page_token: Some("foreign-token".into()),
+            }));
+        let result = layer.list_stream(list_stream_request(), None).await;
+        let error = match result {
+            Ok(_) => panic!("partial foreign listing unexpectedly became a stream"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert!(error.message().contains("continuation token"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsupported_foreign_list_stream_preserves_open_time_cancellation() {
+        use futures::StreamExt as _;
+
+        let layer =
+            round_trip_layer_with_unsupported_list_stream(Arc::new(BufferedOnlyRoundTripLayer {
+                entries: vec![list_info(0)],
+                next_page_token: None,
+            }));
+        let cancel = CancellationToken::new();
+        let mut stream = layer
+            .list_stream(list_stream_request(), Some(cancel.clone()))
+            .await
+            .expect("foreign Unsupported list_stream adapts list");
+        cancel.cancel();
+
+        let error = stream
+            .next()
+            .await
+            .expect("cancellation emits one terminal frame")
+            .expect_err("a cancelled fallback cannot yield its buffered entry");
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert!(stream.next().await.is_none(), "cancellation is terminal");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_half_consumed_round_trip_stream_runs_ffi_drop_once() {
+        use futures::StreamExt as _;
+
+        let observation = ScriptObservation::new();
+        let stream_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let layer = counted_round_trip_layer(
+            Arc::new(ScriptedListLayer::new(384, Arc::clone(&observation))),
+            Arc::clone(&stream_drops),
+        );
+        let mut stream = layer
+            .list_stream(list_stream_request(), None)
+            .await
+            .expect("streamed list across the counted ABI");
+        for _ in 0..17 {
+            stream
+                .next()
+                .await
+                .expect("script has another entry")
+                .expect("entry decodes");
+        }
+        drop(stream);
+
+        wait_for_count(&stream_drops, 1).await;
+        observation.wait_for_drop().await;
+        assert_eq!(
+            stream_drops.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "dropping a half-consumed host stream drives the FFI drop_fn exactly once"
+        );
+    }
+
+    fn fail_list_stream_thread_spawn(_iter: ListEntryIter) -> Result<ListStreamReceiver> {
+        Err(Error::new(
+            ErrorCode::ResourceExhausted,
+            "injected list-stream bridge thread spawn failure",
+        ))
+    }
+
+    #[tokio::test]
+    async fn foreign_list_stream_thread_spawn_failure_is_a_terminal_error_item() {
+        use futures::StreamExt as _;
+
+        let stream_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pulls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = Box::new(StubListEntryState {
+            frames: vec![StubListFrame::Item(Box::new(list_info(0)))].into(),
+            cancel: None,
+            stream_drops: Arc::clone(&stream_drops),
+            pulls: Arc::clone(&pulls),
+            terminal: false,
+        });
+        let foreign_stream = ffi::ListEntryStream {
+            state: Box::into_raw(state) as *mut c_void,
+            next_fn: stub_list_entry_next,
+            drop_fn: stub_list_entry_drop,
+        };
+        let cancel = ffi::cancel_token_to_ffi(CancellationToken::new());
+        let mut stream =
+            bridge_list_stream_with_spawn(foreign_stream, cancel, fail_list_stream_thread_spawn);
+
+        let error = stream
+            .next()
+            .await
+            .expect("spawn failure emits one frame")
+            .expect_err("spawn failure cannot yield an object");
+        assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+        assert!(stream.next().await.is_none(), "spawn failure is terminal");
+        assert_eq!(pulls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            stream_drops.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the failed spawn must release the foreign iterator exactly once",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn foreign_list_stream_flows_in_order_with_bounded_prefetch() {
+        use futures::StreamExt as _;
+
+        let stub = list_stream_stub(
+            (0..20)
+                .map(|index| StubListFrame::Item(Box::new(list_info(index))))
+                .collect(),
+        );
+        let mut stream = stub
+            .layer
+            .list_stream(list_stream_request(), None)
+            .await
+            .expect("open foreign list stream");
+        assert_eq!(
+            stub.pulls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "opening alone must not prefetch"
+        );
+
+        let first = stream
+            .next()
+            .await
+            .expect("first frame")
+            .expect("first item");
+        assert_eq!(first.address.as_str(), "stub://root/prefix/000");
+        wait_for_count(&stub.pulls, 3).await;
+        assert_eq!(
+            stub.pulls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "capacity-one bridge may hold one queued and one sending item only"
+        );
+
+        let mut addresses = vec![first.address];
+        while let Some(item) = stream.next().await {
+            addresses.push(item.expect("stream item").address);
+        }
+        let expected: Vec<_> = (0..20)
+            .map(|index| Url::parse(&format!("stub://root/prefix/{index:03}")).unwrap())
+            .collect();
+        assert_eq!(addresses, expected);
+        assert_eq!(
+            stub.stream_drops.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "natural exhaustion must release the plugin iterator exactly once"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_foreign_list_stream_releases_plugin_iterator() {
+        use futures::StreamExt as _;
+
+        let stub = list_stream_stub(
+            (0..100)
+                .map(|index| StubListFrame::Item(Box::new(list_info(index))))
+                .collect(),
+        );
+        let mut stream = stub
+            .layer
+            .list_stream(list_stream_request(), None)
+            .await
+            .expect("open foreign list stream");
+        stream
+            .next()
+            .await
+            .expect("first frame")
+            .expect("first item");
+        drop(stream);
+        wait_for_count(&stub.stream_drops, 1).await;
+        assert_eq!(
+            stub.stream_drops.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "early drop must drive drop_fn exactly once"
+        );
+        drop(stub.layer);
+        assert_eq!(
+            stub.layer_drops.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the foreign Layer state remains independently releasable"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_foreign_list_stream_wakes_blocking_pull_promptly() {
+        use futures::StreamExt as _;
+
+        let stub = list_stream_stub(vec![StubListFrame::BlockUntilCancelled]);
+        let cancel = CancellationToken::new();
+        let mut stream = stub
+            .layer
+            .list_stream(list_stream_request(), Some(cancel.clone()))
+            .await
+            .expect("open foreign list stream");
+        let next = tokio::spawn(async move { stream.next().await });
+        wait_for_count(&stub.pulls, 1).await;
+        cancel.cancel();
+        let item = tokio::time::timeout(std::time::Duration::from_secs(1), next)
+            .await
+            .expect("cancel wakes FFI next_fn")
+            .expect("consumer task did not panic")
+            .expect("cancel emits a terminal error")
+            .expect_err("cancel cannot yield an object");
+        assert_eq!(item.code(), ErrorCode::Cancelled);
+        wait_for_count(&stub.stream_drops, 1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn foreign_list_stream_error_steps_preserve_codes_and_are_terminal() {
+        use futures::StreamExt as _;
+
+        for (step, code) in [
+            (ffi::StreamStep::Failed, ErrorCode::Internal),
+            (ffi::StreamStep::TransientError, ErrorCode::Transient),
+        ] {
+            let stub = list_stream_stub(vec![
+                StubListFrame::Error(step, Error::new(code, "stub stream error")),
+                StubListFrame::Item(Box::new(list_info(99))),
+            ]);
+            let mut stream = stub
+                .layer
+                .list_stream(list_stream_request(), None)
+                .await
+                .expect("open foreign list stream");
+            let error = stream
+                .next()
+                .await
+                .expect("error frame")
+                .expect_err("frame must remain an error");
+            assert_eq!(error.code(), code);
+            assert!(
+                stream.next().await.is_none(),
+                "both error steps are terminal"
+            );
+            assert_eq!(
+                stub.pulls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the bridge must not pull after an error step"
+            );
+            assert_eq!(
+                stub.stream_drops.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "terminal errors release plugin state"
+            );
+        }
     }
 }

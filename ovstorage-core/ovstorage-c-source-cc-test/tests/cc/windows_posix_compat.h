@@ -16,8 +16,9 @@
  *   - the pthread subset the drivers call: `pthread_create` / `pthread_join`,
  *     `pthread_mutex_*`, and `pthread_cond_init` / `_destroy` / `_wait` /
  *     `_signal`, over SRWLOCK and CONDITION_VARIABLE;
- *   - dynamic loading: `dlopen` / `dlsym` / `dlerror` and the `RTLD_*` flags
- *     the drivers pass, over LoadLibraryW / GetProcAddress;
+ *   - dynamic loading: `dlopen` / `dlsym` / `dlerror` / `dlclose` and the
+ *     `RTLD_*` flags the drivers pass, over LoadLibraryW / GetProcAddress /
+ *     FreeLibrary;
  *   - the small file helpers `ovc_test_remove_file` / `ovc_test_remove_dir` /
  *     `ovc_test_strerror`, which are spelled with their own names rather than
  *     as `unlink` / `rmdir` / `strerror` because their Win32 semantics differ
@@ -257,6 +258,19 @@ static inline void *dlopen(const char *path, int flags)
     module = LoadLibraryW(wide);
     free(wide);
     return (void *)module;
+}
+
+static inline int dlclose(void *handle)
+{
+    if (handle == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (FreeLibrary((HMODULE)handle) != 0) {
+        return 0;
+    }
+    errno = EIO;
+    return -1;
 }
 
 static inline void *dlsym(void *handle, const char *symbol)

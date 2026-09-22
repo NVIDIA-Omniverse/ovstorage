@@ -5,10 +5,17 @@
 
 use std::collections::HashMap;
 
+use ovstorage_plugin::fallback::{ANONYMOUS_FALLBACK_KEY, is_anonymous_fallback_key};
 use ovstorage_plugin::{
     ConfigField, ConfigFieldKind, ConfigValue, CredentialField, CredentialMethod, EnumSource,
-    Error, ErrorCode, Result, Url, address,
+    Error, ErrorCode, LayerConfig, Result, Url, address,
 };
+
+/// SQS long-poll defaults shared by a parsed connection and a synthesized
+/// fallback config, so the two shapes cannot drift on the watch cadence.
+const DEFAULT_SQS_MAX_MESSAGES: u32 = 10;
+const DEFAULT_SQS_WAIT_SECONDS: u32 = 20;
+const DEFAULT_SQS_VISIBILITY_TIMEOUT: u32 = 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompatibilityProfile {
@@ -126,6 +133,46 @@ pub fn resolve_endpoint(config: &S3Config, key: &str) -> Result<ResolvedEndpoint
     })
 }
 
+/// The DNS suffix of the AWS partition a region belongs to. The China
+/// partition is reachable only under `amazonaws.com.cn`; GovCloud and every
+/// other region use the standard suffix. Shared by [`derive_host`] and
+/// [`alternate_url_prefixes`] so the host a request is signed against and the
+/// host spellings the connection accepts name the same partition.
+fn partition_suffix(region: &str) -> &'static str {
+    if region.starts_with("cn-") {
+        "amazonaws.com.cn"
+    } else {
+        "amazonaws.com"
+    }
+}
+
+/// Region prefixes that are NOT in the standard commercial partition.
+const NON_COMMERCIAL_REGION_PREFIXES: [&str; 4] = ["cn-", "us-gov-", "us-iso", "eu-iso"];
+
+/// Whether the region-less "global" S3 host (`s3.<suffix>`) names a bucket in
+/// this region's partition.
+///
+/// Only the standard commercial partition has one. `s3.amazonaws.com` is a
+/// us-east-1 commercial endpoint and does not route into GovCloud, China, or
+/// the isolated partitions — and S3 bucket names are unique only WITHIN a
+/// partition, so the same name can be different data, under a different
+/// owner, in each. Accepting the global form as a spelling of a
+/// non-commercial bucket would therefore alias a URL that names someone
+/// else's bucket onto this connection, and would extend an HTTPS-prefix
+/// authorization grant written for the commercial bucket over this one's
+/// data.
+///
+/// This is the line between the global form and the legacy dashed form, which
+/// IS generated everywhere: the dashed form is region-scoped
+/// (`s3-{configured_region}`), so where it was never issued it is a rule no
+/// request can match — dead, not wrong. The global form is not region-scoped,
+/// so outside the commercial partition it is wrong rather than dead.
+fn has_global_endpoint(region: &str) -> bool {
+    !NON_COMMERCIAL_REGION_PREFIXES
+        .iter()
+        .any(|prefix| region.starts_with(prefix))
+}
+
 fn derive_host(config: &S3Config, path_style: bool) -> Result<(String, String)> {
     if let Some(endpoint) = &config.endpoint {
         let parsed = url::Url::parse(endpoint).map_err(|err| {
@@ -145,7 +192,7 @@ fn derive_host(config: &S3Config, path_style: bool) -> Result<(String, String)> 
     }
     match config.compatibility {
         CompatibilityProfile::Aws => {
-            let suffix = format!("s3.{}.amazonaws.com", config.region);
+            let suffix = format!("s3.{}.{}", config.region, partition_suffix(&config.region));
             let host = if path_style {
                 suffix
             } else {
@@ -194,7 +241,8 @@ fn host_with_port(url: &url::Url) -> Result<String> {
 /// subdomain (virtual-hosted) when `force_path_style` is false, or as a path
 /// segment when true. This mirrors `derive_host` minus the bucket so presigned
 /// URLs and redirect-scope prefixes keep today's host shapes:
-/// - `aws` with no endpoint → `None` (SDK builds `s3.<region>.amazonaws.com`);
+/// - `aws` with no endpoint → `None` (the SDK builds the regional host on its
+///   own partition suffix, as [`partition_suffix`] does here);
 /// - `r2` with no endpoint → `https://r2.cloudflarestorage.com`;
 /// - any profile with an explicit `endpoint` → that endpoint (scheme + host);
 /// - `minio` / `custom` / `b2` without an endpoint → error (as `resolve_endpoint`).
@@ -222,6 +270,126 @@ pub(crate) fn sdk_endpoint_url(config: &S3Config) -> Result<Option<String>> {
             "S3 endpoint is required for this compatibility profile",
         )),
     }
+}
+
+/// The alternate URL prefixes this connection accepts as spellings of its
+/// `s3://{bucket}/` root — the value the layer stamps under
+/// [`ovstorage_plugin::ACCEPTED_URL_SPELLINGS_METADATA_KEY`] so an alias
+/// wrapper above can auto-generate hidden alias rules. Lives next to
+/// [`derive_host`] on purpose: an endpoint-derived spelling must come from
+/// the same derivation as the signed endpoint or the two drift.
+///
+/// The templated AWS shapes diverge from [`derive_host`] in exactly one
+/// place, deliberate and in the accept-only direction (an alias `from`
+/// selects inbound addresses; it never reaches a wire): the virtual-hosted
+/// shapes are withheld for a dotted bucket even though [`derive_host`] signs
+/// against that multi-label host under virtual-hosted addressing. Fixing that
+/// on the SIGNING side — path-style for dotted buckets, as the AWS SDKs do —
+/// is a data-path change with its own blast radius, owned by [`derive_host`],
+/// not here. The partition suffix is NOT such a divergence: both sides read
+/// it from [`partition_suffix`], so a China connection is signed against the
+/// same `amazonaws.com.cn` host it accepts spellings of.
+///
+/// The governing test for membership is *"what URL could a user plausibly be
+/// holding?"*, not "what can the SDK emit":
+///
+/// - **Explicit endpoint** (any profile): exactly the one shape the endpoint
+///   configuration describes, read straight out of [`derive_host`] —
+///   `{scheme}://{host}/{bucket}/` under path-style addressing,
+///   `{scheme}://{bucket}.{host}/` otherwise. No guessing beyond the config.
+/// - **AWS, no endpoint**: the six public shapes — virtual-hosted and
+///   path-style, each in the regional, the global, and the legacy dashed
+///   (`s3-{region}`) spelling. The dashed form is generated for EVERY region
+///   rather than gated on where it was historically issued: such a list rots,
+///   and a dash alias for a post-2019 region is a rule no request can match —
+///   dead, not wrong. It matches `s3-{configured_region}` exactly, never a
+///   wildcard, so `s3-website-…`/`s3-accesspoint-…`/`s3-fips-…` (different
+///   resources, not other spellings) can never be captured. The China
+///   partition swaps the suffix to `amazonaws.com.cn`. All six are generated
+///   regardless of `force_path_style`: the URL a user holds does not depend
+///   on this connection's addressing preference. **Exception: a bucket whose
+///   name contains a dot gets only the three path-style shapes.** Its
+///   virtual-hosted host is multi-label and falls outside AWS's
+///   `*.s3.<region>.<suffix>` wildcard certificate, so the HTTPS spelling
+///   fails the membership test — no fetch of it ever succeeded, so no user
+///   plausibly holds one. Path-style is what AWS documents for such buckets.
+/// - **R2, no endpoint**: the one shape [`derive_host`] signs against on the
+///   fixed `r2.cloudflarestorage.com` suffix.
+/// - **Endpoint required but missing** (MinIO/Custom/B2): empty — backend
+///   construction reports the real configuration error; there is no URL a
+///   user could be holding that came from this config.
+///
+/// Deliberately excluded: transport variants (dualstack, FIPS, transfer
+/// acceleration — this repository never constructs such an endpoint and they
+/// are not universally valid), and different resources (access points, MRAP,
+/// S3 Express, VPC endpoints, Outposts — aliasing those to the bucket would
+/// be incorrect rather than merely noisy).
+pub fn alternate_url_prefixes(config: &S3Config) -> Vec<Url> {
+    let mut spellings: Vec<String> = Vec::new();
+    let bucket = &config.bucket;
+    // The single shape [`derive_host`] would sign against, formatted back into
+    // a root prefix: `derive_host` already folds the bucket into the host under
+    // virtual-hosted addressing, so only the path-style case appends it.
+    // Reusing that derivation rather than re-parsing the endpoint here is what
+    // keeps an accepted spelling from drifting away from the signed endpoint
+    // when endpoint normalization changes. `None` on a configuration
+    // `derive_host` rejects — the backend reports that error where a caller can
+    // read it, and there is no URL to accept for a config that cannot be built.
+    let signed_prefix = || {
+        let path_style = config.use_path_style();
+        let (scheme, host) = derive_host(config, path_style).ok()?;
+        Some(if path_style {
+            format!("{scheme}://{host}/{bucket}/")
+        } else {
+            format!("{scheme}://{host}/")
+        })
+    };
+    if config.endpoint.is_some() {
+        // Exactly from configuration: whatever the endpoint describes.
+        spellings.extend(signed_prefix());
+    } else {
+        match config.compatibility {
+            CompatibilityProfile::Aws => {
+                let region = &config.region;
+                let suffix = partition_suffix(region);
+                // The region-less global form belongs to the commercial
+                // partition alone; see `has_global_endpoint`.
+                let global = has_global_endpoint(region).then(|| format!("s3.{suffix}"));
+                // Regional, then global where it exists, then legacy dashed.
+                let hosts = || {
+                    [Some(format!("s3.{region}.{suffix}")), global.clone()]
+                        .into_iter()
+                        .flatten()
+                        .chain([format!("s3-{region}.{suffix}")])
+                };
+                // A dotted bucket has no working HTTPS virtual-hosted
+                // spelling (the multi-label host is outside AWS's wildcard
+                // certificate), so only its documented path-style shapes are
+                // URLs a user plausibly holds.
+                if !bucket.contains('.') {
+                    spellings.extend(hosts().map(|host| format!("https://{bucket}.{host}/")));
+                }
+                // Path-style twins of the same hosts.
+                spellings.extend(hosts().map(|host| format!("https://{host}/{bucket}/")));
+            }
+            // The fixed `r2.cloudflarestorage.com` suffix is `derive_host`'s
+            // decision too, so it is read from there rather than restated.
+            CompatibilityProfile::R2 => spellings.extend(signed_prefix()),
+            // No endpoint to derive from; `resolve_endpoint` reports the
+            // configuration error where a caller can read it.
+            CompatibilityProfile::Minio
+            | CompatibilityProfile::Custom
+            | CompatibilityProfile::B2 => {}
+        }
+    }
+    // `address::parse` so the prefixes normalize exactly as the alias layer
+    // parses its rule config; the shapes above cannot fail it (the bucket is
+    // validated as a single authority label), but a spelling that somehow
+    // does is dropped rather than poisoning its neighbours.
+    spellings
+        .iter()
+        .filter_map(|spelling| address::parse(spelling).ok())
+        .collect()
 }
 
 /// Canonical-URI path for a key: each segment percent-encoded with the
@@ -573,9 +741,15 @@ pub fn parse_config(config: &HashMap<String, ConfigValue>) -> Result<S3Config> {
     let force_path_style = config_bool(config, "force_path_style")?;
     let force_request_payer = config_bool(config, "force_request_payer")?;
     let sqs_queue_url = config_string(config, "sqs_queue_url", false)?;
-    let sqs_max_messages = config_u32(config, "sqs_max_messages", 10, 1, 10)?;
-    let sqs_wait_seconds = config_u32(config, "sqs_wait_seconds", 20, 0, 20)?;
-    let sqs_visibility_timeout = config_u32(config, "sqs_visibility_timeout", 30, 1, 43_200)?;
+    let sqs_max_messages = config_u32(config, "sqs_max_messages", DEFAULT_SQS_MAX_MESSAGES, 1, 10)?;
+    let sqs_wait_seconds = config_u32(config, "sqs_wait_seconds", DEFAULT_SQS_WAIT_SECONDS, 0, 20)?;
+    let sqs_visibility_timeout = config_u32(
+        config,
+        "sqs_visibility_timeout",
+        DEFAULT_SQS_VISIBILITY_TIMEOUT,
+        1,
+        43_200,
+    )?;
     let address_root = address::parse(&format!("s3://{bucket}/"))?;
     Ok(S3Config {
         bucket,
@@ -591,6 +765,352 @@ pub fn parse_config(config: &HashMap<String, ConfigValue>) -> Result<S3Config> {
         sqs_visibility_timeout,
         address_root,
     })
+}
+
+/// The connection config the anonymous `s3://` fallback synthesizes for one
+/// bucket it reaches with no configured connection.
+///
+/// Shaped exactly like a parsed anonymous connection for `bucket`, so
+/// [`parse_s3_address`] keeps its bucket pin and every data-path operation
+/// runs unchanged: `force_request_payer` off (an anonymous request cannot be
+/// billed to a requester), no SQS queue (a fallback never watches), and the
+/// `address_root` a connection for the same bucket would publish.
+///
+/// A bucket whose name contains a dot is addressed path-style whatever the
+/// operator set. Its virtual-hosted host is multi-label and falls outside
+/// AWS's `*.s3.<region>.amazonaws.com` wildcard certificate, so a TLS
+/// connection to it fails on hostname mismatch; path-style is what AWS
+/// documents for such buckets, and the operator never named this bucket, so
+/// there is no per-bucket setting to defer to.
+///
+/// # Errors
+///
+/// - [`ErrorCode::InvalidArgument`] — `bucket` is not a single URL authority
+///   label.
+pub(crate) fn fallback_config(
+    bucket: &str,
+    region: &str,
+    endpoint: Option<&str>,
+    compatibility: CompatibilityProfile,
+    force_path_style: bool,
+) -> Result<S3Config> {
+    let bucket = canonical_bucket(Some(bucket))?;
+    let address_root = address::parse(&format!("s3://{bucket}/"))?;
+    let force_path_style = force_path_style || bucket.contains('.');
+    Ok(S3Config {
+        region: region.to_string(),
+        endpoint: endpoint.map(str::to_string),
+        profile_name: None,
+        compatibility,
+        force_path_style,
+        force_request_payer: false,
+        sqs_queue_url: None,
+        sqs_max_messages: DEFAULT_SQS_MAX_MESSAGES,
+        sqs_wait_seconds: DEFAULT_SQS_WAIT_SECONDS,
+        sqs_visibility_timeout: DEFAULT_SQS_VISIBILITY_TIMEOUT,
+        address_root,
+        bucket,
+    })
+}
+
+/// Layer key: the region a cold bucket's probe is sent to, and the region a
+/// bucket is assumed to live in when no probe runs.
+pub(crate) const FALLBACK_REGION_KEY: &str = "anonymous_fallback_region";
+/// Layer key: an explicit S3-compatible endpoint for every fallback bucket.
+/// Setting it skips the region probe, because the endpoint pins the host.
+///
+/// Screened at parse ([`fallback_endpoint`]) down to a bare `http` or `https`
+/// origin — scheme, host and port — and refused when it embeds credentials or
+/// carries a path, query or fragment, so the string [`FallbackPolicy`] carries
+/// is that origin and nothing else. Every consumer still rebuilds the host from
+/// parsed parts (`derive_host`, `sdk_endpoint_url`, the anonymous read URL)
+/// rather than concatenating the raw string; a consumer that concatenated it
+/// would be safe only because of the screening, so neither half is to be
+/// dropped without the other.
+pub(crate) const FALLBACK_ENDPOINT_KEY: &str = "anonymous_fallback_endpoint";
+/// Layer key: the compatibility profile, parsed exactly as the connection key.
+pub(crate) const FALLBACK_COMPATIBILITY_KEY: &str = "anonymous_fallback_compatibility_profile";
+/// Layer key: path-style addressing for every fallback bucket.
+pub(crate) const FALLBACK_FORCE_PATH_STYLE_KEY: &str = "anonymous_fallback_force_path_style";
+/// Layer key: how many per-bucket anonymous backends stay resident.
+pub(crate) const FALLBACK_MAX_BACKENDS_KEY: &str = "anonymous_fallback_max_backends";
+/// Layer key: how many backends may be built per sliding minute.
+pub(crate) const FALLBACK_MINTS_PER_MINUTE_KEY: &str = "anonymous_fallback_mints_per_minute";
+
+/// Every layer key the fallback reads besides the grant itself; anything else
+/// under the `anonymous_fallback_` prefix is a typo and is refused by name.
+const FALLBACK_TUNABLE_KEYS: [&str; 6] = [
+    FALLBACK_REGION_KEY,
+    FALLBACK_ENDPOINT_KEY,
+    FALLBACK_COMPATIBILITY_KEY,
+    FALLBACK_FORCE_PATH_STYLE_KEY,
+    FALLBACK_MAX_BACKENDS_KEY,
+    FALLBACK_MINTS_PER_MINUTE_KEY,
+];
+
+const DEFAULT_FALLBACK_REGION: &str = "us-east-1";
+const DEFAULT_FALLBACK_MAX_BACKENDS: usize = 64;
+const DEFAULT_FALLBACK_MINTS_PER_MINUTE: u32 = 120;
+
+/// The layer-level tunables behind `anonymous_fallback = ["s3"]`, read from
+/// the policy half of a layer table. These describe how the fallback reaches
+/// a bucket nobody configured; they are never connection config, and a
+/// connection request carrying one is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FallbackPolicy {
+    /// Probe target and default region.
+    pub region: String,
+    /// Explicit endpoint for every fallback bucket; skips the region probe.
+    /// A bare origin, as [`fallback_endpoint`] admits it.
+    pub endpoint: Option<Url>,
+    pub compatibility: CompatibilityProfile,
+    pub force_path_style: bool,
+    pub max_backends: usize,
+    pub mints_per_minute: u32,
+}
+
+impl FallbackPolicy {
+    /// The endpoint as `S3Config` carries it.
+    pub(crate) fn endpoint_str(&self) -> Option<&str> {
+        self.endpoint.as_ref().map(Url::as_str)
+    }
+}
+
+/// Parse the fallback tunables out of the policy half of layer `layer_name`'s
+/// table.
+///
+/// Defaults: region `us-east-1`, no endpoint, profile `aws` (or `custom` once
+/// an endpoint is set, as a connection defaults), virtual-hosted addressing,
+/// 64 resident backends, 120 builds per minute. Every value is validated here
+/// so a mistake fails at `create_backend` rather than on the first unrouted
+/// address: the region must have the shape of a region identifier because it
+/// becomes part of a hostname, the endpoint must be a bare `http` or `https`
+/// origin because it is what every fallback host and every anonymous read
+/// redirect is built from ([`fallback_endpoint`]), the endpoint and profile
+/// must together derive a host (the same rule a connection meets), and the
+/// bounds must be positive — a zero budget would mean "build nothing" and a
+/// zero cache "keep nothing", neither of which is what an operator means by
+/// turning the fallback on.
+///
+/// # Errors
+///
+/// - [`ErrorCode::InvalidArgument`] — an unknown `anonymous_fallback_*` key,
+///   a value of the wrong type, a region that is not a region identifier, a
+///   bound outside its range, an endpoint that is not a bare `http` or
+///   `https` origin, or an endpoint/profile pair that derives no host.
+pub(crate) fn parse_fallback_policy(
+    policy: &LayerConfig,
+    layer_name: &str,
+) -> Result<FallbackPolicy> {
+    if let Some(key) = policy.keys().find(|key| {
+        is_anonymous_fallback_key(key)
+            && key.as_str() != ANONYMOUS_FALLBACK_KEY
+            && !FALLBACK_TUNABLE_KEYS.contains(&key.as_str())
+    }) {
+        return Err(Error::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "`{key}` is not a fallback layer key; the fallback keys are {}",
+                FALLBACK_TUNABLE_KEYS.join(", ")
+            ),
+        ));
+    }
+    let region = policy_string(policy, FALLBACK_REGION_KEY)?
+        .unwrap_or_else(|| DEFAULT_FALLBACK_REGION.to_string());
+    if !crate::errors::is_valid_region_token(&region) {
+        return Err(Error::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "`{FALLBACK_REGION_KEY}` must be a region identifier such as \
+                 {DEFAULT_FALLBACK_REGION}"
+            ),
+        ));
+    }
+    let endpoint = fallback_endpoint(policy, layer_name)?;
+    let compatibility = match policy_string(policy, FALLBACK_COMPATIBILITY_KEY)? {
+        Some(profile) => CompatibilityProfile::parse(&profile)?,
+        None if endpoint.is_some() => CompatibilityProfile::Custom,
+        None => CompatibilityProfile::Aws,
+    };
+    let force_path_style = policy_bool(policy, FALLBACK_FORCE_PATH_STYLE_KEY)?;
+    let max_backends = policy_bounded(
+        policy,
+        FALLBACK_MAX_BACKENDS_KEY,
+        DEFAULT_FALLBACK_MAX_BACKENDS as i64,
+        1,
+        100_000,
+    )? as usize;
+    let mints_per_minute = policy_bounded(
+        policy,
+        FALLBACK_MINTS_PER_MINUTE_KEY,
+        i64::from(DEFAULT_FALLBACK_MINTS_PER_MINUTE),
+        1,
+        1_000_000,
+    )? as u32;
+    let parsed = FallbackPolicy {
+        region,
+        endpoint,
+        compatibility,
+        force_path_style,
+        max_backends,
+        mints_per_minute,
+    };
+    // The endpoint and profile must derive a host together — the same rule a
+    // connection meets in `resolve_endpoint` — so a profile that requires an
+    // endpoint and has none fails here, not on the first unrouted address.
+    let probe = fallback_config(
+        "bucket",
+        &parsed.region,
+        parsed.endpoint_str(),
+        parsed.compatibility,
+        parsed.force_path_style,
+    )?;
+    resolve_endpoint(&probe, "")?;
+    Ok(parsed)
+}
+
+/// Read and screen the fallback endpoint on layer `layer_name`: `None` when
+/// the key is absent or blank, otherwise the endpoint rebuilt as a bare origin
+/// — scheme, host and port — and nothing else.
+///
+/// This string is what every fallback bucket's host is derived from and, on
+/// an anonymous `read`, what the redirect URL handed back to the caller is
+/// built from. Userinfo is refused because a credential written here would
+/// otherwise ride every anonymous request on a tier whose promise is that
+/// none is sent, and the redirect would hand it to the caller. A query or
+/// fragment is refused because S3 request URLs place the bucket, key and
+/// query after the origin, so a delimiter left here would push them into the
+/// wrong component. A path is refused because S3 addresses the bucket and key
+/// directly under the origin and the host derivation keeps scheme, host and
+/// port only: a path written here would be dropped silently, and an operator
+/// who wrote one meant something by it. The userinfo and delimiter checks read
+/// the raw text as well as the parsed URL: `Url` normalizes an empty userinfo
+/// (`https://@host`) and a bare trailing `?` or `#` away before either is
+/// visible after parsing.
+///
+/// The refusal names the key and the layer, never the value: the value is
+/// where the credential was.
+fn fallback_endpoint(policy: &LayerConfig, layer_name: &str) -> Result<Option<Url>> {
+    let Some(raw) = policy_string(policy, FALLBACK_ENDPOINT_KEY)? else {
+        return Ok(None);
+    };
+    if let Some(component) = address::refused_config_component(&raw) {
+        return Err(fallback_endpoint_refused(
+            layer_name,
+            &format!("must not carry a {}", component.name()),
+        ));
+    }
+    if raw_authority(&raw).contains('@') {
+        return Err(fallback_endpoint_refused(
+            layer_name,
+            "must not embed credentials in the URL",
+        ));
+    }
+    let parsed = Url::parse(&raw).map_err(|err| {
+        fallback_endpoint_refused(layer_name, &format!("must be an absolute URL: {err}"))
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(fallback_endpoint_refused(
+            layer_name,
+            "must use http or https",
+        ));
+    }
+    let Some(host) = parsed.host_str().filter(|host| !host.is_empty()) else {
+        return Err(fallback_endpoint_refused(layer_name, "must name a host"));
+    };
+    // The raw scan above is the check that sees everything; this one is the
+    // parser's own reading of the authority, kept so that no spelling the
+    // parser recognizes as userinfo can reach the rebuild below.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(fallback_endpoint_refused(
+            layer_name,
+            "must not embed credentials in the URL",
+        ));
+    }
+    if !matches!(parsed.path(), "" | "/") {
+        return Err(fallback_endpoint_refused(
+            layer_name,
+            "must not carry a path; the bucket and key are addressed under the origin",
+        ));
+    }
+    // `port()` is already `None` for the scheme default, and an IPv6 host
+    // comes back bracketed, so the parts concatenate straight into a URL.
+    let port = parsed
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    let rebuilt = format!("{}://{host}{port}", parsed.scheme());
+    Url::parse(&rebuilt).map(Some).map_err(|err| {
+        Error::new(
+            ErrorCode::Internal,
+            format!("the screened `{FALLBACK_ENDPOINT_KEY}` does not parse as a URL: {err}"),
+        )
+    })
+}
+
+fn fallback_endpoint_refused(layer_name: &str, why: &str) -> Error {
+    Error::new(
+        ErrorCode::InvalidArgument,
+        format!("`{FALLBACK_ENDPOINT_KEY}` on layer `{layer_name}` {why}"),
+    )
+}
+
+/// The authority substring of a raw endpoint — `[userinfo@]host[:port]` — as
+/// the operator wrote it. `Url` drops a syntactically empty userinfo
+/// (`https://@host` parses with an empty username and no password), so the
+/// raw text is the only place a stray `@` is still visible.
+fn raw_authority(raw: &str) -> &str {
+    let after_scheme = raw.split_once("://").map_or(raw, |(_, rest)| rest);
+    let end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    &after_scheme[..end]
+}
+
+fn policy_string(policy: &LayerConfig, key: &str) -> Result<Option<String>> {
+    match policy.get(key) {
+        Some(ConfigValue::String(value)) if !value.trim().is_empty() => {
+            Ok(Some(value.trim().to_string()))
+        }
+        Some(ConfigValue::String(_)) => Ok(None),
+        Some(_) => Err(Error::new(
+            ErrorCode::InvalidArgument,
+            format!("`{key}` must be a string"),
+        )),
+        None => Ok(None),
+    }
+}
+
+fn policy_bool(policy: &LayerConfig, key: &str) -> Result<bool> {
+    match policy.get(key) {
+        Some(ConfigValue::Bool(value)) => Ok(*value),
+        Some(_) => Err(Error::new(
+            ErrorCode::InvalidArgument,
+            format!("`{key}` must be a bool"),
+        )),
+        None => Ok(false),
+    }
+}
+
+fn policy_bounded(
+    policy: &LayerConfig,
+    key: &str,
+    default: i64,
+    min: i64,
+    max: i64,
+) -> Result<i64> {
+    match policy.get(key) {
+        Some(ConfigValue::Int(value)) if (min..=max).contains(value) => Ok(*value),
+        Some(ConfigValue::Int(_)) => Err(Error::new(
+            ErrorCode::InvalidArgument,
+            format!("`{key}` must be between {min} and {max}"),
+        )),
+        Some(_) => Err(Error::new(
+            ErrorCode::InvalidArgument,
+            format!("`{key}` must be an integer"),
+        )),
+        None => Ok(default),
+    }
 }
 
 fn config_string(
@@ -906,6 +1426,236 @@ mod tests {
         assert!(!sibling.key.starts_with("pub/"));
     }
 
+    fn prefixes(config: &S3Config) -> Vec<String> {
+        alternate_url_prefixes(config)
+            .iter()
+            .map(|url| url.as_str().to_string())
+            .collect()
+    }
+
+    /// The six public AWS shapes, exactly: virtual-hosted and
+    /// path-style, each regional / global / legacy dashed. The dashed form is
+    /// pinned to the CONFIGURED region — never a wildcard — so
+    /// `s3-website-…` and friends can never be captured.
+    #[test]
+    fn aws_generates_the_six_public_url_shapes() {
+        let config = config_for(CompatibilityProfile::Aws, None);
+        assert_eq!(
+            prefixes(&config),
+            vec![
+                "https://example-bucket.s3.us-west-2.amazonaws.com/",
+                "https://example-bucket.s3.amazonaws.com/",
+                "https://example-bucket.s3-us-west-2.amazonaws.com/",
+                "https://s3.us-west-2.amazonaws.com/example-bucket/",
+                "https://s3.amazonaws.com/example-bucket/",
+                "https://s3-us-west-2.amazonaws.com/example-bucket/",
+            ]
+        );
+    }
+
+    /// An explicit endpoint's PATH never reaches a generated spelling. The
+    /// spellings are published in connection metadata that introspection-only
+    /// callers can read, and an endpoint path can be a capability token; the
+    /// derivation reads `derive_host`, which keeps `host[:port]` and nothing
+    /// else, so the withholding is a property of the shared derivation rather
+    /// than a filter that could be forgotten here.
+    #[test]
+    fn an_explicit_endpoint_path_never_reaches_a_spelling() {
+        let config = config_for(
+            CompatibilityProfile::Custom,
+            Some("https://gateway.example/sas-capability-token"),
+        );
+        let generated = prefixes(&config);
+        assert_eq!(
+            generated,
+            vec!["https://gateway.example/example-bucket/"],
+            "the endpoint host is kept and its path is not"
+        );
+        assert!(
+            !generated
+                .iter()
+                .any(|prefix| prefix.contains("sas-capability-token")),
+            "a path-carried token must never be published: {generated:?}"
+        );
+    }
+
+    /// The accepted spellings and the signed endpoint read the partition from
+    /// the same place, so a pasted URL is never aliased onto a host the signer
+    /// then rebuilds in another partition. Asserted as membership rather than
+    /// as a literal: the signed host must be one of the shapes this connection
+    /// says it answers to.
+    #[test]
+    fn the_signed_host_is_one_of_the_accepted_spellings() {
+        for region in ["cn-north-1", "us-west-2", "us-gov-west-1"] {
+            let mut config = config_for(CompatibilityProfile::Aws, None);
+            config.region = region.into();
+            let signed = resolve_endpoint(&config, "key").unwrap();
+            let signed_prefix = format!("{}://{}/", signed.scheme, signed.host);
+            assert!(
+                prefixes(&config).contains(&signed_prefix),
+                "{region}: the signed host {signed_prefix} is not among the \
+                 accepted spellings {:?}",
+                prefixes(&config)
+            );
+        }
+    }
+
+    /// `force_path_style` changes how THIS connection addresses the bucket,
+    /// not which URLs a user may be holding — the six shapes are invariant.
+    #[test]
+    fn aws_shapes_do_not_depend_on_the_addressing_preference() {
+        let mut forced = config_for(CompatibilityProfile::Aws, None);
+        forced.force_path_style = true;
+        assert_eq!(
+            prefixes(&forced),
+            prefixes(&config_for(CompatibilityProfile::Aws, None))
+        );
+    }
+
+    /// Outside the commercial partition there is no region-less global host,
+    /// so only the regional and legacy-dashed shapes are generated — four,
+    /// not six. China additionally swaps the DNS suffix.
+    #[test]
+    fn a_non_commercial_partition_generates_no_global_shape() {
+        let mut config = config_for(CompatibilityProfile::Aws, None);
+        config.region = "cn-north-1".into();
+        assert_eq!(
+            prefixes(&config),
+            vec![
+                "https://example-bucket.s3.cn-north-1.amazonaws.com.cn/",
+                "https://example-bucket.s3-cn-north-1.amazonaws.com.cn/",
+                "https://s3.cn-north-1.amazonaws.com.cn/example-bucket/",
+                "https://s3-cn-north-1.amazonaws.com.cn/example-bucket/",
+            ]
+        );
+
+        // GovCloud keeps the standard suffix, which is exactly why the global
+        // form has to be withheld: `s3.amazonaws.com` is a COMMERCIAL
+        // endpoint, and bucket names are unique only within a partition, so
+        // accepting it would alias a URL naming someone else's bucket onto
+        // this one.
+        let mut config = config_for(CompatibilityProfile::Aws, None);
+        config.region = "us-gov-west-1".into();
+        let generated = prefixes(&config);
+        assert_eq!(
+            generated,
+            vec![
+                "https://example-bucket.s3.us-gov-west-1.amazonaws.com/",
+                "https://example-bucket.s3-us-gov-west-1.amazonaws.com/",
+                "https://s3.us-gov-west-1.amazonaws.com/example-bucket/",
+                "https://s3-us-gov-west-1.amazonaws.com/example-bucket/",
+            ]
+        );
+        assert!(
+            !generated.iter().any(|prefix| {
+                prefix == "https://example-bucket.s3.amazonaws.com/"
+                    || prefix == "https://s3.amazonaws.com/example-bucket/"
+            }),
+            "a commercial global host must never spell a GovCloud bucket: {generated:?}"
+        );
+
+        // The isolated partitions get the same treatment, for the same
+        // reason — their regional hosts are unreachable from here, which is
+        // dead rather than wrong, but the global commercial host is wrong.
+        for region in ["us-iso-east-1", "us-isob-east-1", "eu-isoe-west-1"] {
+            let mut config = config_for(CompatibilityProfile::Aws, None);
+            config.region = region.into();
+            let generated = prefixes(&config);
+            assert_eq!(generated.len(), 4, "{region}: {generated:?}");
+            assert!(
+                !generated
+                    .iter()
+                    .any(|prefix| prefix.contains("s3.amazonaws.com")),
+                "{region} must not borrow the commercial global host: {generated:?}"
+            );
+        }
+    }
+
+    /// And the commercial partition still gets all six.
+    #[test]
+    fn the_commercial_partition_keeps_its_global_shape() {
+        let mut config = config_for(CompatibilityProfile::Aws, None);
+        config.region = "eu-west-1".into();
+        let generated = prefixes(&config);
+        assert_eq!(generated.len(), 6, "{generated:?}");
+        assert!(generated.contains(&"https://example-bucket.s3.amazonaws.com/".to_string()));
+        assert!(generated.contains(&"https://s3.amazonaws.com/example-bucket/".to_string()));
+    }
+
+    /// An explicit endpoint generates exactly the one shape the configuration
+    /// describes — path-style for MinIO/B2 (profile-required) and Custom with
+    /// `force_path_style`, virtual-hosted otherwise — with the endpoint's own
+    /// scheme and port.
+    #[test]
+    fn an_explicit_endpoint_generates_exactly_its_configured_shape() {
+        assert_eq!(
+            prefixes(&config_for(
+                CompatibilityProfile::Minio,
+                Some("http://127.0.0.1:9000"),
+            )),
+            vec!["http://127.0.0.1:9000/example-bucket/"]
+        );
+        assert_eq!(
+            prefixes(&config_for(
+                CompatibilityProfile::B2,
+                Some("https://s3.us-east-005.backblazeb2.com"),
+            )),
+            vec!["https://s3.us-east-005.backblazeb2.com/example-bucket/"]
+        );
+        // A custom endpoint without forced path style is virtual-hosted.
+        assert_eq!(
+            prefixes(&config_for(
+                CompatibilityProfile::Aws,
+                Some("https://store.example.com:8443"),
+            )),
+            vec!["https://example-bucket.store.example.com:8443/"]
+        );
+    }
+
+    /// A dotted bucket gets only its three path-style spellings. Its
+    /// virtual-hosted host is multi-label and falls outside AWS's
+    /// `*.s3.<region>.amazonaws.com` wildcard certificate, so the HTTPS
+    /// spelling fails the membership test — no fetch of it ever succeeded, so
+    /// no user plausibly holds one — while path-style is what AWS documents
+    /// for such buckets. (An explicit-endpoint profile is untouched by this:
+    /// there the shape mirrors the operator's own working configuration
+    /// exactly, dots or not.)
+    #[test]
+    fn a_dotted_bucket_generates_path_style_spellings_only() {
+        let mut config = config_for(CompatibilityProfile::Aws, None);
+        config.bucket = "my.bucket.name".into();
+        assert_eq!(
+            prefixes(&config),
+            vec![
+                "https://s3.us-west-2.amazonaws.com/my.bucket.name/",
+                "https://s3.amazonaws.com/my.bucket.name/",
+                "https://s3-us-west-2.amazonaws.com/my.bucket.name/",
+            ]
+        );
+    }
+
+    #[test]
+    fn r2_generates_its_fixed_suffix_shape() {
+        assert_eq!(
+            prefixes(&config_for(CompatibilityProfile::R2, None)),
+            vec!["https://example-bucket.r2.cloudflarestorage.com/"]
+        );
+    }
+
+    /// A profile whose endpoint is required but missing has no URL a user
+    /// could be holding that came from this config; the configuration error
+    /// is reported by `resolve_endpoint`, not here.
+    #[test]
+    fn a_missing_required_endpoint_generates_nothing() {
+        for profile in [
+            CompatibilityProfile::Minio,
+            CompatibilityProfile::Custom,
+            CompatibilityProfile::B2,
+        ] {
+            assert!(prefixes(&config_for(profile, None)).is_empty());
+        }
+    }
+
     /// A key whose bytes are not valid UTF-8 is refused rather than collapsed.
     ///
     /// The signed canonical URI is built from a `&str`, so there is nowhere for
@@ -920,5 +1670,139 @@ mod tests {
         )
         .expect_err("a non-UTF-8 key has no S3 wire spelling");
         assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    }
+    fn fallback_table(entries: &[(&str, ConfigValue)]) -> LayerConfig {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect()
+    }
+
+    fn parse_fallback_endpoint(spelling: &str) -> Result<FallbackPolicy> {
+        parse_fallback_policy(
+            &fallback_table(&[(FALLBACK_ENDPOINT_KEY, ConfigValue::String(spelling.into()))]),
+            "s3",
+        )
+    }
+
+    fn fallback_endpoint_error(spelling: &str) -> Error {
+        parse_fallback_endpoint(spelling)
+            .err()
+            .unwrap_or_else(|| panic!("{spelling} was accepted"))
+    }
+
+    /// The endpoint is the string every fallback host is derived from and, on
+    /// an anonymous read, the redirect handed to the caller is built from; a
+    /// credential written into it is refused before any client could carry
+    /// it, and the refusal never echoes the value.
+    #[test]
+    fn a_userinfo_bearing_fallback_endpoint_is_refused_at_parse() {
+        for spelling in [
+            "https://reader:hunter2@store.example.test",
+            "https://reader@store.example.test",
+            "http://reader:hunter2@127.0.0.1:9000/",
+            // `Url` normalizes an empty userinfo away; only the raw authority
+            // still shows the `@`.
+            "https://@store.example.test",
+        ] {
+            let error = fallback_endpoint_error(spelling);
+            assert_eq!(error.code(), ErrorCode::InvalidArgument, "{spelling}");
+            assert!(
+                error
+                    .message()
+                    .contains("`anonymous_fallback_endpoint` on layer `s3`")
+                    && error.message().contains("credentials"),
+                "{spelling}: {}",
+                error.message()
+            );
+            assert!(
+                !error.message().contains("hunter2") && !error.message().contains("reader"),
+                "the refusal never echoes the credential: {}",
+                error.message()
+            );
+        }
+    }
+
+    /// A query or fragment would land in the wrong component of every request
+    /// URL built under the origin; a bare delimiter is refused too, because
+    /// the parser would drop it silently.
+    #[test]
+    fn a_fallback_endpoint_carrying_a_query_or_fragment_is_refused_at_parse() {
+        for (spelling, component) in [
+            ("http://127.0.0.1:9000/?x-id=GetObject", "query"),
+            ("http://127.0.0.1:9000/?", "query"),
+            ("http://127.0.0.1:9000/#anchor", "fragment"),
+            ("http://127.0.0.1:9000/#", "fragment"),
+        ] {
+            let error = fallback_endpoint_error(spelling);
+            assert_eq!(error.code(), ErrorCode::InvalidArgument, "{spelling}");
+            assert!(
+                error
+                    .message()
+                    .contains("`anonymous_fallback_endpoint` on layer `s3`")
+                    && error.message().contains(component),
+                "{spelling}: {}",
+                error.message()
+            );
+        }
+    }
+
+    /// Only a bare `http` or `https` origin is an endpoint: the host
+    /// derivation keeps scheme, host and port and nothing else, so a scheme
+    /// it cannot dial, a missing host, or a path it would drop silently is
+    /// refused rather than half-honoured.
+    #[test]
+    fn a_fallback_endpoint_that_is_not_a_bare_http_origin_is_refused_at_parse() {
+        for (spelling, complaint) in [
+            ("minio:9000", "http or https"),
+            ("ftp://store.example.test", "http or https"),
+            ("127.0.0.1:9000", "absolute URL"),
+            ("http:///", "host"),
+            ("http://store.example.test/prefix", "path"),
+        ] {
+            let error = fallback_endpoint_error(spelling);
+            assert_eq!(error.code(), ErrorCode::InvalidArgument, "{spelling}");
+            assert!(
+                error
+                    .message()
+                    .contains("`anonymous_fallback_endpoint` on layer `s3`")
+                    && error.message().contains(complaint),
+                "{spelling}: {}",
+                error.message()
+            );
+        }
+    }
+
+    /// What passes is kept as scheme, host and port only, as `derive_host`
+    /// and `sdk_endpoint_url` read it: the scheme and host fold to lower
+    /// case, a default port drops, an IPv6 host keeps its brackets, and a
+    /// trailing slash is the same origin.
+    #[test]
+    fn the_fallback_endpoint_is_kept_as_a_bare_origin() {
+        for (spelling, expected) in [
+            (
+                "HTTPS://Store.Example.Test:443/",
+                "https://store.example.test/",
+            ),
+            ("http://127.0.0.1:9000", "http://127.0.0.1:9000/"),
+            ("http://127.0.0.1:9000/", "http://127.0.0.1:9000/"),
+            ("http://[::1]:9000", "http://[::1]:9000/"),
+        ] {
+            let parsed =
+                parse_fallback_endpoint(spelling).unwrap_or_else(|err| panic!("{spelling}: {err}"));
+            assert_eq!(parsed.endpoint_str(), Some(expected), "{spelling}");
+            assert_eq!(
+                parsed.compatibility,
+                CompatibilityProfile::Custom,
+                "an endpoint defaults the profile to custom"
+            );
+        }
+        assert_eq!(
+            parse_fallback_policy(&fallback_table(&[]), "s3")
+                .unwrap()
+                .endpoint,
+            None,
+            "no key, no endpoint"
+        );
     }
 }

@@ -19,7 +19,8 @@ into logs, route metadata, or tool output.
 ## When to use this
 
 Use this when adding a new direct-mode connection (`file`, `http`,
-`omniverse-storage-service`, `s3`, `gcs`, `azure`, `opendal`, or any
+`omniverse-storage-service`, `s3`, `gcs`, `azure`, `huggingface`,
+`opendal`, or any
 other backend kind), or when an existing connection reports
 `AuthRequired`, `CredentialExpired`, or an inactive `auth_state_kind`
 in `ovstorage_doctor`.
@@ -45,7 +46,7 @@ in `ovstorage_doctor`.
 6. If it returns `Unsupported`, no flow ran and the connection's state is
    unchanged, so keep the registration and report the state rather than
    treating it as a failure. Backends that always answer this way: `s3`,
-   `gcs`, `azure`, `opendal`; broker connections on a direct endpoint (any
+   `gcs`, `azure`, `huggingface`, `opendal`; broker connections on a direct endpoint (any
    address that is not `http(s)://`); and `file` and `http`, which have no
    connection-auth driver at all. `Unsupported` can also come from a layer
    that does not implement the call — a credentialless visibility-override row,
@@ -120,24 +121,34 @@ static-key profile.
 
 The descriptor exposes two credential methods:
 
-- `service_account_key` — paste a service-account JSON keyfile into
-  the `service_account_key` field. The plugin auto-detects the JSON
+- `service_account_key` — paste an ADC JSON blob into the
+  `service_account_key` field. The plugin auto-detects the JSON
   `type`: `service_account` triggers JWT-bearer exchange (and is
-  the only path that can mint V4-signed read URLs); `authorized_user`
-  triggers an OAuth2 refresh-token exchange (reads stream through
-  `alt=media` under the cached bearer because authorized-user creds
-  cannot V4-sign).
+  the only path that can mint V4-signed read URLs);
+  `authorized_user` triggers an OAuth2 refresh-token exchange;
+  `external_account` runs the workload-identity STS exchange (the
+  subject token is re-fetched from its `file` or `url` source on
+  every exchange, with an optional impersonation hop; token and
+  impersonation endpoints must be https `*.googleapis.com` or
+  loopback, the subject-token url https or loopback, and
+  workforce-pool configs are rejected);
+  `impersonated_service_account` mints its source credential's
+  bearer and spends it on `generateAccessToken`. Every type except
+  `service_account` reads through the plugin (`alt=media`) because
+  only an RSA private key can V4-sign.
 - `gcloud_adc_file` — populate `file_path` with the path to an
-  ADC JSON file written by `gcloud auth application-default login`
+  ADC JSON file of any of those four types — e.g. written by
+  `gcloud auth application-default login` (optionally with
+  `--impersonate-service-account`) or by
+  `gcloud iam workload-identity-pools create-cred-config`
   (defaults to `~/.config/gcloud/application_default_credentials.json`,
   with `~` expanded against `HOME` / `USERPROFILE` + `HOMEDRIVE`).
 
 The plugin does **not** consult `GOOGLE_APPLICATION_CREDENTIALS` or
 any other env var; if you need env-var expansion, do it in the host's
 bundle-resolution layer before handing the bundle to the plugin.
-GCE/GKE metadata, workload-identity federation
-(`external_account`), and service-account impersonation
-(`impersonated_service_account`) are not implemented in-process.
+GCE/GKE metadata-server identity and the AWS / `executable`
+`external_account` source flavors are not implemented in-process.
 
 ### `http`
 
@@ -214,6 +225,19 @@ expands these before the bundle reaches the plugin. The plugin
 itself never reads `AZURE_*` env vars at runtime. Managed Identity
 (IMDS), `az login`, VS Code, and PowerShell credential sources from
 `DefaultAzureCredential` are not implemented in-process.
+
+### `huggingface`
+
+A single static access token in the `token` field (`hf_…`; a
+read-scoped token is sufficient). The descriptor default is
+`${HF_TOKEN}`, resolved by the host at TOML load — the plugin never
+reads the environment itself. An empty bundle connects anonymously,
+which serves public repositories; private and gated repositories
+answer 404/403 without a token. The token is verified once at add
+time with a lenient `whoami` check (only a definitive 401 parks the
+connection); rotation goes through `update_connection_credentials`,
+and `reauth` answers `Unsupported` because no interactive flow
+exists.
 
 ### `opendal`
 

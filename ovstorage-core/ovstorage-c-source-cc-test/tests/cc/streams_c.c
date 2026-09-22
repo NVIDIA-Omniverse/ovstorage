@@ -114,6 +114,8 @@ ovstorage_plugin_init_v1(const OvStoragePlugin_HostCallbacks *host)
 #include <unistd.h>
 #endif
 
+#include "anonymous_temp_file.h"
+
 #if defined(NDEBUG)
 #error "the C source contract tests require assertions"
 #endif
@@ -140,6 +142,10 @@ static void test_sleep_ns(ovc_mutex *mutex,
                           ovc_cond *cond,
                           uint64_t wait_ns);
 static OvStoragePlugin_Str test_owned_str(const char *value);
+static OvStoragePlugin_Bytes test_owned_bytes(const uint8_t *data, size_t len);
+static OvStoragePlugin_Connection *stub_connection(const char *id,
+                                                   const char *display_name);
+static OvStoragePlugin_List_SecretBundleEntry stub_credentials_entries(void);
 
 typedef struct TestIoResult {
     ovc_completion_latch completed;
@@ -215,6 +221,8 @@ typedef struct BlockingPullState {
     int block;
     int fail_on_wake;
     int yield_nul_progress;
+    int yield_credentials_success;
+    int yield_credentials_success_empty;
     int entered;
     int wake;
     int sequence;
@@ -323,6 +331,8 @@ typedef struct StubLayer {
     int block_auth;
     int fail_auth;
     int yield_nul_progress;
+    int yield_credentials_success;
+    int yield_credentials_success_empty;
     int watch_mode;
     int redirect_overflow;
     uint64_t watch_poll_interval_ms;
@@ -334,6 +344,12 @@ typedef struct StubLayer {
     ovc_cond barrier_changed;
     int barrier_arrivals;
     int barrier_timed_out;
+    /* `stub_update_connection_credentials` copies its request's credentials
+     * here (still in plugin form) so the auth-credentials round-trip test
+     * can inspect what the host re-encoded, after the async call
+     * completes. */
+    OvStoragePlugin_SecretBundle captured_update_credentials;
+    int captured_update_credentials_present;
 } StubLayer;
 
 typedef struct StubWatchState {
@@ -353,9 +369,43 @@ static OvStoragePlugin_StreamStep stub_auth_next(
 
     (void)out_event;
     state = (BlockingPullState *)opaque;
-    /* yield_nul_progress and fail_on_wake are written once before the
-     * stream is handed to the pump, so the unlocked reads here are ordered
-     * by the stream handoff. */
+    /* yield_nul_progress, yield_credentials_success and fail_on_wake are
+     * written once before the stream is handed to the pump, so the
+     * unlocked reads here are ordered by the stream handoff. */
+    if (state->yield_credentials_success) {
+        OvStoragePlugin_Connection *connection;
+
+        state->yield_credentials_success = 0;
+        connection = stub_connection("cred-conn", "Cred Result");
+        memset(out_event, 0, sizeof(*out_event));
+        out_event->tag = OvStoragePlugin_AuthEventTag_Succeeded;
+        out_event->succeeded.connection = *connection;
+        /* The struct was copied by value above; only the outer allocation
+         * is this function's to free, not the nested owned strings it
+         * still points at. */
+        ovc_abi_free(connection);
+        out_event->succeeded.credentials.present = true;
+        out_event->succeeded.credentials.value.entries =
+            stub_credentials_entries();
+        return OvStoragePlugin_StreamStep_Yielded;
+    }
+    if (state->yield_credentials_success_empty) {
+        OvStoragePlugin_Connection *connection;
+
+        state->yield_credentials_success_empty = 0;
+        connection = stub_connection("cred-conn", "Cred Result Empty");
+        memset(out_event, 0, sizeof(*out_event));
+        out_event->tag = OvStoragePlugin_AuthEventTag_Succeeded;
+        out_event->succeeded.connection = *connection;
+        ovc_abi_free(connection);
+        /* Present, but with no entries: an explicit, valid request to
+         * replace/clear the connection's credentials, distinct from the
+         * field being absent altogether. */
+        out_event->succeeded.credentials.present = true;
+        out_event->succeeded.credentials.value.entries.ptr = NULL;
+        out_event->succeeded.credentials.value.entries.len = 0;
+        return OvStoragePlugin_StreamStep_Yielded;
+    }
     if (state->yield_nul_progress) {
         /* Interior NUL included: the dispatcher must convert this lossily
          * ("step\0one" -> "step\\0one") instead of failing the flow. */
@@ -553,6 +603,9 @@ static void stub_authenticate(
     pull = blocking_pull_create(cancel, layer->block_auth);
     pull->fail_on_wake = layer->fail_auth;
     pull->yield_nul_progress = layer->yield_nul_progress;
+    pull->yield_credentials_success = layer->yield_credentials_success;
+    pull->yield_credentials_success_empty =
+        layer->yield_credentials_success_empty;
     /* ABI mint: the dispatcher reclaims this outer block with ovc_abi_free
      * in ovc_dispatch_auth_stream_reclaim. */
     stream = (OvStoragePlugin_AuthEventStream *)ovc_abi_alloc(sizeof(*stream));
@@ -703,6 +756,197 @@ static OvStoragePlugin_Connection *stub_connection(
     return connection;
 }
 
+/* Fixture shared by the auth-credentials round-trip test: what a plugin's
+ * Succeeded auth event reports, and what the test later expects the
+ * `update_connection_credentials` re-encode to answer back with. One
+ * variant per `OvStoragePlugin_SecretValueTag`, so every arm of
+ * `ovc_dispatch_secret_bundle_from_plugin`'s decode (and, on the way back
+ * out, `ovc_dispatch_secret_value_copy`'s encode) gets exercised. */
+static const uint8_t stub_credentials_bytes_value[] = {0x10, 0x11, 0x12};
+static const uint8_t stub_credentials_file_value[] = {0x20, 0x21};
+static const uint8_t stub_credentials_oauth_token[] = {0x30, 0x31, 0x32, 0x33};
+static const uint8_t stub_credentials_oauth_refresh[] = {0x40, 0x41};
+/* An exact millisecond value: the host API's expires_at is nanoseconds, and
+ * ms -> ns -> ms is only lossless for a value that started as whole
+ * milliseconds, which is all any real caller has to begin with. */
+static const int64_t stub_credentials_oauth_expires_at_unix_ms = 1700000000123;
+static const uint8_t stub_credentials_mtls_cert[] = {0x50, 0x51, 0x52};
+static const uint8_t stub_credentials_mtls_key[] = {0x60, 0x61};
+
+static OvStoragePlugin_List_SecretBundleEntry stub_credentials_entries(void)
+{
+    OvStoragePlugin_List_SecretBundleEntry entries;
+    OvStoragePlugin_SecretBundleEntry *ptr;
+
+    entries.len = 5;
+    ptr = (OvStoragePlugin_SecretBundleEntry *)ovc_abi_alloc(
+        entries.len * sizeof(*ptr));
+    assert(ptr != NULL);
+    memset(ptr, 0, entries.len * sizeof(*ptr));
+
+    ptr[0].field = test_owned_str("bytes-field");
+    ptr[0].value.tag = OvStoragePlugin_SecretValueTag_Bytes;
+    ptr[0].value.bytes.bytes = test_owned_bytes(
+        stub_credentials_bytes_value, sizeof(stub_credentials_bytes_value));
+
+    ptr[1].field = test_owned_str("file-field");
+    ptr[1].value.tag = OvStoragePlugin_SecretValueTag_File;
+    ptr[1].value.file.bytes = test_owned_bytes(
+        stub_credentials_file_value, sizeof(stub_credentials_file_value));
+
+    ptr[2].field = test_owned_str("oauth-field");
+    ptr[2].value.tag = OvStoragePlugin_SecretValueTag_OAuthToken;
+    ptr[2].value.oauth_token.token.bytes = test_owned_bytes(
+        stub_credentials_oauth_token, sizeof(stub_credentials_oauth_token));
+    ptr[2].value.oauth_token.refresh.present = true;
+    ptr[2].value.oauth_token.refresh.value.bytes = test_owned_bytes(
+        stub_credentials_oauth_refresh,
+        sizeof(stub_credentials_oauth_refresh));
+    ptr[2].value.oauth_token.expires_at_unix_ms.present = true;
+    ptr[2].value.oauth_token.expires_at_unix_ms.value =
+        stub_credentials_oauth_expires_at_unix_ms;
+
+    ptr[3].field = test_owned_str("mtls-field");
+    ptr[3].value.tag = OvStoragePlugin_SecretValueTag_MtlsCertPair;
+    ptr[3].value.mtls_cert_pair.cert_pem.bytes = test_owned_bytes(
+        stub_credentials_mtls_cert, sizeof(stub_credentials_mtls_cert));
+    ptr[3].value.mtls_cert_pair.key_pem.bytes = test_owned_bytes(
+        stub_credentials_mtls_key, sizeof(stub_credentials_mtls_key));
+
+    ptr[4].field = test_owned_str("system-identity-field");
+    ptr[4].value.tag = OvStoragePlugin_SecretValueTag_SystemIdentity;
+
+    entries.ptr = ptr;
+    return entries;
+}
+
+/* Asserts `entries` (as received by `stub_update_connection_credentials`,
+ * i.e. after decode-then-re-encode through the host's public SecretBundle)
+ * matches what `stub_credentials_entries` originally reported. Field order
+ * is not promised by the host API, so this looks each field up by name
+ * instead of assuming `stub_credentials_entries`'s order survived. */
+static void stub_credentials_entries_assert_round_tripped(
+    const OvStoragePlugin_List_SecretBundleEntry *entries)
+{
+    size_t index;
+    int seen_bytes = 0;
+    int seen_file = 0;
+    int seen_oauth = 0;
+    int seen_mtls = 0;
+    int seen_system_identity = 0;
+
+    assert(entries->ptr != NULL);
+    assert(entries->len == 5);
+    for (index = 0; index < entries->len; ++index) {
+        const OvStoragePlugin_SecretBundleEntry *entry = &entries->ptr[index];
+
+        if (stub_str_eq(entry->field, "bytes-field")) {
+            assert(!seen_bytes);
+            seen_bytes = 1;
+            assert(entry->value.tag == OvStoragePlugin_SecretValueTag_Bytes);
+            assert(entry->value.bytes.bytes.len ==
+                   sizeof(stub_credentials_bytes_value));
+            assert(memcmp(entry->value.bytes.bytes.ptr,
+                          stub_credentials_bytes_value,
+                          sizeof(stub_credentials_bytes_value)) == 0);
+        } else if (stub_str_eq(entry->field, "file-field")) {
+            assert(!seen_file);
+            seen_file = 1;
+            assert(entry->value.tag == OvStoragePlugin_SecretValueTag_File);
+            assert(entry->value.file.bytes.len ==
+                   sizeof(stub_credentials_file_value));
+            assert(memcmp(entry->value.file.bytes.ptr,
+                          stub_credentials_file_value,
+                          sizeof(stub_credentials_file_value)) == 0);
+        } else if (stub_str_eq(entry->field, "oauth-field")) {
+            assert(!seen_oauth);
+            seen_oauth = 1;
+            assert(entry->value.tag ==
+                   OvStoragePlugin_SecretValueTag_OAuthToken);
+            assert(entry->value.oauth_token.token.bytes.len ==
+                   sizeof(stub_credentials_oauth_token));
+            assert(memcmp(entry->value.oauth_token.token.bytes.ptr,
+                          stub_credentials_oauth_token,
+                          sizeof(stub_credentials_oauth_token)) == 0);
+            assert(entry->value.oauth_token.refresh.present);
+            assert(entry->value.oauth_token.refresh.value.bytes.len ==
+                   sizeof(stub_credentials_oauth_refresh));
+            assert(memcmp(entry->value.oauth_token.refresh.value.bytes.ptr,
+                          stub_credentials_oauth_refresh,
+                          sizeof(stub_credentials_oauth_refresh)) == 0);
+            assert(entry->value.oauth_token.expires_at_unix_ms.present);
+            assert(entry->value.oauth_token.expires_at_unix_ms.value ==
+                   stub_credentials_oauth_expires_at_unix_ms);
+        } else if (stub_str_eq(entry->field, "mtls-field")) {
+            assert(!seen_mtls);
+            seen_mtls = 1;
+            assert(entry->value.tag ==
+                   OvStoragePlugin_SecretValueTag_MtlsCertPair);
+            assert(entry->value.mtls_cert_pair.cert_pem.bytes.len ==
+                   sizeof(stub_credentials_mtls_cert));
+            assert(memcmp(entry->value.mtls_cert_pair.cert_pem.bytes.ptr,
+                          stub_credentials_mtls_cert,
+                          sizeof(stub_credentials_mtls_cert)) == 0);
+            assert(entry->value.mtls_cert_pair.key_pem.bytes.len ==
+                   sizeof(stub_credentials_mtls_key));
+            assert(memcmp(entry->value.mtls_cert_pair.key_pem.bytes.ptr,
+                          stub_credentials_mtls_key,
+                          sizeof(stub_credentials_mtls_key)) == 0);
+        } else if (stub_str_eq(entry->field, "system-identity-field")) {
+            assert(!seen_system_identity);
+            seen_system_identity = 1;
+            assert(entry->value.tag ==
+                   OvStoragePlugin_SecretValueTag_SystemIdentity);
+        } else {
+            fprintf(stderr, "unexpected credential field name\n");
+            abort();
+        }
+    }
+    assert(seen_bytes && seen_file && seen_oauth && seen_mtls &&
+           seen_system_identity);
+}
+
+/* Releases a captured `stub_update_connection_credentials` request's
+ * bundle. There is no `ovstorage_plugin_secret_bundle_free`, so this walks
+ * the entries the same way `stub_credentials_entries_assert_round_tripped`
+ * reads them. */
+static void stub_secret_bundle_free(OvStoragePlugin_SecretBundle *bundle)
+{
+    size_t index;
+
+    for (index = 0; index < bundle->entries.len; ++index) {
+        OvStoragePlugin_SecretBundleEntry *entry = &bundle->entries.ptr[index];
+
+        ovstorage_plugin_str_free(&entry->field);
+        switch (entry->value.tag) {
+        case OvStoragePlugin_SecretValueTag_Bytes:
+            ovstorage_plugin_bytes_free(&entry->value.bytes.bytes);
+            break;
+        case OvStoragePlugin_SecretValueTag_File:
+            ovstorage_plugin_bytes_free(&entry->value.file.bytes);
+            break;
+        case OvStoragePlugin_SecretValueTag_OAuthToken:
+            ovstorage_plugin_bytes_free(&entry->value.oauth_token.token.bytes);
+            if (entry->value.oauth_token.refresh.present) {
+                ovstorage_plugin_bytes_free(
+                    &entry->value.oauth_token.refresh.value.bytes);
+            }
+            break;
+        case OvStoragePlugin_SecretValueTag_MtlsCertPair:
+            ovstorage_plugin_bytes_free(
+                &entry->value.mtls_cert_pair.cert_pem.bytes);
+            ovstorage_plugin_bytes_free(
+                &entry->value.mtls_cert_pair.key_pem.bytes);
+            break;
+        case OvStoragePlugin_SecretValueTag_SystemIdentity:
+        default:
+            break;
+        }
+    }
+    ovc_abi_free(bundle->entries.ptr);
+    memset(bundle, 0, sizeof(*bundle));
+}
+
 static void stub_get_latest_version(
     void *opaque,
     const OvStoragePlugin_ReadRequest *request,
@@ -829,6 +1073,43 @@ static void stub_update_connection_attributes(
     ovc_abi_free(moved.patch.remove_user_metadata.ptr);
     connection =
         stub_connection("attributes-sentinel", "Attributes Result");
+    on_complete(OvStoragePlugin_FFI_STATUS_OK,
+                connection,
+                NULL,
+                user_data);
+}
+
+/* Captures the request's credentials (still owned, moved rather than
+ * inspected here) onto the layer for the auth-credentials round-trip test
+ * to assert on after the async call completes -- proving what the host's
+ * public SecretBundle re-encoded back to plugin form, the inverse of the
+ * decode a Succeeded auth event exercises. */
+static void stub_update_connection_credentials(
+    void *opaque,
+    const OvStoragePlugin_UpdateConnectionCredentialsRequest *request,
+    const OvStoragePlugin_CancelTokenFFI *cancel,
+    OvStoragePlugin_OnComplete on_complete,
+    void *user_data)
+{
+    StubLayer *layer;
+    OvStoragePlugin_UpdateConnectionCredentialsRequest moved;
+    OvStoragePlugin_Connection *connection;
+
+    layer = (StubLayer *)opaque;
+    (void)cancel;
+    moved = *request;
+    assert(moved.struct_size == sizeof(moved));
+    assert(stub_str_eq(moved.key.target, "test://credentials-target"));
+    assert(stub_str_eq(moved.key.id, "cred-conn"));
+    ovstorage_plugin_str_free(&moved.key.target);
+    ovstorage_plugin_str_free(&moved.key.id);
+    assert(ovc_mutex_lock(&layer->mutex) == 0);
+    assert(!layer->captured_update_credentials_present);
+    layer->captured_update_credentials = moved.credentials;
+    layer->captured_update_credentials_present = 1;
+    assert(ovc_mutex_unlock(&layer->mutex) == 0);
+    connection =
+        stub_connection("credentials-sentinel", "Credentials Result");
     on_complete(OvStoragePlugin_FFI_STATUS_OK,
                 connection,
                 NULL,
@@ -1216,6 +1497,8 @@ static void stub_layer_init(StubLayer *layer, int block_auth)
     layer->vtable.update_connection_attributes =
         stub_update_connection_attributes;
     layer->vtable.authenticate_connection = stub_authenticate;
+    layer->vtable.update_connection_credentials =
+        stub_update_connection_credentials;
 }
 
 static void stub_layer_destroy(StubLayer *layer)
@@ -1372,6 +1655,75 @@ static void test_auth_result_wait(TestAuthResult *result)
 }
 
 static void test_auth_result_destroy(TestAuthResult *result)
+{
+    assert(ovc_completion_latch_destroy(&result->completed) == 0);
+}
+
+/* Unlike TestAuthResult/test_auth_complete above, which destroys every
+ * event as soon as it inspects it, this takes a Succeeded event's
+ * credentials before destroying it -- the only way to keep them, since
+ * ovstorage_auth_event_destroy wipes an untaken bundle. */
+typedef struct TestAuthCredentialsResult {
+    ovc_completion_latch completed;
+    int callback_count;
+    int event_count;
+    int terminal_count;
+    int terminal_had_error;
+    OvStorage_Status terminal_error_code;
+    int bad_shape;
+    int succeeded_seen;
+    OvStorage_SecretBundle *taken_credentials;
+} TestAuthCredentialsResult;
+
+static void test_auth_credentials_result_init(
+    TestAuthCredentialsResult *result)
+{
+    memset(result, 0, sizeof(*result));
+    assert(ovc_completion_latch_init(&result->completed) == 0);
+}
+
+static void test_auth_credentials_complete(OvStorage_AuthEvent *event,
+                                           const OvStorage_Error *error,
+                                           bool done,
+                                           void *user_data)
+{
+    TestAuthCredentialsResult *result;
+
+    result = (TestAuthCredentialsResult *)user_data;
+    ++result->callback_count;
+    if (!done) {
+        if (event == NULL || error != NULL) {
+            result->bad_shape = 1;
+        }
+        ++result->event_count;
+        if (event != NULL &&
+            event->kind == OvStorage_AuthEventKind_Succeeded) {
+            result->succeeded_seen = 1;
+            result->taken_credentials =
+                ovstorage_auth_event_take_succeeded_credentials(event);
+        }
+        ovstorage_auth_event_destroy(event);
+        return;
+    }
+    if (event != NULL) {
+        result->bad_shape = 1;
+        ovstorage_auth_event_destroy(event);
+    }
+    ++result->terminal_count;
+    result->terminal_had_error = error != NULL;
+    result->terminal_error_code =
+        error == NULL ? OvStorage_Status_Ok : error->code;
+    assert(ovc_completion_latch_complete(&result->completed) == 0);
+}
+
+static void test_auth_credentials_result_wait(
+    TestAuthCredentialsResult *result)
+{
+    assert(ovc_completion_latch_wait(&result->completed) == 0);
+}
+
+static void test_auth_credentials_result_destroy(
+    TestAuthCredentialsResult *result)
 {
     assert(ovc_completion_latch_destroy(&result->completed) == 0);
 }
@@ -1763,91 +2115,6 @@ static void test_file_stack_stat_read(OvStorage_LayerHandle *handle,
     test_io_result_destroy(&read_result);
 }
 
-/* An unnamed read/write temporary file for capturing redirected stderr.
- *
- * `tmpfile()` would be the obvious call, but glibc's implementation ignores
- * $TMPDIR and always opens under /tmp, which is not writable everywhere this
- * suite runs.  `mkstemp` honours the resolved temporary root; the immediate
- * `unlink` restores the property the capture leg depends on -- the file is
- * gone once the stream is closed, so it cannot litter the temporary root. */
-static FILE *test_open_anonymous_temp_file(void)
-{
-#if defined(_WIN32)
-    /* `tmpfile_s` has the same defect as glibc's `tmpfile()` in stronger
-     * form: MSVC documents that it creates the file in the ROOT of the
-     * current drive, which is routinely unwritable for a non-elevated
-     * process and ignores the temporary root every other case here honours.
-     * Compose under `ovc_temp_root_dup()` and open delete-on-close, which
-     * is the Win32 spelling of the POSIX branch's `mkstemp` + `unlink`. */
-    char path[OVC_TEMP_DIR_PATH_MAX];
-    char *root;
-    FILE *stream;
-    int written;
-    int descriptor;
-
-    root = ovc_temp_root_dup();
-    if (root == NULL) {
-        return NULL;
-    }
-    written = snprintf(path,
-                       sizeof(path),
-                       "%s\\ovstorage-capture-%lu-%u",
-                       root,
-                       (unsigned long)GetCurrentProcessId(),
-                       (unsigned)GetTickCount());
-    free(root);
-    if (written < 0 || (size_t)written >= sizeof(path)) {
-        return NULL;
-    }
-    if (_sopen_s(&descriptor,
-                 path,
-                 _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY | _O_TEMPORARY,
-                 _SH_DENYNO,
-                 _S_IREAD | _S_IWRITE)
-        != 0) {
-        return NULL;
-    }
-    stream = _fdopen(descriptor, "w+b");
-    if (stream == NULL) {
-        _close(descriptor);
-    }
-    return stream;
-#else
-    char path[OVC_TEMP_DIR_PATH_MAX];
-    char *root;
-    FILE *stream;
-    int written;
-    int descriptor;
-
-    root = ovc_temp_root_dup();
-    if (root == NULL) {
-        return NULL;
-    }
-    written = snprintf(path,
-                       sizeof(path),
-                       "%s/ovstorage-c-source-capture-XXXXXX",
-                       root);
-    free(root);
-    if (written < 0 || (size_t)written >= sizeof(path)) {
-        return NULL;
-    }
-    descriptor = mkstemp(path);
-    if (descriptor < 0) {
-        return NULL;
-    }
-    if (unlink(path) != 0) {
-        (void)close(descriptor);
-        return NULL;
-    }
-    stream = fdopen(descriptor, "w+b");
-    if (stream == NULL) {
-        (void)close(descriptor);
-        return NULL;
-    }
-    return stream;
-#endif
-}
-
 /* `directory` is a native path and is encoded; `suffix` is appended as-is,
  * so callers pass literal URL path text.  Returns the snprintf length, or
  * -1 when the composed URL path does not fit. */
@@ -1908,7 +2175,7 @@ int ovstorage_c_source_runtime_contracts(void)
     stack_a = test_build_file_stack(root_a, 2);
     assert(ovc_runtime_worker_count() == 2);
 
-    capture = test_open_anonymous_temp_file();
+    capture = ovc_test_open_anonymous_temp_file();
     assert(capture != NULL);
     assert(fflush(stderr) == 0);
     saved_stderr = dup(STDERR_FILENO);
@@ -2877,10 +3144,244 @@ static void test_connection_allocation_failures_once(
 }
 #endif
 
+typedef struct TestConnListResult {
+    ovc_completion_latch completed;
+    int callback_count;
+    OvStorage_Status status;
+    OvStorage_ConnectionList *list;
+} TestConnListResult;
+
+static void test_conn_list_complete(OvStorage_Status status,
+                                    OvStorage_ConnectionList *list,
+                                    const OvStorage_Error *error,
+                                    void *user_data)
+{
+    TestConnListResult *result;
+
+    (void)error;
+    result = (TestConnListResult *)user_data;
+    result->status = status;
+    result->list = list;
+    ++result->callback_count;
+    assert(ovc_completion_latch_complete(&result->completed) == 0);
+}
+
+/*
+ * Drive the connection values the DISPATCH layer converts and reclaims.
+ *
+ * The ownership contract above drives probe / update / remove, and every one of
+ * those ends in `Unsupported` or a declined prologue — so no
+ * `OvStoragePlugin_Connection` is ever produced and
+ * `ovc_dispatch_connection_clear` is never entered. The nested allocations of a
+ * successful connection value therefore had no sanitizer coverage on the
+ * client-API side at all, while the pure-C Stack path (`stack.c`) did.
+ *
+ * This drives the two shapes that reach it: a SUCCEEDING `add_connection`,
+ * whose plugin-side value is converted for the caller and then cleared
+ * (`dispatch.c`, the single-connection arm), and `list_connections`, whose
+ * snapshot is cleared element by element. Deleting either free reddens this
+ * contract under LeakSanitizer.
+ *
+ * The `owning_target` string is what makes this newly load-bearing: it is the
+ * first `Optional<Str>` on `OvStoragePlugin_Connection`, so it is the first
+ * nested allocation on these paths that a missing clear would strand.
+ */
+static void test_dispatch_connection_values_once(OvStorage_LayerHandle *handle,
+                                                 const char *root_url)
+{
+    OvStorage_ConnectionRequest *request;
+    OvStorage_ConfigValue *root_value;
+    TestConnResult added;
+    TestConnListResult listed;
+    size_t index;
+
+    request = ovstorage_connection_request_create("file");
+    assert(request != NULL);
+    root_value = ovstorage_config_value_create_string(root_url);
+    assert(root_value != NULL);
+    assert(ovstorage_connection_request_add_config(request, "root", root_value));
+
+    test_conn_result_init(&added);
+    ovstorage_add_connection(handle,
+                             "files",
+                             &request,
+                             NULL,
+                             test_conn_complete,
+                             &added);
+    test_conn_result_wait(&added);
+    assert(added.callback_count == 1);
+    assert(added.status == OvStorage_Status_Ok);
+    assert(added.connection != NULL);
+    /* The file backend stamps its layer instance name on every row, so the
+     * converted value carries it and the clear below has a string to free. */
+    assert(added.connection->owning_target != NULL);
+    assert(strcmp(added.connection->owning_target, "files") == 0);
+    /* The taken path consumes the builder, so the slot is cleared. */
+    assert(request == NULL);
+    test_conn_result_destroy(&added);
+
+    memset(&listed, 0, sizeof(listed));
+    assert(ovc_completion_latch_init(&listed.completed) == 0);
+    ovstorage_list_connections(handle, NULL, test_conn_list_complete, &listed);
+    assert(ovc_completion_latch_wait(&listed.completed) == 0);
+    assert(listed.callback_count == 1);
+    assert(listed.status == OvStorage_Status_Ok);
+    assert(listed.list != NULL);
+    assert(listed.list->len > 0);
+    for (index = 0; index < listed.list->len; ++index) {
+        assert(listed.list->items[index].owning_target != NULL);
+        assert(strcmp(listed.list->items[index].owning_target, "files") == 0);
+    }
+    ovstorage_connection_list_destroy(listed.list);
+    assert(ovc_completion_latch_destroy(&listed.completed) == 0);
+}
+
+typedef struct TestRootListResult {
+    ovc_completion_latch completed;
+    int callback_count;
+    OvStorage_Status status;
+    OvStorage_RootInfoList *list;
+} TestRootListResult;
+
+typedef struct TestRootResult {
+    ovc_completion_latch completed;
+    int callback_count;
+    OvStorage_Status status;
+    OvStorage_RootInfo *root;
+    int had_error;
+} TestRootResult;
+
+static void test_root_list_complete(OvStorage_Status status,
+                                    OvStorage_RootInfoList *list,
+                                    const OvStorage_Error *error,
+                                    void *user_data)
+{
+    TestRootListResult *result;
+
+    (void)error;
+    result = (TestRootListResult *)user_data;
+    result->status = status;
+    result->list = list;
+    ++result->callback_count;
+    assert(ovc_completion_latch_complete(&result->completed) == 0);
+}
+
+static void test_root_complete(OvStorage_Status status,
+                               OvStorage_RootInfo *root,
+                               const OvStorage_Error *error,
+                               void *user_data)
+{
+    TestRootResult *result;
+
+    result = (TestRootResult *)user_data;
+    result->status = status;
+    result->root = root;
+    result->had_error = error != NULL;
+    ++result->callback_count;
+    assert(ovc_completion_latch_complete(&result->completed) == 0);
+}
+
+/*
+ * Drive the ROOT values the dispatch layer converts and reclaims.
+ *
+ * Both root-discovery calls reach `ovc_dispatch_root_info_clear`; this list
+ * drive exercises every nested field in one result under LeakSanitizer,
+ * including its address, its layer kind, its connection id, its route source,
+ * its user metadata and its `owning_target`. Delete any one of them and this
+ * contract reports a leak.
+ *
+ * The `owning_target` assertion below is the premise, not decoration: the free
+ * under test runs only for a root that actually carries a target, so a fixture
+ * that stopped reporting one would leave this drive exercising nothing while
+ * still passing. The file backend stamps its layer INSTANCE name on every
+ * connection-contributed root, so "files" is what a root from
+ * `test_build_file_stack` must name.
+ */
+static void test_dispatch_root_values_once(OvStorage_LayerHandle *handle,
+                                           const char *unrouted_url)
+{
+    TestRootListResult listed;
+    TestRootResult routed;
+    size_t index;
+    size_t attributed;
+    size_t routed_index;
+
+    memset(&listed, 0, sizeof(listed));
+    assert(ovc_completion_latch_init(&listed.completed) == 0);
+    ovstorage_list_address_roots(handle, NULL, test_root_list_complete, &listed);
+    assert(ovc_completion_latch_wait(&listed.completed) == 0);
+    assert(listed.callback_count == 1);
+    assert(listed.status == OvStorage_Status_Ok);
+    assert(listed.list != NULL);
+    assert(listed.list->len > 0);
+
+    attributed = 0;
+    for (index = 0; index < listed.list->len; ++index) {
+        const OvStorage_RootInfo *root;
+
+        root = &listed.list->items[index];
+        assert(root->root != NULL);
+        assert(root->layer_kind != NULL);
+        if (root->owning_target != NULL) {
+            assert(strcmp(root->owning_target, "files") == 0);
+            ++attributed;
+        }
+    }
+    assert(attributed > 0);
+
+    routed_index = listed.list->len;
+    for (index = 1; index < listed.list->len; ++index) {
+        if (strcmp(listed.list->items[index].root,
+                   listed.list->items[0].root) != 0) {
+            routed_index = index;
+            break;
+        }
+    }
+    assert(routed_index < listed.list->len);
+
+    memset(&routed, 0, sizeof(routed));
+    assert(ovc_completion_latch_init(&routed.completed) == 0);
+    ovstorage_root_info_for(handle,
+                            listed.list->items[routed_index].root,
+                            NULL,
+                            test_root_complete,
+                            &routed);
+    assert(ovc_completion_latch_wait(&routed.completed) == 0);
+    assert(routed.callback_count == 1);
+    assert(routed.status == OvStorage_Status_Ok);
+    assert(routed.root != NULL);
+    assert(!routed.had_error);
+    assert(strcmp(routed.root->root,
+                  listed.list->items[routed_index].root) == 0);
+    ovstorage_root_info_destroy(routed.root);
+    assert(ovc_completion_latch_destroy(&routed.completed) == 0);
+
+    memset(&routed, 0, sizeof(routed));
+    assert(ovc_completion_latch_init(&routed.completed) == 0);
+    ovstorage_root_info_for(handle,
+                            unrouted_url,
+                            NULL,
+                            test_root_complete,
+                            &routed);
+    assert(ovc_completion_latch_wait(&routed.completed) == 0);
+    assert(routed.callback_count == 1);
+    assert(routed.status == OvStorage_Status_NoRoute);
+    assert(routed.root == NULL);
+    assert(routed.had_error);
+    assert(ovc_completion_latch_destroy(&routed.completed) == 0);
+
+    ovstorage_root_info_list_destroy(listed.list);
+    assert(ovc_completion_latch_destroy(&listed.completed) == 0);
+}
+
 int ovstorage_c_source_connection_ownership_contract(void)
 {
     char directory[OVC_TEMP_DIR_PATH_MAX];
+    char alternate_directory[OVC_TEMP_DIR_PATH_MAX];
+    char unrouted_directory[OVC_TEMP_DIR_PATH_MAX];
     char root_url[1024];
+    char alternate_root_url[1024];
+    char unrouted_url[1024];
     OvStorage_LayerHandle *handle;
     size_t iteration;
     int written;
@@ -2888,14 +3389,33 @@ int ovstorage_c_source_connection_ownership_contract(void)
     assert(ovc_temp_dir_create("ovstorage-c-source-conn-ownership",
                                directory,
                                sizeof(directory)) == 0);
+    assert(ovc_temp_dir_create("ovstorage-c-source-conn-alternate",
+                               alternate_directory,
+                               sizeof(alternate_directory)) == 0);
+    assert(ovc_temp_dir_create("ovstorage-c-source-conn-unrouted",
+                               unrouted_directory,
+                               sizeof(unrouted_directory)) == 0);
     written = test_file_url(root_url, sizeof(root_url), directory, "/");
     assert(written > 0 && (size_t)written < sizeof(root_url));
+    written = test_file_url(alternate_root_url,
+                            sizeof(alternate_root_url),
+                            alternate_directory,
+                            "/");
+    assert(written > 0 && (size_t)written < sizeof(alternate_root_url));
+    written = test_file_url(unrouted_url,
+                            sizeof(unrouted_url),
+                            unrouted_directory,
+                            "/");
+    assert(written > 0 && (size_t)written < sizeof(unrouted_url));
     handle = test_build_file_stack(root_url, 2);
+    test_dispatch_connection_values_once(handle, alternate_root_url);
 
     for (iteration = 0; iteration < 10; ++iteration) {
         test_connection_ownership_once(handle);
         test_connection_diagnostics_once(handle);
         test_remove_and_authenticate_diagnostics_once(handle);
+        test_dispatch_connection_values_once(handle, root_url);
+        test_dispatch_root_values_once(handle, unrouted_url);
     }
 #if defined(OVC_ABI_ALLOC_FAILURE_TEST)
     test_connection_allocation_failures_once(handle);
@@ -2903,6 +3423,8 @@ int ovstorage_c_source_connection_ownership_contract(void)
 
     ovstorage_layer_handle_destroy(handle);
     assert(rmdir(directory) == 0);
+    assert(rmdir(alternate_directory) == 0);
+    assert(rmdir(unrouted_directory) == 0);
     return EXIT_SUCCESS;
 }
 
@@ -3251,7 +3773,6 @@ int ovstorage_c_source_file_backend_etag_precondition(void)
     static const uint8_t first_payload[] = "etag precondition first";
     static const uint8_t second_payload[] = "etag precondition second write";
     char directory_storage[OVC_TEMP_DIR_PATH_MAX];
-    char meta_directory[1024];
     char root_url[1024];
     char object_url[1024];
     char object_path[1024];
@@ -3283,11 +3804,6 @@ int ovstorage_c_source_file_backend_etag_precondition(void)
                        "%s/etag.bin",
                        directory);
     assert(written > 0 && (size_t)written < sizeof(object_path));
-    written = snprintf(meta_directory,
-                       sizeof(meta_directory),
-                       "%s/.ovstorage-meta",
-                       directory);
-    assert(written > 0 && (size_t)written < sizeof(meta_directory));
 
     /* A fresh Registry is seeded with the builtin file factory; this is
      * exactly how stack.c resolves "file" during ovstorage_stack_build. */
@@ -3374,7 +3890,6 @@ int ovstorage_c_source_file_backend_etag_precondition(void)
     backend.vtable->drop(backend.state);
     ovstorage_registry_destroy(registry);
     assert(unlink(object_path) == 0);
-    (void)rmdir(meta_directory);
     assert(rmdir(directory) == 0);
     return EXIT_SUCCESS;
 }
@@ -3738,6 +4253,49 @@ static void unsupported_update_attributes_once(void)
     OVSTORAGE_UNSUPPORTED_VTABLE.update_connection_attributes(
         NULL, &request, NULL, unsupported_complete, &callbacks);
     assert(callbacks == 1);
+}
+
+static OvStoragePlugin_StreamStep test_list_entry_stream_next(
+    void *state,
+    OvStoragePlugin_ObjectInfo *out_item,
+    OvStoragePlugin_Error *out_error)
+{
+    (void)state;
+    (void)out_item;
+    (void)out_error;
+    return OvStoragePlugin_StreamStep_Ended;
+}
+
+static void test_list_entry_stream_drop(void *state)
+{
+    unsigned *drop_count;
+
+    drop_count = (unsigned *)state;
+    ++*drop_count;
+}
+
+static void test_list_entry_stream_free_once(void)
+{
+    OvStoragePlugin_ListEntryStream *stream;
+    unsigned drop_count = 0;
+
+    stream = (OvStoragePlugin_ListEntryStream *)ovc_abi_alloc(
+        sizeof(*stream));
+    assert(stream != NULL);
+    stream->state = &drop_count;
+    stream->next_fn = test_list_entry_stream_next;
+    stream->drop_fn = test_list_entry_stream_drop;
+
+    ovstorage_plugin_list_entry_stream_free(stream);
+    assert(drop_count == 1u);
+    ovstorage_plugin_list_entry_stream_free(NULL);
+    assert(drop_count == 1u);
+}
+
+int ovstorage_c_source_list_entry_stream_free_contract(void)
+{
+    test_list_entry_stream_free_once();
+    return EXIT_SUCCESS;
 }
 
 static void test_unsupported_new_operations_release_requests(void)
@@ -4113,6 +4671,172 @@ int ovstorage_c_source_auth_terminal_contract(void)
     blocking_pull_assert_dropped_once(pull);
     assert(layer.drop_count == 1);
     test_auth_result_destroy(&result);
+    blocking_pull_destroy(pull);
+    stub_layer_destroy(&layer);
+    return EXIT_SUCCESS;
+}
+
+/* End-to-end coverage for ovc_dispatch_secret_bundle_from_plugin (the
+ * decode a Succeeded auth event's credentials go through) and its inverse,
+ * ovc_dispatch_secret_bundle_copy (the encode update_connection_credentials
+ * uses to hand a host SecretBundle back to a plugin). Every existing
+ * credential test installs a public SecretBundle directly, bypassing the
+ * decode entirely; this drives a real plugin auth flow to a Succeeded
+ * event carrying one entry per SecretValue variant, takes the bundle
+ * ovstorage_auth_event_take_succeeded_credentials hands back, forwards it
+ * through update_connection_credentials, and asserts what the stub plugin
+ * receives on the other side still matches -- proving the decode dropped
+ * nothing (including the OAuth expiry's ms -> ns -> ms round trip)
+ * without needing a bundle-inspection API the public surface doesn't
+ * have. */
+int ovstorage_c_source_auth_credentials_round_trip(void)
+{
+    StubLayer layer;
+    OvStorage_LayerHandle *handle;
+    TestAuthCredentialsResult auth_result;
+    TestConnResult update_result;
+    BlockingPullState *pull;
+    OvStorage_SecretBundle *taken;
+
+    stub_layer_init(&layer, 0);
+    layer.yield_credentials_success = 1;
+    handle = stub_layer_public_handle(&layer);
+    assert(handle != NULL);
+
+    test_auth_credentials_result_init(&auth_result);
+    ovstorage_authenticate_connection(handle,
+                                      "stub",
+                                      "cred-conn",
+                                      OvStorage_InteractiveAuthCapability_None,
+                                      false,
+                                      NULL,
+                                      test_auth_credentials_complete,
+                                      &auth_result);
+    pull = layer.last_pull;
+    assert(pull != NULL);
+    test_auth_credentials_result_wait(&auth_result);
+    assert(auth_result.callback_count == 2);
+    assert(auth_result.event_count == 1);
+    assert(auth_result.terminal_count == 1);
+    assert(!auth_result.terminal_had_error);
+    assert(auth_result.terminal_error_code == OvStorage_Status_Ok);
+    assert(!auth_result.bad_shape);
+    assert(auth_result.succeeded_seen);
+    taken = auth_result.taken_credentials;
+    assert(taken != NULL);
+    test_auth_credentials_result_destroy(&auth_result);
+
+    test_conn_result_init(&update_result);
+    ovstorage_update_connection_credentials(handle,
+                                            "test://credentials-target",
+                                            "cred-conn",
+                                            &taken,
+                                            NULL,
+                                            test_conn_complete,
+                                            &update_result);
+    test_conn_result_wait(&update_result);
+    assert(update_result.callback_count == 1);
+    assert(update_result.status == OvStorage_Status_Ok);
+    /* Per the ownership contract on OvStorage_SecretBundle**: the slot is
+     * NULL exactly when the call took ownership, which a successful update
+     * always does -- so this is not "probably freed", it is the documented
+     * postcondition of status == Ok. */
+    assert(taken == NULL);
+    ovstorage_secret_bundle_destroy(taken);
+    test_conn_result_destroy(&update_result);
+
+    assert(ovc_mutex_lock(&layer.mutex) == 0);
+    assert(layer.captured_update_credentials_present);
+    stub_credentials_entries_assert_round_tripped(
+        &layer.captured_update_credentials.entries);
+    stub_secret_bundle_free(&layer.captured_update_credentials);
+    layer.captured_update_credentials_present = 0;
+    assert(ovc_mutex_unlock(&layer.mutex) == 0);
+
+    ovstorage_layer_handle_destroy(handle);
+    blocking_pull_assert_dropped_once(pull);
+    assert(layer.drop_count == 1);
+    blocking_pull_destroy(pull);
+    stub_layer_destroy(&layer);
+    return EXIT_SUCCESS;
+}
+
+/* A present-but-empty plugin `SecretBundle` (`present == true`,
+ * `entries.len == 0`) is a valid, explicit request to replace/clear
+ * credentials -- distinct from the field being absent altogether
+ * (`present == false`). `ovc_dispatch_secret_bundle_from_plugin` must
+ * therefore hand back a real, non-NULL, zero-entry bundle for it rather
+ * than collapsing it to NULL, the sentinel
+ * `ovstorage_auth_event_take_succeeded_credentials` also uses for "no
+ * credentials field was reported": collapsing the two would make the
+ * caller skip the credentials update the plugin asked for. */
+int ovstorage_c_source_auth_credentials_empty_bundle_present(void)
+{
+    StubLayer layer;
+    OvStorage_LayerHandle *handle;
+    TestAuthCredentialsResult auth_result;
+    TestConnResult update_result;
+    BlockingPullState *pull;
+    OvStorage_SecretBundle *taken;
+
+    stub_layer_init(&layer, 0);
+    layer.yield_credentials_success_empty = 1;
+    handle = stub_layer_public_handle(&layer);
+    assert(handle != NULL);
+
+    test_auth_credentials_result_init(&auth_result);
+    ovstorage_authenticate_connection(handle,
+                                      "stub",
+                                      "cred-conn",
+                                      OvStorage_InteractiveAuthCapability_None,
+                                      false,
+                                      NULL,
+                                      test_auth_credentials_complete,
+                                      &auth_result);
+    pull = layer.last_pull;
+    assert(pull != NULL);
+    test_auth_credentials_result_wait(&auth_result);
+    assert(auth_result.callback_count == 2);
+    assert(auth_result.event_count == 1);
+    assert(auth_result.terminal_count == 1);
+    assert(!auth_result.terminal_had_error);
+    assert(auth_result.terminal_error_code == OvStorage_Status_Ok);
+    assert(!auth_result.bad_shape);
+    assert(auth_result.succeeded_seen);
+    taken = auth_result.taken_credentials;
+    /* The crux of the contract: an empty-but-present bundle must decode to
+     * a real bundle, not NULL. */
+    assert(taken != NULL);
+    test_auth_credentials_result_destroy(&auth_result);
+
+    test_conn_result_init(&update_result);
+    ovstorage_update_connection_credentials(handle,
+                                            "test://credentials-target",
+                                            "cred-conn",
+                                            &taken,
+                                            NULL,
+                                            test_conn_complete,
+                                            &update_result);
+    test_conn_result_wait(&update_result);
+    assert(update_result.callback_count == 1);
+    assert(update_result.status == OvStorage_Status_Ok);
+    assert(taken == NULL);
+    ovstorage_secret_bundle_destroy(taken);
+    test_conn_result_destroy(&update_result);
+
+    assert(ovc_mutex_lock(&layer.mutex) == 0);
+    assert(layer.captured_update_credentials_present);
+    /* The empty bundle must reach the plugin as an empty entry list, not
+     * be silently skipped -- the whole point of not collapsing it to
+     * NULL earlier. */
+    assert(layer.captured_update_credentials.entries.len == 0);
+    stub_secret_bundle_free(&layer.captured_update_credentials);
+    layer.captured_update_credentials_present = 0;
+    assert(ovc_mutex_unlock(&layer.mutex) == 0);
+
+    ovstorage_layer_handle_destroy(handle);
+    blocking_pull_assert_dropped_once(pull);
+    assert(layer.drop_count == 1);
     blocking_pull_destroy(pull);
     stub_layer_destroy(&layer);
     return EXIT_SUCCESS;

@@ -95,11 +95,28 @@ async fn compose_connection(
     }
 }
 
+/// Compose over the `test` backend, a kind that declares user-metadata support
+/// and so carries the broker's attribution wrapper on its branch — the layer
+/// this test observes the DOWN-stamped principal through. (The `file` backend
+/// stores no user metadata and gets no wrapper.)
+async fn compose_test_backend(auth_kind: &str) -> ovstorage::Result<BrokerStack> {
+    let connection = ConnectionConfig::from_request(ConnectionRequest {
+        backend_kind: "test".to_string(),
+        config: HashMap::from([(
+            "test_root".to_string(),
+            ConfigValue::String("test://plugin-auth/".into()),
+        )]),
+        credentials: SecretBundle::default(),
+        persist: false,
+        display_name: Some("plugin-auth-e2e".to_string()),
+    });
+    compose_connection(connection, auth_kind).await
+}
+
 #[tokio::test]
 async fn cdylib_listener_auth_allows_denies_and_stamps_principal_down() {
-    let root = tempfile::tempdir().unwrap();
-    let broker = Broker::from_composed(compose(root.path(), MINI_AUTH_KIND).await.unwrap());
-    let prefix = address_for_path(root.path());
+    let broker = Broker::from_composed(compose_test_backend(MINI_AUTH_KIND).await.unwrap());
+    let prefix = address::parse("test://plugin-auth/").unwrap();
     let allowed = address::join_relative(&prefix, "allowed.txt").unwrap();
     let denied = address::join_relative(&prefix, "denied.txt").unwrap();
     let alice = context(b"alice");
@@ -158,7 +175,7 @@ async fn cdylib_listener_auth_allows_denies_and_stamps_principal_down() {
     assert_eq!(
         error.code(),
         ErrorCode::NotFound,
-        "the denied write must not reach the inner file layer"
+        "the denied write must not reach the inner backend layer"
     );
 
     let error = broker.reload_auth_policy("unused").unwrap_err();

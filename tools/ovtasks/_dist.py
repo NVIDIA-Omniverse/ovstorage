@@ -65,11 +65,13 @@ CONFIG_FILES = (
 PLUGINS = (
     "ovstorage-plugin-core-abi",
     "ovstorage-plugin-cache-abi",
+    "ovstorage-plugin-hub-cache-abi",
     "ovstorage-plugin-http-abi",
     "ovstorage-plugin-test-abi",
     "ovstorage-plugin-services-client",
     "ovstorage-plugin-s3",
     "ovstorage-plugin-gcs",
+    "ovstorage-plugin-huggingface",
     "ovstorage-plugin-azure",
     "ovstorage-plugin-opendal",
     "ovstorage-plugin-nucleus",
@@ -79,6 +81,7 @@ PLUGINS = (
 PLUGIN_ARTIFACT_STEMS = {
     "ovstorage-plugin-core-abi": "ovstorage_plugin_core",
     "ovstorage-plugin-cache-abi": "ovstorage_plugin_cache",
+    "ovstorage-plugin-hub-cache-abi": "ovstorage_plugin_hub_cache",
     "ovstorage-plugin-http-abi": "ovstorage_plugin_http",
 }
 
@@ -591,10 +594,10 @@ def wheel_plugin_filenames() -> tuple[str, ...]:
     """Library filenames the wheel bundles, for this host's platform.
 
     The package-name-to-stem mapping is not a plain hyphen substitution --
-    `PLUGIN_ARTIFACT_STEMS` renames the three `-abi` crates -- so this is the
-    one place that knows how to spell a bundled plugin's filename. Callers that
-    re-derive names themselves get `libovstorage_plugin_core_abi.so`, which no
-    build produces.
+    `PLUGIN_ARTIFACT_STEMS` renames the `-abi` crates whose artifact stem
+    doesn't follow it -- so this is the one place that knows how to spell a
+    bundled plugin's filename. Callers that re-derive names themselves get
+    `libovstorage_plugin_core_abi.so`, which no build produces.
     """
     return tuple(
         dll_filename(PLUGIN_ARTIFACT_STEMS.get(plugin, plugin.replace("-", "_")))

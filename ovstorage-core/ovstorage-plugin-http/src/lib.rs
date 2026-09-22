@@ -26,6 +26,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 
+use ovstorage_layer::{normalize_optional_wire_etag, normalize_wire_etag};
 use ovstorage_plugin::address;
 use ovstorage_plugin::*;
 use ovstorage_plugin::{ReadResult, race_cancel};
@@ -353,6 +354,19 @@ impl HttpBackendFactory {
     ) -> Result<InstantiatedBackend> {
         let root_url = config_url(&request.config, "root_url")?;
         validate_physical_scheme(&root_url)?;
+        // Advisory only. A configured root is the operator's own choice, made
+        // in configuration rather than steered by a remote server, so it is
+        // named in a warning and kept. The redirect path refuses the same
+        // hosts outright because there the destination is the server's choice.
+        if ovstorage_plugin::instance_metadata::is_instance_metadata_url(&root_url) {
+            tracing::warn!(
+                plugin = "http",
+                root = %ovstorage_plugin::redact::origin_only(&root_url),
+                "configured root_url names a cloud instance-metadata endpoint; every \
+                 request on this connection reaches it from this process's network \
+                 position"
+            );
+        }
         let signed_query_scope = config_string(&request.config, "signed_query_scope")?
             .as_deref()
             .map(parse_signed_query_scope)
@@ -516,7 +530,6 @@ impl HttpBackend {
                         RequestHeaders {
                             range: Some("bytes=0-0".to_string()),
                             authorization: bearer,
-                            ..RequestHeaders::default()
                         },
                         Some(2),
                     )
@@ -534,18 +547,21 @@ impl HttpBackend {
             let total = parse_content_range_total(response.headers.get("content-range"));
             let identity =
                 identity_from_headers(&response.headers, Some(response.body.len() as u64), total);
+            let checksums = checksums_from_headers(response.status, &response.headers);
             Ok(ObjectInfo {
+                etag_strength: identity.etag_strength,
                 address: target.resolved_address,
                 kind: ObjectKind::File,
                 etag: identity.etag,
                 version: None,
                 size: identity.size,
                 mtime: identity.mtime,
-                checksums: ChecksumSet::default(),
+                checksums,
                 effective_permissions: None,
                 system_metadata: Some(headers_to_metadata(response.headers)),
                 user_metadata: Some(UserMetadata::new()),
                 modified_by: None,
+                versioned_address: None,
             })
         })
         .await
@@ -594,10 +610,6 @@ impl HttpBackend {
                     .unwrap_or_default();
                 format!("bytes={}-{}", range.start, end)
             });
-            // The SPI etag is the opaque token (already stripped of
-            // `W/` and quotes by `strip_etag_wire_form` on stat). Re-add
-            // RFC 7232 quoting for the wire.
-            let if_match = opts.if_match.as_deref().map(|etag| format!("\"{etag}\""));
             let open_ended = opts
                 .range
                 .as_ref()
@@ -609,7 +621,6 @@ impl HttpBackend {
                     target.resolved_address.clone(),
                     RequestHeaders {
                         range: range.clone(),
-                        if_match,
                         authorization: bearer,
                     },
                     stream_cancel,
@@ -629,7 +640,6 @@ impl HttpBackend {
                 &physical,
                 RequestHeaders {
                     range: range.clone(),
-                    if_match,
                     authorization: bearer,
                 },
                 budget,
@@ -640,18 +650,21 @@ impl HttpBackend {
                 identity_from_headers(&response.headers, Some(response.body.len() as u64), total);
             check_etag(opts.if_match.as_deref(), identity.etag.as_deref())?;
             let body = response.body;
+            let checksums = checksums_from_headers(response.status, &response.headers);
             let info = ObjectInfo {
+                etag_strength: identity.etag_strength,
                 address: target.resolved_address,
                 kind: ObjectKind::File,
                 etag: identity.etag,
                 version: None,
                 size: identity.size,
                 mtime: identity.mtime,
-                checksums: ChecksumSet::default(),
+                checksums,
                 effective_permissions: None,
                 system_metadata: Some(headers_to_metadata(response.headers)),
                 user_metadata: Some(UserMetadata::new()),
                 modified_by: None,
+                versioned_address: None,
             };
             Ok(ReadResult::Bytes { bytes: body, info })
         })
@@ -673,7 +686,6 @@ struct HttpResponse {
 #[derive(Clone, Default)]
 struct RequestHeaders {
     range: Option<String>,
-    if_match: Option<String>,
     authorization: Option<SecretBytes>,
 }
 
@@ -1062,17 +1074,30 @@ async fn send_following_redirects_with_timeout(
             if let Some(range) = headers.range.as_deref() {
                 request = request.header(reqwest::header::RANGE, range);
             }
-            if let Some(if_match) = headers.if_match.as_deref() {
-                request = request.header(reqwest::header::IF_MATCH, if_match);
-            }
             let response = request.send().await.map_err(map_reqwest_error)?;
             let Some(location) = redirect_target(&response) else {
                 return Ok(response);
             };
+            // The destination is judged before the follow policy is consulted,
+            // so the refusal holds under every `redirect_policy`: `none`,
+            // `same_origin`, and `allow_list` with the host listed. An
+            // instance-metadata endpoint is the one destination whose payoff
+            // is the process's own cloud credentials rather than data, and no
+            // operator setting makes that fetch acceptable. That is also why
+            // this is a typed error rather than a clause in
+            // `redirect_is_allowed`: that function answers a bare bool and its
+            // caller hands the 3xx back, so a refusal there would be
+            // indistinguishable from a hop the policy merely declined.
+            // `strip_held_query` and `carry_userinfo` touch only the query and
+            // userinfo, so the verdict on the raw join is the verdict on `next`.
+            let resolved = current.join(location);
+            if let Ok(destination) = &resolved {
+                ovstorage_plugin::instance_metadata::refuse_instance_metadata(destination)?;
+            }
             let Some(scope) = context.redirects else {
                 return Ok(response);
             };
-            let mut next = current.join(location).map_err(|_| {
+            let mut next = resolved.map_err(|_| {
                 Error::new(
                     ErrorCode::Unsupported,
                     "HTTP redirect Location is not a URL this plugin can resolve",
@@ -1142,18 +1167,21 @@ async fn request_streaming(
         .and_then(|value| value.parse::<u64>().ok());
     let total = parse_content_range_total(hmap.get("content-range"));
     let identity = identity_from_headers(&hmap, advertised_size, total);
+    let checksums = checksums_from_headers(status, &hmap);
     let info = ObjectInfo {
+        etag_strength: identity.etag_strength,
         address: dispatch_address,
         kind: ObjectKind::File,
         etag: identity.etag,
         version: None,
         size: identity.size,
         mtime: identity.mtime,
-        checksums: ChecksumSet::default(),
+        checksums,
         effective_permissions: None,
         system_metadata: Some(headers_to_metadata(hmap)),
         user_metadata: Some(UserMetadata::new()),
         modified_by: None,
+        versioned_address: None,
     };
     let upstream = response.bytes_stream().map(|item| match item {
         Ok(bytes) => Ok(bytes),
@@ -1482,24 +1510,6 @@ fn unreachable_state(error: Option<Error>) -> (ConnectionAuthState, Option<Syste
     )
 }
 
-/// Name a route prefix in an operator-facing message by its origin alone.
-///
-/// Every other part of a route prefix can carry a secret: userinfo, a
-/// signed-URL query under any name (`plugin-http.md` positively invites one),
-/// and a capability token in the path. `Error::new`'s redaction pass strips
-/// userinfo and a fixed list of known provider query keys, which covers none
-/// of the rest — so render what is structurally safe rather than trying to
-/// recognise what is not. The origin is enough to act on: it says which
-/// connection the new one collides with, and the operator has their own
-/// config.
-fn route_prefix_origin_for_message(url: &Url) -> String {
-    match (url.host_str(), url.port()) {
-        (Some(host), Some(port)) => format!("{}://{host}:{port}", url.scheme()),
-        (Some(host), None) => format!("{}://{host}", url.scheme()),
-        (None, _) => url.scheme().to_string(),
-    }
-}
-
 /// True when the URL embeds userinfo, which reqwest turns into an
 /// `Authorization: Basic` header on every request built from it.
 ///
@@ -1761,7 +1771,7 @@ fn map_status(status: u16, headers: Option<&HashMap<String, String>>) -> Error {
             let err = Error::new(ErrorCode::ObjectModified, "HTTP precondition failed");
             match headers {
                 Some(h) => err.with_context(ErrorContext::Identity {
-                    new_etag: h.get("etag").map(|raw| strip_etag_wire_form(raw)),
+                    new_etag: h.get("etag").map(|raw| normalize_wire_etag(raw).0),
                 }),
                 None => err,
             }
@@ -1793,12 +1803,71 @@ fn is_method_not_allowed(err: &Error) -> bool {
 }
 
 /// Per-HTTP-response identity fields read from response headers.
-/// Flattened onto `ObjectInfo` at construction; only `etag` is used as
-/// the SPI precondition primitive.
+/// Flattened onto `ObjectInfo` at construction.
 struct HttpIdentity {
     etag: Option<String>,
+    etag_strength: EtagStrength,
     size: Option<u64>,
     mtime: Option<SystemTime>,
+}
+
+/// The checksums a plain-HTTP response advertises: `Content-MD5`, the one
+/// content checksum generic HTTP defines, carrying the base64 of the raw
+/// digest. Cloud-specific checksum headers belong to the redirect module's
+/// per-provider parsing profiles, not here.
+///
+/// Surfacing it is what lets a validator-keyed cache above this backend key
+/// on content identity. omni.client keys the same object
+/// `md5;<Content-MD5>`, and the canonical base64 of the raw bytes surfaced
+/// here reproduces the header exactly, so the two clients meet on one
+/// cache entry.
+///
+/// `Content-MD5` describes the entity actually transferred, so on a
+/// partial response it digests the slice, not the object — publishing that
+/// as the object's checksum would hand every consumer a wrong content
+/// identity next to a whole-object size. The digest is therefore surfaced
+/// only when the response provably carries the whole object: a 200, or a
+/// 206 whose `Content-Range` spans the full total — the same rule
+/// `StreamingVerifier::for_streaming_response` applies to the cloud
+/// checksum headers.
+fn checksums_from_headers(status: u16, headers: &HashMap<String, String>) -> ChecksumSet {
+    let mut checksums = ChecksumSet::default();
+    let whole_object = match status {
+        200 => true,
+        206 => headers
+            .get("content-range")
+            .and_then(|value| redirect::parse_content_range(value))
+            .is_some_and(|range| {
+                range.start == 0
+                    && range
+                        .total
+                        .is_some_and(|total| range.end.checked_add(1) == Some(total))
+            }),
+        _ => false,
+    };
+    if !whole_object {
+        return checksums;
+    }
+    if let Some(raw) = headers.get("content-md5")
+        && let Some(digest) = parse_content_md5(raw)
+    {
+        checksums.insert(ChecksumAlgorithm::md5(), digest);
+    }
+    checksums
+}
+
+/// Parses a `Content-MD5` value strictly: the header is defined as the
+/// base64 of the 16-byte digest and nothing else, so the lenient
+/// cloud-header parser — whose hex and raw-bytes fallbacks would accept
+/// any 16 ASCII characters as a digest — must not be used here. A value
+/// that is not exactly that is no digest, and publishing a guess would
+/// hand every consumer a wrong content identity.
+fn parse_content_md5(raw: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(raw.trim())
+        .ok()?;
+    (decoded.len() == 16).then_some(decoded)
 }
 
 fn identity_from_headers(
@@ -1816,21 +1885,14 @@ fn identity_from_headers(
                 .and_then(|value| value.parse().ok())
         })
         .or(observed_len);
+    let (etag, etag_strength) =
+        normalize_optional_wire_etag(headers.get("etag").map(String::as_str));
     HttpIdentity {
-        etag: headers.get("etag").map(|raw| strip_etag_wire_form(raw)),
+        etag,
+        etag_strength,
         size,
         mtime,
     }
-}
-
-/// Strip RFC 7232 quoting and `W/` weak prefix from a wire etag so the
-/// SPI's `if_match` string is the opaque token — the HTTP-layer
-/// quoting / weakness flags are re-applied when sending `If-Match`
-/// upstream.
-fn strip_etag_wire_form(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let body = trimmed.strip_prefix("W/").unwrap_or(trimmed);
-    body.trim_matches('"').to_string()
 }
 
 /// Response headers that must not be republished as object metadata.
@@ -1877,9 +1939,7 @@ fn check_etag(expected: Option<&str>, actual: Option<&str>) -> Result<()> {
     if expected.is_empty() {
         return Ok(());
     }
-    // RFC 7232: weak ETags (`W/`) allow byte-different responses to share a tag, so skip them for rotation checks.
-    let etag_mismatch = !expected.starts_with("W/") && actual != Some(expected);
-    if etag_mismatch {
+    if actual != Some(expected) {
         Err(
             Error::new(ErrorCode::ObjectModified, "HTTP object etag changed").with_context(
                 ErrorContext::Identity {
@@ -2087,6 +2147,12 @@ impl HttpBackendLayer {
             auth_state: instance.auth_state,
             last_probed: instance.probed_at,
             user_metadata: UserMetadata::new(),
+            // This layer owns the connection, and its instance name is the
+            // `ConnectionKey::target` that reaches it -- the same name
+            // `owned_targets` reports and `remove_connection` gates on. Stamped
+            // at construction so the row carries it wherever it goes, including
+            // out of `ConnectionSet`'s change stream.
+            owning_target: Some(self.name.clone()),
         };
         Ok(Arc::new(HttpInstance {
             backend_id: instance.backend_id,
@@ -2168,7 +2234,7 @@ impl HttpBackendLayer {
                 ErrorCode::RouteConflict,
                 format!(
                     "another connection already serves an address prefix on '{}'",
-                    route_prefix_origin_for_message(&clash.root)
+                    ovstorage_plugin::redact::origin_only(&clash.root)
                 ),
             ));
         }
@@ -2731,6 +2797,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stat.etag.as_deref(), Some("abc"));
+        assert_eq!(stat.etag_strength, EtagStrength::Strong);
 
         let (bytes, info) = buffer_read(
             backend
@@ -2742,24 +2809,82 @@ mod tests {
         assert_eq!(bytes, b"hello-http");
         assert_eq!(info.address, addr);
         assert_eq!(info.etag.as_deref(), Some("abc"));
+        assert_eq!(info.etag_strength, EtagStrength::Strong);
     }
 
+    /// The `Content-MD5` a plain origin sends becomes the surfaced md5
+    /// checksum, raw — and the canonical base64 of those raw bytes
+    /// reproduces the header exactly, which is the property a
+    /// validator-keyed cache above this backend needs to meet omni.client
+    /// (it keys such objects `md5;<Content-MD5>`) on one cache entry.
     #[tokio::test]
-    async fn http_read_forwards_strong_etag_precondition_and_maps_412() {
+    async fn stat_surfaces_the_content_md5_digest() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         spawn_http_fixture(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let mut request = [0_u8; 1024];
+                let len = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..len]);
+                let content_md5 = if request.contains("/object.txt") {
+                    // The md5 of the empty input, as `Content-MD5` spells it.
+                    "Content-MD5: 1B2M2Y8AsgTpgAmY7PhCfg==\r\n"
+                } else {
+                    "Content-MD5: not base64!\r\n"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"abc\"\r\n{content_md5}Connection: close\r\n\r\n"
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let backend = HttpBackend::new();
+
+        let addr = address::parse(&format!("http://127.0.0.1:{port}/object.txt")).unwrap();
+        let stat = backend
+            .stat(target(addr), StatOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            stat.checksums.get(&ChecksumAlgorithm::md5()),
+            Some(
+                &[
+                    0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec,
+                    0xf8, 0x42, 0x7e
+                ][..]
+            ),
+            "the raw digest whose base64 is the header value"
+        );
+
+        // A value that is neither base64 nor hex is no digest, and a
+        // malformed header never fails the stat itself.
+        let addr = address::parse(&format!("http://127.0.0.1:{port}/garbage.txt")).unwrap();
+        let stat = backend
+            .stat(target(addr), StatOptions::default(), None)
+            .await
+            .unwrap();
+        assert!(stat.checksums.get(&ChecksumAlgorithm::md5()).is_none());
+        assert_eq!(stat.etag.as_deref(), Some("abc"));
+    }
+
+    #[tokio::test]
+    async fn http_read_maps_origin_412_without_sending_if_match() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fixture = spawn_http_fixture(move || {
             let mut stream = listener.incoming().next().unwrap().unwrap();
             let mut request = [0_u8; 1024];
             let len = stream.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..len]);
-            // RFC 7230: header names are case-insensitive; hyper lowercases on the wire.
             assert!(
-                request
-                    .to_ascii_lowercase()
-                    .contains("if-match: \"abc\"\r\n")
+                !request
+                    .lines()
+                    .any(|line| line.to_ascii_lowercase().starts_with("if-match:")),
+                "SPI reads must not send a wire If-Match header: {request:?}",
             );
-            let response = "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\n\r\n";
+            let response =
+                "HTTP/1.1 412 Precondition Failed\r\nETag: W/\"new\"\r\nContent-Length: 0\r\n\r\n";
             stream.write_all(response.as_bytes()).unwrap();
         });
 
@@ -2768,8 +2893,6 @@ mod tests {
             .read(
                 target(address::parse(&format!("http://127.0.0.1:{port}/object.txt")).unwrap()),
                 ReadOptions {
-                    // SPI etag is the opaque token; the plugin re-quotes
-                    // for the wire `If-Match` header.
                     if_match: Some("abc".into()),
                     ..ReadOptions::default()
                 },
@@ -2778,6 +2901,13 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ObjectModified);
+        assert_eq!(
+            err.context(),
+            Some(&ErrorContext::Identity {
+                new_etag: Some("new".into()),
+            })
+        );
+        fixture.join().unwrap();
     }
 
     #[tokio::test]
@@ -2811,9 +2941,17 @@ mod tests {
     }
 
     #[test]
-    fn weak_etag_in_check_identity_is_not_comparable() {
-        // Weak etags ("W/...") match anything per RFC 7232; check_etag accepts.
-        check_etag(Some("W/\"weak\""), Some("\"strong\"")).expect("weak etag accepted");
+    fn check_etag_compares_normalized_weak_tokens() {
+        check_etag(Some(""), Some("changed")).expect("empty precondition accepted");
+        check_etag(Some("weak"), Some("weak")).expect("matching token accepted");
+        let err = check_etag(Some("weak"), Some("changed")).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ObjectModified);
+        assert_eq!(
+            err.context(),
+            Some(&ErrorContext::Identity {
+                new_etag: Some("changed".into()),
+            })
+        );
     }
 
     #[test]
@@ -3405,38 +3543,46 @@ mod tests {
     }
 
     #[test]
-    fn strip_etag_wire_form_handles_quotes_and_weak_prefix() {
-        assert_eq!(strip_etag_wire_form("\"abc\""), "abc");
-        assert_eq!(strip_etag_wire_form("abc"), "abc");
-        assert_eq!(strip_etag_wire_form("W/\"weak\""), "weak");
-        assert_eq!(strip_etag_wire_form("W/weak"), "weak");
-        assert_eq!(strip_etag_wire_form("  \"padded\"  "), "padded");
+    fn identity_from_headers_normalizes_etag_and_preserves_strength() {
+        let mut headers = HashMap::new();
+        headers.insert("etag".into(), "W/\"weak\"".into());
+        let identity = identity_from_headers(&headers, None, None);
+        assert_eq!(identity.etag.as_deref(), Some("weak"));
+        assert_eq!(identity.etag_strength, EtagStrength::Weak);
+
+        headers.insert("etag".into(), "  \"strong\"  ".into());
+        let identity = identity_from_headers(&headers, None, None);
+        assert_eq!(identity.etag.as_deref(), Some("strong"));
+        assert_eq!(identity.etag_strength, EtagStrength::Strong);
+
+        headers.insert("etag".into(), "bare".into());
+        let identity = identity_from_headers(&headers, None, None);
+        assert_eq!(identity.etag.as_deref(), Some("bare"));
+        assert_eq!(identity.etag_strength, EtagStrength::Unspecified);
+
+        headers.remove("etag");
+        let identity = identity_from_headers(&headers, None, None);
+        assert_eq!(identity.etag, None);
+        assert_eq!(identity.etag_strength, EtagStrength::Unspecified);
     }
 
     #[tokio::test]
     async fn stat_etag_round_trips_through_if_match() {
-        // Server returns a quoted etag on stat; the SPI etag is the
-        // opaque token (unquoted). Re-using that token as
-        // `ReadOptions.if_match` must round-trip — the plugin re-adds
-        // the wire quoting when sending `If-Match` upstream, so the
-        // server matches and returns 200.
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        spawn_http_fixture(move || {
-            for stream in listener.incoming().take(2) {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fixture_requests = requests.clone();
+        let fixture = spawn_http_fixture(move || {
+            for (index, stream) in listener.incoming().take(3).enumerate() {
                 let mut stream = stream.unwrap();
                 let mut request = [0_u8; 1024];
                 let n = stream.read(&mut request).unwrap();
                 let raw = std::str::from_utf8(&request[..n]).unwrap();
-                let has_if_match = raw
-                    .lines()
-                    .any(|line| line.to_ascii_lowercase().starts_with("if-match: \"abc\""));
-                // `Connection: close`: one reply per accepted connection, so the
-                // client must not pool the stat socket for the follow-up read.
-                let response = if has_if_match || !raw.contains("If-Match") {
+                fixture_requests.lock().unwrap().push(raw.to_owned());
+                let response = if index < 2 {
                     "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"abc\"\r\nConnection: close\r\n\r\nhello"
                 } else {
-                    "HTTP/1.1 412 Precondition Failed\r\nETag: \"abc\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"changed\"\r\nConnection: close\r\n\r\nnewer"
                 };
                 stream.write_all(response.as_bytes()).unwrap();
             }
@@ -3453,12 +3599,13 @@ mod tests {
             .unwrap();
         let etag = stat.etag.clone().expect("etag");
         assert_eq!(etag, "abc", "SPI etag is the unquoted opaque token");
-        let (bytes, _info) = buffer_read(
+        assert_eq!(stat.etag_strength, EtagStrength::Strong);
+        let (bytes, info) = buffer_read(
             backend
                 .read(
                     target(address::parse(&format!("http://127.0.0.1:{port}/object.txt")).unwrap()),
                     ReadOptions {
-                        if_match: Some(etag),
+                        if_match: Some(etag.clone()),
                         ..ReadOptions::default()
                     },
                     None,
@@ -3468,6 +3615,108 @@ mod tests {
         )
         .await;
         assert_eq!(&bytes[..], b"hello");
+        assert_eq!(info.etag.as_deref(), Some("abc"));
+        assert_eq!(info.etag_strength, EtagStrength::Strong);
+
+        let err = backend
+            .read(
+                target(address::parse(&format!("http://127.0.0.1:{port}/object.txt")).unwrap()),
+                ReadOptions {
+                    if_match: Some(etag),
+                    ..ReadOptions::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ObjectModified);
+        assert_eq!(
+            err.context(),
+            Some(&ErrorContext::Identity {
+                new_etag: Some("changed".into()),
+            })
+        );
+        fixture.join().unwrap();
+        assert!(requests.lock().unwrap().iter().all(|request| {
+            !request
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("if-match:"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn weak_origin_etag_round_trips_through_if_match() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fixture_requests = requests.clone();
+        let fixture = spawn_http_fixture(move || {
+            for (index, stream) in listener.incoming().take(3).enumerate() {
+                let mut stream = stream.unwrap();
+                let mut request = [0_u8; 1024];
+                let n = stream.read(&mut request).unwrap();
+                let raw = std::str::from_utf8(&request[..n]).unwrap();
+                fixture_requests.lock().unwrap().push(raw.to_owned());
+                let response = if index < 2 {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: W/\"abc\"\r\nConnection: close\r\n\r\nhello"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: W/\"changed\"\r\nConnection: close\r\n\r\nnewer"
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let backend = HttpBackend::new();
+        let addr = address::parse(&format!("http://127.0.0.1:{port}/object.txt")).unwrap();
+        let stat = backend
+            .stat(target(addr.clone()), StatOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(stat.etag.as_deref(), Some("abc"));
+        assert_eq!(stat.etag_strength, EtagStrength::Weak);
+
+        let (bytes, info) = buffer_read(
+            backend
+                .read(
+                    target(addr.clone()),
+                    ReadOptions {
+                        if_match: stat.etag.clone(),
+                        ..ReadOptions::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(bytes, b"hello");
+        assert_eq!(info.etag.as_deref(), Some("abc"));
+        assert_eq!(info.etag_strength, EtagStrength::Weak);
+
+        let err = backend
+            .read(
+                target(addr),
+                ReadOptions {
+                    if_match: stat.etag,
+                    ..ReadOptions::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ObjectModified);
+        assert_eq!(
+            err.context(),
+            Some(&ErrorContext::Identity {
+                new_etag: Some("changed".into()),
+            })
+        );
+        fixture.join().unwrap();
+        assert!(requests.lock().unwrap().iter().all(|request| {
+            !request
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("if-match:"))
+        }));
     }
 
     #[test]
@@ -3501,11 +3750,11 @@ mod tests {
 
     #[test]
     fn check_identity_mismatch_carries_identity_context() {
-        let err = check_etag(Some("\"old\""), Some("\"new\"")).unwrap_err();
+        let err = check_etag(Some("old"), Some("new")).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ObjectModified);
         match err.context() {
             Some(ErrorContext::Identity { new_etag }) => {
-                assert_eq!(new_etag.as_deref(), Some("\"new\""));
+                assert_eq!(new_etag.as_deref(), Some("new"));
             }
             other => panic!("expected Identity context, got {other:?}"),
         }
@@ -4077,6 +4326,243 @@ mod tests {
             .await
             .expect("allow_list follows the listed host on the data path");
         assert_eq!(destination.hits(), 1, "the data path did follow it");
+    }
+
+    /// The destination is judged before the follow policy, so the refusal is
+    /// the same typed error whether the policy would have declined the hop
+    /// (`none`, `same_origin`) or followed it (`allow_list` naming the host).
+    /// The origin answers exactly once and nothing dials the metadata host.
+    #[tokio::test]
+    async fn a_redirect_to_an_instance_metadata_host_is_refused_under_every_redirect_policy() {
+        use ovstorage_plugin_test::{CannedHttpResponse, ScriptedHttpServer};
+
+        for (destination, host) in [
+            ("http://169.254.169.254/latest/meta-data", "169.254.169.254"),
+            (
+                "https://metadata.google.internal/computeMetadata/v1/",
+                "metadata.google.internal",
+            ),
+            ("http://[fd00:ec2::254]/", "[fd00:ec2::254]"),
+        ] {
+            for policy in ["none", "same_origin", "allow_list"] {
+                let origin = ScriptedHttpServer::spawn(
+                    CannedHttpResponse::new("302 Found", "").with_header("Location", destination),
+                );
+                let instance = instantiate_with_credentials(
+                    config_of(&[
+                        ("root_url", origin.endpoint()),
+                        ("redirect_policy", policy),
+                        ("redirect_allow_hosts", host),
+                    ]),
+                    SecretBundle::default(),
+                )
+                .await
+                .unwrap();
+
+                let err = instance
+                    .backend
+                    .stat(
+                        ResolvedTarget {
+                            backend_id: instance.backend_id.clone(),
+                            resolved_address: address::parse(&format!(
+                                "{}/obj.bin",
+                                origin.endpoint()
+                            ))
+                            .unwrap(),
+                        },
+                        StatOptions::default(),
+                        None,
+                    )
+                    .await
+                    .err()
+                    .unwrap_or_else(|| {
+                        panic!("{policy}: a redirect to {destination} must be refused")
+                    });
+
+                assert_eq!(
+                    err.code(),
+                    ErrorCode::PermissionDenied,
+                    "{policy}: {destination}"
+                );
+                let text = err.to_string();
+                assert!(
+                    text.contains("instance-metadata")
+                        && !text.contains("meta-data")
+                        && !text.contains("computeMetadata"),
+                    "{policy}: the refusal names the origin only: {text}"
+                );
+                assert_eq!(
+                    origin.hits(),
+                    1,
+                    "{policy}: {destination}: the origin answers once and nothing else is dialed"
+                );
+            }
+        }
+
+        // Control: the same `allow_list` follows an ordinary listed host, so
+        // the refusal is specific to the destination, not a policy that has
+        // stopped following anything. Loopback stands in for a CDN so the
+        // test never leaves the machine.
+        let destination = ScriptedHttpServer::spawn(CannedHttpResponse::new("200 OK", "followed"));
+        let origin = ScriptedHttpServer::spawn(
+            CannedHttpResponse::new("302 Found", "")
+                .with_header("Location", format!("{}/moved.bin", destination.endpoint())),
+        );
+        let instance = instantiate_with_credentials(
+            config_of(&[
+                ("root_url", origin.endpoint()),
+                ("redirect_policy", "allow_list"),
+                ("redirect_allow_hosts", "127.0.0.1"),
+            ]),
+            SecretBundle::default(),
+        )
+        .await
+        .unwrap();
+        instance
+            .backend
+            .stat(
+                ResolvedTarget {
+                    backend_id: instance.backend_id.clone(),
+                    resolved_address: address::parse(&format!("{}/obj.bin", origin.endpoint()))
+                        .unwrap(),
+                },
+                StatOptions::default(),
+                None,
+            )
+            .await
+            .expect("allow_list follows a listed host that is not an instance-metadata endpoint");
+        assert_eq!(destination.hits(), 1, "the data path did follow it");
+    }
+
+    /// A configured root at an instance-metadata endpoint is the operator's
+    /// own choice, so it is kept and named in exactly one WARN. The warning is
+    /// the whole operator-facing signal, so it is asserted on directly.
+    #[tokio::test]
+    async fn a_configured_root_url_at_an_instance_metadata_host_only_warns() {
+        for (root, origin) in [
+            ("http://169.254.169.254/latest/", "http://169.254.169.254"),
+            (
+                "https://metadata.google.internal/computeMetadata/v1/",
+                "https://metadata.google.internal",
+            ),
+            ("http://[fd00:ec2::254]/", "http://[fd00:ec2::254]"),
+        ] {
+            warn_capture::start();
+            let instance = instantiate_with_credentials(
+                config_of(&[("root_url", root)]),
+                SecretBundle::default(),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{root}: a configured root is advisory, got {err}"));
+            assert_eq!(instance.address_roots.len(), 1, "{root}");
+
+            let warnings = warn_capture::warnings();
+            assert_eq!(
+                warnings.len(),
+                1,
+                "{root}: exactly one warning, got {warnings:?}"
+            );
+            assert!(
+                warnings[0].contains("instance-metadata") && warnings[0].contains(origin),
+                "{root}: the warning names the origin: {}",
+                warnings[0]
+            );
+            assert!(
+                !warnings[0].contains("latest") && !warnings[0].contains("computeMetadata"),
+                "{root}: the warning carries the origin only: {}",
+                warnings[0]
+            );
+        }
+
+        // An ordinary root says nothing.
+        warn_capture::start();
+        instantiate_with_credentials(
+            config_of(&[("root_url", "https://storage.example/")]),
+            SecretBundle::default(),
+        )
+        .await
+        .unwrap();
+        assert!(warn_capture::warnings().is_empty());
+    }
+
+    /// WARN capture for the advisory tests, built on `tracing` alone because
+    /// this crate carries no subscriber dependency. Installed once for the
+    /// whole test binary: `tracing` caches each callsite's interest on first
+    /// hit, so a per-test default would race the parallel suite. Events are
+    /// tagged with the emitting thread so each test reads only its own;
+    /// `#[tokio::test]` drives `instantiate` on the test thread.
+    mod warn_capture {
+        use std::sync::{Mutex, Once};
+
+        static EVENTS: Mutex<Vec<(std::thread::ThreadId, String)>> = Mutex::new(Vec::new());
+        static INSTALL: Once = Once::new();
+
+        /// Start recording on this thread, discarding anything it logged earlier.
+        pub(super) fn start() {
+            INSTALL.call_once(|| {
+                tracing::subscriber::set_global_default(WarnCapture)
+                    .expect("no other global subscriber in this test binary");
+            });
+            let me = std::thread::current().id();
+            EVENTS
+                .lock()
+                .expect("capture poisoned")
+                .retain(|(thread, _)| *thread != me);
+        }
+
+        /// Every WARN this thread has emitted since [`start`], rendered as
+        /// `field=value` pairs.
+        pub(super) fn warnings() -> Vec<String> {
+            let me = std::thread::current().id();
+            EVENTS
+                .lock()
+                .expect("capture poisoned")
+                .iter()
+                .filter(|(thread, _)| *thread == me)
+                .map(|(_, text)| text.clone())
+                .collect()
+        }
+
+        struct WarnCapture;
+
+        impl tracing::Subscriber for WarnCapture {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                *metadata.level() == tracing::Level::WARN
+            }
+
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut rendered = Render(String::new());
+                event.record(&mut rendered);
+                EVENTS
+                    .lock()
+                    .expect("capture poisoned")
+                    .push((std::thread::current().id(), rendered.0));
+            }
+
+            fn enter(&self, _: &tracing::span::Id) {}
+
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        struct Render(String);
+
+        impl tracing::field::Visit for Render {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                if !self.0.is_empty() {
+                    self.0.push(' ');
+                }
+                let _ = write!(self.0, "{}={value:?}", field.name());
+            }
+        }
     }
 
     #[test]
@@ -5039,6 +5525,96 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::Unsupported);
+    }
+
+    /// `Content-MD5` describes the transferred entity, so the fallback's
+    /// one-byte 206 carries the digest of a slice; surfacing it would hand
+    /// consumers a one-byte digest next to the whole-object size. Only a
+    /// provably whole response contributes the checksum.
+    #[tokio::test]
+    async fn a_partial_responses_content_md5_is_not_the_objects_checksum() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        spawn_http_fixture(move || {
+            for (idx, stream) in listener.incoming().take(2).enumerate() {
+                let mut stream = stream.unwrap();
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf).unwrap();
+                if idx == 0 {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                } else {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\n\
+                              Content-Range: bytes 0-0/15\r\nETag: \"abc\"\r\n\
+                              Content-MD5: 1B2M2Y8AsgTpgAmY7PhCfg==\r\nConnection: close\r\n\r\nT",
+                        )
+                        .unwrap();
+                }
+            }
+        });
+
+        let mut config = HashMap::new();
+        config.insert(
+            "root_url".into(),
+            ConfigValue::String(format!("http://127.0.0.1:{port}/")),
+        );
+        config.insert("allow_range_stat_fallback".into(), ConfigValue::Bool(true));
+        let instance = instantiate_backend(config);
+        let target = ResolvedTarget {
+            backend_id: instance.backend_id.clone(),
+            resolved_address: address::parse(&format!("http://127.0.0.1:{port}/object.bin"))
+                .unwrap(),
+        };
+        let stat = instance
+            .backend
+            .stat(target, StatOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(stat.size, Some(15));
+        assert_eq!(stat.etag.as_deref(), Some("abc"));
+        assert!(
+            stat.checksums.get(&ChecksumAlgorithm::md5()).is_none(),
+            "a slice digest is not the object's checksum"
+        );
+    }
+
+    /// The whole-object gate, over every response shape it discriminates.
+    #[test]
+    fn content_md5_is_surfaced_only_for_provably_whole_responses() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "content-md5".to_string(),
+            "1B2M2Y8AsgTpgAmY7PhCfg==".to_string(),
+        );
+        let md5 = ChecksumAlgorithm::md5();
+        assert!(checksums_from_headers(200, &headers).get(&md5).is_some());
+        // A 206 whose range provably spans the whole object still counts.
+        headers.insert("content-range".to_string(), "bytes 0-14/15".to_string());
+        assert!(checksums_from_headers(206, &headers).get(&md5).is_some());
+        // A slice does not.
+        headers.insert("content-range".to_string(), "bytes 0-0/15".to_string());
+        assert!(checksums_from_headers(206, &headers).get(&md5).is_none());
+        // Nor does a range against an unknown total.
+        headers.insert("content-range".to_string(), "bytes 0-14/*".to_string());
+        assert!(checksums_from_headers(206, &headers).get(&md5).is_none());
+        // Nor a 206 that carries no range at all.
+        headers.remove("content-range");
+        assert!(checksums_from_headers(206, &headers).get(&md5).is_none());
+        // A value that is not the base64 of a 16-byte digest is no digest:
+        // 16 ASCII characters must not be mistaken for the raw bytes.
+        headers.insert("content-md5".to_string(), "abcdefghijklmnop".to_string());
+        assert!(checksums_from_headers(200, &headers).get(&md5).is_none());
+        // Hex spellings belong to cloud headers, not Content-MD5.
+        headers.insert(
+            "content-md5".to_string(),
+            "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+        );
+        assert!(checksums_from_headers(200, &headers).get(&md5).is_none());
     }
 
     #[tokio::test]

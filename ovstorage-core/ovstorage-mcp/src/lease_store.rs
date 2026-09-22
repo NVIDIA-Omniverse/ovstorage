@@ -100,6 +100,7 @@ mod tests {
         LocalDelegate {
             path: PathBuf::from(path),
             info: ObjectInfo {
+                etag_strength: Default::default(),
                 address: address::parse("file:///tmp/test/dummy").unwrap(),
                 kind: ObjectKind::File,
                 etag: None,
@@ -111,6 +112,7 @@ mod tests {
                 system_metadata: None,
                 user_metadata: None,
                 modified_by: None,
+                versioned_address: None,
             },
             guard: None,
         }

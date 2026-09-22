@@ -45,12 +45,10 @@ and compiles against the canonical contracts at
   - `persistence_id` (optional, string): durable account
     discriminator. See
     [Stored credentials belong to one account](#stored-credentials-belong-to-one-account).
-- **Credential methods.** The descriptor offers two
+- **Credential methods.** The descriptor offers three
   `CredentialMethod`s; the UI picks one per connection:
   - **`interactive`** (default; PKCE for browsers, device flow for
-    headless). Uses the `oauth` secret bundle (an `OAuthToken` with
-    access token, optional refresh token, and expiry). Cold-start
-    flows are driven by
+    headless). Gathers no credential fields. Cold-start flows are driven by
     `Layer::authenticate_connection` with a Browser or Headless capability;
     the resulting refresh token is offered to the host's
     `secret_put` callback. Whether it is stored at all turns on the
@@ -59,18 +57,30 @@ and compiles against the canonical contracts at
     can warm-continue from it turns additionally on that process
     re-deriving the same key from the discovery URL, the OIDC client
     and `persistence_id`, on what the host backs the callback with, and
-    on how long that store keeps an entry.
+    on how long that store keeps an entry. Adding a connection with this
+    method while such a stored lineage is still valid warm-continues on
+    it — the saved account is reused and no new flow runs; `reauth`
+    re-runs the flow explicitly, to sign in again or as a different
+    account.
+  - **`token`** (pre-issued OIDC token bundle; direct gRPC only). Uses the
+    `oauth` secret field for a host-held or host-minted access token. This is
+    the credential shape used with a direct gRPC endpoint, where the plugin has
+    no sign-in flow to drive. If a programmatic caller supplies an `OAuthToken`
+    bundle, the direct endpoint uses only its access token.
   - **`client_credentials`** (machine-to-machine for service
     identities). Uses the `client_id` and `client_secret` credential
     fields and authenticates to the IDP directly, with no user sign-in.
 
-    Both methods need the OIDC endpoints that only a discovery root
-    publishes, so **neither applies to a direct gRPC endpoint**. Such a
-    connection takes an access token the host supplies in the `oauth`
-    field and attaches it, whitespace-trimmed and otherwise unaltered;
-    there is no method entry for that,
-    because there is no flow to drive — see
+    The `interactive` and `client_credentials` methods need the OIDC
+    endpoints that only a discovery root publishes, so **neither applies to
+    a direct gRPC endpoint**. For a direct address, `connect` omits those
+    methods and rejects their explicit `--auth` keys; use `token` for an access
+    token the host supplies. The plugin takes it from the `oauth` field and
+    attaches it, whitespace-trimmed and otherwise unaltered — see
     [A host-supplied bearer](#a-host-supplied-bearer-and-how-to-rotate-it).
+    For a discovery URL, `connect` omits `token` from the picker and rejects
+    `--auth token` before prompting; use `interactive` or
+    `client_credentials` instead.
 
 ### Connecting straight to a gRPC endpoint
 
@@ -117,9 +127,10 @@ URL instead — the two forms are alternatives, not a pair.
 ### A host-supplied bearer, and how to rotate it
 
 What a direct endpoint *can* do is carry an access token the host
-already holds. Supply it in the `oauth` credential field and gRPC calls
-go out with `authorization: Bearer <token>`. Supply nothing and the
-connection is anonymous.
+already holds. Choose the `token` credential method and supply it in the
+`oauth` credential field; gRPC calls go out with
+`authorization: Bearer <token>`. Supply nothing and the connection is
+anonymous.
 
 It can be written straight into configuration:
 
@@ -485,7 +496,7 @@ so no credential is persisted and each start signs in again. Set
 does not substitute here: it separates the keys, but the record stored
 under each still has to name the account it belongs to.
 
-Cold-start interactive auth (no `oauth` credential bundle on file)
+Because `interactive` gathers no credential fields, cold-start authentication
 runs through the plugin's `authenticate(...)` entry point. The host
 chooses `InteractiveAuthCapability::Browser` (PKCE with a loopback
 redirect) or `Headless` (RFC 8628 device flow). Both surface
@@ -497,9 +508,17 @@ an `OAuthToken` the host installs as the connection's credentials.
 The Storage API wire carries opaque `ResourceIdentity` values as
 precondition tokens. In this plugin, `encoded_identity` is an etag:
 it validates the resource the caller already observed, and it is not
-a version address. The plugin maps the Layer precondition fields onto
-the wire directly; it does not pre-`Stat` just to compare the current
-head when the caller already supplied the etag/identity token:
+a version address. The Storage API contract defines each ResourceIdentity as a
+specific immutable object instance and explicitly marks it suitable as a cache
+key. In Layer terms, that promise means one encoded identity is not rebound to
+different bytes, including after the original instance becomes unavailable.
+The service may mint different identities for the same bytes, but `Strong`
+requires only the other direction: equal tokens identify equal bytes. A
+non-empty encoded identity is therefore declared `Strong` in object metadata;
+that declaration follows the service contract rather than the opaque token's
+spelling. The plugin maps the Layer precondition fields onto the wire directly;
+it does not pre-`Stat` just to compare the current head when the caller already
+supplied the etag/identity token:
 
 - `ReadOptions::if_match` — `Option<String>` etag, forwarded as
   `ReadRequest.resource_identity.encoded_identity`.
@@ -536,6 +555,20 @@ longer read a supplied identity, the plugin maps that failure to
 `ObjectModified`; it does not reinterpret `ResourceIdentity` as an
 address query parameter.
 
+Under `StatOptions::versioned_address` / `ListOptions::versioned_address`,
+`stat` and `list` obtain the newest `VersionInfo.resource_address` for each
+file through `VersioningService.EnumerateVersions` — one call per object,
+per file entry on `list`, where a failed lookup fails the page (the policy
+the `full_metadata` metadata fetch follows) — and return it verbatim as
+`ObjectInfo.versioned_address`. The selected `VersionInfo.resource_info`
+supplies the entry's etag, size and mtime, so the facts describe the version
+the pin names even when a write lands between the two calls; the address and
+kind stay the caller's, and a `full_metadata` merge lands on top. An address
+the service rejects as already a version address is echoed with the `Stat`
+facts it already describes; an object with no versions answers `None`;
+subfolders answer `None`. With the flag clear the field is `None`, because
+`Stat` and `ListStat` carry no version.
+
 **Version address shape**
 
 `list_versions` calls `VersioningService.EnumerateVersions` with the
@@ -554,6 +587,8 @@ canonicalize is omitted from a listing rather than failing the page it
 appeared on. Each streamed version
 becomes an `ObjectInfo` whose address is the returned version-pinned
 `resource_address`, projected back into caller space by the host.
+`versioned_address` on `list_versions` and `get_latest_version` entries is
+that same returned `resource_address`, whole.
 
 `get_latest_version` first calls `VersioningService.EnumerateVersions`
 and chooses the latest item according to `versions_order`:
@@ -569,14 +604,14 @@ returns it unchanged.
 | Layer method | gRPC RPC |
 |------------|----------|
 | `instantiate` | `CapabilitiesService.ListTopLevelAddresses` (after HTTP service discovery, or directly against a configured gRPC endpoint) |
-| `stat` | `FileObjectService.Stat` |
+| `stat` | `FileObjectService.Stat`; plus `VersioningService.EnumerateVersions` when `StatOptions::versioned_address` is set |
 | `read` | `FileObjectService.ReadFromAddress` (server-stream); chunks → `ReadResult::Stream`, `Redirect` → `ReadResult::Redirect` |
 | `write` / `write_stream` | `FileObjectService.Write` (bidi); inline body, single `ResourceInfo` response |
 | `write_redirect` + `continue_write` | `FileObjectService.Write` returning `WriteRedirect` (single PUT) or `MultipartUpload` (parts), finalized via `CompleteRedirectUpload` / `CompleteMultipartUpload`; aborts via `AbortMultipartUpload` |
 | `delete` | `FileObjectService.Delete` |
-| `list` | `FileFolderService.ListStat` (server-stream) |
-| `list_versions` | `VersioningService.EnumerateVersions` (server-stream; requires `resource_address`) |
-| `get_latest_version` | `VersioningService.EnumerateVersions` with `versions_order` selection; `FileObjectService.Stat` fallback when the service rejects an already version-pinned address |
+| `list` | `FileFolderService.ListStat` (server-stream); plus one `VersioningService.EnumerateVersions` per file entry when `ListOptions::versioned_address` is set |
+| `list_versions` | `VersioningService.EnumerateVersions` (server-stream; requires `resource_address`); each item's `versioned_address` is its own address |
+| `get_latest_version` | `VersioningService.EnumerateVersions` with `versions_order` selection; `FileObjectService.Stat` fallback when the service rejects an already version-pinned address; `versioned_address` is the returned address |
 | `create_directory` / `delete_directory` | `FileFolderService.CreateFolder` / `DeleteFolder` |
 | `copy` / `rename` | `FileObjectService.Copy` / `Move` |
 | `update_metadata` | `MetadataService.UpdateMetadata` (one RPC per key) |
@@ -588,7 +623,11 @@ returns it unchanged.
 commits first.** The service's write RPC carries no metadata, so the
 plugin writes the object, then issues one
 `MetadataService.UpdateMetadata` per key — the same path
-`WriteOptions.message` takes under the reserved `x-ov-message` key.
+`WriteOptions.message` takes under the `x_ov_message` key, outside the
+`ovstorage_` namespace. Key names pass to the metadata service
+unchanged, so the service's own naming rules apply on top of the
+portable subset in
+[User-metadata keys](CONFORMANCE.md#user-metadata-keys).
 
 **A caller key that does not land fails the write with
 `PartialCompletion`.** The error carries `ErrorContext::Partial` naming
@@ -616,7 +655,7 @@ full-metadata `stat` (the ordinary stat conversion leaves
 `user_metadata` unset) to see which landed.
 
 Two failures are deliberately not surfaced to the caller. A failure
-confined to the reserved `ovstorage-` namespace — `ovstorage-modified-by`
+confined to the reserved `ovstorage_` namespace — `ovstorage_modified_by`
 and its neighbours — returns `Ok`, because those keys are the host's, not
 the caller's. And a `WriteOptions.message` stash failure is discarded
 entirely, because that field is droppable by contract. Both cases still
@@ -629,10 +668,10 @@ mis-handles `PartialCompletion` — under that code the bytes did land.
 
 This matches the multi-stage durability rule, which requires a plugin
 whose durability lands in stages to surface a final-stage failure even
-though the earlier stage has committed. The built-in `file` backend
-reports its own second stage the same way: its user-metadata sidecar is
-staged and published after the bytes commit, and a publish failure
-surfaces as `PartialCompletion` too.
+though the earlier stage has committed. This plugin is the in-tree
+example of that shape: the object commits first, the caller's keys land
+through the metadata service after it, and a failure of that second
+stage surfaces as `PartialCompletion` rather than unwinding the bytes.
 
 It is a separate question from the capability-driven silent drop the
 plugin contract forbids: this backend *does* support user metadata, and

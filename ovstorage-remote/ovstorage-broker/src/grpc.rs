@@ -357,7 +357,8 @@ fn spawn_broker_grpc_tcp_listener_inner(
                         broker_handle,
                         transport: ListenerTransport::Tcp,
                         forwarded,
-                    });
+                    })
+                    .max_decoding_message_size(protocol::BROKER_GRPC_MAX_DECODING_MESSAGE_SIZE);
                 let health = health_pb::health_server::HealthServer::new(GrpcHealthService {
                     broker_handle: health_handle,
                 });
@@ -490,7 +491,8 @@ pub fn spawn_broker_grpc_unix_socket_listener_with_handle(
                         broker_handle,
                         transport: ListenerTransport::Uds,
                         forwarded: None,
-                    });
+                    })
+                    .max_decoding_message_size(protocol::BROKER_GRPC_MAX_DECODING_MESSAGE_SIZE);
                 let health = health_pb::health_server::HealthServer::new(GrpcHealthService {
                     broker_handle: health_handle,
                 });
@@ -711,7 +713,8 @@ pub fn spawn_broker_grpc_named_pipe_listener_with_handle(
                         broker_handle,
                         transport: ListenerTransport::NamedPipe,
                         forwarded: None,
-                    });
+                    })
+                    .max_decoding_message_size(protocol::BROKER_GRPC_MAX_DECODING_MESSAGE_SIZE);
                 let health = health_pb::health_server::HealthServer::new(GrpcHealthService {
                     broker_handle: health_handle,
                 });
@@ -1120,6 +1123,36 @@ fn bytes_read_frames(
 }
 type GrpcWriteStream =
     Pin<Box<dyn Stream<Item = Result<pb::WriteResponse, Status>> + Send + 'static>>;
+
+struct CancelOnDropWatchDirectoryStream {
+    inner: ReceiverStream<Result<pb::WatchDirectoryResponse, Status>>,
+    cancel: ovstorage::CancellationToken,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Stream for CancelOnDropWatchDirectoryStream {
+    type Item = Result<pb::WatchDirectoryResponse, Status>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl Drop for CancelOnDropWatchDirectoryStream {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        // Closing the receiver is distinct from cancelling the backend: it
+        // wakes a worker blocked in `blocking_send` on a full response queue.
+        self.inner.close();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 type GrpcWatchDirectoryStream =
     Pin<Box<dyn Stream<Item = Result<pb::WatchDirectoryResponse, Status>> + Send + 'static>>;
 type GrpcWatchAddressRootsStream =
@@ -1585,19 +1618,31 @@ impl pb::broker_service_server::BrokerService for GrpcBrokerService {
             object.address = %crate::trace::RedactedUrl(&prefix_addr),
         );
         let _guard = _span.enter();
-        let stream = self
+        let (stream, rpc_cancel) = self
             .broker()
-            .watch_directory(
+            .watch_directory_with_cancel(
                 &context,
                 prefix_addr,
                 protocol::watch_directory_options_from_proto(&request),
+                None,
             )
             .await
             .map_err(|e| ctx_status(e, &context))?;
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
-        std::thread::Builder::new()
+        let closed_sender = sender.clone();
+        let closed_cancel = rpc_cancel.clone();
+        let worker_done = rpc_cancel.clone();
+        drop(tokio::spawn(async move {
+            tokio::select! {
+                _ = closed_sender.closed() => closed_cancel.cancel(),
+                _ = worker_done.cancelled() => {}
+            }
+        }));
+        let worker_cancel = rpc_cancel.clone();
+        let join = std::thread::Builder::new()
             .name("ovs-grpc-watch".into())
             .spawn(move || {
+                let _cancel_guard = worker_cancel.drop_guard();
                 for event in stream {
                     let response = event
                         .map(|event| pb::WatchDirectoryResponse {
@@ -1609,8 +1654,19 @@ impl pb::broker_service_server::BrokerService for GrpcBrokerService {
                     }
                 }
             })
-            .expect("failed to spawn thread");
-        Ok(GrpcResponse::new(Box::pin(ReceiverStream::new(receiver))))
+            .map_err(|error| {
+                rpc_cancel.cancel();
+                Status::resource_exhausted(format!(
+                    "failed to allocate watch stream worker: {error}"
+                ))
+            })?;
+        Ok(GrpcResponse::new(Box::pin(
+            CancelOnDropWatchDirectoryStream {
+                inner: ReceiverStream::new(receiver),
+                cancel: rpc_cancel,
+                join: Some(join),
+            },
+        )))
     }
 
     async fn create_directory(
@@ -1878,6 +1934,51 @@ impl health_pb::health_server::Health for GrpcHealthService {
         Ok(GrpcResponse::new(health_pb::HealthCheckResponse {
             status: status as i32,
         }))
+    }
+}
+
+#[cfg(test)]
+mod watch_stream_drop_tests {
+    use super::*;
+
+    fn response() -> Result<pb::WatchDirectoryResponse, Status> {
+        Ok(pb::WatchDirectoryResponse { event: None })
+    }
+
+    #[test]
+    fn drop_unblocks_worker_when_response_channel_is_full() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .blocking_send(response())
+            .expect("first response fills the channel");
+
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            attempting_tx.send(()).unwrap();
+            assert!(
+                sender.blocking_send(response()).is_err(),
+                "closing the receiver wakes the blocked sender"
+            );
+        });
+        attempting_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker reaches the blocking send");
+
+        let stream = CancelOnDropWatchDirectoryStream {
+            inner: ReceiverStream::new(receiver),
+            cancel: ovstorage::CancellationToken::new(),
+            join: Some(worker),
+        };
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(stream);
+            dropped_tx.send(()).unwrap();
+        });
+
+        dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dropping the stream must not wait on a full channel");
+        dropper.join().unwrap();
     }
 }
 

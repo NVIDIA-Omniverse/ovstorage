@@ -1,0 +1,348 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+// First-party definition of the Omniverse Hub (usd-workstation-cache) wire
+// protocol: the message set, field numbers, and enum values the hub's own
+// schema defines, which is all the wire format consists of. A test compares
+// this file's protoc descriptor against the hub repository's schema when a
+// sibling checkout is present, so any structural drift — the only kind that
+// can break wire compatibility — fails loudly.
+
+syntax = "proto3";
+
+package nvidia.omniverse.hub.v1alpha;
+
+option go_package = "pb.api.nvidia.com/omniverse/hub/v1alpha;hub";
+option java_multiple_files = true;
+option java_outer_classname = "HubProto";
+option java_package = "com.nvidia.omniverse.hub.v1alpha";
+
+// The hub's result codes, shared by every operation.
+enum ResultCode {
+  RESULT_CODE_SUCCESS = 0;
+  RESULT_CODE_ERROR_ABANDONED = 1;
+  RESULT_CODE_ERROR_ALREADY_EXISTS = 2;
+  RESULT_CODE_ERROR_TOO_LARGE = 3;
+  RESULT_CODE_ERROR_HANDLE_NOT_FOUND = 4;
+  RESULT_CODE_ERROR_INTERNAL = 5;
+  RESULT_CODE_ERROR_NOT_FOUND = 6;
+  RESULT_CODE_ERROR_PENDING_WRITE = 7;
+}
+
+// A semantic version triple.
+message SemVer {
+  uint64 major = 1;
+  uint64 minor = 2;
+  uint64 patch = 3;
+}
+
+// The interfaces a hub can offer.
+enum Interface {
+  INTERFACE_UNKNOWN = 0;
+  INTERFACE_CACHE_ASIDE = 1;
+  INTERFACE_BLOCK_CACHE = 2;
+}
+
+message InterfaceVersion {
+  Interface interface = 1;
+  uint32 version = 2;
+}
+
+message VersionInfo {
+  SemVer software_version = 1;
+  repeated InterfaceVersion interface_versions = 2;
+}
+
+// -----------------------------------------------------------------------------
+// Hub service: operations common to every interface.
+// -----------------------------------------------------------------------------
+
+message ClientConnectParams {
+  string client_name = 1;
+  // A UUID, as its string form.
+  string client_uuid = 2;
+}
+
+message ClientConnectResult {}
+
+message HubVersionInfoParams {}
+
+message HubVersionInfoResult {
+  VersionInfo version_info = 1;
+}
+
+// -----------------------------------------------------------------------------
+// Cache-aside service: whole files, addressed by client-chosen keys.
+// -----------------------------------------------------------------------------
+
+// Asks for the cache-aside protocol revision, which moves only when the
+// protocol itself changes.
+message CacheAsideVersionInfoParams {}
+
+message CacheAsideVersionInfoResult {
+  SemVer version = 1;
+}
+
+// Reclaims the leases an earlier connection of this client left behind.
+message CacheAsideConnectParams {
+  repeated FileConnectItem files = 1;
+}
+
+message FileConnectItem {
+  // The entry's unique, client-chosen key.
+  string key = 1;
+  // The provider string given when the entry was opened.
+  string provider = 2;
+  // The extension given when the entry was opened.
+  string extension = 3;
+  // The hub-issued handle being reclaimed.
+  uint64 handle = 4;
+  // Whether the handle held write access.
+  bool open_for_write = 5;
+}
+
+message CacheAsideConnectResult {
+  ResultCode result_code = 1;
+  repeated ResultCode file_result_codes = 2;
+}
+
+// Takes a read lease on an entry; the hub pins the entry while any client
+// holds one.
+message CacheAsideOpenForReadParams {
+  // The entry's unique, client-chosen key.
+  string key = 1;
+  // The scheme the object originally came from; diagnostic only.
+  string provider = 2;
+  string extension = 3;
+}
+
+message CacheAsideOpenForReadResult {
+  ResultCode result_code = 1;
+  optional string local_file = 2;
+  optional uint64 handle = 3;
+}
+
+// Reserves an entry for writing at a declared size; keys are write-once.
+message CacheAsideOpenForWriteParams {
+  // The entry's unique, client-chosen key.
+  string key = 1;
+  // The scheme the object originally came from; diagnostic only.
+  string provider = 2;
+  // The on-disk file name's extension, e.g. "usd"; not part of the key.
+  string extension = 3;
+  // The exact byte count being reserved.
+  uint64 size = 4;
+}
+
+message CacheAsideOpenForWriteResult {
+  ResultCode result_code = 1;
+  // The local path the bytes are staged into.
+  optional string local_file = 2;
+  // The hub-issued handle for the reservation.
+  optional uint64 handle = 3;
+}
+
+// Releases a handle; releasing a write handle commits its entry.
+message CacheAsideCloseParams {
+  uint64 handle = 1;
+}
+
+message CacheAsideCloseResult {
+  ResultCode result_code = 1;
+}
+
+// Releases a handle and, when it held the last reference, marks the entry
+// collectable instead of committing it.
+message CacheAsideRemoveParams {
+  uint64 handle = 1;
+}
+
+message CacheAsideRemoveResult {
+  ResultCode result_code = 1;
+}
+
+// -----------------------------------------------------------------------------
+// Block-cache service: fixed blocks, addressed by binary keys. Not used by
+// this crate (the layer is cache-aside only, by decision); carried so the
+// oneof numbering below matches the hub's schema exactly.
+// -----------------------------------------------------------------------------
+
+message BlockCacheConnectParams {
+  repeated BlockConnectItem blocks = 1;
+}
+
+message BlockConnectItem {
+  bytes key = 1;
+  optional string extension = 2;
+  uint64 handle = 3;
+  bool open_for_put = 4;
+}
+
+message BlockCacheConnectResult {
+  repeated ResultCode result_codes = 1;
+}
+
+message BlockCacheGetParams {
+  repeated bytes keys = 1;
+  uint64 timeout_us = 2;
+}
+
+message BlockCacheGetResult {
+  repeated BlockGetResult results = 1;
+  string base_path = 2;
+}
+
+message BlockGetResult {
+  ResultCode result_code = 1;
+  optional BlockInfo block = 2;
+}
+
+message BlockInfo {
+  uint64 handle = 1;
+  BlockLocation location = 2;
+}
+
+message BlockLocation {
+  string path = 1;
+  uint64 id = 2;
+  uint64 offset = 3;
+  uint64 size = 4;
+}
+
+message BlockCacheCloseParams {
+  repeated uint64 handles = 1;
+}
+
+message BlockCacheCloseResult {
+  repeated ResultCode result_codes = 1;
+}
+
+message BlockCachePutParams {
+  repeated BlockPutItem blocks = 1;
+}
+
+message BlockPutItem {
+  bytes key = 1;
+  uint64 size = 2;
+  uint64 rank = 3;
+  optional string extension = 4;
+}
+
+message BlockCachePutResult {
+  repeated BlockPutResult results = 1;
+  string base_path = 2;
+}
+
+message BlockPutResult {
+  ResultCode result_code = 1;
+  optional BlockInfo block = 2;
+}
+
+message BlockCacheCommitParams {
+  repeated uint64 handles = 1;
+}
+
+message BlockCacheCommitResult {
+  repeated ResultCode result_codes = 1;
+}
+
+message BlockCacheAbortParams {
+  repeated uint64 handles = 1;
+}
+
+message BlockCacheAbortResult {
+  repeated ResultCode result_codes = 1;
+}
+
+message BlockCacheStatParams {
+  repeated bytes keys = 1;
+  uint64 timeout_us = 2;
+}
+
+message BlockMetadata {
+  uint64 last_accessed = 1;
+  uint64 accesses = 2;
+  uint64 size = 3;
+}
+
+message BlockStatResult {
+  ResultCode result_code = 1;
+  optional BlockMetadata metadata = 2;
+}
+
+message BlockCacheStatResult {
+  repeated BlockStatResult results = 1;
+}
+
+// -----------------------------------------------------------------------------
+// Framing: one request or response per length-prefixed frame.
+// -----------------------------------------------------------------------------
+
+// A human-readable error, answered when a request could not produce its
+// ordinary result type.
+message ErrorInfoResult {
+  string message = 1;
+}
+
+// The parameter set naming what a request asks for; exactly one is present.
+message RequestParams {
+  oneof params {
+    ClientConnectParams client_connect = 1;
+    HubVersionInfoParams hub_version_info = 2;
+
+    CacheAsideVersionInfoParams cache_aside_version_info = 3;
+    CacheAsideConnectParams cache_aside_connect = 4;
+    CacheAsideOpenForReadParams cache_aside_open_for_read = 5;
+    CacheAsideOpenForWriteParams cache_aside_open_for_write = 6;
+    CacheAsideCloseParams cache_aside_close = 7;
+    CacheAsideRemoveParams cache_aside_remove = 8;
+
+    BlockCacheConnectParams block_cache_connect = 9;
+    BlockCacheGetParams block_cache_get = 10;
+    BlockCachePutParams block_cache_put = 11;
+    BlockCacheCloseParams block_cache_close = 12;
+    BlockCacheCommitParams block_cache_commit = 13;
+    BlockCacheAbortParams block_cache_abort = 14;
+    BlockCacheStatParams block_cache_stat = 15;
+  }
+}
+
+// The result matching a request's parameter set, or `error_info` when the
+// request failed outside its ordinary result vocabulary.
+message ResponseResult {
+  oneof result {
+    ClientConnectResult client_connect = 1;
+    HubVersionInfoResult hub_version_info = 2;
+
+    CacheAsideVersionInfoResult cache_aside_version_info = 3;
+    CacheAsideConnectResult cache_aside_connect = 4;
+    CacheAsideOpenForReadResult cache_aside_open_for_read = 5;
+    CacheAsideOpenForWriteResult cache_aside_open_for_write = 6;
+    CacheAsideCloseResult cache_aside_close = 7;
+    CacheAsideRemoveResult cache_aside_remove = 8;
+
+    BlockCacheConnectResult block_cache_connect = 9;
+    BlockCacheGetResult block_cache_get = 10;
+    BlockCachePutResult block_cache_put = 11;
+    BlockCacheCloseResult block_cache_close = 12;
+    BlockCacheCommitResult block_cache_commit = 13;
+    BlockCacheAbortResult block_cache_abort = 14;
+    BlockCacheStatResult block_cache_stat = 15;
+
+    ErrorInfoResult error_info = 16;
+  }
+}
+
+// One request. `request_id` is the correlation token: unique among the
+// client's pending requests, echoed verbatim by the response.
+message Request {
+  uint64 request_id = 1;
+  RequestParams params = 2;
+}
+
+// One response, answering the request whose `request_id` it echoes.
+// Responses may arrive in any order.
+message Response {
+  uint64 request_id = 1;
+  ResponseResult result = 2;
+}

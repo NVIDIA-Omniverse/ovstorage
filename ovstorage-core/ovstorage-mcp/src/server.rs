@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use ovstorage::Stack;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, tool_handler};
 
 use crate::lease_store::LeaseStore;
@@ -37,8 +37,8 @@ impl OvstorageServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for OvstorageServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::default())
             .with_server_info(
                 Implementation::new("ovstorage-mcp", env!("CARGO_PKG_VERSION"))

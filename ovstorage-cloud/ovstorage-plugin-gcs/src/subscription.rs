@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -34,13 +34,22 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// event's ack nonblockingly; a `Full`/`Closed` `try_send` is a terminal
 /// upstream error (never a silently-dropped ack).
 const ACK_CHANNEL_CAPACITY: usize = 256;
-/// Maximum ackIds coalesced into one Pub/Sub `acknowledge` call. Bounded by the
-/// ack channel so a drain-until-empty collects at most one channel's worth.
+/// Maximum ackIds coalesced into one Pub/Sub `acknowledge` call. Receipts that
+/// arrive during a call remain queued locally for subsequent bounded batches.
 const ACK_BATCH_MAX: usize = ACK_CHANNEL_CAPACITY;
+
+/// Work serialized through the ack pump. Provider acknowledgements and
+/// producer-side terminal failures share this channel so the pump is the only
+/// task that publishes a terminal error and can keep draining queued acks while
+/// that publication is backpressured.
+enum PumpRequest {
+    Ack(DeliveryId),
+    Terminal(Error),
+}
 
 /// One item on the coalescer's [`AckingStream`]: an event plus the nonblocking
 /// [`AckHandle`] the dispatcher invokes after fanning it out, or a terminal
-/// error (an async provider ack failure surfaces here, drained after any
+/// error (provider pull and ack failures surface here, drained after any
 /// already-queued events).
 type UpstreamItem = Result<(BackendChangeEvent, AckHandle)>;
 
@@ -146,7 +155,7 @@ pub async fn watch_directory(
                 let clock = Arc::new(SystemClock);
                 let (event_tx, event_rx) =
                     mpsc::sync_channel::<UpstreamItem>(EVENT_CHANNEL_CAPACITY);
-                let (ack_tx, ack_rx) = tokio_mpsc::channel::<DeliveryId>(ACK_CHANNEL_CAPACITY);
+                let (ack_tx, ack_rx) = tokio_mpsc::channel::<PumpRequest>(ACK_CHANNEL_CAPACITY);
 
                 tokio::spawn(ack_pump(
                     client.clone(),
@@ -200,7 +209,7 @@ fn directory_watch_target(mut target: GcsObjectRef) -> GcsObjectRef {
 struct ProducerContext {
     client: PubsubClient,
     event_tx: mpsc::SyncSender<UpstreamItem>,
-    ack_tx: tokio_mpsc::Sender<DeliveryId>,
+    ack_tx: tokio_mpsc::Sender<PumpRequest>,
     cancel: CancellationToken,
     target: GcsObjectRef,
     address_root: Url,
@@ -297,7 +306,7 @@ async fn producer(ctx: ProducerContext) {
                         tokio::select! {
                             biased;
                             _ = cancel.cancelled() => return,
-                            res = ack_tx.send(delivery_id) => {
+                            res = ack_tx.send(PumpRequest::Ack(delivery_id)) => {
                                 if res.is_err() {
                                     // Pump receiver gone => teardown underway;
                                     // stop the producer.
@@ -341,7 +350,20 @@ async fn producer(ctx: ProducerContext) {
             }
             Err(err) if err.code() == ErrorCode::Cancelled => return,
             Err(err) => {
-                let _ = send_item(&event_tx, Err(err)).await;
+                // Only the ack pump owns `ack_rx`, so only it can publish a
+                // terminal while concurrently draining tail acknowledgements.
+                // Awaiting this enqueue applies backpressure instead of losing
+                // the real provider failure behind a full event channel.
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    res = ack_tx.send(PumpRequest::Terminal(err)) => {
+                        if res.is_err() {
+                            // Pump receiver gone => teardown underway.
+                            return;
+                        }
+                    }
+                }
                 return;
             }
         }
@@ -371,10 +393,10 @@ fn empty_pull_idle_interval(opts: &WatchDirectoryOptions) -> Duration {
 }
 
 /// Drain ack requests, decrement the owning delivery's refcount, and
-/// acknowledge the Pub/Sub message when its last event acks. A provider (ack)
-/// failure is published as a terminal `Err` on the event stream — ordered AFTER
-/// any events already queued ahead of it — so the coalescer tears the fan-out
-/// down and reopens; an ack is never silently lost.
+/// acknowledge the Pub/Sub message when its last event acks. Provider pull and
+/// ack failures are published as a terminal `Err` on the event stream — ordered
+/// AFTER any events already queued ahead of it — so the coalescer tears the
+/// fan-out down and reopens; an ack is never silently lost.
 ///
 /// Publishing that terminal `Err` and draining `ack_rx` run CONCURRENTLY (see
 /// [`publish_terminal_then_drain`]). The terminal send is a blocking send on the
@@ -383,81 +405,113 @@ fn empty_pull_idle_interval(opts: &WatchDirectoryOptions) -> Duration {
 /// `provider_ack.try_send` never sees a `Full`/`Closed` channel and masks the
 /// real terminal with a fresh generic `Internal`. Each discarded delivery
 /// redelivers via Pub/Sub at-least-once.
+/// If a producer terminal is found while collecting an ack batch or while its
+/// provider call is in flight, that call is dropped and the collected ack IDs
+/// are left for at-least-once redelivery for the same reason.
 async fn ack_pump(
     client: PubsubClient,
     pending: Arc<PubsubPending>,
-    mut ack_rx: tokio_mpsc::Receiver<DeliveryId>,
+    mut ack_rx: tokio_mpsc::Receiver<PumpRequest>,
     event_tx: mpsc::SyncSender<UpstreamItem>,
     cancel: CancellationToken,
     watch_config: SubscriptionConfig,
     clock: Arc<SystemClock>,
 ) {
-    while let Some(delivery_id) = ack_rx.recv().await {
+    let runtime = AckPumpRuntime {
+        pending,
+        watch_config,
+        clock,
+    };
+    let mut ready = VecDeque::new();
+    let mut ack_rx_closed = false;
+    loop {
+        while ready.is_empty() && !ack_rx_closed {
+            let Some(request) = ack_rx.recv().await else {
+                ack_rx_closed = true;
+                break;
+            };
+            if let Err(err) = collect_pump_request(&runtime.pending, request, &mut ready) {
+                publish_terminal_then_drain(&event_tx, err, &mut ack_rx, &cancel).await;
+                return;
+            }
+        }
+
+        if ready.is_empty() {
+            break;
+        }
+
         // Batch the network acks. The dispatcher's fan-out is in-memory (fast)
         // while each Pub/Sub `acknowledge` is a round-trip (slow), so a
         // per-message ack could never keep pace with sustained delivery — the
         // bounded ack channel would fill and a `provider_ack.try_send` would
         // return `Full`, terminating the stream on a routine backlog. After
-        // receiving one id, drain up to `ACK_BATCH_MAX - 1` more READY receipts
-        // nonblockingly and acknowledge them all in ONE call. This lifts ack
+        // receiving one id, drain the READY receipts currently queued and
+        // acknowledge up to `ACK_BATCH_MAX` of them in ONE call. This lifts ack
         // throughput to match batched delivery, so the channel drains and `Full`
         // is a pathological-only backstop. Only READY deliveries (refcount hit 0
         // in `decrement`) contribute an ackId; a still-`Pending` decrement adds
         // nothing but is still consumed from the channel.
-        let mut batch: Vec<AckEntry> = Vec::new();
-        match decrement_entry(&pending, delivery_id) {
-            Ok(Some(entry)) => batch.push(entry),
-            Ok(None) => {}
-            Err(id) => {
-                publish_terminal_then_drain(
-                    &event_tx,
-                    missing_delivery_error(id),
-                    &mut ack_rx,
-                    &cancel,
-                )
-                .await;
-                return;
-            }
-        }
-        while batch.len() < ACK_BATCH_MAX {
+        let mut terminal = None;
+        for _ in 0..ACK_CHANNEL_CAPACITY {
             match ack_rx.try_recv() {
-                Ok(id) => match decrement_entry(&pending, id) {
-                    Ok(Some(entry)) => batch.push(entry),
-                    Ok(None) => continue,
-                    Err(id) => {
-                        publish_terminal_then_drain(
-                            &event_tx,
-                            missing_delivery_error(id),
-                            &mut ack_rx,
-                            &cancel,
-                        )
-                        .await;
-                        return;
+                Ok(request) => {
+                    if let Err(err) = collect_pump_request(&runtime.pending, request, &mut ready) {
+                        // Once a terminal is dequeued it wins terminal ordering.
+                        // Do not start another provider round-trip: while that
+                        // call is in flight, queued event acknowledgements could
+                        // fill `ack_rx` and mask this error with a generic
+                        // `Internal`. Collected ack IDs are intentionally left
+                        // for at-least-once redelivery.
+                        terminal = Some(err);
+                        break;
                     }
-                },
-                // Channel drained or closed: acknowledge what we have. A closed
-                // channel is observed as `None` on the next outer `recv`.
-                Err(tokio_mpsc::error::TryRecvError::Empty)
-                | Err(tokio_mpsc::error::TryRecvError::Disconnected) => break,
+                }
+                Err(tokio_mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                    ack_rx_closed = true;
+                    break;
+                }
             }
         }
-        if batch.is_empty() {
-            continue;
+        if let Some(err) = terminal {
+            publish_terminal_then_drain(&event_tx, err, &mut ack_rx, &cancel).await;
+            return;
         }
-        match client
-            .ack_batch(&batch, &watch_config, clock.as_ref(), &cancel)
+
+        let batch: Vec<_> = ready.drain(..ready.len().min(ACK_BATCH_MAX)).collect();
+        match ack_batch_while_draining(&client, &batch, &runtime, &cancel, &mut ack_rx, &mut ready)
             .await
         {
-            AckOutcome::Success | AckOutcome::ExpectedStale => {}
-            AckOutcome::Transient(err) => {
+            AckBatchWait::Outcome(AckOutcome::Success | AckOutcome::ExpectedStale) => {}
+            AckBatchWait::Outcome(AckOutcome::Transient(err)) => {
                 warn!(plugin = "gcs", error = %err.message(), "Pub/Sub ack failed transiently");
             }
-            AckOutcome::Fatal(err) => {
+            AckBatchWait::Outcome(AckOutcome::Fatal(err)) | AckBatchWait::Terminal(err) => {
                 publish_terminal_then_drain(&event_tx, err, &mut ack_rx, &cancel).await;
                 return;
             }
+            AckBatchWait::Cancelled => return,
         }
     }
+}
+
+/// Apply one queued pump request. Ready acknowledgements are retained locally
+/// so receiving them concurrently with a provider round-trip never loses work;
+/// a producer terminal or a missing delivery preempts that round-trip.
+fn collect_pump_request(
+    pending: &PubsubPending,
+    request: PumpRequest,
+    ready: &mut VecDeque<AckEntry>,
+) -> Result<()> {
+    match request {
+        PumpRequest::Ack(id) => match decrement_entry(pending, id) {
+            Ok(Some(entry)) => ready.push_back(entry),
+            Ok(None) => {}
+            Err(id) => return Err(missing_delivery_error(id)),
+        },
+        PumpRequest::Terminal(err) => return Err(err),
+    }
+    Ok(())
 }
 
 /// One ready receipt awaiting a batched acknowledge: the ackId and its ack
@@ -508,7 +562,7 @@ fn missing_delivery_error(id: DeliveryId) -> Error {
 async fn publish_terminal_then_drain(
     tx: &mpsc::SyncSender<UpstreamItem>,
     err: Error,
-    ack_rx: &mut tokio_mpsc::Receiver<DeliveryId>,
+    ack_rx: &mut tokio_mpsc::Receiver<PumpRequest>,
     cancel: &CancellationToken,
 ) {
     let mut send = std::pin::pin!(send_item(tx, Err(err)));
@@ -534,7 +588,7 @@ async fn publish_terminal_then_drain(
 /// event stream. Exits when the dispatcher cancels the upstream (teardown) or
 /// the ack channel closes.
 async fn drain_acks_until_cancel(
-    ack_rx: &mut tokio_mpsc::Receiver<DeliveryId>,
+    ack_rx: &mut tokio_mpsc::Receiver<PumpRequest>,
     cancel: &CancellationToken,
 ) {
     loop {
@@ -552,14 +606,16 @@ async fn drain_acks_until_cancel(
 
 /// A nonblocking [`AckHandle`] that dispatches this event's acknowledge into the
 /// bounded ack pump. A `Full`/`Closed` `try_send` is a terminal upstream error.
-fn provider_ack(ack_tx: tokio_mpsc::Sender<DeliveryId>, delivery_id: DeliveryId) -> AckHandle {
+fn provider_ack(ack_tx: tokio_mpsc::Sender<PumpRequest>, delivery_id: DeliveryId) -> AckHandle {
     Box::new(move || {
-        ack_tx.try_send(delivery_id).map_err(|err| {
-            Error::new(
-                ErrorCode::Internal,
-                format!("GCS Pub/Sub ack pump unavailable: {err}"),
-            )
-        })
+        ack_tx
+            .try_send(PumpRequest::Ack(delivery_id))
+            .map_err(|err| {
+                Error::new(
+                    ErrorCode::Internal,
+                    format!("GCS Pub/Sub ack pump unavailable: {err}"),
+                )
+            })
     })
 }
 
@@ -567,6 +623,56 @@ fn provider_ack(ack_tx: tokio_mpsc::Sender<DeliveryId>, delivery_id: DeliveryId)
 /// synthesized `Lapsed`).
 fn noop_ack() -> AckHandle {
     Box::new(|| Ok(()))
+}
+
+enum AckBatchWait {
+    Outcome(AckOutcome),
+    Terminal(Error),
+    Cancelled,
+}
+
+struct AckPumpRuntime {
+    pending: Arc<PubsubPending>,
+    watch_config: SubscriptionConfig,
+    clock: Arc<SystemClock>,
+}
+
+/// Await one provider acknowledge while keeping the bounded pump channel
+/// writable. Acknowledgements received during the call are retained in order
+/// for the next pump iteration; a producer terminal drops the provider future
+/// and takes over terminal publication immediately.
+async fn ack_batch_while_draining(
+    client: &PubsubClient,
+    batch: &[AckEntry],
+    runtime: &AckPumpRuntime,
+    cancel: &CancellationToken,
+    ack_rx: &mut tokio_mpsc::Receiver<PumpRequest>,
+    ready: &mut VecDeque<AckEntry>,
+) -> AckBatchWait {
+    let mut outcome = std::pin::pin!(client.ack_batch(
+        batch,
+        &runtime.watch_config,
+        runtime.clock.as_ref(),
+        cancel
+    ));
+    let mut ack_rx_open = true;
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return AckBatchWait::Cancelled,
+            result = &mut outcome => return AckBatchWait::Outcome(result),
+            request = ack_rx.recv(), if ack_rx_open => {
+                match request {
+                    Some(request) => {
+                        if let Err(err) = collect_pump_request(&runtime.pending, request, ready) {
+                            return AckBatchWait::Terminal(err);
+                        }
+                    }
+                    None => ack_rx_open = false,
+                }
+            }
+        }
+    }
 }
 
 /// Send an item into the blocking event channel from an async task without
@@ -1317,6 +1423,8 @@ mod tests {
     use super::*;
     use crate::GcsConnectionConfig;
     use ovstorage_plugin::ConfigValue;
+
+    mod producer_terminal_tests;
 
     fn target(prefix: &str) -> GcsObjectRef {
         GcsObjectRef {
@@ -2149,12 +2257,12 @@ mod tests {
 
     #[tokio::test]
     async fn provider_ack_dispatches_delivery_then_reports_full_and_closed() {
-        let (tx, mut rx) = tokio_mpsc::channel::<DeliveryId>(1);
+        let (tx, mut rx) = tokio_mpsc::channel::<PumpRequest>(1);
         let id = a_delivery_id();
 
         // A successful dispatch hands the delivery id to the pump, in order.
         provider_ack(tx.clone(), id)().expect("first ack dispatches");
-        assert_eq!(rx.recv().await, Some(id));
+        assert!(matches!(rx.recv().await, Some(PumpRequest::Ack(received)) if received == id));
 
         // Fill the capacity-1 channel; the next try_send returns `Full`, which
         // the handle reports as a terminal upstream error (never a dropped ack).
@@ -2188,10 +2296,12 @@ mod tests {
 
         // Saturate the ack channel: a non-draining pump would let the
         // dispatcher's next `try_send` return `Full` and mask the real terminal.
-        let (ack_tx, mut ack_rx) = tokio_mpsc::channel::<DeliveryId>(ACK_CHANNEL_CAPACITY);
+        let (ack_tx, mut ack_rx) = tokio_mpsc::channel::<PumpRequest>(ACK_CHANNEL_CAPACITY);
         let id = a_delivery_id();
         for _ in 0..ACK_CHANNEL_CAPACITY {
-            ack_tx.try_send(id).expect("saturate the ack channel");
+            ack_tx
+                .try_send(PumpRequest::Ack(id))
+                .expect("saturate the ack channel");
         }
 
         let cancel = CancellationToken::new();
@@ -2213,7 +2323,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async move {
             for _ in 0..(ACK_CHANNEL_CAPACITY * 2) {
                 ack_tx
-                    .send(id)
+                    .send(PumpRequest::Ack(id))
                     .await
                     .expect("a draining pump keeps the ack channel writable");
             }
@@ -2245,6 +2355,176 @@ mod tests {
         );
     }
 
+    // A producer terminal can sit immediately behind an ack already collected
+    // into a provider batch. No provider call may begin after that terminal is
+    // observed: the pump must start draining before a queued event's ack can
+    // fill the bounded channel and mask the provider error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_behind_collected_ack_skips_provider_call_and_drains() {
+        let mock = MockPubsub::new(Vec::new(), 200, "{}");
+        let client = mock.client();
+        let pending = Arc::new(PubsubPending::new());
+        let id = pending.insert(
+            PubsubHandle {
+                ack_id: "ack-before-terminal".into(),
+            },
+            1,
+            Instant::now() + Duration::from_secs(30),
+        );
+
+        let (event_tx, event_rx) = mpsc::sync_channel::<UpstreamItem>(1);
+        event_tx
+            .send(Ok((lapsed_event(), noop_ack())))
+            .expect("prefill queued event tail");
+        let (ack_tx, ack_rx) = tokio_mpsc::channel::<PumpRequest>(ACK_CHANNEL_CAPACITY);
+        ack_tx
+            .try_send(PumpRequest::Ack(id))
+            .expect("enqueue collected ack");
+        ack_tx
+            .try_send(PumpRequest::Terminal(Error::new(
+                ErrorCode::PermissionDenied,
+                "pull failed after collected ack",
+            )))
+            .expect("enqueue terminal behind ack");
+        let ack_probe = ack_tx.clone();
+        let cancel = CancellationToken::new();
+        let pump = tokio::spawn(ack_pump(
+            client,
+            pending,
+            ack_rx,
+            event_tx,
+            cancel.clone(),
+            SubscriptionConfig {
+                ack_deadline_seconds: 30,
+                exactly_once_delivery: false,
+            },
+            Arc::new(SystemClock),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ack_probe.capacity() != ACK_CHANNEL_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..(ACK_CHANNEL_CAPACITY * 2) {
+                ack_tx
+                    .send(PumpRequest::Ack(id))
+                    .await
+                    .expect("terminal path keeps draining acknowledgements");
+            }
+        })
+        .await
+        .expect("terminal path waited for a provider ack instead of draining");
+
+        assert_eq!(
+            mock.ack_hits(),
+            0,
+            "a dequeued terminal must preempt the final provider acknowledge"
+        );
+        assert!(matches!(
+            event_rx.recv().expect("queued tail event"),
+            Ok((BackendChangeEvent::Lapsed { .. }, _))
+        ));
+        let terminal = event_rx.recv().expect("provider terminal");
+        let err = match terminal {
+            Err(err) => err,
+            Ok(_) => panic!("terminal must remain the pull error"),
+        };
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        assert!(err.message().contains("pull failed after collected ack"));
+
+        cancel.cancel();
+        drop(ack_tx);
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("ack pump did not stop after terminal teardown")
+            .expect("ack pump task panicked");
+    }
+
+    // A producer terminal can also arrive immediately AFTER the pump observes
+    // an empty ack channel and starts the provider call. The pump must keep
+    // receiving while that call is in flight, drop the slow call when it sees
+    // the terminal, and drain the queued event tail's acknowledgements.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_during_provider_ack_preempts_the_call_and_drains() {
+        let mock = MockPubsub::new(Vec::new(), 200, "{}");
+        mock.hang_from_ack(1);
+        let client = mock.client();
+        let pending = Arc::new(PubsubPending::new());
+        let id = pending.insert(
+            PubsubHandle {
+                ack_id: "ack-in-flight".into(),
+            },
+            1,
+            Instant::now() + Duration::from_secs(30),
+        );
+
+        let (event_tx, event_rx) = mpsc::sync_channel::<UpstreamItem>(1);
+        event_tx
+            .send(Ok((lapsed_event(), noop_ack())))
+            .expect("prefill queued event tail");
+        let (ack_tx, ack_rx) = tokio_mpsc::channel::<PumpRequest>(ACK_CHANNEL_CAPACITY);
+        ack_tx
+            .try_send(PumpRequest::Ack(id))
+            .expect("enqueue the provider acknowledgement");
+        let cancel = CancellationToken::new();
+        let pump = tokio::spawn(ack_pump(
+            client,
+            pending,
+            ack_rx,
+            event_tx,
+            cancel.clone(),
+            SubscriptionConfig {
+                ack_deadline_seconds: 30,
+                exactly_once_delivery: false,
+            },
+            Arc::new(SystemClock),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while mock.ack_hits() == 0 {
+                tokio::task::yield_now().await;
+            }
+            ack_tx
+                .send(PumpRequest::Terminal(Error::new(
+                    ErrorCode::PermissionDenied,
+                    "pull failed during provider ack",
+                )))
+                .await
+                .expect("enqueue terminal during provider call");
+
+            // The terminal is ordered ahead of this tail. A pump parked in the
+            // provider call fills at capacity; a concurrently receiving pump
+            // reaches the terminal and keeps every tail enqueue writable.
+            for _ in 0..(ACK_CHANNEL_CAPACITY * 2) {
+                ack_tx
+                    .send(PumpRequest::Ack(id))
+                    .await
+                    .expect("terminal path keeps draining acknowledgements");
+            }
+        })
+        .await
+        .expect("terminal waited behind the in-flight provider acknowledge");
+
+        assert!(matches!(
+            event_rx.recv().expect("queued tail event"),
+            Ok((BackendChangeEvent::Lapsed { .. }, _))
+        ));
+        let terminal = event_rx.recv().expect("provider terminal");
+        let err = match terminal {
+            Err(err) => err,
+            Ok(_) => panic!("terminal must remain the pull error"),
+        };
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        assert!(err.message().contains("pull failed during provider ack"));
+
+        cancel.cancel();
+        drop(ack_tx);
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("ack pump did not stop after terminal teardown")
+            .expect("ack pump task panicked");
+    }
+
     // === Pub/Sub HTTP mock: drives the real `producer`/`ack_pump` against
     // canned `:pull`/`:acknowledge` responses so the async ack path — and its
     // classification — is exercised end to end through the pump, not just at
@@ -2260,6 +2540,9 @@ mod tests {
         // Successive `:pull` response bodies; once drained, `:pull` returns an
         // empty batch so the producer idles on its cadence.
         pull_bodies: std::sync::Mutex<std::collections::VecDeque<String>>,
+        // Optional status for each corresponding pull body. Constructors used
+        // by ack tests leave this empty, which preserves the default HTTP 200.
+        pull_statuses: std::sync::Mutex<std::collections::VecDeque<u16>>,
         // Successive `:acknowledge` responses (status, body). Popped per call; once
         // drained, `ack_fallback` answers every subsequent call. This lets a test
         // drive the ambiguous-400 isolation, whose fresh-subset retry is a SECOND
@@ -2295,6 +2578,7 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let shared = Arc::new(MockShared {
                 pull_bodies: std::sync::Mutex::new(pull_bodies.into()),
+                pull_statuses: std::sync::Mutex::new(std::collections::VecDeque::new()),
                 ack_responses: std::sync::Mutex::new(
                     ack_responses
                         .into_iter()
@@ -2317,6 +2601,18 @@ mod tests {
                 shared,
                 handle: Some(handle),
             }
+        }
+
+        /// Build a mock whose pulls can fail as well as return message batches.
+        fn with_pull_responses(
+            pull_responses: Vec<(u16, String)>,
+            ack_status: u16,
+            ack_body: &str,
+        ) -> Self {
+            let (statuses, bodies): (Vec<_>, Vec<_>) = pull_responses.into_iter().unzip();
+            let mock = Self::new(bodies, ack_status, ack_body);
+            *mock.shared.pull_statuses.lock().unwrap() = statuses.into();
+            mock
         }
 
         fn ack_hits(&self) -> usize {
@@ -2419,7 +2715,13 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| "{}".to_string());
-            (200u16, body)
+            let status = shared
+                .pull_statuses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(200);
+            (status, body)
         } else {
             (404u16, "{}".to_string())
         };
@@ -2514,7 +2816,7 @@ mod tests {
         let pending = Arc::new(PubsubPending::new());
         let clock = Arc::new(SystemClock);
         let (event_tx, event_rx) = mpsc::sync_channel::<UpstreamItem>(EVENT_CHANNEL_CAPACITY);
-        let (ack_tx, ack_rx) = tokio_mpsc::channel::<DeliveryId>(ACK_CHANNEL_CAPACITY);
+        let (ack_tx, ack_rx) = tokio_mpsc::channel::<PumpRequest>(ACK_CHANNEL_CAPACITY);
         let cancel = CancellationToken::new();
         // Exactly-once, deadline in the FUTURE → `now < deadline`, so this is a
         // genuine ack-ID rejection, NOT an expected post-deadline stale ack.
@@ -2530,7 +2832,9 @@ mod tests {
             1,
             deadline,
         );
-        ack_tx.try_send(id).expect("enqueue the delivery");
+        ack_tx
+            .try_send(PumpRequest::Ack(id))
+            .expect("enqueue the delivery");
 
         let pump = tokio::spawn(ack_pump(
             client,
@@ -2784,7 +3088,7 @@ mod tests {
         let pending = Arc::new(PubsubPending::new());
         let clock = Arc::new(SystemClock);
         let (event_tx, event_rx) = mpsc::sync_channel::<UpstreamItem>(EVENT_CHANNEL_CAPACITY);
-        let (ack_tx, ack_rx) = tokio_mpsc::channel::<DeliveryId>(ACK_CHANNEL_CAPACITY);
+        let (ack_tx, ack_rx) = tokio_mpsc::channel::<PumpRequest>(ACK_CHANNEL_CAPACITY);
         let cancel = CancellationToken::new();
         let config = exactly_once_config();
 
@@ -2805,8 +3109,12 @@ mod tests {
             1,
             now + Duration::from_secs(30),
         );
-        ack_tx.try_send(stale).expect("enqueue stale");
-        ack_tx.try_send(fresh).expect("enqueue fresh");
+        ack_tx
+            .try_send(PumpRequest::Ack(stale))
+            .expect("enqueue stale");
+        ack_tx
+            .try_send(PumpRequest::Ack(fresh))
+            .expect("enqueue fresh");
 
         let pump = tokio::spawn(ack_pump(
             client,
@@ -2974,7 +3282,7 @@ mod tests {
         let pending = Arc::new(PubsubPending::new());
         let clock = Arc::new(SystemClock);
         let (event_tx, _event_rx) = mpsc::sync_channel::<UpstreamItem>(EVENT_CHANNEL_CAPACITY);
-        let (ack_tx, ack_rx) = tokio_mpsc::channel::<DeliveryId>(ACK_CHANNEL_CAPACITY);
+        let (ack_tx, ack_rx) = tokio_mpsc::channel::<PumpRequest>(ACK_CHANNEL_CAPACITY);
         let cancel = CancellationToken::new();
         let config = SubscriptionConfig {
             ack_deadline_seconds: 30,
@@ -2992,7 +3300,9 @@ mod tests {
                 1,
                 Instant::now() + Duration::from_secs(30),
             );
-            ack_tx.try_send(id).expect("enqueue ready delivery");
+            ack_tx
+                .try_send(PumpRequest::Ack(id))
+                .expect("enqueue ready delivery");
         }
 
         let pump = tokio::spawn(ack_pump(
@@ -3075,7 +3385,7 @@ mod tests {
         event_tx
             .send(Ok((lapsed_event(), noop_ack())))
             .expect("prefill the queued tail");
-        let (ack_tx, ack_rx) = tokio_mpsc::channel::<DeliveryId>(ACK_CHANNEL_CAPACITY);
+        let (ack_tx, ack_rx) = tokio_mpsc::channel::<PumpRequest>(ACK_CHANNEL_CAPACITY);
         let cancel = CancellationToken::new();
         let config = SubscriptionConfig {
             ack_deadline_seconds: 30,
@@ -3135,7 +3445,7 @@ mod tests {
             let flood_id = pending_zero_flood_id();
             for _ in 0..(ACK_CHANNEL_CAPACITY * 2) {
                 ack_tx
-                    .send(flood_id)
+                    .send(PumpRequest::Ack(flood_id))
                     .await
                     .expect("a draining pump keeps the ack channel writable");
             }
@@ -3197,7 +3507,7 @@ mod tests {
         let pending = Arc::new(PubsubPending::new());
         let clock = Arc::new(SystemClock);
         let (event_tx, _event_rx) = mpsc::sync_channel::<UpstreamItem>(EVENT_CHANNEL_CAPACITY);
-        let (ack_tx, mut ack_rx) = tokio_mpsc::channel::<DeliveryId>(ACK_CHANNEL_CAPACITY);
+        let (ack_tx, mut ack_rx) = tokio_mpsc::channel::<PumpRequest>(ACK_CHANNEL_CAPACITY);
         let cancel = CancellationToken::new();
         let config = SubscriptionConfig {
             ack_deadline_seconds: 30,
@@ -3234,7 +3544,7 @@ mod tests {
             .await
             .expect("zero-event ack was not routed to the pump (inline-ack regression)")
             .expect("ack channel closed unexpectedly");
-        let _ = enqueued;
+        assert!(matches!(enqueued, PumpRequest::Ack(_)));
 
         // And it did NOT ack inline on the producer thread: `:acknowledge`
         // belongs to the pump, which is not running here.
@@ -3303,8 +3613,10 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::sync_channel::<UpstreamItem>(EVENT_CHANNEL_CAPACITY);
         // Capacity-1 ack channel, PREFILLED to capacity (no free slot): any
         // enqueue must wait. No `ack_pump` drains it.
-        let (ack_tx, mut ack_rx) = tokio_mpsc::channel::<DeliveryId>(1);
-        ack_tx.try_send(sentinel).expect("prefill the single slot");
+        let (ack_tx, mut ack_rx) = tokio_mpsc::channel::<PumpRequest>(1);
+        ack_tx
+            .try_send(PumpRequest::Ack(sentinel))
+            .expect("prefill the single slot");
         let cancel = CancellationToken::new();
 
         tokio::spawn(producer(ProducerContext {
@@ -3356,9 +3668,8 @@ mod tests {
 
         // Free exactly one slot by draining the sentinel; it must still be there
         // (the parked producer did not displace it).
-        assert_eq!(
-            ack_rx.recv().await,
-            Some(sentinel),
+        assert!(
+            matches!(ack_rx.recv().await, Some(PumpRequest::Ack(id)) if id == sentinel),
             "the prefilled slot must still hold the sentinel (producer parked, did not drop)"
         );
 
@@ -3371,6 +3682,9 @@ mod tests {
                 "backpressured zero-event ack never arrived after the slot freed (try_send drop regression)",
             )
             .expect("ack channel closed unexpectedly");
+        let PumpRequest::Ack(synthetic) = synthetic else {
+            panic!("zero-event path must enqueue an ack request");
+        };
         assert_ne!(
             synthetic, sentinel,
             "the synthetic zero-event delivery must arrive, distinct from the sentinel"

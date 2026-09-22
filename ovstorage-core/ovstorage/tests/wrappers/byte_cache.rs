@@ -12,11 +12,11 @@ use futures::StreamExt as _;
 use ovstorage::layers::BYTE_CACHE_KIND;
 use ovstorage::{
     Body, ByteRange, CancellationToken, ConfigValue, CopyOptions, CopyRequest,
-    DeleteDirectoryOptions, DeleteDirectoryRequest, DeleteOptions, DeleteRequest, ErrorCode, Layer,
-    LayerConfig, LayerHandle, LayerKindDescriptor, LocalDelegate, ObjectInfo, ReadRequest,
-    ReadResult, ReadStream, RenameOptions, RenameRequest, Request, Result, Stack, StatRequest,
-    UpdateMetadataOptions, UpdateMetadataRequest, Url, WriteOptions, WriteRequest, WriteResult,
-    WriteStep,
+    DeleteDirectoryOptions, DeleteDirectoryRequest, DeleteOptions, DeleteRequest, ErrorCode,
+    EtagStrength, Layer, LayerConfig, LayerHandle, LayerKindDescriptor, LocalDelegate, ObjectInfo,
+    ReadRequest, ReadResult, ReadStream, RenameOptions, RenameRequest, Request, Result, Stack,
+    StatRequest, UpdateMetadataOptions, UpdateMetadataRequest, Url, WriteOptions, WriteRequest,
+    WriteResult, WriteStep,
 };
 use ovstorage_plugin_cache::ByteCacheWrapperFactory;
 
@@ -292,9 +292,234 @@ async fn byte_cache_hit_avoids_second_backend_read() {
     let first = stack.read(read_request("file:///obj"), None).await.unwrap();
     assert_eq!(collect(first).await, b"content");
     let second = stack.read(read_request("file:///obj"), None).await.unwrap();
+    let ReadResult::LocalDelegate(local) = &second else {
+        panic!("a non-buffering cache hit must return a local delegate");
+    };
+    assert_eq!(local.info.etag_strength, EtagStrength::Strong);
     assert_eq!(collect(second).await, b"content");
     // Second read served from the byte cache — backend read only once.
     assert_eq!(backend.reads.load(Ordering::SeqCst), 1);
+}
+
+/// Backend whose nonempty etag has a caller-selected trust declaration.
+/// Every operation returns the same declaration so one probe covers all cache
+/// ingress paths without conflating a strong stat with an untrusted result.
+struct ValidatorStrengthProbe {
+    strength: std::sync::Mutex<EtagStrength>,
+    content: std::sync::Mutex<Vec<u8>>,
+    source: std::path::PathBuf,
+    reads: AtomicUsize,
+    materializes: AtomicUsize,
+    stat_error: std::sync::Mutex<Option<ErrorCode>>,
+}
+
+impl ValidatorStrengthProbe {
+    fn new(strength: EtagStrength, source: std::path::PathBuf) -> Arc<Self> {
+        std::fs::write(&source, b"backend-body").unwrap();
+        Arc::new(Self {
+            strength: std::sync::Mutex::new(strength),
+            content: std::sync::Mutex::new(b"backend-body".to_vec()),
+            source,
+            reads: AtomicUsize::new(0),
+            materializes: AtomicUsize::new(0),
+            stat_error: std::sync::Mutex::new(None),
+        })
+    }
+
+    fn set_stat_error(&self, code: Option<ErrorCode>) {
+        *self.stat_error.lock().unwrap() = code;
+    }
+
+    fn set_strength(&self, strength: EtagStrength) {
+        *self.strength.lock().unwrap() = strength;
+    }
+
+    fn set_content(&self, content: &[u8]) {
+        *self.content.lock().unwrap() = content.to_vec();
+        std::fs::write(&self.source, content).unwrap();
+    }
+
+    fn info(&self, address: Url) -> ObjectInfo {
+        ObjectInfo {
+            etag_strength: *self.strength.lock().unwrap(),
+            etag: Some("validator".to_string()),
+            ..object_info(address, self.content.lock().unwrap().len() as u64)
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Layer for ValidatorStrengthProbe {
+    fn name(&self) -> &str {
+        "validator-strength-probe"
+    }
+
+    fn descriptor(&self) -> LayerKindDescriptor {
+        backend_descriptor(PROBE_KIND)
+    }
+
+    async fn stat(
+        &self,
+        request: Request<StatRequest>,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<ObjectInfo> {
+        if let Some(code) = *self.stat_error.lock().unwrap() {
+            return Err(ovstorage::Error::new(code, "scripted stat failure"));
+        }
+        Ok(self.info(request.input.address))
+    }
+
+    async fn read(
+        &self,
+        request: Request<ReadRequest>,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<ReadResult> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        let bytes = self.content.lock().unwrap().clone();
+        Ok(ReadResult::Bytes {
+            bytes,
+            info: self.info(request.input.address),
+        })
+    }
+
+    async fn materialize(
+        &self,
+        request: Request<ReadRequest>,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<LocalDelegate> {
+        self.materializes.fetch_add(1, Ordering::SeqCst);
+        Ok(LocalDelegate {
+            path: self.source.clone(),
+            info: self.info(request.input.address),
+            guard: None,
+        })
+    }
+
+    async fn write(
+        &self,
+        request: Request<WriteRequest>,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<WriteResult> {
+        let address = request.input.address;
+        let Body::Bytes(bytes) = request.input.body else {
+            panic!("the validator-strength probe expects a buffered write");
+        };
+        std::fs::write(&self.source, &bytes).unwrap();
+        *self.content.lock().unwrap() = bytes;
+        Ok(WriteResult {
+            info: self.info(address),
+        })
+    }
+}
+
+async fn assert_untrusted_strength_bypasses_cache(strength: EtagStrength) {
+    let tmp = tempfile::tempdir().unwrap();
+    let address = "mem:///obj";
+
+    let read_root = tmp.path().join("read-cache");
+    let read_backend =
+        ValidatorStrengthProbe::new(EtagStrength::Strong, tmp.path().join("read-source"));
+    let read_stack =
+        byte_cache_stack_with_config(read_backend.clone(), byte_cache_config(&read_root)).await;
+    read_stack.read(read_request(address), None).await.unwrap();
+    read_backend.set_content(b"changed-read-body");
+    read_backend.set_strength(strength);
+    for _ in 0..2 {
+        let result = read_stack.read(read_request(address), None).await.unwrap();
+        assert_eq!(collect(result).await, b"changed-read-body");
+    }
+    assert_eq!(
+        read_backend.reads.load(Ordering::SeqCst),
+        3,
+        "an untrusted read result must neither hit the strong row nor refill"
+    );
+    assert_eq!(content_row_count(&read_root), 0);
+    assert_eq!(availability_validator(&read_root), None);
+    read_backend.set_stat_error(Some(ErrorCode::Transient));
+    read_stack.read(read_request(address), None).await.unwrap();
+    assert_eq!(
+        read_backend.reads.load(Ordering::SeqCst),
+        4,
+        "an untrusted read must clear the strong availability fallback"
+    );
+
+    let materialize_root = tmp.path().join("materialize-cache");
+    let materialize_backend =
+        ValidatorStrengthProbe::new(EtagStrength::Strong, tmp.path().join("materialize-source"));
+    let materialize_stack = byte_cache_stack_with_config(
+        materialize_backend.clone(),
+        byte_cache_config(&materialize_root),
+    )
+    .await;
+    materialize_stack
+        .materialize(read_request(address), None)
+        .await
+        .unwrap();
+    materialize_backend.set_content(b"changed-materialize-body");
+    materialize_backend.set_strength(strength);
+    for _ in 0..2 {
+        let local = materialize_stack
+            .materialize(read_request(address), None)
+            .await
+            .unwrap();
+        assert_eq!(local.path, materialize_backend.source);
+    }
+    assert_eq!(
+        materialize_backend.materializes.load(Ordering::SeqCst),
+        3,
+        "an untrusted materialize result must neither hit the strong row nor refill"
+    );
+    assert_eq!(content_row_count(&materialize_root), 0);
+    assert_eq!(availability_validator(&materialize_root), None);
+    materialize_backend.set_stat_error(Some(ErrorCode::Transient));
+    materialize_stack
+        .materialize(read_request(address), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        materialize_backend.materializes.load(Ordering::SeqCst),
+        4,
+        "an untrusted materialize must clear the strong availability fallback"
+    );
+
+    let write_root = tmp.path().join("write-cache");
+    let write_backend =
+        ValidatorStrengthProbe::new(EtagStrength::Strong, tmp.path().join("write-source"));
+    let write_stack =
+        byte_cache_stack_with_config(write_backend.clone(), byte_cache_config(&write_root)).await;
+    write_stack.read(read_request(address), None).await.unwrap();
+    write_backend.set_strength(strength);
+    write_stack
+        .write(
+            Request::new(WriteRequest {
+                address: Url::parse(address).unwrap(),
+                body: Body::Bytes(b"written-body".to_vec()),
+                options: WriteOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    write_backend.set_stat_error(Some(ErrorCode::Transient));
+    let result = write_stack.read(read_request(address), None).await.unwrap();
+    assert_eq!(collect(result).await, b"written-body");
+    assert_eq!(
+        write_backend.reads.load(Ordering::SeqCst),
+        2,
+        "an untrusted write result must neither fill nor preserve the strong fallback"
+    );
+    assert_eq!(content_row_count(&write_root), 0);
+    assert_eq!(availability_validator(&write_root), None);
+}
+
+#[tokio::test]
+async fn weak_validators_bypass_read_materialize_and_write_through() {
+    assert_untrusted_strength_bypasses_cache(EtagStrength::Weak).await;
+}
+
+#[tokio::test]
+async fn unspecified_validators_bypass_read_materialize_and_write_through() {
+    assert_untrusted_strength_bypasses_cache(EtagStrength::Unspecified).await;
 }
 
 /// Origin-shaped probe whose authenticated representation varies by principal
@@ -341,6 +566,7 @@ impl PrincipalOriginProbe {
     fn info(address: Url, size: usize) -> ObjectInfo {
         let mut info = object_info(address, size as u64);
         info.etag = Some("shared-etag".into());
+        info.etag_strength = EtagStrength::Strong;
         info
     }
 }
@@ -352,7 +578,7 @@ impl Layer for PrincipalOriginProbe {
     }
 
     fn descriptor(&self) -> LayerKindDescriptor {
-        backend_descriptor(PROBE_KIND)
+        wrapper_descriptor(PROBE_KIND)
     }
 
     async fn stat(
@@ -1013,6 +1239,7 @@ impl Layer for UnversionedProbe {
     ) -> Result<ovstorage::ObjectInfo> {
         let mut info = self.inner.stat(request, cancel).await?;
         info.etag = None;
+        info.etag_strength = EtagStrength::Unspecified;
         Ok(info)
     }
 
@@ -1024,6 +1251,7 @@ impl Layer for UnversionedProbe {
         match self.inner.read(request, cancel).await? {
             ReadResult::Bytes { bytes, mut info } => {
                 info.etag = None;
+                info.etag_strength = EtagStrength::Unspecified;
                 Ok(ReadResult::Bytes { bytes, info })
             }
             other => Ok(other),
@@ -1434,6 +1662,7 @@ impl ResizingProbe {
     fn info(&self, address: Url) -> ovstorage::ObjectInfo {
         let content = self.content();
         ovstorage::ObjectInfo {
+            etag_strength: EtagStrength::Strong,
             etag: Some(self.etag()),
             ..object_info(address, content.len() as u64)
         }
@@ -2109,6 +2338,7 @@ impl StreamWriteProbe {
 
     fn info(&self, address: Url, size: u64) -> ovstorage::ObjectInfo {
         ovstorage::ObjectInfo {
+            etag_strength: EtagStrength::Strong,
             etag: Some(self.etag()),
             ..object_info(address, size)
         }
@@ -2364,6 +2594,7 @@ impl SwitchableProbe {
     fn info(&self, address: Url) -> ObjectInfo {
         let state = self.state.lock().unwrap();
         ObjectInfo {
+            etag_strength: EtagStrength::Strong,
             etag: Some(state.etag.clone()),
             ..object_info(address, state.content.len() as u64)
         }
@@ -2559,6 +2790,7 @@ impl BarrierProbe {
     }
     fn info(&self, address: Url) -> ObjectInfo {
         ObjectInfo {
+            etag_strength: EtagStrength::Strong,
             etag: Some(self.etag.clone()),
             ..object_info(address, self.body.len() as u64)
         }
@@ -2571,7 +2803,7 @@ impl Layer for BarrierProbe {
         "backend"
     }
     fn descriptor(&self) -> LayerKindDescriptor {
-        backend_descriptor(PROBE_KIND)
+        wrapper_descriptor(PROBE_KIND)
     }
     async fn stat(
         &self,
@@ -2899,6 +3131,7 @@ impl WriteRefusingBackend {
 
     fn info(&self, address: Url) -> ObjectInfo {
         ObjectInfo {
+            etag_strength: EtagStrength::Strong,
             etag: Some(self.etag()),
             ..object_info(address, self.body.len() as u64)
         }
@@ -3047,7 +3280,7 @@ fn availability_blob_path(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let conn = rusqlite::Connection::open(dir.join("state").join("index.sqlite")).unwrap();
     let cas_key: Option<String> = conn
         .query_row(
-            "SELECT cas_key FROM entries WHERE resolved_target LIKE '%' || char(2) || '%'",
+            "SELECT cas_key FROM entries WHERE resolved_target LIKE '%' || char(4) || '%'",
             [],
             |row| row.get(0),
         )
@@ -3170,7 +3403,7 @@ fn availability_validator(dir: &std::path::Path) -> Option<String> {
     let conn = rusqlite::Connection::open(dir.join("state").join("index.sqlite")).ok()?;
     let cas_key: String = conn
         .query_row(
-            "SELECT cas_key FROM entries WHERE resolved_target LIKE '%' || char(2) || '%'",
+            "SELECT cas_key FROM entries WHERE resolved_target LIKE '%' || char(4) || '%'",
             [],
             |row| row.get(0),
         )
@@ -3217,6 +3450,7 @@ impl ObservingBackend {
 
     fn info(&self, address: Url) -> ObjectInfo {
         ObjectInfo {
+            etag_strength: EtagStrength::Strong,
             etag: Some(self.etag()),
             ..object_info(address, self.body.len() as u64)
         }
@@ -3388,6 +3622,7 @@ impl SizedProbe {
 
     fn info(&self, address: Url) -> ObjectInfo {
         ObjectInfo {
+            etag_strength: EtagStrength::Strong,
             etag: Some(self.etag.clone()),
             ..object_info(address, self.body.len() as u64)
         }
@@ -3474,7 +3709,7 @@ fn content_row_count(dir: &std::path::Path) -> i64 {
         .unwrap();
     let availability: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM entries WHERE resolved_target LIKE '%' || char(2) || '%'",
+            "SELECT COUNT(*) FROM entries WHERE resolved_target LIKE '%' || char(4) || '%'",
             [],
             |row| row.get(0),
         )
@@ -3896,6 +4131,7 @@ impl EmptyEtagProbe {
     fn info(&self, address: Url) -> ObjectInfo {
         let size = self.content.lock().unwrap().len() as u64;
         ObjectInfo {
+            etag_strength: EtagStrength::Strong,
             etag: Some(self.etag.lock().unwrap().clone()),
             // Reported as unknown so a streamed write's commit is gated by the
             // validator rule under test and not by a size mismatch against a
@@ -3913,7 +4149,7 @@ impl Layer for EmptyEtagProbe {
     }
 
     fn descriptor(&self) -> ovstorage::LayerKindDescriptor {
-        backend_descriptor("probe")
+        wrapper_descriptor("probe")
     }
 
     async fn stat(
@@ -4059,6 +4295,50 @@ impl Layer for ReadOnlyValidatorProbe {
     ) -> Result<ObjectInfo> {
         let mut info = self.inner.stat(request, cancel).await?;
         info.etag = None;
+        info.etag_strength = EtagStrength::Unspecified;
+        Ok(info)
+    }
+
+    async fn read(
+        &self,
+        request: Request<ReadRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ReadResult> {
+        self.inner.read(request, cancel).await
+    }
+}
+
+/// Backend whose metadata probe supplies an untrusted validator while its read
+/// result supplies a strong one. This pins the byte cache's deliberate split:
+/// the read can fill strict content, but the pre-read stat does not license an
+/// availability fence or lost-backing publication.
+struct UntrustedStatStrongReadProbe {
+    inner: Arc<CacheProbe>,
+}
+
+impl UntrustedStatStrongReadProbe {
+    fn new(inner: Arc<CacheProbe>) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
+}
+
+#[async_trait::async_trait]
+impl Layer for UntrustedStatStrongReadProbe {
+    fn name(&self) -> &str {
+        "backend"
+    }
+
+    fn descriptor(&self) -> ovstorage::LayerKindDescriptor {
+        self.inner.descriptor()
+    }
+
+    async fn stat(
+        &self,
+        request: Request<StatRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ObjectInfo> {
+        let mut info = self.inner.stat(request, cancel).await?;
+        info.etag_strength = EtagStrength::Weak;
         Ok(info)
     }
 
@@ -4104,6 +4384,44 @@ async fn byte_cache_fill_publishes_a_fallback_when_only_the_read_proves_a_valida
         inner.reads.load(Ordering::SeqCst),
         1,
         "a fill whose validator came from the read must still publish a fallback"
+    );
+}
+
+#[tokio::test]
+async fn byte_cache_present_untrusted_stat_suppresses_read_result_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inner = CacheProbe::new(b"payload", Vec::new());
+    let backend = UntrustedStatStrongReadProbe::new(inner.clone());
+    let stack = byte_cache_stack_with_config(backend, byte_cache_config(tmp.path())).await;
+    let address = Url::parse("mem:///obj").unwrap();
+
+    let first = stack
+        .read(read_request(address.as_str()), None)
+        .await
+        .unwrap();
+    assert_eq!(collect(first).await, b"payload");
+    assert_eq!(inner.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        content_row_count(tmp.path()),
+        1,
+        "the Strong read result may still fill strict validator-keyed content"
+    );
+    assert_eq!(
+        availability_validator(tmp.path()),
+        None,
+        "a present Weak stat must not publish a lost-backing fallback"
+    );
+
+    inner.set_stat_error(Some(ErrorCode::Transient));
+    let during_outage = stack
+        .read(read_request(address.as_str()), None)
+        .await
+        .unwrap();
+    assert_eq!(collect(during_outage).await, b"payload");
+    assert_eq!(
+        inner.reads.load(Ordering::SeqCst),
+        2,
+        "without an availability row, the stat outage must reach the backend"
     );
 }
 
@@ -4207,6 +4525,7 @@ impl WarmDelegateProbe {
 
     fn info(&self, address: Url) -> ObjectInfo {
         ObjectInfo {
+            etag_strength: EtagStrength::Strong,
             etag: Some(self.etag.clone()),
             ..object_info(address, self.size)
         }

@@ -30,13 +30,18 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use futures::StreamExt as _;
 use ovstorage_plugin::{
-    AccessOps, BackendId, BodyStream, ConfigValue, CopyOptions, CreateDirectoryOptions,
-    DeleteDirectoryOptions, DeleteOptions, ErrorCode, ListOptions, ObjectKind, RedirectResultBatch,
-    RenameOptions, ResolvedTarget, StatOptions, UpdateMetadataOptions, WriteOptions,
-    WriteRedirectBatch, address,
+    AccessOps, BackendFactory, BackendId, Body, BodyStream, CancellationToken, ConfigValue,
+    ConnectionRequest, ContinueWriteRequest, CopyOptions, CopyRequest, CreateDirectoryOptions,
+    CreateDirectoryRequest, DeleteDirectoryOptions, DeleteDirectoryRequest, DeleteOptions,
+    DeleteRequest, ErrorCode, LayerConfig, LayerConnectionRequest, LayerHandle, ListOptions,
+    ListRequest, ObjectKind, ReadOptions, ReadRequest, ReadResult, RedirectCredential,
+    RedirectResultBatch, RenameOptions, RenameRequest, Request, ResolvedTarget, SecretBundle,
+    StatOptions, StatRequest, UpdateMetadataOptions, UpdateMetadataRequest, WatchDirectoryOptions,
+    WatchDirectoryRequest, WriteOptions, WriteRedirectBatch, WriteRequest, address,
 };
-use ovstorage_plugin_s3::{AwsCredentials, S3Backend};
+use ovstorage_plugin_s3::{AwsCredentials, S3Backend, S3LayerFactory};
 
 const BUCKET: &str = "bkt";
 
@@ -46,7 +51,7 @@ const BUCKET: &str = "bkt";
 /// `LIST_ITEM_CEILING` in the backend: the 100,000-entry budget plus one full
 /// 1000-key page. Private there, so the fixture restates it; the tests that use
 /// it assert on the message, which carries the backend's own number.
-const LIST_ITEM_CEILING_ENTRIES: usize = 101_000;
+const LIST_ITEM_CEILING: usize = 101_000;
 
 const LIST_BODY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
     <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -128,6 +133,56 @@ fn bulk_page(n: usize, token: Option<&str>) -> String {
     body
 }
 
+/// One deterministic page from a generated listing.
+///
+/// The continuation token is the next zero-based page number, so a second walk
+/// over the same fixture starts from page zero again. Each response body is
+/// built only when requested; even the oversize-listing test never retains a
+/// whole-prefix fixture in the server.
+fn generated_page(page: usize, page_size: usize, entries: usize) -> String {
+    let start = page * page_size;
+    let end = (start + page_size).min(entries);
+    let next_page = (end < entries).then_some(page + 1);
+    let mut body = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>bkt</Name><Prefix>assets/</Prefix>",
+    );
+    body.push_str(&format!(
+        "<KeyCount>{}</KeyCount><MaxKeys>{page_size}</MaxKeys>\
+         <IsTruncated>{}</IsTruncated>",
+        end - start,
+        if next_page.is_some() { "true" } else { "false" }
+    ));
+    if let Some(next_page) = next_page {
+        body.push_str(&format!(
+            "<NextContinuationToken>G{next_page}</NextContinuationToken>"
+        ));
+    }
+    for index in start..end {
+        body.push_str(&format!(
+            "<Contents><Key>assets/item-{index:06}.usd</Key>\
+             <LastModified>2026-01-02T03:04:05.000Z</LastModified>\
+             <ETag>&quot;e{index}&quot;</ETag><Size>1</Size></Contents>"
+        ));
+    }
+    body.push_str("</ListBucketResult>");
+    body
+}
+
+fn generated_page_from_request(raw: &str) -> usize {
+    raw.lines()
+        .next()
+        .and_then(|line| line.split('?').nth(1))
+        .and_then(|query| query.split_whitespace().next())
+        .and_then(|query| {
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("continuation-token=G"))
+        })
+        .map_or(0, |page| page.parse().expect("generated page token"))
+}
+
 /// One page of an A -> B -> A cycle, parameterised by the token it hands back.
 fn cycle_page(token: &str) -> String {
     format!(
@@ -205,6 +260,10 @@ enum Answer {
     /// Pages of `n` synthetic objects each, truncated for ever — a store with
     /// more entries than one call is allowed to hold.
     EndlessPages(usize),
+    /// A finite, repeatable listing whose response bodies are generated one
+    /// page at a time. The token determines the page, so independent walks of
+    /// the same prefix see the same entries.
+    GeneratedListing { entries: usize, page_size: usize },
     /// EMPTY pages, truncated for ever, with a fresh token each time. Grows no
     /// entries at all, so the entry budget never trips.
     EndlessEmptyPages,
@@ -345,6 +404,17 @@ fn spawn_fake_s3(answer: Answer) -> Fixture {
                             body,
                         )
                     }
+                    Answer::GeneratedListing { entries, page_size } => {
+                        let body =
+                            generated_page(generated_page_from_request(&raw), page_size, entries);
+                        format!(
+                            "HTTP/1.1 200 OK\r\nConnection: close\r\n\
+                             x-amz-request-id: TESTREQ\r\n\
+                             Content-Type: application/xml\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body,
+                        )
+                    }
                     Answer::ThreeRealPages(n) => {
                         // The counter is incremented before this runs, so
                         // `seen` is 1 on the first request: pages 1..=3 are
@@ -399,7 +469,7 @@ fn spawn_fake_s3(answer: Answer) -> Fixture {
                         )
                     }
                     Answer::OneOversizePage => {
-                        let body = bulk_page(LIST_ITEM_CEILING_ENTRIES + 1, None);
+                        let body = bulk_page(LIST_ITEM_CEILING + 1, None);
                         format!(
                             "HTTP/1.1 200 OK\r\nConnection: close\r\n\
                              x-amz-request-id: TESTREQ\r\n\
@@ -902,6 +972,171 @@ async fn a_listing_over_the_entry_budget_is_refused_rather_than_truncated() {
         fake.requests().len() <= 105,
         "the walk stopped near the budget, not far past it: {}",
         fake.requests().len()
+    );
+}
+
+/// The streaming surface is the escape hatch for a real prefix larger than a
+/// buffered call is allowed to materialize. The fake generates each 1000-key
+/// response on demand and can replay the same prefix for the buffered control.
+#[tokio::test]
+async fn a_listing_past_the_materialization_cap_streams_to_completion() {
+    const ENTRIES: usize = LIST_ITEM_CEILING + 1_000;
+    const PAGE_SIZE: usize = 1_000;
+    const PAGES: usize = ENTRIES / PAGE_SIZE;
+
+    let fake = spawn_fake_s3(Answer::GeneratedListing {
+        entries: ENTRIES,
+        page_size: PAGE_SIZE,
+    });
+    let backend = anonymous_backend(&fake.endpoint);
+    let mut stream = backend
+        .list_stream(target("assets/"), ListOptions::default(), None)
+        .await
+        .expect("open an oversize listing as a stream");
+
+    let (count, first, last) = tokio::time::timeout(Duration::from_secs(120), async {
+        let mut count = 0;
+        let mut first = None;
+        let mut last = None;
+        while let Some(item) = stream.next().await {
+            let item = item.expect("every generated entry streams successfully");
+            let address = item.address.to_string();
+            first.get_or_insert_with(|| address.clone());
+            last = Some(address);
+            count += 1;
+        }
+        (count, first, last)
+    })
+    .await
+    .expect("the generated stream completes");
+
+    assert_eq!(count, ENTRIES);
+    assert_eq!(first.as_deref(), Some("s3://bkt/assets/item-000000.usd"));
+    assert_eq!(last.as_deref(), Some("s3://bkt/assets/item-101999.usd"));
+    assert_eq!(fake.served(), PAGES, "one request per generated page");
+
+    let requests_before_buffered_control = fake.served();
+    let err = tokio::time::timeout(
+        Duration::from_secs(120),
+        backend.list(target("assets/"), ListOptions::default(), None),
+    )
+    .await
+    .expect("the buffered budget ends the replayed walk")
+    .expect_err("the buffered surface keeps refusing the oversize prefix");
+
+    assert_eq!(err.code(), ErrorCode::Internal, "{err}");
+    assert!(!err.code().retryable(), "{err}");
+    assert!(err.message().contains("budget"), "{err}");
+    assert_eq!(
+        fake.served() - requests_before_buffered_control,
+        101,
+        "the buffered control refuses on the unchanged cumulative budget edge"
+    );
+}
+
+/// A consumer parked after one item cannot make the page walk fetch ahead.
+/// The two one-shot channels are an explicit parked/release handshake, so the
+/// request-count assertion does not depend on a scheduler delay.
+#[tokio::test]
+async fn a_slow_stream_consumer_bounds_page_fetches() {
+    const ENTRIES: usize = 4_000;
+    const PAGE_SIZE: usize = 1_000;
+
+    let fake = spawn_fake_s3(Answer::GeneratedListing {
+        entries: ENTRIES,
+        page_size: PAGE_SIZE,
+    });
+    let backend = anonymous_backend(&fake.endpoint);
+    let mut stream = backend
+        .list_stream(target("assets/"), ListOptions::default(), None)
+        .await
+        .expect("open generated listing stream");
+    let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+    let consumer = tokio::spawn(async move {
+        let first = stream
+            .next()
+            .await
+            .expect("first stream item")
+            .expect("first entry succeeds");
+        parked_tx
+            .send(first.address.to_string())
+            .expect("test observes the parked consumer");
+        release_rx.await.expect("test releases the consumer");
+
+        let mut count = 1;
+        while let Some(item) = stream.next().await {
+            item.expect("remaining generated entry succeeds");
+            count += 1;
+        }
+        count
+    });
+
+    let first = parked_rx.await.expect("consumer reaches the gate");
+    assert_eq!(first, "s3://bkt/assets/item-000000.usd");
+    assert_eq!(
+        fake.served(),
+        1,
+        "a parked consumer retains one response and fetches no later page"
+    );
+
+    release_tx.send(()).expect("release parked consumer");
+    let count = tokio::time::timeout(Duration::from_secs(30), consumer)
+        .await
+        .expect("released consumer completes")
+        .expect("consumer task succeeds");
+    assert_eq!(count, ENTRIES);
+    assert_eq!(fake.served(), ENTRIES / PAGE_SIZE);
+}
+
+/// Cancellation after several complete responses is terminal and prevents the
+/// pull that would otherwise request the next continuation token.
+#[tokio::test]
+async fn cancelling_a_listing_stream_stops_backend_requests() {
+    const ENTRIES: usize = 100;
+    const PAGE_SIZE: usize = 10;
+    const CONSUMED_PAGES: usize = 3;
+
+    let fake = spawn_fake_s3(Answer::GeneratedListing {
+        entries: ENTRIES,
+        page_size: PAGE_SIZE,
+    });
+    let backend = anonymous_backend(&fake.endpoint);
+    let cancel = CancellationToken::new();
+    let mut stream = backend
+        .list_stream(
+            target("assets/"),
+            ListOptions::default(),
+            Some(cancel.clone()),
+        )
+        .await
+        .expect("open cancellable listing stream");
+
+    for _ in 0..PAGE_SIZE * CONSUMED_PAGES {
+        stream
+            .next()
+            .await
+            .expect("entry before cancellation")
+            .expect("generated entry succeeds");
+    }
+    assert_eq!(fake.served(), CONSUMED_PAGES);
+
+    cancel.cancel();
+    let err = stream
+        .next()
+        .await
+        .expect("stream reports cancellation")
+        .expect_err("cancellation is terminal");
+    assert_eq!(err.code(), ErrorCode::Cancelled, "{err}");
+    assert!(
+        stream.next().await.is_none(),
+        "the error terminates the stream"
+    );
+    assert_eq!(
+        fake.served(),
+        CONSUMED_PAGES,
+        "no continuation request starts after cancellation"
     );
 }
 
@@ -2128,4 +2363,807 @@ async fn mutations_on_an_anonymous_connection_are_refused_without_a_request() {
             "{operation} must say the connection is anonymous: {message}"
         );
     }
+}
+
+// === The anonymous s3:// fallback on the wire ===
+//
+// A layer granted `anonymous_fallback = ["s3"]` reaches an unconfigured bucket
+// through a per-bucket anonymous backend. The properties pinned here are the
+// ones the grant promises and a fake can witness: the request leaves unsigned
+// whatever the process's ambient credentials are, every mutation is refused
+// before a byte reaches the wire, and the first touch is logged by origin
+// alone. `layer_connection_lifecycle.rs` covers the factory and routing side.
+
+const FALLBACK_ENV_CHILD_MODE: &str = "OVSTORAGE_S3_FALLBACK_ENV_TEST_CHILD";
+const FALLBACK_ENV_CHILD_ENDPOINT: &str = "OVSTORAGE_S3_FALLBACK_ENV_TEST_ENDPOINT";
+/// Printed by the child once its assertions have actually run, so a filter
+/// matching no test — libtest exits 0 — cannot pass the parent vacuously.
+const FALLBACK_ENV_SENTINEL: &str = "FALLBACK_ENV_ASSERTED";
+
+/// A layer table granting the `s3://` fallback and pointing every fallback
+/// bucket at `endpoint`, path-style, so the loopback fake can answer.
+fn fallback_policy(endpoint: &str) -> LayerConfig {
+    let mut config = LayerConfig::new();
+    config.insert(
+        "anonymous_fallback".into(),
+        ConfigValue::Toml("anonymous_fallback = [\"s3\"]\n".into()),
+    );
+    config.insert(
+        "anonymous_fallback_endpoint".into(),
+        ConfigValue::String(endpoint.into()),
+    );
+    config.insert(
+        "anonymous_fallback_force_path_style".into(),
+        ConfigValue::Bool(true),
+    );
+    config
+}
+
+async fn fallback_layer(endpoint: &str) -> LayerHandle {
+    S3LayerFactory::default()
+        .create_backend("s3", &fallback_policy(endpoint), None)
+        .await
+        .expect("the granted layer builds")
+}
+
+fn fallback_address(bucket: &str, key: &str) -> ovstorage_plugin::Url {
+    address::parse(&format!("s3://{bucket}/{key}")).expect("parse address")
+}
+
+/// List and read one unconfigured bucket through `layer`, asserting that the
+/// listing left unsigned and the read redirect carries no credential.
+async fn assert_fallback_read_is_unsigned(layer: &LayerHandle, fake: &Fixture) {
+    let page = layer
+        .list(
+            Request::new(ListRequest {
+                prefix: fallback_address("unconfigured", "assets/"),
+                options: ListOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect("an unconfigured public bucket lists through the fallback");
+    assert_eq!(
+        page.items.len(),
+        2,
+        "the answer was parsed, not merely received"
+    );
+
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 1, "exactly one ListObjectsV2 was issued");
+    let listing = &requests[0];
+    assert!(
+        !listing.has_header("authorization"),
+        "a fallback list must carry no Authorization header; got: {}",
+        listing.raw
+    );
+    for signed_marker in [
+        "x-amz-signature",
+        "x-amz-credential",
+        "x-amz-security-token",
+    ] {
+        assert!(
+            !listing.raw.to_lowercase().contains(signed_marker),
+            "a fallback list must carry no {signed_marker}; got: {}",
+            listing.raw
+        );
+    }
+    assert!(
+        listing.request_line().starts_with("GET /unconfigured/?"),
+        "path-style GET on the bucket the address named: {}",
+        listing.request_line()
+    );
+
+    // `read` mints a redirect and sends nothing itself; the URL it hands the
+    // host is a plain object URL with no signature and no credential.
+    let result = layer
+        .read(
+            Request::new(ReadRequest {
+                address: fallback_address("unconfigured", "assets/teapot.usd"),
+                options: ReadOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect("a fallback read mints a redirect");
+    let ReadResult::Redirect(redirect) = result else {
+        panic!("expected a redirect, got {result:?}");
+    };
+    assert_eq!(
+        redirect.request.url,
+        format!("{}/unconfigured/assets/teapot.usd", fake.endpoint),
+        "a plain unsigned object URL at the fallback endpoint"
+    );
+    assert!(
+        !redirect.request.url.to_lowercase().contains("x-amz-"),
+        "no query signature: {}",
+        redirect.request.url
+    );
+    assert!(
+        !redirect
+            .request
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization")),
+        "no Authorization header on the redirect: {:?}",
+        redirect.request.headers
+    );
+    assert_eq!(redirect.scope.credential, RedirectCredential::None);
+    assert_eq!(fake.served(), 1, "the read itself sent nothing");
+}
+
+/// A fallback read of a bucket no connection serves leaves unsigned: the
+/// listing carries no `Authorization`, and the read redirect carries no
+/// credential. The control is [`a_credentialed_connection_still_signs_its_list`]
+/// — the same fixture and operation with credentials, which must sign.
+#[tokio::test]
+async fn a_fallback_read_of_an_unconfigured_bucket_leaves_unsigned() {
+    let fake = spawn_fake_s3(Answer::Public);
+    let layer = fallback_layer(&fake.endpoint).await;
+    assert_fallback_read_is_unsigned(&layer, &fake).await;
+}
+
+/// Child half of
+/// [`a_fallback_read_leaves_unsigned_with_ambient_credential_env_set`]: runs
+/// in a subprocess whose environment the parent populated with every AWS
+/// credential variable and a credentials file, so no `set_var` races another
+/// test's client construction in this process. Returns immediately when not
+/// spawned as the child.
+#[tokio::test]
+async fn fallback_ambient_credentials_child() {
+    if std::env::var(FALLBACK_ENV_CHILD_MODE).is_err() {
+        return;
+    }
+    let endpoint = std::env::var(FALLBACK_ENV_CHILD_ENDPOINT).expect("child endpoint");
+    for var in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE"] {
+        assert!(
+            std::env::var(var).is_ok(),
+            "the parent must set {var} for this run to prove anything"
+        );
+    }
+    // The fake lives in the parent process; this child only reaches it.
+    let fixture = Fixture {
+        endpoint,
+        requests: Arc::new(Mutex::new(Vec::new())),
+        served: Arc::new(AtomicUsize::new(0)),
+    };
+    let layer = fallback_layer(&fixture.endpoint).await;
+    let page = layer
+        .list(
+            Request::new(ListRequest {
+                prefix: fallback_address("unconfigured", "assets/"),
+                options: ListOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect("the list succeeds with ambient credentials present");
+    assert_eq!(page.items.len(), 2);
+    let result = layer
+        .read(
+            Request::new(ReadRequest {
+                address: fallback_address("unconfigured", "assets/teapot.usd"),
+                options: ReadOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect("the read mints a redirect");
+    let ReadResult::Redirect(redirect) = result else {
+        panic!("expected a redirect, got {result:?}");
+    };
+    assert_eq!(redirect.scope.credential, RedirectCredential::None);
+    assert!(!redirect.request.url.to_lowercase().contains("x-amz-"));
+    println!("{FALLBACK_ENV_SENTINEL}");
+}
+
+/// The fallback builds its client with no credential source at all, so the
+/// process's ambient AWS identity — `AWS_ACCESS_KEY_ID`, a profile, a shared
+/// credentials file under `$HOME` — can never be spent on a bucket the
+/// operator did not configure. Driven in a subprocess with all of those set;
+/// the parent reads the wire the child produced.
+#[test]
+fn a_fallback_read_leaves_unsigned_with_ambient_credential_env_set() {
+    let fake = spawn_fake_s3(Answer::Public);
+    let home = tempfile::tempdir().expect("temp home");
+    let aws_dir = home.path().join(".aws");
+    std::fs::create_dir_all(&aws_dir).expect("create .aws");
+    let credentials_file = aws_dir.join("credentials");
+    std::fs::write(
+        &credentials_file,
+        "[default]\naws_access_key_id = AKIAAMBIENTFILE\n\
+         aws_secret_access_key = wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY\n",
+    )
+    .expect("write credentials file");
+
+    let mut command =
+        std::process::Command::new(std::env::current_exe().expect("current integration test"));
+    command
+        .arg("fallback_ambient_credentials_child")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(FALLBACK_ENV_CHILD_MODE, "1")
+        .env(FALLBACK_ENV_CHILD_ENDPOINT, &fake.endpoint)
+        .env("HOME", home.path())
+        .env("AWS_ACCESS_KEY_ID", "AKIAAMBIENTENV")
+        .env(
+            "AWS_SECRET_ACCESS_KEY",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        )
+        .env("AWS_SESSION_TOKEN", "ambient-session-token")
+        .env("AWS_PROFILE", "default")
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_SHARED_CREDENTIALS_FILE", &credentials_file);
+    let output = command.output().expect("run the ambient-credentials child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "child failed\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        stdout.contains(FALLBACK_ENV_SENTINEL),
+        "the child must reach its assertions\nstdout:\n{stdout}"
+    );
+
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 1, "the child issued exactly one listing");
+    let listing = &requests[0];
+    assert!(
+        !listing.has_header("authorization"),
+        "ambient credentials must not sign a fallback request; got: {}",
+        listing.raw
+    );
+    for marker in [
+        "x-amz-signature",
+        "x-amz-credential",
+        "x-amz-security-token",
+        "akiaambient",
+    ] {
+        assert!(
+            !listing.raw.to_lowercase().contains(marker),
+            "no trace of the ambient identity may reach the wire ({marker}): {}",
+            listing.raw
+        );
+    }
+}
+
+/// Every mutating slot and `watch_directory` are refused on a fallback-served
+/// address before anything reaches the wire, with `Unsupported` naming the
+/// fallback and a remedy naming the bucket root. Driven slot by slot, because
+/// a refusal placed by hand at N sites proves nothing about site N+1.
+#[tokio::test]
+async fn a_fallback_refuses_every_mutation_without_touching_the_wire() {
+    let fake = spawn_fake_s3(Answer::Public);
+    let layer = fallback_layer(&fake.endpoint).await;
+    let object = fallback_address("unconfigured", "assets/new.usd");
+    let mut failures: Vec<(&str, ovstorage_plugin::Error)> = Vec::new();
+
+    let write = layer
+        .write(
+            Request::new(WriteRequest {
+                address: object.clone(),
+                body: Body::Bytes(b"bytes".to_vec()),
+                options: WriteOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect_err("write is refused");
+    failures.push(("write", write));
+
+    // A body whose first chunk is an error: the refusal must come before the
+    // stream is consumed, or the source error is what surfaces.
+    let body = BodyStream::from_iter(
+        vec![Err::<Vec<u8>, ovstorage_plugin::Error>(
+            ovstorage_plugin::Error::new(
+                ErrorCode::Transient,
+                "the stream must not be consumed at all",
+            ),
+        )]
+        .into_iter(),
+    );
+    let write_stream = layer
+        .write_stream(
+            Request::new(WriteRequest {
+                address: object.clone(),
+                body: Body::Stream(body),
+                options: WriteOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect_err("write_stream is refused");
+    failures.push(("write_stream", write_stream));
+
+    let write_redirect = layer
+        .write_redirect(
+            Request::new(WriteRequest {
+                address: object.clone(),
+                body: Body::Bytes(Vec::new()),
+                options: WriteOptions {
+                    size_hint: Some(16),
+                    ..WriteOptions::default()
+                },
+            }),
+            None,
+        )
+        .await
+        .expect_err("write_redirect is refused");
+    failures.push(("write_redirect", write_redirect));
+
+    // The continuation is junk: the refusal must come before it is decoded,
+    // which `Unsupported` rather than `InvalidArgument` proves.
+    let continue_write = layer
+        .continue_write(
+            Request::new(ContinueWriteRequest {
+                address: object.clone(),
+                redirects: WriteRedirectBatch {
+                    redirects: Vec::new(),
+                    continuation: b"not a continuation".to_vec(),
+                },
+                results: RedirectResultBatch {
+                    results: Vec::new(),
+                },
+            }),
+            None,
+        )
+        .await
+        .expect_err("continue_write is refused");
+    failures.push(("continue_write", continue_write));
+
+    let delete = layer
+        .delete(
+            Request::new(DeleteRequest {
+                address: object.clone(),
+                options: DeleteOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect_err("delete is refused");
+    failures.push(("delete", delete));
+
+    let copy = layer
+        .copy(
+            Request::new(CopyRequest {
+                source: object.clone(),
+                destination: fallback_address("unconfigured", "assets/copy.usd"),
+                options: CopyOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect_err("copy is refused");
+    failures.push(("copy", copy));
+
+    let rename = layer
+        .rename(
+            Request::new(RenameRequest {
+                source: object.clone(),
+                destination: fallback_address("unconfigured", "assets/moved.usd"),
+                options: RenameOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect_err("rename is refused");
+    failures.push(("rename", rename));
+
+    let create_directory = layer
+        .create_directory(
+            Request::new(CreateDirectoryRequest {
+                address: fallback_address("unconfigured", "assets/new/"),
+                options: CreateDirectoryOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect_err("create_directory is refused");
+    failures.push(("create_directory", create_directory));
+
+    let delete_directory = layer
+        .delete_directory(
+            Request::new(DeleteDirectoryRequest {
+                address: fallback_address("unconfigured", "assets/textures/"),
+                options: DeleteDirectoryOptions,
+            }),
+            None,
+        )
+        .await
+        .expect_err("delete_directory is refused");
+    failures.push(("delete_directory", delete_directory));
+
+    let update_metadata = layer
+        .update_metadata(
+            Request::new(UpdateMetadataRequest {
+                address: object.clone(),
+                options: UpdateMetadataOptions {
+                    allow_rewrite_emulation: true,
+                    ..UpdateMetadataOptions::default()
+                },
+            }),
+            None,
+        )
+        .await
+        .expect_err("update_metadata is refused");
+    failures.push(("update_metadata", update_metadata));
+
+    let watch = layer
+        .watch_directory(
+            Request::new(WatchDirectoryRequest {
+                prefix: fallback_address("unconfigured", "assets/"),
+                options: WatchDirectoryOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .err()
+        .expect("watch_directory is refused");
+    failures.push(("watch_directory", watch));
+
+    for (operation, err) in failures {
+        assert_eq!(
+            err.code(),
+            ErrorCode::Unsupported,
+            "{operation} must be Unsupported through the fallback: {err}"
+        );
+        assert!(
+            err.message().contains("anonymous s3:// fallback"),
+            "{operation} must name the fallback: {}",
+            err.message()
+        );
+        let remedy = err
+            .next_action()
+            .unwrap_or_else(|| panic!("{operation} must offer a remedy"));
+        assert!(
+            remedy.contains("s3://unconfigured/"),
+            "{operation} names the bucket root to configure: {remedy}"
+        );
+        assert!(
+            !remedy.contains("assets"),
+            "{operation} must not echo the caller's path: {remedy}"
+        );
+    }
+    assert_eq!(fake.served(), 0, "nothing reached the wire");
+}
+
+/// A store refusal heard through the fallback names the remedy the fallback
+/// has. There is no connection to remove and re-add — the bucket is reached
+/// through the fallback precisely because none is configured — so the operator
+/// is sent to add one for the bucket root, in the words the fallback's own
+/// mutation refusal uses. Driven through `list` and `stat`, which reach the
+/// restatement by different routes.
+#[tokio::test]
+async fn a_refusal_through_the_fallback_sends_the_operator_to_add_a_connection() {
+    let fake = spawn_fake_s3(Answer::Refuse(403));
+    let layer = fallback_layer(&fake.endpoint).await;
+
+    let list = layer
+        .list(
+            Request::new(ListRequest {
+                prefix: fallback_address("private", "assets/"),
+                options: ListOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect_err("the bucket refuses anonymous ListBucket");
+    let stat = layer
+        .stat(
+            Request::new(StatRequest {
+                address: fallback_address("private", "assets/teapot.usd"),
+                options: StatOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect_err("the bucket refuses anonymous HeadObject");
+    assert!(fake.served() >= 2, "both requests reached the store");
+
+    for (operation, err) in [("list", list), ("stat", stat)] {
+        assert_eq!(
+            err.code(),
+            ErrorCode::PermissionDenied,
+            "{operation}: a policy refusal: {err}"
+        );
+        assert!(
+            err.message().contains("anonymous s3:// fallback"),
+            "{operation} must say the request was unsigned because of the fallback: {}",
+            err.message()
+        );
+        let remedy = err
+            .next_action()
+            .unwrap_or_else(|| panic!("{operation} must offer a remedy"));
+        assert!(
+            remedy.contains("add a connection for s3://private/"),
+            "{operation} names the bucket root to configure: {remedy}"
+        );
+        assert!(
+            remedy.contains("public-access"),
+            "{operation} still offers the policy repair: {remedy}"
+        );
+        for forbidden in ["remove and re-add", "this connection", "assets"] {
+            assert!(
+                !remedy.contains(forbidden),
+                "{operation} must not name a connection that does not exist or \
+                 echo the caller's path (found {forbidden:?}): {remedy}"
+            );
+        }
+    }
+}
+
+/// A copy or rename with a configured connection on one end and the fallback
+/// on the other is refused for the fallback end, before the source is read.
+#[tokio::test]
+async fn a_copy_from_a_configured_root_into_a_fallback_root_is_refused_before_any_read() {
+    let fallback_store = spawn_fake_s3(Answer::Public);
+    let configured_store = spawn_fake_s3(Answer::Public);
+    let layer = fallback_layer(&fallback_store.endpoint).await;
+    let mut config = raw_config(&configured_store.endpoint);
+    config.insert("bucket".into(), ConfigValue::String("configured".into()));
+    layer
+        .add_connection(
+            Request::new(LayerConnectionRequest {
+                target: "s3".into(),
+                connection: ConnectionRequest {
+                    backend_kind: "s3".into(),
+                    config,
+                    credentials: SecretBundle::default(),
+                    persist: false,
+                    display_name: None,
+                },
+            }),
+            None,
+        )
+        .await
+        .expect("an anonymous connection adds with no RPC");
+
+    let copy = layer
+        .copy(
+            Request::new(CopyRequest {
+                source: fallback_address("configured", "assets/teapot.usd"),
+                destination: fallback_address("unconfigured", "assets/teapot.usd"),
+                options: CopyOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect_err("the destination is fallback-served");
+    assert_eq!(copy.code(), ErrorCode::Unsupported, "{copy}");
+    assert!(
+        copy.message().contains("anonymous s3:// fallback"),
+        "{copy}"
+    );
+    assert!(
+        copy.next_action()
+            .is_some_and(|remedy| remedy.contains("s3://unconfigured/")),
+        "the remedy names the fallback end: {:?}",
+        copy.next_action()
+    );
+
+    let rename = layer
+        .rename(
+            Request::new(RenameRequest {
+                source: fallback_address("unconfigured", "assets/teapot.usd"),
+                destination: fallback_address("configured", "assets/teapot.usd"),
+                options: RenameOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect_err("the source is fallback-served");
+    assert_eq!(rename.code(), ErrorCode::Unsupported, "{rename}");
+    assert!(
+        rename
+            .next_action()
+            .is_some_and(|remedy| remedy.contains("s3://unconfigured/")),
+        "the remedy names the fallback end: {:?}",
+        rename.next_action()
+    );
+
+    assert_eq!(configured_store.served(), 0, "the source was never read");
+    assert_eq!(fallback_store.served(), 0, "and the fallback sent nothing");
+}
+
+/// A `tracing` subscriber that keeps every `INFO`-and-above event as one line
+/// of `LEVEL target field=value …`, for asserting what the fallback logs and,
+/// more to the point, what it does not. Hand-rolled on the `tracing` crate
+/// alone.
+///
+/// Installed once, process-wide, rather than per test with a thread-local
+/// default. `tracing` caches each callsite's interest the first time any
+/// thread hits it, and with a single registered dispatcher it computes that
+/// interest from the hitting thread's default subscriber — so a parallel test
+/// with no subscriber that reaches the fallback's `info!` first would cache
+/// "never" on the very callsite a thread-local capture is waiting on, and the
+/// event would be skipped without the capture ever being asked. One global
+/// subscriber makes every thread's answer the same. Tests that read it filter
+/// by a bucket or host name no other test uses.
+struct CapturedLogs(Arc<Mutex<Vec<String>>>);
+
+impl CapturedLogs {
+    fn lines(&self) -> Vec<String> {
+        self.0.lock().expect("capture poisoned").clone()
+    }
+}
+
+struct CaptureSubscriber(Arc<Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for CaptureSubscriber {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        // `INFO` and louder: the fallback's first-touch line and the layer's
+        // advisory warning. The SDK's `debug!`/`trace!` chatter stays out.
+        *metadata.level() <= tracing::Level::INFO
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Line(String);
+        impl tracing::field::Visit for Line {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, " {}={:?}", field.name(), value);
+            }
+        }
+        let metadata = event.metadata();
+        let mut line = Line(format!("{} {}", metadata.level(), metadata.target()));
+        event.record(&mut line);
+        self.0.lock().expect("capture poisoned").push(line.0);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+static CAPTURED_LOGS: std::sync::OnceLock<Arc<Mutex<Vec<String>>>> = std::sync::OnceLock::new();
+
+/// The process-wide capture, installed on first use. Callers then hit the
+/// callsite they care about once and call
+/// `tracing::callsite::rebuild_interest_cache()`, so a callsite another thread
+/// registered before the capture existed is re-evaluated against it.
+fn capture_logs() -> CapturedLogs {
+    let lines = CAPTURED_LOGS
+        .get_or_init(|| {
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            tracing::subscriber::set_global_default(CaptureSubscriber(lines.clone()))
+                .expect("this test binary installs no other global subscriber");
+            lines
+        })
+        .clone();
+    CapturedLogs(lines)
+}
+
+/// The first touch of a bucket logs one line naming the origin — the bucket
+/// root — and never the key; a second touch, served from the cache, logs
+/// nothing more.
+#[tokio::test]
+async fn first_touch_logs_the_origin_and_not_the_key() {
+    let fake = spawn_fake_s3(Answer::Public);
+    let layer = fallback_layer(&fake.endpoint).await;
+    let logs = capture_logs();
+    // Warm the first-touch callsite on a throwaway bucket, then re-evaluate
+    // every callsite's cached interest against the capture; see `CapturedLogs`.
+    layer
+        .stat(
+            Request::new(StatRequest {
+                address: fallback_address("warm-up", "object.bin"),
+                options: StatOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect("the warm-up stat succeeds");
+    tracing::callsite::rebuild_interest_cache();
+
+    layer
+        .stat(
+            Request::new(StatRequest {
+                address: fallback_address("bucket-name", "secret/path.bin"),
+                options: StatOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect("the stat succeeds");
+
+    let built = |logs: &CapturedLogs| -> Vec<String> {
+        logs.lines()
+            .into_iter()
+            .filter(|line| {
+                line.contains("anonymous fallback backend built") && line.contains("bucket-name")
+            })
+            .collect()
+    };
+    let built_lines = built(&logs);
+    assert_eq!(
+        built_lines.len(),
+        1,
+        "one first-touch line: {built_lines:?}"
+    );
+    let line = &built_lines[0];
+    assert!(line.starts_with("INFO ovstorage.fallback"), "{line}");
+    assert!(
+        line.contains("s3://bucket-name"),
+        "names the origin: {line}"
+    );
+    assert!(
+        !line.contains("secret") && !line.contains("path.bin"),
+        "never the key: {line}"
+    );
+    // Nothing the fallback itself logs names the key at any level.
+    for line in logs
+        .lines()
+        .iter()
+        .filter(|line| line.contains("ovstorage.fallback"))
+    {
+        assert!(
+            !line.contains("secret") && !line.contains("path.bin"),
+            "a fallback log line carries the key: {line}"
+        );
+    }
+
+    layer
+        .stat(
+            Request::new(StatRequest {
+                address: fallback_address("bucket-name", "secret/other.bin"),
+                options: StatOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect("the second stat is served from the cache");
+    assert_eq!(built(&logs).len(), 1, "a cache hit logs no first touch");
+    assert_eq!(
+        fake.served(),
+        3,
+        "the warm-up and both stats reached the store"
+    );
+}
+
+/// A configured connection whose endpoint is a cloud instance-metadata host is
+/// warned about and not refused: the operator chose it, and the request
+/// carries the operator's own credential. Only the fallback, whose hosts come
+/// from callers, refuses such a host.
+#[tokio::test]
+async fn a_configured_instance_metadata_endpoint_is_warned_about_not_refused() {
+    let layer = fallback_layer("http://127.0.0.1:1").await;
+    let logs = capture_logs();
+    tracing::callsite::rebuild_interest_cache();
+    let mut config = raw_config("http://169.254.169.254:1");
+    config.insert("bucket".into(), ConfigValue::String("chosen".into()));
+
+    let connection = layer
+        .add_connection(
+            Request::new(LayerConnectionRequest {
+                target: "s3".into(),
+                connection: ConnectionRequest {
+                    backend_kind: "s3".into(),
+                    config,
+                    credentials: SecretBundle::default(),
+                    persist: false,
+                    display_name: None,
+                },
+            }),
+            None,
+        )
+        .await
+        .expect("an operator's endpoint is not refused");
+    assert_eq!(connection.backend_kind, "s3");
+
+    let warned: Vec<String> = logs
+        .lines()
+        .into_iter()
+        .filter(|line| line.starts_with("WARN") && line.contains("instance-metadata"))
+        .collect();
+    assert_eq!(warned.len(), 1, "one advisory line: {warned:?}");
+    assert!(warned[0].contains("169.254.169.254"), "{}", warned[0]);
 }

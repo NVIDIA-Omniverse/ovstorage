@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-hub-client"
+version.workspace = true
+edition = "2024"
+description = "Direct protobuf client for the Omniverse Hub (usd-workstation-cache) cache-aside interface."
+license = "Apache-2.0"
+
+[dependencies]
+base64 = "0.22.1"
+prost = "0.13.5"
+sha2 = "0.10.9"
+tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tracing = "0.1.44"
+url = "2.5.8"
+uuid = { version = "1.23.2", features = ["v4"] }
+
+[build-dependencies]
+prost-build = "0.13.5"
+protoc-bin-vendored = "3.2.0"
+
+[dev-dependencies]
+# The descriptor-parity test compiles this crate's schema and the hub
+# repository's side by side; see tests/proto_parity.rs.
+protoc-bin-vendored = "3.2.0"
+tempfile = "3.27.0"
+# The fake hub's tests drive it from several threads at once, which the
+# library's own single-threaded feature set does not provide.
+tokio = { version = "1.52.3", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Exposes the in-process fake hub to dependent-crate tests. The module also
+# compiles for this crate's own tests, so a default build carries neither.
+fake-hub = []
+
+[lints]
+workspace = true

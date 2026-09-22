@@ -1,5 +1,9 @@
 # broker-operator — agent routing
 
+> **Not recommended for new deployments.** `ovstorage-broker` is maintained for
+> deployments that already exist; see [README.md](README.md) for why it is
+> not the recommended entry point for new work.
+
 Terse map for agents operating an `ovstorage-broker` deployment. For
 prose, see [README.md](README.md).
 
@@ -123,19 +127,24 @@ prose, see [README.md](README.md).
 
 - Inline upload size is bounded by `WRITE_BODY_BYTE_CAP` (64 MiB)
   after authz. Larger writes use the redirect branch.
-- Watch_directory fan-out: no per-principal watcher cap (future work at
-  a central chokepoint, not the per-backend coalescer) and no global
-  per-watch-key cap. Per-watcher queue depth is 256; overflow injects
+- `watch_directory` admission: the broker-native `watch_limit` Layer enforces positive
+  `max_watches_per_principal` (default 256) and `max_watches_total` (default
+  4096) limits globally across backends and connections; exhaustion maps to
+  `ResourceExhausted`. There is no separate global per-watch-key fan-out cap.
+  The SDK coalescer's per-subscriber queue depth remains 256; overflow injects
   one `Lapsed` and resumes.
 - gRPC `Write` distinguishes graceful EOF (commit) from
   RST_STREAM(CANCEL) (abort with `Status::cancelled`).
 
 ## Observability
 
-- Metrics: opt-in `[observability] prometheus_bind`. 10 families
-  register; some are dormant (RPC-latency histogram,
-  cache-eviction counter, watch-fanout gauge). Auth decisions are
-  `ovstorage_auth_decisions_total` (`outcome = allow|deny|error`).
+- Metrics: opt-in `[observability] prometheus_bind`. The broker defines
+  11 families; some are dormant (RPC-latency histogram, cache-eviction
+  counter, watch-fanout gauge). Auth decisions are
+  `ovstorage_auth_decisions_total` (`outcome = allow|deny|error`), and
+  `broker_continuation_seal_refusals_total` starts at zero for each bounded
+  `reason = malformed|tag|mac` and increments for invalid
+  write-continuation seals.
 - Health: standard `grpc.health.v1`. Readiness not flipped during
   drain.
 - Tracing: `principal.id`, redacted `object.address`, `audit_id`,

@@ -37,8 +37,8 @@ than the stack.
 |---|---|---|
 | `ovstorage_doctor` | `ovstorage doctor --json` | Agent-friendly health/config summary. |
 | `ovstorage_capabilities` | `ovstorage list-backends` plus `ovstorage list-routes` | MCP reports capabilities for one prefix. |
-| `ovstorage_stat` | `ovstorage stat ADDRESS` | Same object-info surface. |
-| `ovstorage_list` | `ovstorage list PREFIX` | Pagination is explicit in MCP via `next_page_token`. |
+| `ovstorage_stat` | `ovstorage stat ADDRESS` | Same object-info surface; `versioned_address` is the CLI's `--versioned-address`. |
+| `ovstorage_list` | `ovstorage list PREFIX` | Pagination is explicit in MCP via `next_page_token`; `versioned_address` is the CLI's `--versioned-address`. |
 | `ovstorage_read` | `ovstorage read ADDRESS` | MCP returns base64 bytes and requires `max_bytes`. |
 | `ovstorage_materialize` | `ovstorage read ADDRESS -o FILE` | MCP returns a leased local path; CLI writes a caller-owned file. |
 | `ovstorage_release` | none | Releases an MCP materialize lease. |
@@ -74,12 +74,17 @@ diagnostic commands such as `cache-status`, `cache-doctor`, and
 
 ## Read
 
-- `ovstorage_stat` takes `{ "address": string, "full_metadata"?: bool }`.
-  Returns address, size, mtime, etag, version, metadata maps, and directory
-  shape when present.
+- `ovstorage_stat` takes `{ "address": string, "full_metadata"?: bool,
+  "versioned_address"?: bool }`. Returns address, `versioned_address` (the
+  pinned address that serves this exact version, or `null`), size, mtime,
+  etag, `etag_strength` (`"strong"`, `"weak"`, or `null` when unspecified),
+  version, metadata maps, and directory shape when present.
 - `ovstorage_list` takes `{ "prefix": string, "recursive"?: bool,
-  "max_results"?: int, "page_token"?: string, "full_metadata"?: bool }`.
-  Returns `{ "items": [], "next_page_token"?: string }`.
+  "max_results"?: int, "page_token"?: string, "full_metadata"?: bool,
+  "versioned_address"?: bool }`.
+  Returns `{ "items": [], "next_page_token"?: string }`; each item includes
+  the same nullable `versioned_address`, etag and `etag_strength` declaration
+  as `stat`.
 - `ovstorage_read` takes `{ "address": string, "max_bytes": int,
   "if_match"?: string, "range_start"?: int, "range_end"?: int }`. `max_bytes`
   is required. `if_match` is the bare etag string from a prior `stat` or
@@ -90,6 +95,17 @@ diagnostic commands such as `cache-status`, `cache-doctor`, and
   done; if omitted, the server releases after the TTL.
 - `ovstorage_release` takes `{ "lease_id": string }` and idempotently releases
   a materialized local-path lease.
+
+`full_metadata` and `versioned_address` are cost knobs, not inclusion lists.
+Leaving one clear says "spend no extra round-trips on this"; setting it says
+"I will pay". A backend that already has the value in hand returns it either
+way, so an absent field means "the backend has none" only when you asked, and
+a present field does not mean you asked. With `versioned_address` set, a
+versioning backend returns the pinned address for every object it versions;
+an absent `versioned_address` under the flag means the backend does not
+version this object.
+A `versioned_address` is a pin, not an identity: writes through it are
+refused, and it resolves only as long as the backend retains the version.
 
 ## Preconditions
 
@@ -118,6 +134,10 @@ Three concrete shapes are used across the write-side tools:
 - `ovstorage_update_metadata` takes `{ "address": string, "set"?: object,
   "remove"?: [string], "if_match"?: string, "allow_rewrite_emulation"?: bool,
   "message"?: string }`.
+- `user_metadata` and `set` keys matching `[a-z_][a-z0-9_]*` are accepted by
+  every backend that stores user metadata; wider names are backend-specific,
+  and the `ovstorage_` prefix is reserved for host-attested keys — see
+  [User-metadata keys](../plugin-storage/CONFORMANCE.md#user-metadata-keys).
 - `ovstorage_create_directory` takes `{ "address": string }`.
 - `ovstorage_copy` takes `{ "src": string, "dest": string,
   "if_source"?: string, "if_dest"?: object, "message"?: string }`.
@@ -180,8 +200,12 @@ is absent:
 
 - `ovstorage_connections_list` takes no params and returns configured
   connections.
-- `ovstorage_address_roots_list` takes no params and returns visible address
-  roots.
+- `ovstorage_address_roots_list` takes no params and returns every address
+  root the stack publishes, hidden roots included, as `{ "address",
+  "backend_kind", "display_name", "visibility" }`; the CLI's `list-routes`
+  shows only `Visible` roots. A root's `connection_id` and `user_metadata`
+  (where the scheme-fallback marker lives) are reported by `ovstorage_doctor`
+  alone.
 
 ## Error Handling
 

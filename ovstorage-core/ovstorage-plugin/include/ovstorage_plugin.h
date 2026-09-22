@@ -187,8 +187,97 @@
  *   v14 producer never wrote as a Rust `bool`: an indeterminate value where
  *   `true` composes an attribution layer over a backend that declared
  *   nothing, which is the case this field exists to stop being guessed.
+ * - v16: [`Connection`] gained `owning_target`, the instance name of the Layer
+ *   that owns the connection — the `ConnectionKey.target` a connection op
+ *   routes by, and the same fact [`RootInfo::owning_target`] already reports
+ *   for a root. A `Connection` otherwise names no target, so a host holding a
+ *   row from a loaded COMPOSITE plugin — one reporting several `owned_targets`
+ *   — could not say which of that plugin's internal targets holds it, and
+ *   discovered ownership by attempting the real operation against each
+ *   candidate in turn. That scan is sound only while the id is unique in the
+ *   graph, which nothing promises: an id names a connection only within its
+ *   owning layer. Reporting the target beside the id makes the two halves of
+ *   the key one answer from one call, as `root_info_for` already does.
+ *
+ *   Appended at the tail, after `user_metadata`, so every prior field keeps
+ *   its offset. Unlike [`RootInfo`], `Connection` carries no `_reserved` tail
+ *   and no `struct_size` prefix, so the `Optional<Str>` grows it by 24 bytes —
+ *   and it is embedded BY VALUE in `Optional<Connection>`, `List<Connection>`
+ *   and `AuthEventSucceeded`, so `ConnectionChange` and the auth-event stream
+ *   grow with it — measured on x86_64-unknown-linux-gnu against the generated
+ *   headers either side of the bump, `ConnectionChange` is 392 bytes at v15
+ *   and 416 at v16, and `AuthEvent` 480 and 504. `ConnectionSnapshot` does NOT
+ *   grow: it is a `List<Connection>` and a `bool`, and a `List` is a pointer
+ *   and a length, so it is 24 bytes on both sides. What changes for it is the
+ *   STRIDE of the elements behind that pointer.
+ *
+ *   No size check guards any of this: `struct_size` lives on the
+ *   options and request envelopes and on the vtables, and this bump adds no
+ *   vtable slot, so `LayerVTableV1.struct_size` is unchanged and a v15 cdylib
+ *   passes every size check there is. The exact `abi_version` match is the
+ *   only thing that rejects it, and it is load-bearing rather than
+ *   belt-and-braces. What it prevents is a host reading 24 bytes a v15
+ *   producer never wrote: `owning_target` past the end of a single
+ *   connection's allocation, and — past element 0 of a connection list — every
+ *   field of every later element at the wrong stride, including the [`Str`]
+ *   pointers the host would then free.
+ *
+ *   A plugin sets the field to one of its own `owned_targets()` entries; a
+ *   composite sets the internal child's name, never its outer host name.
+ *   Absent (`present == false`) means the plugin declines to attribute the
+ *   row, and the host fills it from the sole `owned_targets` entry where the
+ *   plugin declares exactly one. A composite that declines stays unattributed,
+ *   because no name it has is a target a route lookup would find. The host
+ *   does not validate a reported target against `owned_targets()`: that slot
+ *   may legitimately be narrower, and rewriting the row on a mismatch would
+ *   make a wrong answer indistinguishable from no answer. It fails later and
+ *   locally, as `NotFound` from the plugin's own slot.
+ * - v17: [`LayerVTableV1`] gained the additive terminal `list_stream` slot,
+ *   consuming one reserved slot. It returns [`ListEntryStream`], a pull
+ *   iterator that yields one [`ObjectInfo`] per `next_fn` call. The
+ *   [`CancelTokenFFI`] passed when opening the stream stays live for the
+ *   stream's whole lifetime; `next_fn` takes no separate cancel argument and
+ *   polls that open-time token.
+ * - v18: [`ObjectInfo`], [`BackendItemInfo`], and [`ResponseParsing`] each
+ *   gained a tail-appended `etag_strength`, a one-byte [`EtagStrengthV1`]
+ *   declaration plus layout padding. None has a `struct_size` prefix;
+ *   `ResponseParsing` is also embedded by value in [`ReadRedirect`]. The
+ *   exact-match `abi_version` check is therefore the only guard against
+ *   reading a pre-v18 cdylib under the grown layouts, and the loader rejects
+ *   every such cdylib at load. The zero value is deliberately `Unspecified`,
+ *   the fail-safe, untrusted reading for a producer that made no declaration.
+ * - v19: [`ObjectInfo`] and [`BackendItemInfo`] each gained a tail-appended
+ *   `versioned_address: Optional<Str>`, the address that names the served
+ *   version of the object (`present == false` when the backend does not
+ *   version it or was not asked), and [`StatOptions`] and [`ListOptions`]
+ *   each gained a tail-appended `versioned_address: bool`, the caller's
+ *   declaration that it will pay for that pin. Neither info struct has a
+ *   `struct_size` prefix, and both are embedded by value: `ObjectInfo` in
+ *   [`WriteResult`], [`ReadResultBytes`], [`ReadResultStream`] and
+ *   [`LocalDelegate`], and as the element behind `List<ObjectInfo>` in
+ *   [`ListPage`], [`VersionPage`] and every `list_stream` entry, whose
+ *   stride grows by one `Optional<Str>` while the `List` itself stays a
+ *   pointer and a length. The two options structs do carry `struct_size`,
+ *   but the new `bool` lands in padding both already had, so neither changes
+ *   size and `struct_size` cannot see this bump either; a v18 producer's
+ *   padding byte would otherwise read as the caller's declaration. The
+ *   exact-match `abi_version` check is therefore the only guard on all four
+ *   structs, and the loader rejects every pre-v19 cdylib at load.
+ *   `present == false` is the zero value, so a producer that never writes
+ *   the field answers "no pin" rather than a dangling pointer.
+ *   v19 also respells the reserved user-metadata namespace and the
+ *   attribution key as `ovstorage_` and `ovstorage_modified_by`, and names the
+ *   per-operation annotation key `MESSAGE_METADATA_KEY`, spelled
+ *   `x_ov_message`. These are source-level constants a plugin links
+ *   statically, so a cdylib built against an earlier version re-asserts
+ *   attribution under the namespace it links: on `continue_write` it strips
+ *   and re-stamps only its own spelling, and a continuation-supplied
+ *   `ovstorage_modified_by` survives for the host to harvest as the attested
+ *   writer. The same exact-match check that guards the grown layouts refuses
+ *   such a cdylib, so an attributing host never runs over a plugin that
+ *   spells the namespace differently.
  */
-#define OVSTORAGE_PLUGIN_ABI_VERSION 15
+#define OVSTORAGE_PLUGIN_ABI_VERSION 19
 
 /**
  * The v2 (Layer) **family floor**: the first `abi_version` ever assigned
@@ -508,6 +597,29 @@ typedef uint8_t OvStoragePlugin_ObjectKindV1;
 #endif // __cplusplus
 
 /**
+ * Strength declaration for an etag. Numeric values are the ABI contract.
+ * The zero value is deliberately `Unspecified`, so zero-initialized storage
+ * and producers that do not write the field receive the fail-safe,
+ * untrusted interpretation rather than promising a strong validator.
+ */
+enum OvStoragePlugin_EtagStrengthV1
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  OvStoragePlugin_EtagStrengthV1_Unspecified = 0,
+  OvStoragePlugin_EtagStrengthV1_Strong = 1,
+  OvStoragePlugin_EtagStrengthV1_Weak = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum OvStoragePlugin_EtagStrengthV1 OvStoragePlugin_EtagStrengthV1;
+#else
+typedef uint8_t OvStoragePlugin_EtagStrengthV1;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
  * Tag for [`Body`].
  */
 typedef enum {
@@ -769,10 +881,14 @@ typedef uint8_t OvStoragePlugin_InteractiveAuthCapabilityV1;
 typedef struct OvStoragePlugin_AtomicCancelState OvStoragePlugin_AtomicCancelState;
 
 /**
- * Owned UTF-8 string buffer. `ptr` is never null; `len` bounds the
- * reads (the buffer is NOT NUL-terminated). UTF-8 validity is
- * enforced at marshalling time. Empty strings carry `len == 0` and
- * a one-byte sentinel allocation.
+ * Owned UTF-8 string buffer. A well-formed producer never leaves `ptr`
+ * null: empty strings carry `len == 0` and a one-byte sentinel
+ * allocation. `len` bounds the reads (the buffer is NOT NUL-terminated).
+ * UTF-8 validity is enforced at marshalling time. Inside a present
+ * `Optional`, a null `ptr` with a zero `len` is the bytes a zeroed struct
+ * already holds, not an empty string; a host may read that shape as absent,
+ * and both hosts do so for the root-info and operation-result strings
+ * (see `optional_str_unset_as_none` for the list).
  */
 typedef struct {
   char *ptr;
@@ -985,6 +1101,7 @@ typedef struct {
   bool supports_write_redirect;
   bool supports_delete;
   bool supports_list;
+  bool supports_list_stream;
   bool wants_list_backed_stat;
   bool supports_recursive_list;
   bool populates_subdirectory_metadata;
@@ -1130,6 +1247,26 @@ typedef struct {
   OvStoragePlugin_ConnectionAuthState auth_state;
   OvStoragePlugin_Optional_i64 last_probed_unix_ms;
   OvStoragePlugin_KeyValueList user_metadata;
+  /**
+   * The instance name of the Layer that owns this connection — the
+   * `ConnectionKey.target` a connection op routes by, and the same fact
+   * [`RootInfo::owning_target`](crate::ffi::v2::RootInfo) already reports for
+   * a root. A plugin sets one of its own `owned_targets()` entries; a
+   * composite sets the INTERNAL child's name, never its outer host name.
+   * Absent means the plugin declines to attribute the row, and the host fills
+   * it from the sole `owned_targets` entry where there is one.
+   *
+   * APPENDED AT THE TAIL, so every prior field keeps its offset. Unlike
+   * `RootInfo`, this struct carries no `struct_size` prefix and no
+   * `_reserved` tail, so the `Optional<Str>` GROWS it by 24 bytes — and it is
+   * embedded BY VALUE in `Optional<Connection>`, `List<Connection>` and
+   * `AuthEventSucceeded`, so the snapshot, the change stream and the
+   * auth-event stream grow with it and a connection list's element stride
+   * changes. No `struct_size` check anywhere covers that; the exact
+   * `abi_version` match is what rejects a producer built against the earlier
+   * layout. The `layout_is_frozen` assertion below pins the tail position.
+   */
+  OvStoragePlugin_Optional_Str owning_target;
 } OvStoragePlugin_Connection;
 
 /**
@@ -1554,6 +1691,13 @@ typedef struct {
   OvStoragePlugin_Optional_SystemMetadata system_metadata;
   OvStoragePlugin_Optional_UserMetadata user_metadata;
   OvStoragePlugin_Optional_Str modified_by;
+  OvStoragePlugin_EtagStrengthV1 etag_strength;
+  /**
+   * The address that names this version of the object; `present == false`
+   * when the backend does not version it or was not asked. Tail-appended
+   * in ABI v19.
+   */
+  OvStoragePlugin_Optional_Str versioned_address;
 } OvStoragePlugin_ObjectInfo;
 
 /**
@@ -1698,6 +1842,10 @@ typedef struct {
    * See `crate::ResponseParsing::checksum_headers`.
    */
   OvStoragePlugin_List_ChecksumHeaderBinding checksum_headers;
+  /**
+   * See `crate::ResponseParsing::etag_strength`. Tail-appended in ABI v18.
+   */
+  OvStoragePlugin_EtagStrengthV1 etag_strength;
 } OvStoragePlugin_ResponseParsing;
 
 /**
@@ -2369,6 +2517,33 @@ typedef struct {
 } OvStoragePlugin_ConnectionChangeStream;
 
 /**
+ * `next_fn` signature for [`ListEntryStream`].
+ */
+typedef OvStoragePlugin_StreamStep (*OvStoragePlugin_ListEntryNextFn)(void *state,
+                                                                      OvStoragePlugin_ObjectInfo *out_item,
+                                                                      OvStoragePlugin_Error *out_error);
+
+/**
+ * Plugin-emitted iterator over `Result<ObjectInfo>` from `list_stream`.
+ *
+ * **Cancellation contract:** `next_fn` takes no cancel argument by
+ * design — cancellation flows through the token the host passed to
+ * `list_stream` at open, which is guaranteed live for the stream's whole
+ * lifetime (the host retains its `CancelTokenHandle` and the plugin retains
+ * the matching `CancelTokenLocal` guard in the stream state, rather than
+ * dropping them when the open returns). A plugin list stream therefore MUST
+ * poll that open-time token between blocking waits so a host cancel can
+ * interrupt a parked `next()`; a `next()` that blocks without polling its
+ * token cannot be preempted (inherent to a pull iterator). Dropping the
+ * stream runs `drop_fn`, which tears down the listing walk.
+ */
+typedef struct {
+  void *state;
+  OvStoragePlugin_ListEntryNextFn next_fn;
+  OvStoragePlugin_StreamDropFn drop_fn;
+} OvStoragePlugin_ListEntryStream;
+
+/**
  * Owned homogeneous list of `T`. `ptr` points at exactly `len`
  * elements (capacity == len). Empty lists use a one-element
  * sentinel allocation. cbindgen emits a distinct C type per
@@ -2724,11 +2899,15 @@ typedef void (*OvStoragePlugin_LayerListAddressRootsFn)(void *state,
 /**
  * `StatOptions` shadow shape. Every options struct starts with a
  * `struct_size` prefix; receivers validate `>= size_of::<T>()`
- * before reading tail fields.
+ * before reading tail fields. The trailing `versioned_address` occupies
+ * padding the struct already carried, so `struct_size` is unchanged across
+ * the ABI bump that added it and the exact-match `abi_version` check is
+ * what keeps a producer from leaving it uninitialized.
  */
 typedef struct {
   size_t struct_size;
   bool full_metadata;
+  bool versioned_address;
 } OvStoragePlugin_StatOptions;
 
 /**
@@ -2860,25 +3039,29 @@ typedef void (*OvStoragePlugin_LayerWriteFn)(void *state,
 /**
  * One redirect's outcome as reported by the party that performed it.
  *
- * Caller-supplied input, not an observation. That party is a redirect follower
- * inside a host stack on one route — the library deployment, and equally the
- * broker's own `write` path — or a remote client driving the redirect protocol
- * over the broker's `continue_write` RPC. Check the batch cardinality against
- * the redirect batch yourself, at the top of `continue_write`: no follower
- * route performs that check, and the RPC's own is against a count the same
- * caller supplied. That RPC is also the only place a status outside `200..300`
- * is refused; nothing else is validated, and the echoed continuation blob is
- * unauthenticated too.
+ * Reported input at the Layer SPI, not an observation. That party is a redirect
+ * follower inside a host stack on one route — the library deployment, and
+ * equally the broker's own `write` path — or a remote client driving the
+ * redirect protocol over the broker's `continue_write` RPC. Check the batch
+ * cardinality against the redirect batch yourself, at the top of
+ * `continue_write`: no follower route performs that check, and the RPC's own is
+ * against a count the same caller supplied. That RPC is also the only place a
+ * status outside `200..300` is refused.
  *
- * The request address is the only authenticated part of the call, so **derive
- * the object you act on from it** rather than taking it from the continuation.
- * Comparing the continuation's copy against the address is weaker: on the
- * client-driven route the caller supplies both sides, presenting an address it
- * is authorized for beside a blob whose recorded copy it rewrote to match.
- * Values the address cannot supply — a server-issued session
+ * The broker's client-driven RPC additionally verifies an HMAC-SHA256 envelope
+ * binding the continuation bytes to the request address, then strips it before
+ * Layer dispatch. That seal does not cover redirect results, prevent
+ * same-address replay, bind a principal, or apply to follower routes and
+ * non-broker hosts. The Layer SPI itself supplies no continuation integrity.
+ *
+ * The request address is the only authenticated input on every route, so
+ * **derive the object you act on from it** rather than taking it from the
+ * continuation. The broker seal protects its client-driven route, but a direct
+ * SPI caller or another host can still rewrite the continuation's copy to match
+ * the address. Values the address cannot supply — a server-issued session
  * handle, the preconditions of the original write — have to travel in the blob;
- * treat those as caller-chosen and do not build a guarantee another principal
- * depends on out of them.
+ * on an unsealed route, treat those as caller-chosen and do not build a
+ * guarantee another principal depends on out of them.
  *
  * These values may shape the result returned, and must never be evidence about
  * connection authentication, credential validity, quota, principal identity, or
@@ -3086,7 +3269,9 @@ typedef struct {
 } OvStoragePlugin_Optional_u32;
 
 /**
- * `ListOptions` shadow shape.
+ * `ListOptions` shadow shape. The trailing `versioned_address` occupies
+ * padding the struct already carried, so `struct_size` is unchanged across
+ * the ABI bump that added it.
  */
 typedef struct {
   size_t struct_size;
@@ -3094,6 +3279,7 @@ typedef struct {
   OvStoragePlugin_Optional_u32 max_results;
   OvStoragePlugin_Optional_Str page_token;
   bool full_metadata;
+  bool versioned_address;
 } OvStoragePlugin_ListOptions;
 
 /**
@@ -3420,13 +3606,27 @@ typedef void (*OvStoragePlugin_LayerAuthenticateFn)(void *state,
                                                     void *user_data);
 
 /**
+ * `list_stream` (`result`: [`ListEntryStream`]).
+ *
+ * The `CancelTokenFFI` passed when opening the stream stays live for the
+ * stream's whole lifetime. `ListEntryStream::next_fn` takes no separate
+ * cancel argument and polls that open-time token.
+ */
+typedef void (*OvStoragePlugin_LayerListStreamFn)(void *state,
+                                                  const OvStoragePlugin_ListRequest *request,
+                                                  const OvStoragePlugin_CancelTokenFFI *cancel,
+                                                  OvStoragePlugin_OnComplete on_complete,
+                                                  void *user_data);
+
+/**
  * The operational Layer vtable. **Slot order is the freeze**: it
- * mirrors the `ovstorage_layer::Layer` trait method order exactly
- * (`{drop}` is the only C-only lifecycle slot, ahead of the 31 trait
- * slots), enforced by the `slot_order` test. Every slot is always
+ * mirrors the original `ovstorage_layer::Layer` trait method order
+ * (`{drop}` is the only C-only lifecycle slot, ahead of the 32 trait
+ * slots), enforced by the `slot_order` test. Existing slots retain their
+ * frozen order and additive methods are appended. Every slot is always
  * populated — pure wrappers install `OVSTORAGE_PASSTHROUGH_VTABLE`
  * thunks and backends install `OVSTORAGE_UNSUPPORTED_VTABLE` thunks
- * rather than leaving NULLs (see `thunks_v2`). The trailing 16
+ * rather than leaving NULLs (see `thunks_v2`). The trailing 15
  * `_reserved` slots grow the ABI additively pre-2.0.
  */
 typedef struct {
@@ -3480,9 +3680,13 @@ typedef struct {
   OvStoragePlugin_LayerUpdateAttributesFn update_connection_attributes;
   OvStoragePlugin_LayerAuthenticateFn authenticate_connection;
   /**
+   * Additive operational slots retain append-only ABI order.
+   */
+  OvStoragePlugin_LayerListStreamFn list_stream;
+  /**
    * Reserved padding for additive growth pre-2.0.
    */
-  OvStoragePlugin_Error *(*_reserved[16])(void*);
+  OvStoragePlugin_Error *(*_reserved[15])(void*);
 } OvStoragePlugin_LayerVTableV1;
 
 /**
@@ -3640,6 +3844,12 @@ typedef struct {
   OvStoragePlugin_Optional_SystemMetadata system_metadata;
   OvStoragePlugin_Optional_UserMetadata user_metadata;
   OvStoragePlugin_Optional_Str modified_by;
+  OvStoragePlugin_EtagStrengthV1 etag_strength;
+  /**
+   * See `crate::BackendItemInfo::versioned_address`. Tail-appended in ABI
+   * v19.
+   */
+  OvStoragePlugin_Optional_Str versioned_address;
 } OvStoragePlugin_BackendItemInfo;
 
 #define OvStoragePlugin_FFI_STATUS_OK 0
@@ -4064,6 +4274,17 @@ void ovstorage_plugin_connection_change_free(OvStoragePlugin_ConnectionChange *v
  * ovstorage call.
  */
 void ovstorage_plugin_connection_change_stream_free(OvStoragePlugin_ConnectionChangeStream *value);
+
+/**
+ * Reclaim a heap-allocated [`ListEntryStream`]. Drives `drop_fn` exactly
+ * once before releasing the outer allocation. Safe with NULL.
+ *
+ * # Safety
+ *
+ * `value`, when non-null, must be a heap pointer produced by an ovstorage
+ * call. Passing a non-heap pointer is UB.
+ */
+void ovstorage_plugin_list_entry_stream_free(OvStoragePlugin_ListEntryStream *value);
 
 /**
  * Reclaim a heap-allocated [`ListPage`]. Safe with NULL.

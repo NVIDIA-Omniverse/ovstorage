@@ -90,6 +90,7 @@ def test_runtime_export_lists_match_the_package_surface() -> None:
         "byte_cache": ["ByteCache"],
         "copy_rename_fallback": ["CopyRenameFallback"],
         "file": ["FileBackend"],
+        "hub_cache": ["HubCache"],
         "metadata_cache": ["MetadataCache"],
         "plugin": ["PluginBackend"],
         "redirect_follower": ["RedirectFollower"],

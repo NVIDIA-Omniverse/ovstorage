@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-hub-cache"
+version.workspace = true
+edition = "2024"
+description = "Omniverse Hub (usd-workstation-cache) cache-aside Layer for ovstorage."
+license = "Apache-2.0"
+
+[dependencies]
+bytes = "1.11.1"
+futures = "0.3.32"
+# The crate is published as `md-5` but its library is `md5`; naming the
+# dependency after the library keeps imports and unused-dependency
+# detection agreeing about what it is called.
+md5 = { package = "md-5", version = "0.10.6" }
+metrics = "0.24.6"
+ovstorage-hub-client = { workspace = true }
+ovstorage-plugin = { workspace = true }
+async-trait = "0.1.89"
+tokio = { version = "1.52.3", features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+ovstorage-hub-client = { workspace = true, features = ["fake-hub"] }
+# The one composition where omni.client's digest-tier key is reachable end
+# to end; see tests/http_composition.rs.
+ovstorage-plugin-http = { workspace = true }
+ovstorage-plugin-test = { workspace = true }
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

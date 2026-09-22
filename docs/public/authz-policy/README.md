@@ -107,6 +107,46 @@ those are two distinct objects, so **a rule written for a subtree also covers
 the sibling object of that name.** This is a widening, and it holds for
 `allow` as much as for `deny`.
 
+**Policy sees the caller's address, before alias resolution.** Authorization
+sits above the alias layer, so an alias rule's `from` space and its `to`
+space are separate scopes: a grant on `azure://account/container` does *not*
+cover a caller addressing `https://account.blob.core.windows.net/container`,
+even though the alias layer would resolve one onto the other. This applies
+equally to the alias rules the `s3`, `azure` and `huggingface` plugins
+generate automatically (see "Generated aliases" in
+[configuration.md](../configuration.md)): those
+rules are **inert behind this policy until you grant their URL space**, and
+no grant is ever generated for them — that would be automatic widening of a
+deny-by-default policy. To let callers use the ordinary cloud URLs of a
+connection, grant the URL prefixes alongside the canonical form, exactly as
+you would for an alias you authored by hand.
+
+**Policy sees the caller's address before routing, too.** A host may route an
+address that no configured connection serves to the backend of its scheme and
+try it anonymously (see "Anonymous fallback for s3, gs and azure" in
+[configuration.md](../configuration.md#anonymous-fallback-for-s3-gs-and-azure)).
+That changes what is *reachable*, never what is *authorized*. The fallback
+runs below this layer, so an address reached that way is evaluated here
+first, as the caller spelled it, against the same deny-by-default rules: a
+bucket nobody configured is denied until you write an allow rule whose prefix
+pins its scheme, host and path — `s3://public-bucket/` — exactly as for a
+configured connection, and a caller the policy denies never reaches the
+fallback at all. No grant is ever generated for a fallback-reached address —
+that would be automatic widening of a deny-by-default policy. Component
+matching then decides who sees the root the fallback publishes. A grant on
+`s3://public-bucket/` does not cover the scheme root `s3:///` — a hostless
+scope matches only a hostless address — so the hidden root a granted layer
+publishes is invisible to principals holding only bucket-scoped grants:
+`list_address_roots` withholds it, and `root_info_for` on a bucket the
+principal has no rule for answers `NoRoute`, exactly as for an absent one. A
+rule whose prefix is the bare scheme, `prefix = "s3://"`, loads as the scope
+`s3:///`, lists that root, and grants nothing on any bucket. That is the rule
+a brokered client's principal needs: a `broker-client` layer routes
+fallback-only buckets through the broker only when its own layer carries a
+local `anonymous_fallback` grant **and** its principal holds a rule covering
+the bare scheme, because the broker advertises the hidden root only to a
+principal who may see it. The bucket rule is still what authorizes the read.
+
 ### How a prefix must be spelled
 
 Because matching is on the parsed address, a prefix whose text does not
@@ -135,6 +175,9 @@ loosely:
 
 - Policy evaluation is deny-by-default and runs on every request. There is no
   policy-epoch counter, no freshness window, and no persisted policy state.
+- **Authorization runs before routing.** A denied address is never routed, so
+  an anonymous fallback attempt or an outbound request cannot be caused by a
+  caller the policy denies.
 - Policy reload swaps the active policy atomically; the next request observes
   the new rules.
 - The Layer gates data operations and filters per-item list and watch results.

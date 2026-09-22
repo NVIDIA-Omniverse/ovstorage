@@ -335,21 +335,36 @@ fn refuse_known_size_over_cap(size: Option<u64>, max_bytes: Option<u64>) -> Resu
     }
 }
 
-/// The composition error every fallback-read arm surfaces for an unfollowed
-/// `ReadResult::Redirect`.
+/// The error every fallback-read arm surfaces when nothing below followed a
+/// `ReadResult::Redirect`. A redirect follower may have deliberately declined
+/// it (because of its size cap or `follow_reads = false`), or there may be no
+/// follower on the path; this wrapper cannot distinguish those cases.
 fn unfollowed_redirect_error() -> Error {
     Error::new(
         ErrorCode::Unsupported,
-        "transfer received an unfollowed redirect \
-         (RedirectFollower must compose below CopyRenameFallback)",
+        "transfer source returned a redirect that was not followed",
+    )
+    .with_next_action(
+        "A redirect_follower below may have declined the redirect because \
+         `follow_reads = false`, or because the object exceeds its \
+         `follow_reads_max_bytes` cap or has unknown size; alternatively, no \
+         redirect-following layer may be composed between this wrapper and the \
+         backend. Set `follow_reads = true` on the redirect_follower and raise \
+         or unset `follow_reads_max_bytes` as needed. Do not configure a cap \
+         while `follow_reads = false`; that combination is invalid. Or compose \
+         a `copy_rename_fallback` in the caller's own stack so the caller \
+         emulates the transfer and its redirect_follower can follow the \
+         surfaced redirect.",
     )
 }
 
 impl CopyRenameFallbackWrapper {
     /// Read `address` fully into memory — the `write`-only destination path
-    /// (`Body::Bytes` needs the whole object). A `Redirect` here is a
-    /// composition error — `RedirectFollower`
-    /// must sit below this wrapper.
+    /// (`Body::Bytes` needs the whole object). An unfollowed `Redirect` means
+    /// nothing below followed it, either deliberately (a size cap or
+    /// `follow_reads = false`) or structurally (no follower on the path); this
+    /// wrapper cannot distinguish those cases, so its error names each
+    /// possibility.
     ///
     /// `max_bytes` bounds host memory: the source's known size (from the
     /// read's `ObjectInfo.size`) refuses an over-cap transfer up front — never
@@ -439,8 +454,10 @@ impl CopyRenameFallbackWrapper {
     /// Read `address` as a chunked [`Body::Stream`] plus the source's size
     /// (the destination write's `size_hint`) — the `write_stream` destination
     /// path. Each `ReadResult` variant maps to its cheapest streaming shape.
-    /// A `Redirect` here is a composition error — `RedirectFollower` must sit
-    /// below this wrapper.
+    /// An unfollowed `Redirect` means nothing below followed it, either
+    /// deliberately (a size cap or `follow_reads = false`) or structurally (no
+    /// follower on the path); this wrapper cannot distinguish those cases, so
+    /// its error names each possibility.
     ///
     /// Only a source the backend already buffered (`ReadResult::Bytes`)
     /// occupies whole-object host memory here, as a single chunk; the other
@@ -714,10 +731,21 @@ impl Layer for CopyRenameFallbackWrapper {
         self.descriptor.clone()
     }
 
-    /// Everything except `copy`/`rename` and `root_info_for` delegates to
-    /// `inner` via the trait defaults.
+    /// Everything except `copy`/`rename`, root discovery, and streaming list
+    /// pass-through delegates to `inner` via the trait defaults.
     fn inner_layer(&self) -> Option<&LayerHandle> {
         Some(&self.inner)
+    }
+
+    /// This wrapper does not inspect listings. Delegate the streaming slot
+    /// directly so the trait's buffered compatibility default cannot turn an
+    /// inner native stream back into a whole-prefix allocation.
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        self.inner.list_stream(request, cancel).await
     }
 
     /// Raise the **availability** bits the fallback makes true. The mechanism
@@ -976,5 +1004,30 @@ impl Layer for CopyRenameFallbackWrapper {
                  either one.",
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unfollowed_redirect_names_causes_and_recovery_without_asserting_one() {
+        let error = unfollowed_redirect_error();
+
+        assert_eq!(error.code(), ErrorCode::Unsupported);
+        assert_eq!(
+            error.message(),
+            "transfer source returned a redirect that was not followed"
+        );
+
+        let next_action = error.next_action().expect("recovery hint");
+        assert!(next_action.contains("`follow_reads = false`"));
+        assert!(next_action.contains("`follow_reads = true`"));
+        assert!(next_action.contains("`follow_reads_max_bytes`"));
+        assert!(next_action.contains("combination is invalid"));
+        assert!(next_action.contains("no redirect-following layer"));
+        assert!(next_action.contains("caller's own stack"));
+        assert!(next_action.contains("`copy_rename_fallback`"));
     }
 }

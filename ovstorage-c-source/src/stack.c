@@ -2362,6 +2362,9 @@ static void ovc_stack_abi_connection_destroy(
             &connection->auth_state.auth_failed.error_message);
     }
     ovc_stack_abi_key_values_clear(&connection->user_metadata);
+    if (connection->owning_target.present) {
+        ovc_stack_abi_str_clear(&connection->owning_target.value);
+    }
     /* add_connection's result payload is a plugin-minted heap Connection. */
     ovc_abi_free(connection);
 }

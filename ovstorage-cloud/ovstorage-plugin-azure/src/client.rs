@@ -410,7 +410,7 @@ impl AzureClient {
     pub fn new(account: String, auth: AzureAuth) -> Result<Self> {
         let http = Client::builder()
             .timeout(Duration::from_secs(60))
-            // Redirects are followed exactly as before; the policy only
+            // Redirects are followed; the policy only
             // OBSERVES them, recording that a hop happened so the promotion
             // rule declines to judge an answer the credential did not reach.
             // The limit matches `Policy::limited(10)`, the default this
@@ -587,6 +587,27 @@ impl AzureClient {
         let body_len = req.body.as_ref().map(|b| b.len() as u64).unwrap_or(0);
         let mut url = req.url.clone();
 
+        // Azure signs conditional headers exactly as they appear on the wire,
+        // and it requires RFC 7232 entity-tag quoting on them. Quote ONCE here
+        // so the Shared Key string-to-sign and the emitted header can never
+        // disagree: signing the raw etag while sending the quoted one produced
+        // `AuthenticationFailed` / "The MAC signature found in the HTTP request
+        // ... is not the same as any computed signature" on every SharedKey
+        // request carrying an If-Match -- `update_metadata` being the one the
+        // integration suite hits. `quote_etag` is a no-op on an already-quoted
+        // value.
+        let if_match_header = req.if_match.as_deref().map(crate::backend::quote_etag);
+        // `If-None-Match: *` is the only wildcard the no-overwrite path uses;
+        // everything else is an entity-tag that must round-trip through
+        // `quote_etag`.
+        let if_none_match_header = req.if_none_match.as_deref().map(|value| {
+            if value == "*" {
+                value.to_string()
+            } else {
+                crate::backend::quote_etag(value)
+            }
+        });
+
         match self.auth.source() {
             AuthSource::Sas { sas_token } => {
                 let separator = if url.contains('?') { '&' } else { '?' };
@@ -603,8 +624,8 @@ impl AzureClient {
                     content_length: if body_len == 0 { None } else { Some(body_len) },
                     content_type: req.content_type.as_deref(),
                     content_md5: req.content_md5.as_deref(),
-                    if_match: req.if_match.as_deref(),
-                    if_none_match: req.if_none_match.as_deref(),
+                    if_match: if_match_header.as_deref(),
+                    if_none_match: if_none_match_header.as_deref(),
                     range: req.range.as_deref(),
                 };
                 let canonical = shared_key_string_to_sign(&signing_request);
@@ -626,30 +647,42 @@ impl AzureClient {
         if let Some(content_md5) = req.content_md5.as_deref() {
             builder = builder.header("Content-MD5", content_md5);
         }
-        if let Some(if_match) = req.if_match.as_deref() {
-            // Azure requires RFC 7232 entity-tag quoting on conditional
-            // headers; the SPI documents `if_match` as the raw etag
-            // value the backend handed back. `quote_etag` is a no-op
-            // if the caller already supplied the quoted form.
-            builder = builder.header("If-Match", crate::backend::quote_etag(if_match));
+        // Both quoted above, so these are byte-identical to what was signed.
+        if let Some(if_match) = if_match_header.as_deref() {
+            builder = builder.header("If-Match", if_match);
         }
-        if let Some(if_none_match) = req.if_none_match.as_deref() {
-            // `If-None-Match: *` is the only wildcard the no-overwrite
-            // path uses; everything else is an entity-tag that must
-            // round-trip through `quote_etag`.
-            let value = if if_none_match == "*" {
-                if_none_match.to_string()
-            } else {
-                crate::backend::quote_etag(if_none_match)
-            };
-            builder = builder.header("If-None-Match", value);
+        if let Some(if_none_match) = if_none_match_header.as_deref() {
+            builder = builder.header("If-None-Match", if_none_match);
         }
         if let Some(range) = req.range.as_deref() {
             builder = builder.header("Range", range);
         }
         builder = builder.headers(to_reqwest_headers(&headers)?);
         if let Some(body) = req.body {
+            let empty = body.is_empty();
             builder = builder.body(body);
+            if empty && matches!(req.method, Method::PUT | Method::POST | Method::PATCH) {
+                // See below: a zero-length body is omitted from the wire just
+                // like an absent one, so it needs the same explicit header.
+                // `create_directory` sends `Some(Vec::new())` and hit this.
+                builder = builder.header(reqwest::header::CONTENT_LENGTH, "0");
+            }
+        } else if matches!(req.method, Method::PUT | Method::POST | Method::PATCH) {
+            // Azure's front end rejects a body-bearing method that arrives with
+            // neither a Content-Length nor chunked encoding:
+            //   HTTP 411 -- "The request must be chunked or have a content
+            //   length."
+            // reqwest omits Content-Length entirely when no body is set, so
+            // every bodyless PUT/POST hit this: copy (Copy Blob), rename (which
+            // falls back to copy), set-metadata, and the zero-byte directory
+            // marker. GET/HEAD are excluded -- they need no such header, and
+            // some intermediaries treat a Content-Length on them as malformed.
+            //
+            // This does NOT perturb the Shared Key signature: the canonical
+            // string uses the empty string for a zero Content-Length (the
+            // 2015-02-21-and-later rule), which is exactly what the
+            // `content_length: None` above already encodes.
+            builder = builder.header(reqwest::header::CONTENT_LENGTH, "0");
         }
         // The evidence below is withheld for ANY redirect — see [`note_redirected`]
         // for why azure is stricter than the gcs sibling, and why the hop is
@@ -796,6 +829,7 @@ pub(crate) fn map_status_to_error(response: &AzureResponse, operation: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// What azure answers a `SharedKey` signature that does not cover the
     /// resource the request landed on.
@@ -809,6 +843,221 @@ mod tests {
             headers: HeaderMap::default(),
             body: body.to_vec(),
         }
+    }
+
+    fn shared_key_client() -> (AzureClient, Vec<u8>) {
+        use base64::Engine as _;
+        use ovstorage_plugin::{SecretBundle, SecretBytes, SecretValue};
+
+        let account_key_bytes = b"0123456789abcdef".to_vec();
+        let mut bundle = SecretBundle::default();
+        bundle.fields.insert(
+            "account_key".into(),
+            SecretValue::Bytes(SecretBytes(
+                base64::engine::general_purpose::STANDARD
+                    .encode(&account_key_bytes)
+                    .into_bytes(),
+            )),
+        );
+        let auth = AzureAuth::resolve(&bundle).expect("shared key auth resolves");
+        (
+            AzureClient::new("acct".into(), auth).expect("client builds"),
+            account_key_bytes,
+        )
+    }
+
+    async fn raw_request_listener() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw request listener");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let captured = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let count = stream.read(&mut buf).await.expect("read request head");
+                if count == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..count]);
+                if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nx-ms-request-id: req-raw-wire\r\n\
+                      content-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write response");
+            stream.shutdown().await.expect("shutdown response");
+            String::from_utf8(raw).expect("request head is ASCII")
+        });
+        (url, captured)
+    }
+
+    fn raw_header_values<'a>(request: &'a str, wanted: &str) -> Vec<&'a str> {
+        request
+            .split("\r\n")
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| value.trim())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn shared_key_if_match_is_quoted_once_and_signed_as_sent() {
+        for supplied in ["etag-value", "\"etag-value\""] {
+            let (url, captured) = raw_request_listener().await;
+            let (client, account_key_bytes) = shared_key_client();
+            let canonical_path = "/acct/bkt/obj.txt";
+            client
+                .send(AzureRequest {
+                    method: Method::PUT,
+                    url: format!("{url}/bkt/obj.txt"),
+                    canonical_path,
+                    canonical_query: vec![],
+                    extra_headers: vec![],
+                    content_type: None,
+                    content_md5: None,
+                    if_match: Some(supplied.into()),
+                    if_none_match: None,
+                    range: None,
+                    body: None,
+                })
+                .await
+                .expect("capturing endpoint accepts request");
+            let request = captured.await.expect("capture task completes");
+
+            let if_match = raw_header_values(&request, "if-match");
+            assert_eq!(if_match, ["\"etag-value\""], "{request}");
+
+            let date = raw_header_values(&request, X_MS_DATE);
+            let version = raw_header_values(&request, X_MS_VERSION);
+            assert_eq!(date.len(), 1, "{request}");
+            assert_eq!(version.len(), 1, "{request}");
+            let signed_headers = vec![
+                (X_MS_VERSION.to_string(), version[0].to_string()),
+                (X_MS_DATE.to_string(), date[0].to_string()),
+            ];
+            let signing_request = SharedKeyRequest {
+                method: "PUT",
+                account: "acct",
+                canonical_path,
+                canonical_query: &[],
+                headers: &signed_headers,
+                content_length: None,
+                content_type: None,
+                content_md5: None,
+                if_match: Some(if_match[0]),
+                if_none_match: None,
+                range: None,
+            };
+            let canonical = shared_key_string_to_sign(&signing_request);
+            let signature = shared_key_signature(&account_key_bytes, &canonical).unwrap();
+            let expected = shared_key_authorization_value("acct", &signature);
+            assert_eq!(
+                raw_header_values(&request, "authorization"),
+                [expected.as_str()],
+                "wire authorization must sign the wire If-Match value"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_key_if_none_match_preserves_wildcard_quotes_etags_and_signs_as_sent() {
+        for (supplied, expected_wire) in [
+            ("*", "*"),
+            ("etag-value", "\"etag-value\""),
+            ("\"etag-value\"", "\"etag-value\""),
+        ] {
+            let (url, captured) = raw_request_listener().await;
+            let (client, account_key_bytes) = shared_key_client();
+            let canonical_path = "/acct/bkt/obj.txt";
+            client
+                .send(AzureRequest {
+                    method: Method::PUT,
+                    url: format!("{url}/bkt/obj.txt"),
+                    canonical_path,
+                    canonical_query: vec![],
+                    extra_headers: vec![],
+                    content_type: None,
+                    content_md5: None,
+                    if_match: None,
+                    if_none_match: Some(supplied.into()),
+                    range: None,
+                    body: None,
+                })
+                .await
+                .expect("capturing endpoint accepts request");
+            let request = captured.await.expect("capture task completes");
+
+            let if_none_match = raw_header_values(&request, "if-none-match");
+            assert_eq!(if_none_match, [expected_wire], "{request}");
+
+            let date = raw_header_values(&request, X_MS_DATE);
+            let version = raw_header_values(&request, X_MS_VERSION);
+            assert_eq!(date.len(), 1, "{request}");
+            assert_eq!(version.len(), 1, "{request}");
+            let signed_headers = vec![
+                (X_MS_VERSION.to_string(), version[0].to_string()),
+                (X_MS_DATE.to_string(), date[0].to_string()),
+            ];
+            let signing_request = SharedKeyRequest {
+                method: "PUT",
+                account: "acct",
+                canonical_path,
+                canonical_query: &[],
+                headers: &signed_headers,
+                content_length: None,
+                content_type: None,
+                content_md5: None,
+                if_match: None,
+                if_none_match: Some(if_none_match[0]),
+                range: None,
+            };
+            let canonical = shared_key_string_to_sign(&signing_request);
+            let signature = shared_key_signature(&account_key_bytes, &canonical).unwrap();
+            let expected = shared_key_authorization_value("acct", &signature);
+            assert_eq!(
+                raw_header_values(&request, "authorization"),
+                [expected.as_str()],
+                "wire authorization must sign the exact wire If-None-Match value"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bodyless_put_sends_exact_zero_content_length() {
+        let (url, captured) = raw_request_listener().await;
+        let (client, _) = shared_key_client();
+        let canonical_path = "/acct/bkt/copied.bin";
+
+        client
+            .send(AzureRequest {
+                method: Method::PUT,
+                url: format!("{url}/bkt/copied.bin"),
+                canonical_path,
+                canonical_query: vec![],
+                extra_headers: vec![("x-ms-copy-source".into(), "source".into())],
+                content_type: None,
+                content_md5: None,
+                if_match: None,
+                if_none_match: None,
+                range: None,
+                body: None,
+            })
+            .await
+            .expect("capturing endpoint accepts request");
+        let request = captured.await.expect("capture task completes");
+
+        assert_eq!(raw_header_values(&request, "content-length"), ["0"]);
+        assert!(
+            raw_header_values(&request, "transfer-encoding").is_empty(),
+            "bodyless PUT must not become chunked: {request}"
+        );
     }
 
     /// Shape of a real Shared Key 401: the `<AuthenticationErrorDetail>`

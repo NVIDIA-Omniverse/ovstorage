@@ -16,10 +16,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use ovstorage::{
-    CancellationToken, ChecksumSet, Error, ErrorCode, Layer, LayerConfig, LayerKindDescriptor,
-    LayerType, ListOptions, ListPage, ListRequest, ObjectInfo, ObjectKind, ReadOptions,
-    ReadRequest, ReadResult, Request, Result, StatOptions, StatRequest, Url, WrapperFactory,
-    export_handle, import_handle,
+    CancellationToken, ChecksumSet, Error, ErrorCode, EtagStrength, Layer, LayerConfig,
+    LayerKindDescriptor, LayerType, ListOptions, ListPage, ListRequest, ObjectInfo, ObjectKind,
+    ReadOptions, ReadRequest, ReadResult, Request, Result, StatOptions, StatRequest, Url,
+    WrapperFactory, export_handle, import_handle,
 };
 use ovstorage_plugin::{ffi, import_handle_force_foreign, marshal, thunks_v2};
 
@@ -29,6 +29,7 @@ const B_PAYLOAD: &[u8] = b"handoff payload b (second object)";
 
 fn object_info(address: Url, size: u64) -> ObjectInfo {
     ObjectInfo {
+        etag_strength: EtagStrength::Strong,
         address,
         kind: ObjectKind::File,
         etag: Some(format!("size:{size}")),
@@ -40,6 +41,7 @@ fn object_info(address: Url, size: u64) -> ObjectInfo {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 

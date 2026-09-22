@@ -184,6 +184,7 @@ pub fn connection_to_ffi(value: Connection) -> ffi::Connection {
             primitive::system_time_to_unix_ms,
         ),
         user_metadata: primitive::key_value_list_to_ffi(value.user_metadata),
+        owning_target: primitive::optional_to_ffi(value.owning_target, primitive::str_to_ffi),
     }
 }
 
@@ -201,6 +202,11 @@ pub unsafe fn connection_from_ffi(value: ffi::Connection) -> Result<Connection, 
         let auth_state_ffi = value.auth_state;
         let last_probed_ffi = value.last_probed_unix_ms;
         let user_metadata_ffi = value.user_metadata;
+        // Every field is moved out by name: this function partial-moves `value`,
+        // so a field left unread here would be dropped at end of scope — freed
+        // correctly, but silently lost, with nothing on the FFI side failing to
+        // compile. `connection_round_trip_preserves_full_payload` is the guard.
+        let owning_target_ffi = value.owning_target;
 
         let id = connection::connection_id_from_ffi(id_ffi);
         let backend_kind = primitive::str_from_ffi(backend_kind_ffi);
@@ -216,6 +222,21 @@ pub unsafe fn connection_from_ffi(value: ffi::Connection) -> Result<Connection, 
                 Ok(primitive::system_time_from_unix_ms(ms))
             });
         let user_metadata = primitive::key_value_list_from_ffi(user_metadata_ffi);
+        // **`present` can outrun the payload, and this is the one place the two
+        // shapes underneath it can be told apart.** `present == true` with
+        // `ptr == NULL, len == 0` is what `calloc` already gives a C plugin, so
+        // it arrives by omission and carries no attribution: it decodes to
+        // `None`, which keeps the host's sole-target fill and every
+        // owner-deriving fallback reachable. `present == true` with a non-NULL
+        // pointer and a zero length is a target the producer encoded as `""` on
+        // purpose, and it decodes to `Some("")`: an empty layer instance name is
+        // legal at the graph level, so discarding it would drop an attribution
+        // the producer really made.
+        //
+        // `optional_str_unset_as_none` is the single definition of that rule;
+        // `RootInfo::owning_target` decodes through the same helper, so the two
+        // decoders of this one field cannot disagree about what absence means.
+        let owning_target = primitive::optional_str_unset_as_none(owning_target_ffi);
 
         Ok(Connection {
             id: id?,
@@ -227,6 +248,7 @@ pub unsafe fn connection_from_ffi(value: ffi::Connection) -> Result<Connection, 
             auth_state: auth_state?,
             last_probed: last_probed?,
             user_metadata: user_metadata?,
+            owning_target: owning_target?,
         })
     }
 }

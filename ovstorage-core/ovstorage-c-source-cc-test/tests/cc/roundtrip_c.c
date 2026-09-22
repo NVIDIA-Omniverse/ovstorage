@@ -8,7 +8,6 @@
 #include "../../../../ovstorage-c-source/src/temp_dir.h"
 
 #include "file_url.h"
-#include "sidecar_cleanup.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -676,8 +675,9 @@ int ovstorage_c_source_roundtrip_c(void)
     char native_object[512];
     char native_renamed[512];
     char native_copied[512];
+    char config_toml[3 * OVC_TEMP_DIR_PATH_MAX + 512];
     OvStorage_Registry *registry = NULL;
-    OvStorage_Stack *stack = NULL;
+    OvStorage_StackConfig *config = NULL;
     OvStorage_ConnectionRequest *request = NULL;
     OvStorage_ConfigValue *root_value = NULL;
     OvStorage_LayerHandle *layer = NULL;
@@ -788,58 +788,52 @@ int ovstorage_c_source_roundtrip_c(void)
     }
     stream_initialized = 1;
 
+    written = snprintf(config_toml,
+                       sizeof(config_toml),
+                       "[ovstorage]\n"
+                       "root = \"files\"\n"
+                       "[ovstorage.layers.files]\n"
+                       "kind = \"file\"\n"
+                       "[[ovstorage.connections]]\n"
+                       "target = \"files\"\n"
+                       "backend_kind = \"file\"\n"
+                       "config = { root = \"%s\" }\n",
+                       root_address);
+    if (written < 0 || (size_t)written >= sizeof(config_toml)) {
+        fprintf(stderr, "config-driven Stack TOML is too long\n");
+        goto cleanup;
+    }
+
     registry = ovstorage_registry_create();
-    stack = ovstorage_stack_create();
-    if (registry == NULL || stack == NULL) {
-        fprintf(stderr, "failed to create the registry or Stack builder\n");
-        goto cleanup;
-    }
-
-    /* No plugin is loaded or registered: success proves that a fresh
-     * registry resolves the seeded built-in file factory. */
-    if (!status_succeeded(
-            "seeded file resolution with zero plugins loaded",
-            ovstorage_stack_add_layer(
-                stack, registry, "files", "file", &error),
-            &error)) {
+    if (registry == NULL) {
+        fprintf(stderr, "failed to create the registry\n");
         goto cleanup;
     }
     if (!status_succeeded(
-            "stack_set_root",
-            ovstorage_stack_set_root(stack, "files", &error),
+            "StackConfig::from_toml_str",
+            ovstorage_stack_config_from_toml_str(config_toml,
+                                                  &config,
+                                                  &error),
             &error)) {
         goto cleanup;
     }
-
-    request = ovstorage_connection_request_create("file");
-    root_value = ovstorage_config_value_create_string(root_address);
-    if (request == NULL || root_value == NULL) {
-        fprintf(stderr, "failed to create the file connection config\n");
-        goto cleanup;
-    }
-    if (!ovstorage_connection_request_add_config(request, "root", root_value)) {
-        fprintf(stderr, "failed to add the file connection root config\n");
-        goto cleanup;
-    }
-    root_value = NULL;
-
+    /* No plugin is loaded or registered: config-driven success proves that a
+     * fresh registry resolves the seeded built-in file factory. */
     if (!status_succeeded(
-            "stack_add_connection",
-            ovstorage_stack_add_connection(stack, "files", &request, &error),
+            "stack_build_from_config",
+            ovstorage_stack_build_from_config(config,
+                                               registry,
+                                               &build_options,
+                                               &layer,
+                                               &error),
             &error)) {
         goto cleanup;
     }
-    request = NULL;
-
-    if (!status_succeeded(
-            "stack_build",
-            ovstorage_stack_build(stack, &build_options, &layer, &error),
-            &error)) {
-        goto cleanup;
-    }
-    stack = NULL;
+    ovstorage_stack_config_destroy(config);
+    config = NULL;
     if (layer == NULL) {
-        fprintf(stderr, "stack_build returned no root Layer handle\n");
+        fprintf(stderr,
+                "stack_build_from_config returned no root Layer handle\n");
         goto cleanup;
     }
 
@@ -1230,6 +1224,7 @@ int ovstorage_c_source_roundtrip_c(void)
                      object_address,
                      renamed_address,
                      NULL,
+                     NULL,
                      on_status,
                      &completion);
     completion_wait(&completion);
@@ -1258,6 +1253,7 @@ int ovstorage_c_source_roundtrip_c(void)
                    renamed_address,
                    copied_address,
                    NULL,
+                   NULL,
                    on_info,
                    &completion);
     completion_wait(&completion);
@@ -1278,6 +1274,177 @@ int ovstorage_c_source_roundtrip_c(void)
                         OvStorage_Status_Ok,
                         "stat of the copy source")) {
         goto cleanup;
+    }
+
+    /* CopyOptions: both preconditions unexercised by every call above,
+     * which all pass NULL. A regression that ignores no_overwrite, maps
+     * if_match_etag to unconditional overwrite, or mishandles the C
+     * marshalling would leave the rest of this suite green. */
+    {
+        OvStorage_CopyOptions copy_options = {0};
+        char copied_etag[256];
+
+        /* no_overwrite onto the existing copy destination must report
+         * AlreadyExists, and must not touch the existing content. */
+        copy_options.no_overwrite = true;
+        completion_prepare(&completion);
+        ovstorage_copy(layer,
+                       renamed_address,
+                       copied_address,
+                       &copy_options,
+                       NULL,
+                       on_info,
+                       &completion);
+        completion_wait(&completion);
+        if (completion.status != OvStorage_Status_AlreadyExists) {
+            fprintf(stderr,
+                    "no_overwrite copy onto an existing destination "
+                    "returned status %d instead of AlreadyExists\n",
+                    (int)completion.status);
+            goto cleanup;
+        }
+        copy_options.no_overwrite = false;
+        if (!read_equals(layer,
+                         &completion,
+                         copied_address,
+                         payload,
+                         sizeof(payload) - 1,
+                         "read of the copy destination after a rejected "
+                         "no_overwrite copy")) {
+            goto cleanup;
+        }
+
+        /* Setting both preconditions is rejected before either is
+         * evaluated. */
+        copy_options.no_overwrite = true;
+        copy_options.if_match_etag = "stale-etag";
+        completion_prepare(&completion);
+        ovstorage_copy(layer,
+                       renamed_address,
+                       copied_address,
+                       &copy_options,
+                       NULL,
+                       on_info,
+                       &completion);
+        completion_wait(&completion);
+        copy_options.no_overwrite = false;
+        if (completion.status != OvStorage_Status_InvalidArgument) {
+            fprintf(stderr,
+                    "copy with both no_overwrite and if_match_etag "
+                    "returned status %d instead of InvalidArgument\n",
+                    (int)completion.status);
+            goto cleanup;
+        }
+
+        /* A stale if_match_etag must report PreconditionFailed and leave
+         * the destination untouched. */
+        completion_prepare(&completion);
+        ovstorage_stat(layer,
+                       copied_address,
+                       &stat_options,
+                       NULL,
+                       on_info,
+                       &completion);
+        completion_wait(&completion);
+        if (!completion_succeeded("stat of the copy destination", &completion)) {
+            goto cleanup;
+        }
+        if (completion.info == NULL || completion.info->etag == NULL) {
+            fprintf(stderr, "stat of the copy destination reported no etag\n");
+            goto cleanup;
+        }
+        written = snprintf(copied_etag,
+                           sizeof(copied_etag),
+                           "%s",
+                           completion.info->etag);
+        if (written <= 0 || (size_t)written >= sizeof(copied_etag)) {
+            fprintf(stderr, "copy destination etag is too long\n");
+            goto cleanup;
+        }
+
+        copy_options.if_match_etag = "stale-etag";
+        completion_prepare(&completion);
+        ovstorage_copy(layer,
+                       renamed_address,
+                       copied_address,
+                       &copy_options,
+                       NULL,
+                       on_info,
+                       &completion);
+        completion_wait(&completion);
+        if (completion.status != OvStorage_Status_PreconditionFailed) {
+            fprintf(stderr,
+                    "copy with a stale if_match_etag returned status %d "
+                    "instead of PreconditionFailed\n",
+                    (int)completion.status);
+            goto cleanup;
+        }
+        if (!read_equals(layer,
+                         &completion,
+                         copied_address,
+                         payload,
+                         sizeof(payload) - 1,
+                         "read of the copy destination after a rejected "
+                         "if_match_etag copy")) {
+            goto cleanup;
+        }
+
+        /* The matching etag lets the copy proceed. */
+        copy_options.if_match_etag = copied_etag;
+        completion_prepare(&completion);
+        ovstorage_copy(layer,
+                       renamed_address,
+                       copied_address,
+                       &copy_options,
+                       NULL,
+                       on_info,
+                       &completion);
+        completion_wait(&completion);
+        if (!completion_succeeded("copy with a matching if_match_etag",
+                                  &completion)) {
+            goto cleanup;
+        }
+        if (!read_equals(layer,
+                         &completion,
+                         copied_address,
+                         payload,
+                         sizeof(payload) - 1,
+                         "read of the copy destination after a matching "
+                         "if_match_etag copy")) {
+            goto cleanup;
+        }
+
+        /* rename shares the same C marshalling (ovc_dispatch_if_dest_from_
+         * precondition) as copy above; a spot check that the option
+         * actually reaches ovstorage_rename, rather than full precondition
+         * coverage again, is what this adds. */
+        copy_options.if_match_etag = NULL;
+        copy_options.no_overwrite = true;
+        completion_prepare(&completion);
+        ovstorage_rename(layer,
+                         renamed_address,
+                         copied_address,
+                         &copy_options,
+                         NULL,
+                         on_status,
+                         &completion);
+        completion_wait(&completion);
+        copy_options.no_overwrite = false;
+        if (completion.status != OvStorage_Status_AlreadyExists) {
+            fprintf(stderr,
+                    "no_overwrite rename onto an existing destination "
+                    "returned status %d instead of AlreadyExists\n",
+                    (int)completion.status);
+            goto cleanup;
+        }
+        if (!stat_status_is(layer,
+                            &completion,
+                            renamed_address,
+                            OvStorage_Status_Ok,
+                            "stat of the rename source after a rejected "
+                            "no_overwrite rename")) {
+            goto cleanup;
+        }
     }
 
     /* Delete both objects and pin stat-after-delete -> NotFound. */
@@ -1312,7 +1479,7 @@ int ovstorage_c_source_roundtrip_c(void)
 
 cleanup:
     ovstorage_layer_handle_destroy(layer);
-    ovstorage_stack_destroy(stack);
+    ovstorage_stack_config_destroy(config);
     ovstorage_connection_request_destroy(request);
     ovstorage_config_value_destroy(root_value);
     ovstorage_registry_destroy(registry);
@@ -1334,9 +1501,6 @@ cleanup:
     if (paths_initialized && unlink(native_copied) != 0 && errno != ENOENT) {
         fprintf(stderr, "unlink failed: %s\n", strerror(errno));
         exit_code = EXIT_FAILURE;
-    }
-    if (directory != NULL) {
-        ovc_test_remove_metadata_sidecars(directory);
     }
     if (directory != NULL && rmdir(directory) != 0) {
         fprintf(stderr, "rmdir failed: %s\n", strerror(errno));

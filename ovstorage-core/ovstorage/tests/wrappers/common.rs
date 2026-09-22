@@ -16,10 +16,10 @@ use ovstorage::{
     AddressVisibility, BackendFactory, BackendItemInfo, Body, BodyStream, CancellationToken,
     Capabilities, ChangeEvent, ChangeKind, ChangeStream, ChecksumSet, ConfigLayer, ConfigValue,
     ContinueWriteRequest, CopyRequest, CreateDirectoryRequest, DeleteDirectoryRequest,
-    DeleteRequest, Error, ErrorCode, Layer, LayerConfig, LayerHandle, LayerKindDescriptor,
-    LayerSpec, LayerType, ListPage, ListRequest, LocalDelegate, ObjectInfo, ObjectKind,
-    RangeReadStrategy, ReadOptions, ReadRedirect, ReadRequest, ReadResult, RedirectResultBatch,
-    RenameRequest, Request, Result, RootInfo, RouteSource, Stack, StatRequest,
+    DeleteRequest, Error, ErrorCode, EtagStrength, Layer, LayerConfig, LayerHandle,
+    LayerKindDescriptor, LayerSpec, LayerType, ListPage, ListRequest, LocalDelegate, ObjectInfo,
+    ObjectKind, RangeReadStrategy, ReadOptions, ReadRedirect, ReadRequest, ReadResult,
+    RedirectResultBatch, RenameRequest, Request, Result, RootInfo, RouteSource, Stack, StatRequest,
     UpdateMetadataRequest, Url, UserMetadata, WatchDirectoryCursor, WatchDirectoryRequest,
     WrapperFactory, WriteRedirectBatch, WriteRequest, WriteResult, WriteStep,
 };
@@ -228,6 +228,12 @@ impl Layer for FlakyWriteBackend {
     }
 }
 
+pub(crate) fn wrapper_descriptor(kind: &str) -> LayerKindDescriptor {
+    let mut descriptor = backend_descriptor(kind);
+    descriptor.layer_type = LayerType::Wrapper;
+    descriptor
+}
+
 pub(crate) fn backend_descriptor(kind: &str) -> LayerKindDescriptor {
     LayerKindDescriptor {
         display_name: kind.to_string(),
@@ -246,6 +252,7 @@ pub(crate) fn backend_descriptor(kind: &str) -> LayerKindDescriptor {
 
 pub(crate) fn object_info(address: Url, size: u64) -> ObjectInfo {
     ObjectInfo {
+        etag_strength: Default::default(),
         address,
         kind: ObjectKind::File,
         etag: None,
@@ -257,6 +264,7 @@ pub(crate) fn object_info(address: Url, size: u64) -> ObjectInfo {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
@@ -478,6 +486,7 @@ impl CacheProbe {
     fn versioned_info(&self, address: Url, size: u64) -> ObjectInfo {
         let mut info = object_info(address, size);
         info.etag = Some(self.etag());
+        info.etag_strength = EtagStrength::Strong;
         info
     }
 }
@@ -489,7 +498,7 @@ impl Layer for CacheProbe {
     }
 
     fn descriptor(&self) -> LayerKindDescriptor {
-        backend_descriptor(PROBE_KIND)
+        wrapper_descriptor(PROBE_KIND)
     }
 
     async fn read(
@@ -525,6 +534,7 @@ impl Layer for CacheProbe {
         let mut info = self.versioned_info(request.input.address, self.content.len() as u64);
         if self.stat_omits_validator.load(Ordering::SeqCst) {
             info.etag = None;
+            info.etag_strength = EtagStrength::Unspecified;
         }
         Ok(info)
     }
@@ -706,6 +716,10 @@ impl StreamProbe {
 
     fn info(&self, address: Url) -> ObjectInfo {
         ObjectInfo {
+            etag_strength: self
+                .etag
+                .as_ref()
+                .map_or(EtagStrength::Unspecified, |_| EtagStrength::Strong),
             etag: self.etag.clone(),
             ..object_info(address, self.content.len() as u64)
         }
@@ -776,6 +790,10 @@ impl DelegateReadProbe {
 
     fn info(&self, address: Url) -> ObjectInfo {
         ObjectInfo {
+            etag_strength: self
+                .etag
+                .as_ref()
+                .map_or(EtagStrength::Unspecified, |_| EtagStrength::Strong),
             etag: self.etag.clone(),
             ..object_info(address, self.size)
         }
@@ -817,6 +835,7 @@ impl Layer for DelegateReadProbe {
 
 pub(crate) fn backend_item_info() -> BackendItemInfo {
     BackendItemInfo {
+        etag_strength: Default::default(),
         kind: ObjectKind::File,
         etag: None,
         version: None,
@@ -827,6 +846,7 @@ pub(crate) fn backend_item_info() -> BackendItemInfo {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 

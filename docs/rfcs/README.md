@@ -44,3 +44,4 @@ references never break.
 | --- | --- | --- | --- |
 | [0066](0066-layered-architecture.md) | Layered ovstorage | Implemented | — |
 | [0395](0395-c-value-types-as-visible-structs.md) | C snapshot types as visible structs | Implemented | 0066 |
+| [0639](0639-anonymous-fallback-routing.md) | Anonymous fallback routing | Accepted | 0066 |

@@ -550,6 +550,9 @@ OVSTORAGE_FIRE(fire_status, status_awaiter,
 OVSTORAGE_FIRE(fire_info, info_awaiter,
                on_complete(OvStorage_Status_Internal, nullptr, &error,
                            user_data))
+OVSTORAGE_FIRE(fire_root_info, root_info_awaiter,
+               on_complete(OvStorage_Status_Internal, nullptr, &error,
+                           user_data))
 OVSTORAGE_FIRE(fire_local_delegate, local_delegate_awaiter,
                on_complete(OvStorage_Status_Internal, nullptr, &error,
                            user_data))
@@ -648,6 +651,8 @@ bool every_boundary_reports_an_allocation_failure()
         "status_awaiter::on_complete", fire_status);
     ok &= boundary_reports_the_failure<info_awaiter, Info>(
         "info_awaiter::on_complete", fire_info);
+    ok &= boundary_reports_the_failure<root_info_awaiter, RootInfo>(
+        "root_info_awaiter::on_complete", fire_root_info);
     ok &= boundary_reports_the_failure<read_bytes_awaiter,
                                        std::pair<Bytes, Info>>(
         "read_bytes_awaiter::on_complete", fire_read_bytes,

@@ -24,7 +24,11 @@ path = "../.."
 # ovstorage-plugin-http drives the standard conformance scenarios in
 # tests/conformance_scenarios.rs against the scripted HTTP fixtures, so it
 # holds a [dev-dependencies] grant: test-only code that never reaches the
-# shipped plugin.
+# shipped plugin. ovstorage-plugin-hub-cache holds the same grant for its
+# mandatory tests/streaming_invariant.rs, which drives the shared
+# streaming recorder through the read tee, and a [dev-dependencies] grant
+# on ovstorage-plugin-http for tests/http_composition.rs — the one
+# composition where omni.client's digest-tier key is reachable end to end.
 #
 # ovstorage-plugin-test-layer's auth-capable fixture decodes the canonical
 # credential wire format through the pure ovstorage-authz-context crate. The
@@ -37,9 +41,15 @@ path = "../.."
 "ovstorage-plugin-test-abi" = ["ovstorage-plugin-test"]
 "ovstorage-plugin-core-abi" = ["ovstorage-plugin-core"]
 "ovstorage-plugin-cache-abi" = ["ovstorage-plugin-cache"]
+"ovstorage-plugin-hub-cache-abi" = ["ovstorage-plugin-hub-cache"]
 "ovstorage-plugin-http-abi" = ["ovstorage-plugin-http"]
 "ovstorage-plugin-test-abi-alloc" = ["ovstorage-plugin-test", "ovstorage-plugin"]
 "ovstorage-plugin-test-layer" = ["ovstorage-authz-context"]
 "ovstorage-plugin-core" = ["ovstorage-layer", "ovstorage-retry"]
 "ovstorage-plugin-cache" = ["ovstorage-cache", "ovstorage-layer"]
+"ovstorage-plugin-hub-cache" = [
+    "ovstorage-hub-client",
+    "ovstorage-plugin-http",
+    "ovstorage-plugin-test",
+]
 "ovstorage-plugin-http" = ["ovstorage-layer", "ovstorage-plugin-test", "ovstorage-retry"]

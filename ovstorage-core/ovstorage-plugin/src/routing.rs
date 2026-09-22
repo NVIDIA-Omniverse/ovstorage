@@ -11,6 +11,7 @@
 //! plugin cdylib and re-exports `ovstorage-layer`, so it is the lowest crate
 //! that can host them without inverting the dependency graph.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::address;
@@ -28,22 +29,66 @@ static FRESH_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 ///
 /// Selection is **longest prefix wins**; on a genuine overlap (two roots with
 /// the same address, e.g. a broker advertising a prefix another connection
-/// already serves) the tie-break is **FIFO** — the first-registered root keeps
-/// the route and later ones are shadowed (with a `warn`). FIFO falls out of a
-/// stable sort by descending prefix length over inputs given in registration
-/// order, so `lookup` returns the first (earliest) longest match.
+/// already serves), the root supplied earliest in the caller's aggregation
+/// order keeps the route and later ones are shadowed (with a `warn`). This
+/// order belongs to the graph producer and is not the declaration order of
+/// connection configuration. The tie-break falls out of a stable sort by
+/// descending prefix rank, so `lookup` returns the earliest longest match.
+///
+/// A caller that cares WHICH of two colliding roots keeps the route says so by
+/// the order it supplies them in, and one that must not move a route it has
+/// already published reads its previous table back through
+/// [`RouteTable::entries`] and leads with those bindings. The host `Router` does
+/// exactly that, so an overlap there is decided by incumbency rather than by
+/// which child happens to come first in the graph.
+///
+/// # Two tiers
+///
+/// [`RouteTable::lookup`] answers in two tiers. The first is the prefix scan
+/// above. The second runs only when the first misses, and only for an address
+/// whose query carries no credential
+/// ([`generated_rule_may_answer`](ovstorage_layer::generated_rule_may_answer)
+/// is the gate, for the same reason it gates a generated alias rule: an S3
+/// presigned or Azure SAS URL authenticates itself, and an anonymous attempt
+/// would discard the authority the caller presented): it returns the **scheme
+/// fallback root** registered for `url.scheme()`, if the table holds one. A
+/// scheme fallback root is a `RootInfo` that
+/// [`is_scheme_fallback_root`](ovstorage_layer::is_scheme_fallback_root)
+/// accepts — marked in `user_metadata` AND shaped as a bare scheme — and a
+/// backend layer publishes one only under an operator's grant. A hostless root
+/// without the marker (`file:///`, `mem:///`) is an ordinary prefix root and
+/// is not a catch-all: the tier never consults it.
+///
+/// **A second-tier hit is not a prefix hit.** For it,
+/// `relative_suffix(url, &root.root)` is `None`, because `s3://bucket/key` is
+/// not under `s3:///` in the prefix sense. A caller must therefore not compute
+/// a suffix from a hit; every in-tree consumer maps the hit to its target only,
+/// and the backend derives the bucket, account or container from the address
+/// itself. [`RouteTable::lookup_prefix`] exposes the first tier alone for the
+/// caller whose question is "who serves this exact node" rather than "who
+/// answers for this address".
+///
+/// Because this type is shared by the host `Router`, every connection-owning
+/// plugin's internal table and the brokered client's, all of them gain the
+/// tier at once: a marked scheme root reaches the same backend whether the
+/// address arrives at the Router or directly at the layer that published it.
 pub struct RouteTable<T> {
     entries: Vec<(RootInfo, T)>,
+    /// Second tier: scheme → index into `entries` of the first-ranked scheme
+    /// fallback root for that scheme. Built once in [`RouteTable::build`], so a
+    /// miss costs one hash probe rather than a second scan.
+    scheme_fallbacks: HashMap<String, usize>,
 }
 
 impl<T> RouteTable<T> {
     pub fn empty() -> Self {
         Self {
             entries: Vec::new(),
+            scheme_fallbacks: HashMap::new(),
         }
     }
 
-    /// Build from `(root, target)` pairs in registration order.
+    /// Build from `(root, target)` pairs in aggregation order.
     pub fn build(items: Vec<(RootInfo, T)>) -> Self {
         // Dedup on the node, not the spelling. An exact-string set does not see
         // that `x` and `x/` are one root, so the collision warning stayed
@@ -64,27 +109,81 @@ impl<T> RouteTable<T> {
                     address = %crate::RedactedUrl(&root.root),
                     connection.id = ?root.connection_id,
                     layer.kind = %root.layer_kind,
-                    "overlapping address root shadowed; first-registered route wins (FIFO)"
+                    "overlapping address root shadowed; the root aggregated earliest wins \
+                     (graph order, not config declaration order)"
                 );
             }
         }
         let mut entries = items;
         // Rank by how specific the root is, not by how many bytes it spells.
         // Byte length made the slashed spelling of a root outrank the slashless
-        // spelling of that same root regardless of registration order,
-        // inverting the documented FIFO tie-break. `node_rank` is depth then
-        // whether the root pins a query — both properties of the node — so two
-        // spellings of one root tie and this stable sort keeps the first
-        // registration, while a pinned root still outranks its parent.
+        // spelling of that same root regardless of aggregation order,
+        // inverting the documented input-order tie-break. `node_rank` is depth
+        // then whether the root pins a query — both properties of the node —
+        // so two spellings of one root tie and this stable sort keeps the first
+        // input, while a pinned root still outranks its parent.
         //
         // Depth alone would tie a pinned root with its unpinned parent, leaving
         // the pinned root unreachable for the address it publishes.
         entries.sort_by_key(|(root, _)| std::cmp::Reverse(ovstorage_layer::node_rank(&root.root)));
-        Self { entries }
+        // Indexed AFTER the sort, in ranked order, so the first marked root per
+        // scheme is the one `lookup`'s first tier would also prefer. Two marked
+        // roots for one scheme are two spellings of one node (`s3:///`), which
+        // the collision scan above has already warned about; `or_insert` keeps
+        // the earliest and says nothing more.
+        let mut scheme_fallbacks = HashMap::new();
+        for (index, (root, _)) in entries.iter().enumerate() {
+            if ovstorage_layer::is_scheme_fallback_root(root) {
+                scheme_fallbacks
+                    .entry(root.root.scheme().to_string())
+                    .or_insert(index);
+            }
+        }
+        Self {
+            entries,
+            scheme_fallbacks,
+        }
     }
 
-    /// Longest matching prefix for `url`, or `None` if nothing routes it.
+    /// The entry that answers for `url`, or `None` if nothing routes it.
+    ///
+    /// Two tiers, per the type's docs: the longest matching prefix, then the
+    /// scheme fallback root for `url.scheme()` when no prefix matches and the
+    /// address carries no credential in its query. A second-tier hit is not a
+    /// prefix hit — `relative_suffix(url, &root.root)` is `None` for it — so a
+    /// caller maps it to its target and derives nothing else from the root.
     pub fn lookup(&self, url: &Url) -> Option<&(RootInfo, T)> {
+        self.lookup_prefix(url).or_else(|| {
+            // A credential-bearing query never takes the fallback, exactly as
+            // it never takes a generated alias rule: the signature in the query
+            // is the authority the caller presented, and an anonymous attempt
+            // against the canonical address would silently discard it.
+            if !ovstorage_layer::generated_rule_may_answer(url) {
+                return None;
+            }
+            let index = *self.scheme_fallbacks.get(url.scheme())?;
+            // The origin only: the path of an unrouted address is not this
+            // table's to print, and the shared redaction pass recognises only
+            // some of the secrets a path or query can carry.
+            tracing::debug!(
+                scheme = url.scheme(),
+                address = %ovstorage_layer::origin_only(url),
+                "no prefix matches; routing by scheme fallback"
+            );
+            Some(&self.entries[index])
+        })
+    }
+
+    /// The first tier alone: the longest matching prefix for `url`, or `None`
+    /// if no root is an ancestor-or-self of it.
+    ///
+    /// For the caller asking "who serves this exact node" — the host Router's
+    /// check that an incoming connection does not collide with a root another
+    /// child already publishes. A scheme fallback root names no node an
+    /// incoming connection could collide with, so it must not be the answer
+    /// there; reading this tier alone states that rather than relying on a
+    /// downstream `same_node` guard to discard the hit.
+    pub fn lookup_prefix(&self, url: &Url) -> Option<&(RootInfo, T)> {
         self.entries
             .iter()
             .find(|(root, _)| address::relative_suffix(url, &root.root).is_some())
@@ -92,6 +191,17 @@ impl<T> RouteTable<T> {
 
     pub fn roots(&self) -> impl Iterator<Item = &RootInfo> {
         self.entries.iter().map(|(root, _)| root)
+    }
+
+    /// Every `(root, target)` pair in ranked order — the BINDINGS, where
+    /// [`RouteTable::roots`] gives the roots alone.
+    ///
+    /// Ranked order is what makes this answer "who currently serves this node":
+    /// among several entries for one node the first is the one `lookup` returns,
+    /// and the rest are the shadowed ones. A caller rebuilding its table uses
+    /// that to keep a published route where it is (see the type's docs).
+    pub fn entries(&self) -> impl Iterator<Item = &(RootInfo, T)> {
+        self.entries.iter()
     }
 }
 
@@ -244,16 +354,15 @@ pub fn fold_markers_and_infer_subdir_kinds(
 /// object. So a `File` keeps whatever it has, and only the directory kinds gain
 /// one.
 fn normalize_directory_addresses(items: Vec<ObjectInfo>) -> Vec<ObjectInfo> {
-    items
-        .into_iter()
-        .map(|mut item| {
-            if is_directory_like(item.kind) && !item.address.path().ends_with('/') {
-                let path = format!("{}/", item.address.path());
-                item.address.set_path(&path);
-            }
-            item
-        })
-        .collect()
+    items.into_iter().map(normalize_directory_address).collect()
+}
+
+pub(crate) fn normalize_directory_address(mut item: ObjectInfo) -> ObjectInfo {
+    if is_directory_like(item.kind) && !item.address.path().ends_with('/') {
+        let path = format!("{}/", item.address.path());
+        item.address.set_path(&path);
+    }
+    item
 }
 
 fn fold_concrete_over_inferred(items: Vec<ObjectInfo>) -> Vec<ObjectInfo> {
@@ -310,7 +419,7 @@ fn synthesize_missing_inferred_ancestors(
 /// the one a `delete_directory` on the emitted address would destroy.
 /// `Url::set_path` leaves a literal `%` alone, which is what makes truncation
 /// the right tool here and the wrong one on the emit side.
-fn ancestor_addresses(listed_prefix: &Url, address: &Url) -> Vec<Url> {
+pub(crate) fn ancestor_addresses(listed_prefix: &Url, address: &Url) -> Vec<Url> {
     let path = address.path();
     // Compare node forms so the boundaries are spelling-independent: the
     // listed prefix written with or without its trailing slash bounds the same
@@ -345,8 +454,9 @@ fn ancestor_addresses(listed_prefix: &Url, address: &Url) -> Vec<Url> {
         .collect()
 }
 
-fn inferred_directory_info(address: Url) -> ObjectInfo {
+pub(crate) fn inferred_directory_info(address: Url) -> ObjectInfo {
     ObjectInfo {
+        etag_strength: Default::default(),
         address,
         kind: ObjectKind::DirectoryInferred,
         etag: None,
@@ -358,17 +468,18 @@ fn inferred_directory_info(address: Url) -> ObjectInfo {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
-fn is_flat_marker_entry(item: &ObjectInfo) -> bool {
+pub(crate) fn is_flat_marker_entry(item: &ObjectInfo) -> bool {
     item.kind == ObjectKind::DirectoryMarker
         || (item.kind == ObjectKind::File
             && item.address.path().ends_with('/')
             && item.size.unwrap_or(0) == 0)
 }
 
-fn is_directory_like(kind: ObjectKind) -> bool {
+pub(crate) fn is_directory_like(kind: ObjectKind) -> bool {
     matches!(
         kind,
         ObjectKind::Directory | ObjectKind::DirectoryMarker | ObjectKind::DirectoryInferred
@@ -426,6 +537,32 @@ mod tests {
             .map(|(_, target)| target.clone())
     }
 
+    /// The first tier alone, for the tests that separate the two.
+    fn prefix_route_for(table: &RouteTable<String>, address: &str) -> Option<String> {
+        table
+            .lookup_prefix(&address::parse(address).expect("test address parses"))
+            .map(|(_, target)| target.clone())
+    }
+
+    /// The marked scheme fallback root a granted backend layer publishes,
+    /// built by the shared constructor so these tests pin the table against
+    /// the root's real shape rather than a hand-assembled approximation.
+    fn fallback_root(scheme: &str) -> RootInfo {
+        ovstorage_layer::scheme_fallback_root(scheme, "test", crate::Capabilities::empty(), None)
+            .expect("the scheme is in the closed fallback set")
+    }
+
+    /// Like [`table`], for roots that need more than a spelling — a marked
+    /// scheme root beside ordinary prefix roots.
+    fn table_with(roots: Vec<(RootInfo, &str)>) -> RouteTable<String> {
+        RouteTable::build(
+            roots
+                .into_iter()
+                .map(|(root, target)| (root, target.to_string()))
+                .collect(),
+        )
+    }
+
     /// Two spellings of one root are one root, whichever order they register.
     ///
     /// Ranking by the serialized byte length made the slashed spelling win
@@ -447,29 +584,50 @@ mod tests {
         }
     }
 
-    /// Rendered `tracing` events captured off the thread-local subscriber.
-    /// The shadowing warning is the whole of the operator-facing signal, so
-    /// the test that owns it asserts on the line itself.
-    #[derive(Clone, Default)]
-    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    /// Rendered `tracing` events emitted on the calling thread since
+    /// [`CapturedLogs::start`]. The shadowing warning and the tier-two line
+    /// are the whole of the operator-facing signal, so the tests that own
+    /// them assert on the line itself.
+    ///
+    /// The subscriber is process-wide and installed once, not scoped per
+    /// test: `tracing` caches each callsite's interest on its first hit, and
+    /// while a single scoped subscriber is the only one registered, that
+    /// interest is computed from the *hitting* thread's default. A sibling
+    /// test on another thread, with no subscriber of its own, can therefore
+    /// pin the callsite under test to `never` before this thread reaches it.
+    /// A global subscriber leaves no such window. Each thread records only
+    /// what it emits itself, which is exact here because the table builds
+    /// and lookups run synchronously on the test thread.
+    struct CapturedLogs;
+
+    thread_local! {
+        /// `Some` on threads that called [`CapturedLogs::start`]; every other
+        /// thread in the binary is passed over.
+        static CAPTURED: std::cell::RefCell<Option<Vec<String>>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
     impl CapturedLogs {
-        fn install(&self) -> tracing::subscriber::DefaultGuard {
-            use tracing_subscriber::layer::SubscriberExt;
-            tracing::subscriber::set_default(
-                tracing_subscriber::registry().with(CaptureLayer(self.clone())),
-            )
+        /// Start recording on this thread, discarding anything it logged earlier.
+        fn start() -> Self {
+            static INSTALL: std::sync::Once = std::sync::Once::new();
+            INSTALL.call_once(|| {
+                use tracing_subscriber::layer::SubscriberExt;
+                tracing::subscriber::set_global_default(
+                    tracing_subscriber::registry().with(CaptureLayer),
+                )
+                .expect("no other global subscriber in this test binary");
+            });
+            CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+            Self
         }
 
         fn lines(&self) -> Vec<String> {
-            self.0
-                .lock()
-                .expect("the capture lock is not poisoned")
-                .clone()
+            CAPTURED.with(|captured| captured.borrow().clone().unwrap_or_default())
         }
     }
 
-    struct CaptureLayer(CapturedLogs);
+    struct CaptureLayer;
 
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
         fn on_event(
@@ -477,12 +635,18 @@ mod tests {
             event: &tracing::Event<'_>,
             _ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            let mut visitor = RenderVisitor(String::new());
-            event.record(&mut visitor);
-            (self.0.0)
-                .lock()
-                .expect("the capture lock is not poisoned")
-                .push(visitor.0);
+            // `try_with`: a thread tearing down its locals may still log.
+            let _ = CAPTURED.try_with(|captured| {
+                if captured.borrow().is_none() {
+                    return;
+                }
+                // Render outside any borrow: a field's `Debug` may itself log.
+                let mut visitor = RenderVisitor(String::new());
+                event.record(&mut visitor);
+                if let Some(lines) = captured.borrow_mut().as_mut() {
+                    lines.push(visitor.0);
+                }
+            });
         }
     }
 
@@ -506,14 +670,11 @@ mod tests {
     /// password into structured logs each time.
     #[test]
     fn a_shadowed_root_is_logged_without_its_credentials() {
-        let logs = CapturedLogs::default();
-        let shadowed = {
-            let _guard = logs.install();
-            table(&[
-                ("https://alice:hunter2@host.invalid/root/", "first"),
-                ("https://bob:swordfish@host.invalid/root/", "second"),
-            ])
-        };
+        let logs = CapturedLogs::start();
+        let shadowed = table(&[
+            ("https://alice:hunter2@host.invalid/root/", "first"),
+            ("https://bob:swordfish@host.invalid/root/", "second"),
+        ]);
         // The premise: the two roots really are one node, so the warning fired
         // and the assertion below is asserting on something.
         assert_eq!(
@@ -789,10 +950,297 @@ mod tests {
     fn route_table_empty_matches_nothing() {
         let table: RouteTable<String> = RouteTable::empty();
         assert_eq!(route_for(&table, "s3://bucket/x.txt"), None);
+        assert_eq!(prefix_route_for(&table, "s3://bucket/x.txt"), None);
+    }
+
+    // ---- RouteTable: the second tier ------------------------------------
+    //
+    // A scheme fallback root cannot be a catch-all through the prefix scan:
+    // `is_ancestor_or_self` requires host equality and `s3:///` has no host to
+    // equal `bucket`. These pin the tier that answers after that miss, and —
+    // just as carefully — everything the tier must NOT answer.
+
+    /// The contract in one table: a configured bucket keeps its route, and an
+    /// address on the same scheme that no prefix serves reaches the marked
+    /// scheme root instead of `None`.
+    #[test]
+    fn a_marked_scheme_root_answers_after_every_prefix_misses() {
+        let table = table_with(vec![
+            (route_root("s3://bucket/"), "bucket"),
+            (fallback_root("s3"), "fallback"),
+        ]);
+        assert_eq!(
+            route_for(&table, "s3://bucket/x").as_deref(),
+            Some("bucket")
+        );
+        assert_eq!(
+            route_for(&table, "s3://other/x").as_deref(),
+            Some("fallback"),
+            "an unrouted address on a granted scheme takes the scheme fallback"
+        );
+        // The premise the type's docs state: a second-tier hit is not a prefix
+        // hit, so a consumer computing a suffix from it would get nothing.
+        let (root, _) = table
+            .lookup(&address::parse("s3://other/x").unwrap())
+            .expect("the fallback answers");
+        assert_eq!(
+            address::relative_suffix(&address::parse("s3://other/x").unwrap(), &root.root),
+            None,
+            "a tier-two hit yields no relative suffix"
+        );
+    }
+
+    /// A hostless root without the marker is an ordinary prefix root, not a
+    /// catch-all: `file:///`, `mem:///` and a foreign `my:///` serve every
+    /// hostless address under them and nothing with a host, byte-for-byte as
+    /// they always have. An unmarked `s3:///` is the same case — the structure
+    /// alone does not make a fallback root.
+    #[test]
+    fn an_unmarked_hostless_root_never_answers_a_hosted_address() {
+        for (root, hosted, hostless) in [
+            ("file:///", "file://host/k", "file:///k"),
+            ("mem:///", "mem://b/k", "mem:///k"),
+            ("my:///", "my://b/k", "my:///k"),
+            ("s3:///", "s3://b/k", "s3:///k"),
+        ] {
+            let table = table(&[(root, "root")]);
+            assert!(
+                table.scheme_fallbacks.is_empty(),
+                "{root} carries no marker and must register no second tier"
+            );
+            assert_eq!(
+                route_for(&table, hosted),
+                None,
+                "unmarked {root} must not answer {hosted}"
+            );
+            // The prefix relation it always had is untouched.
+            assert_eq!(
+                route_for(&table, hostless).as_deref(),
+                Some("root"),
+                "unmarked {root} still serves {hostless} by prefix"
+            );
+        }
+    }
+
+    /// The tier is keyed on the exact scheme string: a `gs` grant says nothing
+    /// about `s3`, and an `s3` grant says nothing about the `s3+minio` spelling
+    /// a compatibility profile uses.
+    #[test]
+    fn the_scheme_fallback_is_scheme_exact() {
+        let gs_only = table_with(vec![(fallback_root("gs"), "gs-fallback")]);
+        assert_eq!(route_for(&gs_only, "s3://b/k"), None);
+        assert_eq!(
+            route_for(&gs_only, "gs://b/k").as_deref(),
+            Some("gs-fallback")
+        );
+
+        let s3_only = table_with(vec![(fallback_root("s3"), "s3-fallback")]);
+        assert_eq!(route_for(&s3_only, "s3+minio://b/k"), None);
+        assert_eq!(
+            route_for(&s3_only, "s3://b/k").as_deref(),
+            Some("s3-fallback")
+        );
+    }
+
+    /// A presigned or SAS address authenticates itself with its query; an
+    /// anonymous attempt would discard that authority, so it gets `None` — the
+    /// byte-identical `NoRoute` the address had before any grant. A carried
+    /// key (`versionId`) is a version selector, not a credential, and passes.
+    #[test]
+    fn a_credential_bearing_query_never_takes_the_fallback() {
+        let table = table_with(vec![(fallback_root("s3"), "fallback")]);
+        assert_eq!(
+            route_for(&table, "s3://b/k?X-Amz-Signature=abc"),
+            None,
+            "a signed query must not reach the anonymous fallback"
+        );
+        assert_eq!(
+            route_for(&table, "s3://b/k?versionId=1").as_deref(),
+            Some("fallback"),
+            "a carried version selector is not a credential"
+        );
+    }
+
+    /// The first tier is exposed on its own for the caller asking "who serves
+    /// this exact node": it must see a prefix root and never the fallback.
+    #[test]
+    fn lookup_prefix_never_sees_the_second_tier() {
+        let table = table_with(vec![
+            (route_root("s3://bucket/"), "bucket"),
+            (fallback_root("s3"), "fallback"),
+        ]);
+        assert_eq!(
+            prefix_route_for(&table, "s3://bucket/x").as_deref(),
+            Some("bucket")
+        );
+        assert_eq!(prefix_route_for(&table, "s3://other/x"), None);
+        // The same address through the full lookup, so the two are provably
+        // different questions and not one answer spelled twice.
+        assert_eq!(
+            route_for(&table, "s3://other/x").as_deref(),
+            Some("fallback")
+        );
+    }
+
+    /// The scheme root's own address, and every hostless address under it, is
+    /// a FIRST-tier hit: `s3:///` is an ancestor-or-self of `s3:///` and of
+    /// `s3:///k`. The table routes them like any prefix; it is the backend
+    /// that refuses the bare scheme root with `InvalidArgument`, because no
+    /// bucket can be derived from an address with no authority.
+    #[test]
+    fn the_scheme_root_itself_is_a_tier_one_hit() {
+        let table = table_with(vec![(fallback_root("s3"), "fallback")]);
+        for hostless in ["s3:///", "s3:///k"] {
+            assert_eq!(
+                prefix_route_for(&table, hostless).as_deref(),
+                Some("fallback"),
+                "{hostless} is under s3:/// in the prefix sense"
+            );
+            assert_eq!(route_for(&table, hostless).as_deref(), Some("fallback"));
+        }
+    }
+
+    /// Two marked roots for one scheme are two spellings of one node, so the
+    /// existing shadowing warning fires once and the earliest-aggregated one
+    /// keeps the tier — no second warning, no second rule.
+    #[test]
+    fn two_marked_roots_for_one_scheme_warn_and_the_earliest_wins() {
+        let logs = CapturedLogs::start();
+        let table = table_with(vec![
+            (fallback_root("s3"), "first"),
+            (fallback_root("s3"), "second"),
+        ]);
+        assert_eq!(route_for(&table, "s3://b/k").as_deref(), Some("first"));
+        let warnings = logs
+            .lines()
+            .iter()
+            .filter(|line| line.contains("overlapping address root shadowed"))
+            .count();
+        assert_eq!(
+            warnings,
+            1,
+            "one collision, one warning; captured lines: {:?}",
+            logs.lines()
+        );
+        assert_eq!(
+            table.scheme_fallbacks.len(),
+            1,
+            "one scheme, one second-tier entry"
+        );
+    }
+
+    /// The tier-two line names the address by its origin and nothing else: the
+    /// path of an unrouted address can carry a capability token no redaction
+    /// list recognises, and this line is emitted for every such address.
+    #[test]
+    fn a_tier_two_hit_is_logged_with_the_origin_only() {
+        let table = table_with(vec![(fallback_root("s3"), "fallback")]);
+        let logs = CapturedLogs::start();
+        assert_eq!(
+            route_for(&table, "s3://bucket-name/secret/path.bin?versionId=7").as_deref(),
+            Some("fallback")
+        );
+        // A first-tier hit and a miss say nothing.
+        assert_eq!(route_for(&table, "s3:///").as_deref(), Some("fallback"));
+        assert_eq!(route_for(&table, "gs://bucket-name/secret"), None);
+        let lines: Vec<String> = logs
+            .lines()
+            .into_iter()
+            .filter(|line| line.contains("routing by scheme fallback"))
+            .collect();
+        assert_eq!(lines.len(), 1, "captured lines: {:?}", logs.lines());
+        assert!(
+            lines[0].contains("s3://bucket-name"),
+            "the line must name the origin: {}",
+            lines[0]
+        );
+        for withheld in ["secret", "path.bin", "versionId"] {
+            assert!(
+                !lines[0].contains(withheld),
+                "the line leaked `{withheld}`: {}",
+                lines[0]
+            );
+        }
+    }
+
+    /// `http`/`https` cannot be spelled hostless, so their scheme root uses
+    /// the reserved `.invalid` placeholder host. The tier still keys on the
+    /// scheme, so the placeholder answers every `https` address no prefix
+    /// serves — and, being scheme-exact, none on `http`.
+    #[test]
+    fn a_placeholder_host_root_answers_a_special_scheme() {
+        let root = fallback_root("https");
+        assert_eq!(
+            root.root.host_str(),
+            Some(ovstorage_layer::SCHEME_FALLBACK_PLACEHOLDER_HOST)
+        );
+        let table = table_with(vec![(root, "https-fallback")]);
+        assert_eq!(
+            route_for(&table, "https://other.example/x").as_deref(),
+            Some("https-fallback")
+        );
+        assert_eq!(route_for(&table, "http://other.example/x"), None);
+        // The placeholder is not a prefix of a real host's address.
+        assert_eq!(prefix_route_for(&table, "https://other.example/x"), None);
+    }
+
+    /// With no marked root anywhere, `lookup` IS `lookup_prefix`: the tables
+    /// every earlier test builds answer exactly as they did before the tier
+    /// existed, hit and miss alike.
+    #[test]
+    fn an_unmarked_table_is_unchanged() {
+        let tables = [
+            table(&[
+                ("s3://bucket/", "bucket"),
+                ("s3://bucket/team/", "team"),
+                ("s3://bucket/team/docs/", "docs"),
+            ]),
+            table(&[
+                ("file:///data/root/deep/", "deep"),
+                ("file:///data/root", "shallow"),
+            ]),
+            table(&[
+                ("s3://b/root/", "generic"),
+                ("s3://b/root?snapshot=7", "pinned"),
+            ]),
+            table(&[("file:///", "fs"), ("mem:///", "mem"), ("s3:///", "bare")]),
+            table(&[("https://alice:hunter2@host.invalid/root/", "first")]),
+        ];
+        let addresses = [
+            "s3://bucket/other.txt",
+            "s3://bucket/team/x.txt",
+            "s3://bucket/team/docs/x.txt",
+            "s3://other/x",
+            "s3://b/root?snapshot=7",
+            "s3://b/root/f.txt",
+            "s3://b/k?X-Amz-Signature=abc",
+            "file:///data/root/deep/f.txt",
+            "file:///data/root/other.txt",
+            "file:///data/rootx",
+            "file:///anything",
+            "file://host/k",
+            "mem:///k",
+            "mem://host/k",
+            "s3:///",
+            "gs://b/k",
+            "https://host.invalid/root/f.txt",
+            "https://other.invalid/root/f.txt",
+        ];
+        for table in &tables {
+            assert!(table.scheme_fallbacks.is_empty());
+            for address in addresses {
+                assert_eq!(
+                    route_for(table, address),
+                    prefix_route_for(table, address),
+                    "{address} must answer identically through both tiers"
+                );
+            }
+        }
     }
 
     fn make_object_info(addr: &str) -> ObjectInfo {
         ObjectInfo {
+            etag_strength: Default::default(),
             address: Url::parse(addr).unwrap(),
             kind: ObjectKind::File,
             etag: None,
@@ -804,6 +1252,7 @@ mod tests {
             system_metadata: None,
             user_metadata: None,
             modified_by: None,
+            versioned_address: None,
         }
     }
 

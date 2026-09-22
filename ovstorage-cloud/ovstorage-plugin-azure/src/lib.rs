@@ -12,6 +12,7 @@ mod config;
 mod convert;
 mod driver;
 mod error_body;
+mod fallback;
 mod layer;
 mod parse;
 mod signing;
@@ -166,6 +167,38 @@ mod tests {
             connection.auth_state,
             ConnectionAuthState::Anonymous
         ));
+        // The registered row carries the accepted-URL-spellings contract the
+        // alias wrapper consumes — the wire between the two tested halves
+        // (`alternate_url_prefixes` shapes, wrapper consumption) — so a
+        // refactor that drops the stamping cannot ship a silently dead
+        // feature. Flat namespace: blob tier only.
+        assert_eq!(
+            connection
+                .user_metadata
+                .get(ovstorage_plugin::ACCEPTED_URL_SPELLINGS_METADATA_KEY)
+                .map(String::as_str),
+            Some("https://acct123.blob.core.windows.net/assets/")
+        );
+        // The probe preview row carries the same contract, so a host can show
+        // "these URLs will also resolve" before the caller commits.
+        let preview = layer
+            .probe(
+                Request::new(LayerConnectionRequest {
+                    target: "azure".into(),
+                    connection: connection_request(false),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            preview
+                .user_metadata
+                .get(ovstorage_plugin::ACCEPTED_URL_SPELLINGS_METADATA_KEY),
+            connection
+                .user_metadata
+                .get(ovstorage_plugin::ACCEPTED_URL_SPELLINGS_METADATA_KEY),
+        );
         let flat_root = layer
             .root_info_for(
                 &address::parse("azure://acct123/assets/x").unwrap(),
@@ -181,9 +214,20 @@ mod tests {
         assert!(!flat_root.capabilities.supports_server_side_rename);
         assert_eq!(flat_root.root.as_str(), "azure://acct123/assets/");
 
-        let (layer, _) = layer_with_connection(connection_request(true))
+        let (layer, hns_connection) = layer_with_connection(connection_request(true))
             .await
             .unwrap();
+        // Under HNS the DFS host is a second spelling of the same data.
+        assert_eq!(
+            hns_connection
+                .user_metadata
+                .get(ovstorage_plugin::ACCEPTED_URL_SPELLINGS_METADATA_KEY)
+                .map(String::as_str),
+            Some(
+                "https://acct123.blob.core.windows.net/assets/\n\
+                 https://acct123.dfs.core.windows.net/assets/"
+            )
+        );
         let hns_root = layer
             .root_info_for(
                 &address::parse("azure://acct123/assets/x").unwrap(),

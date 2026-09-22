@@ -13,16 +13,16 @@ use bytes::Bytes;
 use futures::Stream;
 use futures::StreamExt;
 use ovstorage_plugin::{
-    AccessDecision, AccessOps, BackendId, ByteRange, Capabilities, ChecksumSet, CopyOptions,
-    DeleteOptions, IfDestExists, ListOptions, ListVersionsOptions, ObjectInfo, ObjectKind,
-    ReadOptions, ReadResult, RedirectResult, RedirectResultBatch, RenameOptions, ResolvedTarget,
-    StatOptions, UpdateMetadataOptions, Url, WriteOptions, WriteStep,
+    AccessDecision, AccessOps, BackendId, ByteRange, CancellationToken, Capabilities, ChecksumSet,
+    CopyOptions, DeleteOptions, IfDestExists, ListOptions, ListVersionsOptions, ObjectInfo,
+    ObjectKind, ReadOptions, ReadResult, RedirectResult, RedirectResultBatch, RenameOptions,
+    ResolvedTarget, StatOptions, UpdateMetadataOptions, Url, WriteOptions, WriteStep,
 };
 use ovstorage_plugin_services_client::auth::DiscoveryState;
 use ovstorage_plugin_services_client::backend::OmniverseStorageBackend;
 use ovstorage_plugin_services_client::factory::build_auth_state;
 use ovstorage_plugin_services_client::transport::OmniverseStorageTransport;
-use ovstorage_services_protos::google::protobuf::{ListValue, Value, value::Kind};
+use ovstorage_services_protos::google::protobuf::{ListValue, Timestamp, Value, value::Kind};
 use ovstorage_services_protos::nvidia::omniverse::storage::filefolder::v1alpha as ff;
 use ovstorage_services_protos::nvidia::omniverse::storage::fileobject::v1alpha as fo;
 use ovstorage_services_protos::nvidia::omniverse::storage::metadata::v1alpha as md;
@@ -30,6 +30,9 @@ use ovstorage_services_protos::nvidia::omniverse::storage::versioning::v1alpha a
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
+
+type ListStatReceiver = mpsc::Receiver<std::result::Result<ff::ListStatResponse, Status>>;
+type ListStatSender = mpsc::Sender<std::result::Result<ff::ListStatResponse, Status>>;
 
 #[derive(Default, Clone)]
 struct Recorded {
@@ -42,6 +45,7 @@ struct Recorded {
     read_calls: Vec<fo::ReadRequest>,
     read_from_address_calls: Vec<fo::ReadFromAddressRequest>,
     enumerate_versions_calls: Vec<ver::EnumerateVersionsRequest>,
+    get_metadata_requests: Vec<md::GetMetadataRequest>,
     update_metadata_requests: Vec<md::UpdateMetadataRequest>,
     delete_metadata_requests: Vec<md::DeleteMetadataRequest>,
     /// How the fake metadata service answers `UpdateMetadata`. Lives here
@@ -93,7 +97,12 @@ enum ReadServerBehavior {
 
 #[derive(Clone)]
 struct VersionServerBehavior {
+    /// The frames every `EnumerateVersions` call answers with, unless the
+    /// requested address has its own row in `responses_by_address`.
     responses: Vec<ver::EnumerateVersionsResponse>,
+    /// Per-address frames, so a listing with several file entries can prove
+    /// each entry received its own lookup's answer rather than a neighbour's.
+    responses_by_address: Vec<(String, Vec<ver::EnumerateVersionsResponse>)>,
     reject_invalid_argument: bool,
 }
 
@@ -108,6 +117,7 @@ impl Default for VersionServerBehavior {
                     "2026-01",
                 )],
             }],
+            responses_by_address: Vec::new(),
             reject_invalid_argument: false,
         }
     }
@@ -533,6 +543,7 @@ impl fo::file_object_service_server::FileObjectService for FakeFileObjectService
 #[derive(Clone)]
 struct FakeFileFolderService {
     capability_behavior: Arc<Mutex<CapabilityServerBehavior>>,
+    list_stat_stream: Arc<Mutex<Option<ListStatReceiver>>>,
 }
 
 #[tonic::async_trait]
@@ -553,7 +564,13 @@ impl ff::file_folder_service_server::FileFolderService for FakeFileFolderService
         &self,
         _req: Request<ff::ListStatRequest>,
     ) -> std::result::Result<Response<Self::ListStatStream>, Status> {
-        Err(Status::unimplemented("unused"))
+        let receiver = self
+            .list_stat_stream
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| Status::unimplemented("unused"))?;
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 
     async fn create_folder(
@@ -601,6 +618,7 @@ impl ver::versioning_service_server::VersioningService for FakeVersioningService
         req: Request<ver::EnumerateVersionsRequest>,
     ) -> std::result::Result<Response<Self::EnumerateVersionsStream>, Status> {
         let request = req.into_inner();
+        let requested = request.resource_address.clone();
         self.recorded
             .lock()
             .unwrap()
@@ -612,7 +630,12 @@ impl ver::versioning_service_server::VersioningService for FakeVersioningService
                 "version resource addresses cannot be enumerated",
             ));
         }
-        let responses = behavior.responses;
+        let responses = behavior
+            .responses_by_address
+            .into_iter()
+            .find(|(address, _)| *address == requested)
+            .map(|(_, responses)| responses)
+            .unwrap_or(behavior.responses);
         let stream = tokio_stream::iter(responses.into_iter().map(Ok));
         Ok(Response::new(Box::pin(stream)))
     }
@@ -668,6 +691,11 @@ impl md::metadata_service_server::MetadataService for FakeMetadataService {
         req: Request<md::GetMetadataRequest>,
     ) -> std::result::Result<Response<md::GetMetadataResponse>, Status> {
         let request = req.into_inner();
+        self.recorded
+            .lock()
+            .unwrap()
+            .get_metadata_requests
+            .push(request.clone());
         let response = self.response.lock().unwrap().clone();
         let mut user_metadata = self.entries.lock().unwrap().clone();
         user_metadata
@@ -823,6 +851,58 @@ async fn spawn_fake_server_full_with_versions_and_capabilities(
     capability_behavior: CapabilityServerBehavior,
     base_capabilities: Capabilities,
 ) -> (OmniverseStorageBackend, Arc<Mutex<Recorded>>) {
+    spawn_fake_server_full_with_versions_capabilities_and_list(
+        behavior,
+        read_behavior,
+        acl_response,
+        version_behavior,
+        capability_behavior,
+        base_capabilities,
+        None,
+    )
+    .await
+}
+
+async fn spawn_fake_server_with_list(
+    list_stat_stream: mpsc::Receiver<std::result::Result<ff::ListStatResponse, Status>>,
+) -> (OmniverseStorageBackend, Arc<Mutex<Recorded>>) {
+    spawn_fake_server_full_with_versions_capabilities_and_list(
+        WriteServerBehavior::Inline,
+        ReadServerBehavior::default(),
+        AclResponse::None,
+        VersionServerBehavior::default(),
+        CapabilityServerBehavior::default(),
+        capabilities(),
+        Some(list_stat_stream),
+    )
+    .await
+}
+
+async fn spawn_fake_server_with_list_and_versions(
+    list_stat_stream: ListStatReceiver,
+    version_behavior: VersionServerBehavior,
+) -> (OmniverseStorageBackend, Arc<Mutex<Recorded>>) {
+    spawn_fake_server_full_with_versions_capabilities_and_list(
+        WriteServerBehavior::Inline,
+        ReadServerBehavior::default(),
+        AclResponse::None,
+        version_behavior,
+        CapabilityServerBehavior::default(),
+        capabilities(),
+        Some(list_stat_stream),
+    )
+    .await
+}
+
+async fn spawn_fake_server_full_with_versions_capabilities_and_list(
+    behavior: WriteServerBehavior,
+    read_behavior: ReadServerBehavior,
+    acl_response: AclResponse,
+    version_behavior: VersionServerBehavior,
+    capability_behavior: CapabilityServerBehavior,
+    base_capabilities: Capabilities,
+    list_stat_stream: Option<mpsc::Receiver<std::result::Result<ff::ListStatResponse, Status>>>,
+) -> (OmniverseStorageBackend, Arc<Mutex<Recorded>>) {
     let recorded = Arc::new(Mutex::new(Recorded::default()));
     let capability_behavior = Arc::new(Mutex::new(capability_behavior));
     let service = FakeFileObjectService {
@@ -833,6 +913,7 @@ async fn spawn_fake_server_full_with_versions_and_capabilities(
     };
     let filefolder_service = FakeFileFolderService {
         capability_behavior: capability_behavior.clone(),
+        list_stat_stream: Arc::new(Mutex::new(list_stat_stream)),
     };
     let metadata_service = FakeMetadataService {
         response: Arc::new(Mutex::new(acl_response)),
@@ -913,6 +994,30 @@ fn version_info(resource_address: &str, identity: &str, sorting_key: &str) -> ve
         sorting_key: Some(sorting_key.into()),
         resource_address: Some(resource_address.into()),
     }
+}
+
+/// `version_info` with facts unlike the ones the fake `Stat` (size 42, no
+/// mtime) and `ListStat` fixtures answer with, so an `ObjectInfo` still
+/// describing the head is told apart from one describing the pinned version.
+fn version_info_with_facts(
+    resource_address: &str,
+    identity: &str,
+    sorting_key: &str,
+    size: u64,
+    mtime_seconds: i64,
+) -> ver::VersionInfo {
+    let mut item = version_info(resource_address, identity, sorting_key);
+    let metadata = item
+        .resource_info
+        .as_mut()
+        .and_then(|info| info.metadata.as_mut())
+        .expect("version_info carries metadata");
+    metadata.data_object_size = Some(size);
+    metadata.last_modified_timestamp = Some(Timestamp {
+        seconds: mtime_seconds,
+        nanos: 0,
+    });
+    item
 }
 
 #[tokio::test]
@@ -1418,6 +1523,84 @@ async fn list_refuses_recursive() {
     assert_eq!(err.code(), ovstorage_plugin::ErrorCode::Unsupported);
 }
 
+/// A live `ListStat` response is flattened frame-by-frame: the first entry is
+/// available while the server stream remains open, full-metadata enrichment is
+/// applied before that entry is yielded, and cancellation is observed before a
+/// second entry already resident in the same frame can escape.
+#[tokio::test]
+async fn list_stream_yields_before_completion_and_cancels_between_entries() {
+    let (frame_tx, frame_rx) = mpsc::channel(1);
+    let (backend, recorded) = spawn_fake_server_with_list(frame_rx).await;
+    let cancel = CancellationToken::new();
+    let mut stream = backend
+        .list_stream(
+            target(),
+            ListOptions {
+                full_metadata: true,
+                ..ListOptions::default()
+            },
+            Some(cancel.clone()),
+        )
+        .await
+        .expect("list stream opens before the first response frame");
+
+    frame_tx
+        .send(Ok(ff::ListStatResponse {
+            subfolder_addresses: Vec::new(),
+            entries: vec![
+                ff::ListItem {
+                    resource_address: "omni://server/path/a.usd".into(),
+                    resource_info: Some(fo::ResourceInfo {
+                        resource_identity: Some(fo::ResourceIdentity {
+                            encoded_identity: "a-etag".into(),
+                        }),
+                        metadata: Some(fo::Metadata {
+                            data_object_size: Some(1),
+                            last_modified_timestamp: None,
+                        }),
+                    }),
+                },
+                ff::ListItem {
+                    resource_address: "omni://server/path/b.usd".into(),
+                    resource_info: Some(fo::ResourceInfo {
+                        resource_identity: Some(fo::ResourceIdentity {
+                            encoded_identity: "b-etag".into(),
+                        }),
+                        metadata: Some(fo::Metadata {
+                            data_object_size: Some(2),
+                            last_modified_timestamp: None,
+                        }),
+                    }),
+                },
+            ],
+        }))
+        .await
+        .expect("server sends the first bounded frame");
+
+    // Keep `frame_tx` alive: the RPC has not completed, so receiving this item
+    // proves the backend did not collect the server stream before yielding.
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("first entry must not wait for ListStat completion")
+        .expect("stream has a first entry")
+        .expect("first entry succeeds");
+    assert_eq!(first.address.as_str(), "omni://server/path/a.usd");
+    assert_eq!(first.etag.as_deref(), Some("a-etag"));
+    assert_eq!(first.modified_by.as_deref(), Some("alice@example"));
+
+    cancel.cancel();
+    let error = stream
+        .next()
+        .await
+        .expect("cancellation is reported")
+        .expect_err("the pending second entry must not escape after cancellation");
+    assert_eq!(error.code(), ovstorage_plugin::ErrorCode::Cancelled);
+    assert!(stream.next().await.is_none(), "cancellation is terminal");
+    let metadata_requests = &recorded.lock().unwrap().get_metadata_requests;
+    assert_eq!(metadata_requests.len(), 1);
+    assert_eq!(metadata_requests[0].uri, "omni://server/path/a.usd");
+}
+
 /// EnumerateVersions has no pagination knobs on the wire, and the
 /// host doesn't paginate list_versions for the plugin. Honor the
 /// caller's bounded request or refuse — silently returning every
@@ -1555,6 +1738,12 @@ async fn get_latest_version_stats_service_rejected_version_address() {
         .await
         .expect("pinned latest ok");
     assert_eq!(latest.address.as_str(), address);
+    // The address the service refused to enumerate already names one version,
+    // so the plain stat's answer carries it as its own pin.
+    assert_eq!(
+        latest.versioned_address.as_ref().map(Url::as_str),
+        Some(address)
+    );
     let expected_etag = format!("identity:{address}");
     assert_eq!(latest.etag.as_deref(), Some(expected_etag.as_str()));
     let recorded = recorded.lock().unwrap();
@@ -1624,6 +1813,527 @@ async fn get_latest_version_refuses_unspecified_order() {
     assert_eq!(err.code(), ovstorage_plugin::ErrorCode::Unsupported);
 }
 
+fn versioned_stat() -> StatOptions {
+    StatOptions {
+        full_metadata: false,
+        versioned_address: true,
+    }
+}
+
+fn versioned_list() -> ListOptions {
+    ListOptions {
+        versioned_address: true,
+        ..ListOptions::default()
+    }
+}
+
+fn versioned_list_with_metadata() -> ListOptions {
+    ListOptions {
+        full_metadata: true,
+        ..versioned_list()
+    }
+}
+
+/// A newest-first `EnumerateVersions` answer whose winner is `winner`.
+fn newest_first(winner: ver::VersionInfo) -> Vec<ver::EnumerateVersionsResponse> {
+    vec![ver::EnumerateVersionsResponse {
+        versions_order: ver::VersionsOrder::NewestFirst as i32,
+        items: vec![winner],
+    }]
+}
+
+/// An answer the picker refuses: without an order there is no way to select.
+fn unspecified_order(pin: &str) -> Vec<ver::EnumerateVersionsResponse> {
+    vec![ver::EnumerateVersionsResponse {
+        versions_order: ver::VersionsOrder::Unspecified as i32,
+        items: vec![version_info(pin, "pinned-identity", "k")],
+    }]
+}
+
+/// One `ListStat` frame with a subfolder and two file entries, the shape the
+/// version-pinning list tests share.
+fn listing_frame() -> ff::ListStatResponse {
+    ff::ListStatResponse {
+        subfolder_addresses: vec![ff::FolderAddress {
+            uri: "omni://server/path/sub/".into(),
+        }],
+        entries: ["a", "b"]
+            .into_iter()
+            .map(|name| ff::ListItem {
+                resource_address: format!("omni://server/path/{name}.usd"),
+                resource_info: Some(fo::ResourceInfo {
+                    resource_identity: Some(fo::ResourceIdentity {
+                        encoded_identity: format!("{name}-etag"),
+                    }),
+                    metadata: Some(fo::Metadata {
+                        data_object_size: Some(1),
+                        last_modified_timestamp: None,
+                    }),
+                }),
+            })
+            .collect(),
+    }
+}
+
+/// The version answers `listing_frame`'s two files receive: distinct pins, so
+/// a pin landing on the wrong entry is visible, and facts unlike the frame's
+/// `<name>-etag` / size 1, so an entry still describing the head is visible.
+fn pins_for_listing_frame() -> VersionServerBehavior {
+    VersionServerBehavior {
+        responses_by_address: vec![
+            (
+                "omni://server/path/a.usd".into(),
+                newest_first(version_info_with_facts(
+                    "omni://server/path/a.usd?version=v7",
+                    "a-v7-etag",
+                    "k7",
+                    70,
+                    1_700_000_007,
+                )),
+            ),
+            (
+                "omni://server/path/b.usd".into(),
+                newest_first(version_info_with_facts(
+                    "omni://server/path/b.usd?version=v2",
+                    "b-v2-etag",
+                    "k2",
+                    20,
+                    1_700_000_002,
+                )),
+            ),
+        ],
+        ..Default::default()
+    }
+}
+
+/// What `list` and `list_stream` must both report for `listing_frame` under
+/// `pins_for_listing_frame`: each file entry keeps its own address, carries
+/// its own pin, and describes the pinned version rather than the head the
+/// frame described.
+fn assert_pinned_listing(items: &[ObjectInfo], recorded: &Recorded) {
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0].address.as_str(), "omni://server/path/sub/");
+    assert_eq!(items[0].kind, ObjectKind::Directory);
+    assert!(
+        items[0].versioned_address.is_none(),
+        "a subfolder has no version to pin"
+    );
+    assert_eq!(items[1].address.as_str(), "omni://server/path/a.usd");
+    assert_eq!(items[1].kind, ObjectKind::File);
+    assert_eq!(items[1].etag.as_deref(), Some("a-v7-etag"));
+    assert_eq!(items[1].size, Some(70));
+    assert_eq!(
+        items[1].mtime,
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_007))
+    );
+    assert_eq!(
+        items[1].versioned_address.as_ref().map(Url::as_str),
+        Some("omni://server/path/a.usd?version=v7")
+    );
+    assert_eq!(items[2].address.as_str(), "omni://server/path/b.usd");
+    assert_eq!(items[2].kind, ObjectKind::File);
+    assert_eq!(items[2].etag.as_deref(), Some("b-v2-etag"));
+    assert_eq!(items[2].size, Some(20));
+    assert_eq!(
+        items[2].mtime,
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_002))
+    );
+    assert_eq!(
+        items[2].versioned_address.as_ref().map(Url::as_str),
+        Some("omni://server/path/b.usd?version=v2")
+    );
+    let looked_up: Vec<&str> = recorded
+        .enumerate_versions_calls
+        .iter()
+        .map(|call| call.resource_address.as_str())
+        .collect();
+    assert_eq!(
+        looked_up,
+        ["omni://server/path/a.usd", "omni://server/path/b.usd"],
+        "one lookup per file entry and none for the subfolder"
+    );
+}
+
+/// What `list` and `list_stream` must both add to `assert_pinned_listing` when
+/// `full_metadata` is on as well: the metadata merge lands on each pinned file
+/// entry rather than being replaced by the pin's rebuild.
+fn assert_metadata_on_pinned_listing(items: &[ObjectInfo], recorded: &Recorded) {
+    assert!(
+        items[0].modified_by.is_none(),
+        "a subfolder has no metadata fetched"
+    );
+    for item in &items[1..] {
+        assert_eq!(
+            item.modified_by.as_deref(),
+            Some("alice@example"),
+            "{}",
+            item.address
+        );
+    }
+    assert_eq!(
+        recorded.get_metadata_requests.len(),
+        2,
+        "one metadata fetch per file entry"
+    );
+}
+
+/// Open `list_stream` with `opts`, send `listing_frame` once the RPC is open,
+/// and collect its three entries while the server stream is still live.
+async fn stream_listing_frame(
+    backend: &OmniverseStorageBackend,
+    opts: ListOptions,
+    frame_tx: ListStatSender,
+) -> Vec<ObjectInfo> {
+    let mut stream = backend
+        .list_stream(target(), opts, None)
+        .await
+        .expect("list stream opens before the first response frame");
+    frame_tx
+        .send(Ok(listing_frame()))
+        .await
+        .expect("server sends the frame");
+
+    // `frame_tx` stays alive: every entry below is pinned and yielded while the
+    // ListStat RPC is still open.
+    let mut items = Vec::new();
+    for _ in 0..3 {
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("an entry must not wait for ListStat completion")
+            .expect("stream has the entry")
+            .expect("entry succeeds");
+        items.push(entry);
+    }
+    drop(frame_tx);
+    assert!(
+        stream.next().await.is_none(),
+        "the listing ends with the server stream"
+    );
+    items
+}
+
+#[tokio::test]
+async fn stat_with_versioned_address_reports_latest_resource_address() {
+    let (backend, recorded) = spawn_fake_server_with_versions(VersionServerBehavior {
+        responses: vec![ver::EnumerateVersionsResponse {
+            versions_order: ver::VersionsOrder::NewestFirst as i32,
+            items: vec![
+                version_info("omni://server/path?version=v3", "identity-v3", "k3"),
+                version_info("omni://server/path?version=v2", "identity-v2", "k2"),
+            ],
+        }],
+        ..Default::default()
+    })
+    .await;
+    let info = backend
+        .stat(target(), versioned_stat(), None)
+        .await
+        .expect("stat ok");
+    // The address stays the caller's; the facts and the pin are the selected
+    // version's, and the pin is the server's spelling verbatim.
+    assert_eq!(info.address.as_str(), "omni://server/path");
+    assert_eq!(info.etag.as_deref(), Some("identity-v3"));
+    assert_eq!(
+        info.versioned_address.as_ref().map(Url::as_str),
+        Some("omni://server/path?version=v3")
+    );
+    let recorded = recorded.lock().unwrap();
+    assert_eq!(recorded.stat_calls, 1);
+    assert_eq!(recorded.enumerate_versions_calls.len(), 1);
+    assert_eq!(
+        recorded.enumerate_versions_calls[0].resource_address,
+        "omni://server/path"
+    );
+}
+
+/// `Stat` and `EnumerateVersions` are two round trips and a write can land
+/// between them, so the facts beside the pin are the pinned version's, not the
+/// head `Stat` saw: the fake `Stat` answers identity `identity:<address>`, size
+/// 42 and no mtime, and the version answers otherwise on all three.
+/// `full_metadata` is on as well: its merge lands on the rebuilt fields rather
+/// than being replaced by them.
+#[tokio::test]
+async fn stat_with_versioned_address_describes_the_pinned_version_and_keeps_full_metadata() {
+    let (backend, recorded) = spawn_fake_server_with_versions(VersionServerBehavior {
+        responses: vec![ver::EnumerateVersionsResponse {
+            versions_order: ver::VersionsOrder::NewestFirst as i32,
+            items: vec![version_info_with_facts(
+                "omni://server/path?version=v9",
+                "identity-v9",
+                "k9",
+                9_000,
+                1_700_000_009,
+            )],
+        }],
+        ..Default::default()
+    })
+    .await;
+    let info = backend
+        .stat(
+            target(),
+            StatOptions {
+                full_metadata: true,
+                versioned_address: true,
+            },
+            None,
+        )
+        .await
+        .expect("stat ok");
+    assert_eq!(info.address.as_str(), "omni://server/path");
+    assert_eq!(info.kind, ObjectKind::File);
+    assert_eq!(info.etag.as_deref(), Some("identity-v9"));
+    assert_eq!(info.size, Some(9_000));
+    assert_eq!(
+        info.mtime,
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_009))
+    );
+    assert_eq!(
+        info.versioned_address.as_ref().map(Url::as_str),
+        Some("omni://server/path?version=v9")
+    );
+    assert_eq!(info.modified_by.as_deref(), Some("alice@example"));
+    let sys = info
+        .system_metadata
+        .expect("system_metadata merged onto the pinned version");
+    assert_eq!(
+        sys.get("created_by").map(String::as_str),
+        Some("bob@example")
+    );
+    let recorded = recorded.lock().unwrap();
+    assert_eq!(recorded.stat_calls, 1);
+    assert_eq!(recorded.enumerate_versions_calls.len(), 1);
+    assert_eq!(recorded.get_metadata_requests.len(), 1);
+}
+
+/// A selected version without `resource_info` has nothing to describe itself
+/// with, so the facts `Stat` answered stand and only the pin is added.
+#[tokio::test]
+async fn stat_with_versioned_address_keeps_the_stat_facts_when_the_version_has_no_resource_info() {
+    let (backend, _) = spawn_fake_server_with_versions(VersionServerBehavior {
+        responses: vec![ver::EnumerateVersionsResponse {
+            versions_order: ver::VersionsOrder::NewestFirst as i32,
+            items: vec![ver::VersionInfo {
+                resource_info: None,
+                sorting_key: Some("k4".into()),
+                resource_address: Some("omni://server/path?version=v4".into()),
+            }],
+        }],
+        ..Default::default()
+    })
+    .await;
+    let info = backend
+        .stat(target(), versioned_stat(), None)
+        .await
+        .expect("stat ok");
+    assert_eq!(info.address.as_str(), "omni://server/path");
+    assert_eq!(info.etag.as_deref(), Some("identity:omni://server/path"));
+    assert_eq!(info.size, Some(42));
+    assert_eq!(
+        info.versioned_address.as_ref().map(Url::as_str),
+        Some("omni://server/path?version=v4")
+    );
+}
+
+#[tokio::test]
+async fn stat_default_makes_no_enumerate_versions_call() {
+    let (backend, recorded) =
+        spawn_fake_server_with_versions(VersionServerBehavior::default()).await;
+    let info = backend
+        .stat(target(), StatOptions::default(), None)
+        .await
+        .expect("stat ok");
+    assert!(info.versioned_address.is_none());
+    assert_eq!(recorded.lock().unwrap().enumerate_versions_calls.len(), 0);
+}
+
+#[tokio::test]
+async fn stat_with_versioned_address_echoes_a_version_address_the_service_rejects() {
+    let address = "omni://server/path;2";
+    let (backend, recorded) = spawn_fake_server_with_versions(VersionServerBehavior {
+        reject_invalid_argument: true,
+        ..Default::default()
+    })
+    .await;
+    let pinned = ResolvedTarget {
+        backend_id: BackendId("test".into()),
+        resolved_address: Url::parse(address).unwrap(),
+    };
+    let info = backend
+        .stat(pinned, versioned_stat(), None)
+        .await
+        .expect("stat of a version address ok");
+    assert_eq!(info.address.as_str(), address);
+    // The refusal carries no entry to describe the version with, so the
+    // facts `Stat` answered stand beside the echoed pin.
+    assert_eq!(info.etag.as_deref(), Some("identity:omni://server/path;2"));
+    assert_eq!(info.size, Some(42));
+    assert_eq!(
+        info.versioned_address.as_ref().map(Url::as_str),
+        Some(address)
+    );
+    let recorded = recorded.lock().unwrap();
+    assert_eq!(recorded.stat_calls, 1);
+    assert_eq!(recorded.enumerate_versions_calls.len(), 1);
+}
+
+#[tokio::test]
+async fn stat_with_versioned_address_on_an_object_with_no_versions_is_none() {
+    let (backend, recorded) = spawn_fake_server_with_versions(VersionServerBehavior {
+        responses: Vec::new(),
+        ..Default::default()
+    })
+    .await;
+    let info = backend
+        .stat(target(), versioned_stat(), None)
+        .await
+        .expect("an object without versions still stats");
+    assert!(info.versioned_address.is_none());
+    assert_eq!(recorded.lock().unwrap().enumerate_versions_calls.len(), 1);
+}
+
+#[tokio::test]
+async fn list_with_versioned_address_pins_each_file_entry_and_leaves_subfolders_none() {
+    let (frame_tx, frame_rx) = mpsc::channel(1);
+    let (backend, recorded) =
+        spawn_fake_server_with_list_and_versions(frame_rx, pins_for_listing_frame()).await;
+    frame_tx
+        .send(Ok(listing_frame()))
+        .await
+        .expect("server sends the frame");
+    drop(frame_tx);
+    let items = backend
+        .list(target(), versioned_list(), None)
+        .await
+        .expect("list ok");
+    assert_pinned_listing(&items, &recorded.lock().unwrap());
+}
+
+#[tokio::test]
+async fn list_with_versioned_address_and_full_metadata_merges_onto_the_pinned_entries() {
+    let (frame_tx, frame_rx) = mpsc::channel(1);
+    let (backend, recorded) =
+        spawn_fake_server_with_list_and_versions(frame_rx, pins_for_listing_frame()).await;
+    frame_tx
+        .send(Ok(listing_frame()))
+        .await
+        .expect("server sends the frame");
+    drop(frame_tx);
+    let items = backend
+        .list(target(), versioned_list_with_metadata(), None)
+        .await
+        .expect("list ok");
+    let recorded = recorded.lock().unwrap();
+    assert_pinned_listing(&items, &recorded);
+    assert_metadata_on_pinned_listing(&items, &recorded);
+}
+
+#[tokio::test]
+async fn list_with_versioned_address_fails_the_page_when_a_lookup_fails() {
+    let (frame_tx, frame_rx) = mpsc::channel(1);
+    let (backend, recorded) = spawn_fake_server_with_list_and_versions(
+        frame_rx,
+        VersionServerBehavior {
+            responses_by_address: vec![
+                (
+                    "omni://server/path/a.usd".into(),
+                    newest_first(version_info(
+                        "omni://server/path/a.usd?version=v7",
+                        "pinned-identity",
+                        "k",
+                    )),
+                ),
+                (
+                    "omni://server/path/b.usd".into(),
+                    unspecified_order("omni://server/path/b.usd?version=v2"),
+                ),
+            ],
+            ..Default::default()
+        },
+    )
+    .await;
+    frame_tx
+        .send(Ok(listing_frame()))
+        .await
+        .expect("server sends the frame");
+    drop(frame_tx);
+    let err = backend
+        .list(target(), versioned_list(), None)
+        .await
+        .expect_err("a pin the caller paid for and did not get fails the page");
+    assert_eq!(err.code(), ovstorage_plugin::ErrorCode::Unsupported);
+    // The first entry's lookup succeeded; the second's is the failure.
+    assert_eq!(recorded.lock().unwrap().enumerate_versions_calls.len(), 2);
+}
+
+#[tokio::test]
+async fn list_stream_with_versioned_address_pins_each_file_entry_and_leaves_subfolders_none() {
+    let (frame_tx, frame_rx) = mpsc::channel(1);
+    let (backend, recorded) =
+        spawn_fake_server_with_list_and_versions(frame_rx, pins_for_listing_frame()).await;
+    let items = stream_listing_frame(&backend, versioned_list(), frame_tx).await;
+    assert_pinned_listing(&items, &recorded.lock().unwrap());
+}
+
+#[tokio::test]
+async fn list_stream_with_versioned_address_and_full_metadata_merges_onto_the_pinned_entries() {
+    let (frame_tx, frame_rx) = mpsc::channel(1);
+    let (backend, recorded) =
+        spawn_fake_server_with_list_and_versions(frame_rx, pins_for_listing_frame()).await;
+    let items = stream_listing_frame(&backend, versioned_list_with_metadata(), frame_tx).await;
+    let recorded = recorded.lock().unwrap();
+    assert_pinned_listing(&items, &recorded);
+    assert_metadata_on_pinned_listing(&items, &recorded);
+}
+
+#[tokio::test]
+async fn list_versions_items_carry_their_own_address_as_versioned_address() {
+    let (backend, _) = spawn_fake_server_with_versions(VersionServerBehavior {
+        responses: vec![ver::EnumerateVersionsResponse {
+            versions_order: ver::VersionsOrder::NewestFirst as i32,
+            items: vec![
+                version_info("omni://server/path?version=v2", "identity-v2", "k2"),
+                version_info("omni://server/path?version=v1", "identity-v1", "k1"),
+            ],
+        }],
+        ..Default::default()
+    })
+    .await;
+    let versions = backend
+        .list_versions(target(), ListVersionsOptions::default(), None)
+        .await
+        .expect("list_versions ok");
+    assert_eq!(versions.len(), 2);
+    for item in &versions {
+        assert_eq!(
+            item.versioned_address.as_ref(),
+            Some(&item.address),
+            "{}",
+            item.address
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_latest_version_carries_its_address_as_versioned_address() {
+    let (backend, _) = spawn_fake_server_with_versions(VersionServerBehavior {
+        responses: vec![ver::EnumerateVersionsResponse {
+            versions_order: ver::VersionsOrder::NewestFirst as i32,
+            items: vec![
+                version_info("omni://server/path?version=v3", "identity-v3", "k3"),
+                version_info("omni://server/path?version=v2", "identity-v2", "k2"),
+            ],
+        }],
+        ..Default::default()
+    })
+    .await;
+    let latest = backend
+        .get_latest_version(target(), None)
+        .await
+        .expect("latest ok");
+    assert_eq!(latest.address.as_str(), "omni://server/path?version=v3");
+    assert_eq!(latest.versioned_address.as_ref(), Some(&latest.address));
+}
+
 /// `write_redirect` without a `size_hint` cannot produce a valid
 /// `RedirectBodySource::UserBytes { len }` (the host's redirect
 /// follower needs an exact byte count). Refuse rather than emit a
@@ -1673,6 +2383,7 @@ async fn stat_full_metadata_populates_modified_by_and_system_metadata() {
             target(),
             StatOptions {
                 full_metadata: true,
+                versioned_address: false,
             },
             None,
         )
@@ -2229,6 +2940,7 @@ fn _unused_drop() {
     let _: ObjectKind = ObjectKind::File;
     let _: Bytes = Bytes::new();
     let _: ObjectInfo = ObjectInfo {
+        etag_strength: Default::default(),
         address: Url::parse("a:b").unwrap(),
         kind: ObjectKind::File,
         etag: None,
@@ -2240,6 +2952,7 @@ fn _unused_drop() {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     };
     let _: AccessOps = AccessOps::default();
     let _: DeleteOptions = DeleteOptions::default();
@@ -2247,10 +2960,11 @@ fn _unused_drop() {
 
 /// Substitution, not modification: a caller holding a genuine multipart
 /// continuation minted for `omni://server/path` presents it against the
-/// authorized request address `omni://server/victim`. Under the broker's
-/// client-driven `ContinueWrite` RPC the batch is echoed back by the remote
-/// caller, so the completion — and the abort behind it — must name the address
-/// authorization was decided on.
+/// authorized request address `omni://server/victim`. This direct-plugin test
+/// represents an SPI caller or unsealed host; the broker's client-driven RPC
+/// rejects the address substitution at its seal boundary. The plugin must still
+/// make the completion — and the abort behind it — name the address
+/// authorization was decided on for every supported route.
 #[tokio::test]
 async fn continue_write_completes_against_the_authorized_destination() {
     let (backend, recorded) = spawn_fake_server(WriteServerBehavior::Multipart { parts: 2 }).await;
@@ -2399,7 +3113,7 @@ async fn continue_write_stashes_the_asserted_writer_over_the_continuations() {
     let (backend, recorded) = spawn_fake_server(WriteServerBehavior::Multipart { parts: 2 }).await;
     let mut planted = std::collections::HashMap::new();
     planted.insert(
-        "ovstorage-modified-by".to_string(),
+        "ovstorage_modified_by".to_string(),
         "impersonated-principal".to_string(),
     );
     planted.insert("author".to_string(), "unreserved".to_string());
@@ -2456,7 +3170,7 @@ async fn continue_write_stashes_the_asserted_writer_over_the_continuations() {
         "the commit must have stashed something to assert about"
     );
     assert_eq!(
-        stashed.get("ovstorage-modified-by").copied().flatten(),
+        stashed.get("ovstorage_modified_by").copied().flatten(),
         Some("alice@example.com"),
         "the asserted writer must be what the commit stashes"
     );
@@ -2475,7 +3189,7 @@ async fn continue_write_without_an_assertion_stashes_the_continuations_metadata(
     let (backend, recorded) = spawn_fake_server(WriteServerBehavior::Multipart { parts: 2 }).await;
     let mut planted = std::collections::HashMap::new();
     planted.insert(
-        "ovstorage-modified-by".to_string(),
+        "ovstorage_modified_by".to_string(),
         "impersonated-principal".to_string(),
     );
     let batch = backend
@@ -2511,7 +3225,7 @@ async fn continue_write_without_an_assertion_stashes_the_continuations_metadata(
         "exactly the continuation's one key"
     );
     let request = &recorded.update_metadata_requests[0];
-    assert_eq!(request.user_metadata_key, "ovstorage-modified-by");
+    assert_eq!(request.user_metadata_key, "ovstorage_modified_by");
     let value = match request
         .user_metadata
         .as_ref()
@@ -2669,6 +3383,7 @@ async fn user_metadata_written_inline_reads_back_from_stat() {
             target(),
             StatOptions {
                 full_metadata: true,
+                versioned_address: false,
             },
             None,
         )
@@ -2873,6 +3588,7 @@ async fn a_partially_applied_map_still_reports_one_partial_completion() {
             target(),
             StatOptions {
                 full_metadata: true,
+                versioned_address: false,
             },
             None,
         )
@@ -2928,6 +3644,7 @@ async fn a_mixed_unimplemented_run_reports_not_applied_and_promises_no_retry() {
             target(),
             StatOptions {
                 full_metadata: true,
+                versioned_address: false,
             },
             None,
         )
@@ -2959,16 +3676,238 @@ async fn a_message_only_write_still_succeeds_when_the_metadata_service_refuses()
         .await
         .expect("a dropped message must not fail a committed write");
     // The attempt was made and discarded, so this is the best-effort path and
-    // not a case where nothing was tried.
+    // not a case where nothing was tried. The key is a literal rather than
+    // `MESSAGE_METADATA_KEY`: the wire spelling is the pin.
     assert!(
         recorded
             .lock()
             .unwrap()
             .update_metadata_requests
             .iter()
-            .any(|r| r.user_metadata_key == "x-ov-message"),
+            .any(|r| r.user_metadata_key == "x_ov_message"),
         "the message stash must have been attempted",
     );
+}
+
+/// Every value the fake was sent for `x_ov_message`, in wire order. Each stash
+/// is one `UpdateMetadata` RPC per key and the service keeps the latest, so the
+/// last element is the value the object ends up with.
+fn message_stash_values(recorded: &Arc<Mutex<Recorded>>) -> Vec<String> {
+    recorded
+        .lock()
+        .unwrap()
+        .update_metadata_requests
+        .iter()
+        .filter(|r| r.user_metadata_key == "x_ov_message")
+        .map(
+            |r| match r.user_metadata.as_ref().and_then(|v| v.kind.as_ref()) {
+                Some(Kind::StringValue(s)) => s.clone(),
+                other => panic!("expected a string metadata value, got {other:?}"),
+            },
+        )
+        .collect()
+}
+
+/// The write options every message-precedence test sends: a caller-supplied
+/// entry under the message key beside a real `message`.
+fn caller_key_beside_message() -> WriteOptions {
+    WriteOptions {
+        user_metadata: Some(metadata_map(&[
+            ("x_ov_message", "caller"),
+            ("label", "hero"),
+        ])),
+        message: Some("real".into()),
+        ..Default::default()
+    }
+}
+
+/// Precedence between `message` and a caller-supplied entry under the message
+/// key is the same on every backend: the caller's entry stands, because
+/// `user_metadata` must be persisted while the message is droppable by
+/// contract. Here that is a wire fact — the caller's `UpdateMetadata` is the
+/// ONLY RPC sent for the key. The message stash is skipped outright rather
+/// than sent first and overwritten, so the recorded values are exactly
+/// `["caller"]`; a last-value check alone would not distinguish the two.
+#[tokio::test]
+async fn a_callers_entry_is_the_only_value_stashed_under_the_message_key_on_an_inline_write() {
+    let (backend, recorded) = spawn_fake_server(WriteServerBehavior::Inline).await;
+    backend
+        .write(
+            target(),
+            b"hello".to_vec(),
+            caller_key_beside_message(),
+            None,
+        )
+        .await
+        .expect("write ok");
+    assert_eq!(
+        message_stash_values(&recorded),
+        vec!["caller".to_string()],
+        "the message RPC is skipped when the caller's map carries the key"
+    );
+    // The caller's other key lands too: the whole map is persisted.
+    assert!(
+        recorded
+            .lock()
+            .unwrap()
+            .update_metadata_requests
+            .iter()
+            .any(|r| r.user_metadata_key == "label"),
+    );
+    let info = backend
+        .stat(
+            target(),
+            StatOptions {
+                full_metadata: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("stat ok");
+    let user = info.user_metadata.expect("user_metadata populated");
+    assert_eq!(user.get("x_ov_message").map(String::as_str), Some("caller"));
+}
+
+/// The same precedence when both fields ride a continuation through a single
+/// redirect and are stashed at completion: the caller's entry is the only
+/// value sent for the key.
+#[tokio::test]
+async fn a_callers_entry_is_the_only_value_stashed_under_the_message_key_on_a_redirect_completion()
+{
+    let (backend, recorded) = spawn_fake_server(WriteServerBehavior::SingleRedirect).await;
+    let batch = backend
+        .write_redirect(
+            target(),
+            WriteOptions {
+                size_hint: Some(1024),
+                ..caller_key_beside_message()
+            },
+            None,
+        )
+        .await
+        .expect("write_redirect ok");
+    let results = RedirectResultBatch {
+        results: vec![RedirectResult {
+            status_code: 200,
+            captured_headers: vec![("etag".into(), "remote-etag".into())],
+            captured_body: Vec::new(),
+        }],
+    };
+    let step = backend
+        .continue_write(target(), batch, results, None, None)
+        .await
+        .expect("continue_write ok");
+    assert!(matches!(step, WriteStep::Done(_)), "got {step:?}");
+    assert_eq!(
+        message_stash_values(&recorded),
+        vec!["caller".to_string()],
+        "the message RPC is skipped when the caller's map carries the key"
+    );
+}
+
+/// And through a multipart upload, whose completion is the third stash site:
+/// again exactly one value for the key, the caller's.
+#[tokio::test]
+async fn a_callers_entry_is_the_only_value_stashed_under_the_message_key_on_a_multipart_completion()
+{
+    let (backend, recorded) = spawn_fake_server(WriteServerBehavior::Multipart { parts: 2 }).await;
+    let batch = backend
+        .write_redirect(
+            target(),
+            WriteOptions {
+                size_hint: Some(1024),
+                ..caller_key_beside_message()
+            },
+            None,
+        )
+        .await
+        .expect("write_redirect ok");
+    let results = RedirectResultBatch {
+        results: batch
+            .redirects
+            .iter()
+            .map(|_| RedirectResult {
+                status_code: 200,
+                captured_headers: vec![("etag".into(), "part-etag".into())],
+                captured_body: Vec::new(),
+            })
+            .collect(),
+    };
+    let step = backend
+        .continue_write(target(), batch, results, None, None)
+        .await
+        .expect("continue_write ok");
+    assert!(matches!(step, WriteStep::Done(_)), "got {step:?}");
+    assert_eq!(
+        message_stash_values(&recorded),
+        vec!["caller".to_string()],
+        "the message RPC is skipped when the caller's map carries the key"
+    );
+}
+
+/// A caller key that fails still leaves the message stashed: the message is
+/// best-effort and independent of the caller-key outcome, which is what
+/// propagates. The caller's map carries no entry under the message key here,
+/// so the message is the value that lands.
+#[tokio::test]
+async fn a_failing_caller_key_does_not_skip_the_message_stash() {
+    let (backend, recorded) = spawn_fake_server(WriteServerBehavior::Inline).await;
+    set_update_behavior(
+        &recorded,
+        UpdateMetadataBehavior::FailKeys(vec!["label".into()], tonic::Code::Internal),
+    );
+    let err = backend
+        .write(
+            target(),
+            b"hello".to_vec(),
+            WriteOptions {
+                user_metadata: Some(metadata_map(&[("label", "hero")])),
+                message: Some("real".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("a lost caller key must surface");
+    assert_metadata_partial_completion(&err, ovstorage_plugin::StageOutcome::Unknown);
+    let values = message_stash_values(&recorded);
+    assert_eq!(
+        values,
+        vec!["real".to_string()],
+        "the message stash runs regardless of the caller key's outcome"
+    );
+}
+
+/// `update_metadata` follows the same rule: a caller's `user_metadata_set`
+/// entry under the message key stands and the message is not sent at all.
+#[tokio::test]
+async fn update_metadata_keeps_the_callers_entry_under_the_message_key() {
+    let (backend, recorded) = spawn_fake_server(WriteServerBehavior::Inline).await;
+    let mut opts = UpdateMetadataOptions::default();
+    opts.user_metadata_set
+        .insert("x_ov_message".into(), "caller".into());
+    opts.message = Some("real".into());
+    backend
+        .update_metadata(target(), opts, None)
+        .await
+        .expect("update_metadata ok");
+    assert_eq!(message_stash_values(&recorded), vec!["caller"]);
+}
+
+/// Without a caller entry under the key, `update_metadata` stashes the message
+/// after the caller's keys, replacing whatever the object held under it.
+#[tokio::test]
+async fn update_metadata_stashes_the_message_when_the_caller_sets_no_entry_under_its_key() {
+    let (backend, recorded) = spawn_fake_server(WriteServerBehavior::Inline).await;
+    let mut opts = UpdateMetadataOptions::default();
+    opts.user_metadata_set.insert("label".into(), "hero".into());
+    opts.message = Some("real".into());
+    backend
+        .update_metadata(target(), opts, None)
+        .await
+        .expect("update_metadata ok");
+    assert_eq!(message_stash_values(&recorded), vec!["real"]);
 }
 
 /// A write carrying no metadata at all is untouched by any of this.
@@ -2992,7 +3931,7 @@ async fn a_write_without_user_metadata_is_unaffected_by_a_refusing_metadata_serv
 // ---------------------------------------------------------------------------
 // The host's own reserved-namespace keys are exempt from propagation.
 //
-// A broker or REST branch stamps `ovstorage-modified-by` on every mutating
+// A broker or REST branch stamps `ovstorage_modified_by` on every mutating
 // write, whether or not the caller asked for metadata. Failing the caller's
 // committed write because the HOST's audit stamp did not land would charge the
 // caller for a decision the host made — so a failure confined to the reserved
@@ -3206,7 +4145,7 @@ async fn an_attribution_only_write_still_stores_the_stamp_when_the_service_works
 }
 
 /// The stated consequence of testing the namespace rather than the one key the
-/// host plants: a caller that sets its own `ovstorage-`-prefixed key on a path
+/// host plants: a caller that sets its own `ovstorage_`-prefixed key on a path
 /// with no attribution layer to strip it gets best-effort semantics.
 ///
 /// Pinned deliberately. It is a real hole and an accepted one — the namespace is
@@ -3221,7 +4160,7 @@ async fn a_caller_key_inside_the_reserved_namespace_is_treated_as_the_hosts() {
         UpdateMetadataBehavior::AlwaysFail(tonic::Code::Internal),
     );
     // Not the attribution key: a key a caller invented inside the namespace.
-    let smuggled = metadata_map(&[("ovstorage-my-own-key", "value")]);
+    let smuggled = metadata_map(&[("ovstorage_my_own_key", "value")]);
     assert!(
         !smuggled.contains_key(ovstorage_plugin::ATTRIBUTION_KEY_MODIFIED_BY),
         "the fixture must not be the host's own stamp, or it proves nothing",
@@ -3245,7 +4184,7 @@ async fn a_caller_key_inside_the_reserved_namespace_is_treated_as_the_hosts() {
             .unwrap()
             .update_metadata_requests
             .iter()
-            .any(|r| r.user_metadata_key == "ovstorage-my-own-key"),
+            .any(|r| r.user_metadata_key == "ovstorage_my_own_key"),
         "the reserved key must have been attempted, not skipped",
     );
 

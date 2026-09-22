@@ -8,7 +8,7 @@
 
 That is different from first-party backend conformance:
 
-- `file`, `s3`, `gcs`, `azure`, `http`, `opendal`, `broker-client`, and `nucleus` prove the public contracts against realistic backends and provider APIs.
+- `file`, `s3`, `gcs`, `azure`, `http`, `huggingface`, `opendal`, `broker-client`, and `nucleus` prove the public contracts against realistic backends and provider APIs.
 - `plugin-conformance` proves that the host (`ovstorage`, `ovstorage-broker`, and `broker-protocol`) consumes every legal storage SPI shape correctly.
 
 The plugin is intentionally small, scripted, and boring. It does not model S3, GCS, Azure, Nucleus, POSIX filesystems, or provider-specific metadata. It emits named scenarios from a fixed registry and records the host calls it observed. If a behavior can be exercised cheaply against a real backend, the real-backend test remains the primary test and the conformance scenario is only a host-edge supplement.
@@ -115,7 +115,7 @@ Free-form scenario scripts are not accepted in config. If a test needs a new beh
 
 ### Capability profiles (design)
 
-> Implemented: 4 `CapsPreset` variants (`Minimal`, `Full`, `ReadOnly`, `RedirectHeavy`) in `src/config.rs:107-113`, plus 6 boolean overrides (`test_caps_versioning`, `test_caps_server_copy`, `test_caps_server_rename`, `test_caps_copy`, `test_caps_rename`, `test_caps_watch`) — the availability knobs are independent of the server-side ones so a scenario can express available-but-not-server-side. The `Profile` enum in `src/scenarios.rs` adds 10 named scenario profiles (`Minimal`, `ConditionalWrites`, `MetadataNative`, `VersionsNewest`, `DirectoriesReal`, `AtomicRename`, `WatchDirectoryResumable`, `AddressRootsDynamic`, `Redirects`, `LocalDelegate`) with `Profile::capabilities()` mapping each to a `Capabilities` value; ~10 of the ~20 design profiles below are unimplemented (e.g., `metadata_rewrite_only`, `metadata_unsupported`, `versions_oldest`/`versions_unordered`, `permissions_on_stat`, `access_check`, `watch_directory_non_resumable`, `directories_flat`, `server_side_copy`, `server_side_rename`). Per-instance capability immutability is partly enforced (`TestBackend::capabilities` snapshots at instantiate, `src/lib.rs:152`); profile-level scenario gating in the runner is implemented but not driven from the `TestConfig` knob layer.
+> Implemented: 4 `CapsPreset` variants (`Minimal`, `Full`, `ReadOnly`, `RedirectHeavy`) in `src/config.rs:107-113`, plus 6 boolean overrides (`test_caps_versioning`, `test_caps_server_copy`, `test_caps_server_rename`, `test_caps_copy`, `test_caps_rename`, `test_caps_watch`) — the availability knobs are independent of the server-side ones so a scenario can express available-but-not-server-side. The `Profile` enum in `src/scenarios.rs` adds 9 named scenario profiles (`Minimal`, `ConditionalWrites`, `MetadataNative`, `VersionsNewest`, `DirectoriesReal`, `AtomicRename`, `WatchDirectoryResumable`, `Redirects`, `LocalDelegate`) with `Profile::capabilities()` mapping each to a `Capabilities` value; ~10 of the ~20 design profiles below are unimplemented (e.g., `metadata_rewrite_only`, `metadata_unsupported`, `versions_oldest`/`versions_unordered`, `permissions_on_stat`, `access_check`, `watch_directory_non_resumable`, `directories_flat`, `server_side_copy`, `server_side_rename`). Per-instance capability immutability is partly enforced (`TestBackend::capabilities` snapshots at instantiate, `src/lib.rs:152`); profile-level scenario gating in the runner is implemented but not driven from the `TestConfig` knob layer.
 
 Each profile maps to a fixed `Capabilities` value. Tests choose profiles to verify that the host honors capability gating before plugin dispatch.
 
@@ -131,7 +131,6 @@ Each profile maps to a fixed `Capabilities` value. Tests choose profiles to veri
 | `access_check` | Advertises `supports_access_check = true` and returns scripted `AccessDecision` values. |
 | `watch_directory_resumable` | Advertises resumable watch_directory streams and a bounded `watch_directory_max_lag`. |
 | `watch_directory_non_resumable` | Supports watch_directory but emits `Lapsed` when opened with `since`. |
-| `dynamic_roots` | Sets `address_roots_are_dynamic = true` and drives `watch_address_roots` `Snapshot` / `Added` / `Removed` events. |
 | `directories_real` | Reports `has_real_directories = true` and uses real-directory semantics inside the in-memory store. |
 | `directories_flat` | Reports flat-backend marker semantics for directory tests. |
 | `server_side_copy` | Advertises `supports_server_side_copy = true`; copy scenarios expect a single `Layer::copy` call instead of host read/write fallback. |
@@ -417,7 +416,7 @@ plugin-conformance scenario `read-streamed-midstream-error`
 | `watch-directory-one-level-filter` | `recursive = false` suppresses nested-key events; `recursive = true` includes them. |
 | `watch-directory-option-superset` | Recursive watches retain all non-recursive events, and metadata-inclusive watches retain all object events while adding metadata changes. |
 | `address-roots-absolute` | `address_roots` returns absolute `ObjectAddress` values; host does not prepend route prefixes. |
-| `watch-address-roots-default-snapshot` | Profile without `address_roots_are_dynamic` gets the default single `Snapshot` behavior and no synthetic deltas. |
+| `watch-address-roots-default-snapshot` | `list_address_roots` returns the current root snapshot and an update stream; no profile controls root updates. |
 | `watch-address-roots-snapshot` | Emits a `Snapshot` followed by `Added` and `Removed`; host mutates routes under a single route-epoch bump per change batch. |
 
 ### Authentication and connection management

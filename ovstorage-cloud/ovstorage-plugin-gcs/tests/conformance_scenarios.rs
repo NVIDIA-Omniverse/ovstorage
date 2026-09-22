@@ -24,8 +24,9 @@ use ovstorage_plugin::{
     BackendChangeEvent, BackendChangeStream, BackendFactory, BackendId, Body, CancellationToken,
     ConfigValue, ConnectionAuthState, ConnectionRequest, DeleteOptions, DeleteRequest, ErrorCode,
     IfDestExists, LayerConfig, LayerConnectionRequest, LayerHandle, ListOptions, ListRequest,
-    ObjectKind, RenameOptions, RenameRequest, Request, ResolvedTarget, SecretBundle, StatOptions,
-    StatRequest, WatchDirectoryOptions, WatchDirectoryRequest, WriteOptions, WriteRequest, address,
+    ListVersionsOptions, ListVersionsRequest, ObjectInfo, ObjectKind, ReadOptions, ReadRequest,
+    RenameOptions, RenameRequest, Request, ResolvedTarget, SecretBundle, StatOptions, StatRequest,
+    WatchDirectoryOptions, WatchDirectoryRequest, WriteOptions, WriteRequest, address,
 };
 use ovstorage_plugin_gcs::{GcsBackend, GcsLayerFactory};
 use ovstorage_plugin_test::{
@@ -54,6 +55,14 @@ const LIST_BODY: &str = "{\
     {\"bucket\": \"bkt\", \"name\": \"team/file.txt\", \"size\": \"5\", \"etag\": \"f\"}\
     ],\
     \"prefixes\": [\"docs/\"]}";
+
+const LIST_STREAM_BODY: &str = "{\
+    \"items\": [\
+    {\"bucket\": \"bkt\", \"name\": \"a.txt\", \"size\": \"1\", \"etag\": \"a\"},\
+    {\"bucket\": \"bkt\", \"name\": \"team/\", \"size\": \"0\", \"etag\": \"m\"},\
+    {\"bucket\": \"bkt\", \"name\": \"team/file.txt\", \"size\": \"5\", \"etag\": \"f\"}\
+    ],\
+    \"prefixes\": [\"z-last/\"]}";
 
 const ERROR_BODY: &str = "{\"error\": {\"message\": \"scripted\"}}";
 
@@ -323,6 +332,21 @@ async fn drive_list_one_level_vs_recursive(scenario: &Scenario) -> ScenarioRepor
         );
     }
     pass(scenario)
+}
+
+async fn drive_list_stream_parity_and_cancel(scenario: &Scenario) -> ScenarioReport {
+    let (layer, _server) = anonymous_layer("200 OK", LIST_STREAM_BODY).await;
+    // Keep the provider's injectable scripted transport while forcing this
+    // scenario through the same producer/consumer v17 slot bridge as a
+    // cross-image plugin handle. The loaded test-plugin suite separately owns
+    // dlopen and staged-cdylib freshness coverage.
+    let handle = ovstorage_plugin::thunks_v2::export_handle(layer);
+    let layer: LayerHandle =
+        ovstorage_plugin::consume_v2::ForeignVtableLayer::from_handle(handle, None)
+            .expect("import GCS layer through the foreign vtable bridge");
+    scenario
+        .drive_list_stream_parity_and_cancel(layer.as_ref(), address::parse("gs://bkt/").unwrap())
+        .await
 }
 
 /// `IfDestExists::Fail` against an existing destination surfaces exactly
@@ -715,6 +739,178 @@ async fn drive_watch_concurrent_cross_prefix_no_split(scenario: &Scenario) -> Sc
     )
 }
 
+// === versioned_address ===
+//
+// `generation` rides on every object resource `objects.get` and
+// `objects.list` return, so the pin is free: it is populated whether or not
+// the caller set the cost flag, and costs no extra RPC either way.
+
+const VERSIONED_OBJECT_BODY: &str = "{\"bucket\": \"bkt\", \"name\": \"obj.txt\", \
+    \"size\": \"5\", \"etag\": \"f\", \"generation\": \"42\"}";
+
+const VERSIONED_LIST_BODY: &str = "{\
+    \"items\": [\
+    {\"bucket\": \"bkt\", \"name\": \"team/\", \"size\": \"0\", \"etag\": \"m\", \
+     \"generation\": \"7\"},\
+    {\"bucket\": \"bkt\", \"name\": \"team/file.txt\", \"size\": \"5\", \"etag\": \"f\", \
+     \"generation\": \"42\"}\
+    ],\
+    \"prefixes\": [\"docs/\"]}";
+
+const VERSIONS_BODY: &str = "{\
+    \"items\": [\
+    {\"bucket\": \"bkt\", \"name\": \"obj.txt\", \"size\": \"5\", \"etag\": \"f\", \
+     \"generation\": \"41\"},\
+    {\"bucket\": \"bkt\", \"name\": \"obj.txt\", \"size\": \"6\", \"etag\": \"g\", \
+     \"generation\": \"42\"}\
+    ]}";
+
+fn versioned(info: &ObjectInfo) -> Option<&str> {
+    info.versioned_address
+        .as_ref()
+        .map(ovstorage_plugin::Url::as_str)
+}
+
+#[tokio::test]
+async fn stat_pins_the_generation_whether_or_not_the_flag_is_set() {
+    for flag in [false, true] {
+        let (layer, server) = anonymous_layer("200 OK", VERSIONED_OBJECT_BODY).await;
+        let info = layer
+            .stat(
+                Request::new(StatRequest {
+                    address: object_address("obj.txt"),
+                    options: StatOptions {
+                        versioned_address: flag,
+                        ..StatOptions::default()
+                    },
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.kind, ObjectKind::File);
+        assert_eq!(info.address.as_str(), "gs://bkt/obj.txt");
+        assert_eq!(info.version.as_deref(), Some("42"));
+        assert_eq!(
+            versioned(&info),
+            Some("gs://bkt/obj.txt?generation=42"),
+            "flag={flag}"
+        );
+        assert_eq!(server.hits(), 1, "the pin costs no extra RPC (flag={flag})");
+    }
+}
+
+/// A caller pin reaches the wire as the `generation` selector and is echoed
+/// back as the canonical spelling of that pin.
+#[tokio::test]
+async fn stat_honours_and_echoes_a_caller_generation_pin() {
+    let (layer, server) = anonymous_layer("200 OK", VERSIONED_OBJECT_BODY).await;
+    let pinned = object_address("obj.txt?generation=42");
+    let info = layer
+        .stat(
+            Request::new(StatRequest {
+                address: pinned.clone(),
+                options: StatOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(info.address, pinned);
+    assert_eq!(versioned(&info), Some("gs://bkt/obj.txt?generation=42"));
+    let raw = server.requests();
+    assert!(
+        raw[0].contains("generation=42"),
+        "the pin must reach the wire as a selector: {}",
+        raw[0]
+    );
+}
+
+#[tokio::test]
+async fn list_pins_files_and_leaves_markers_and_prefixes_unpinned() {
+    for flag in [false, true] {
+        let (layer, server) = anonymous_layer("200 OK", VERSIONED_LIST_BODY).await;
+        let page = layer
+            .list(
+                Request::new(ListRequest {
+                    prefix: address::parse("gs://bkt/").unwrap(),
+                    options: ListOptions {
+                        versioned_address: flag,
+                        ..ListOptions::default()
+                    },
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let of_kind = |kind: ObjectKind| {
+            page.items
+                .iter()
+                .find(|item| item.kind == kind)
+                .unwrap_or_else(|| panic!("no {kind:?} item (flag={flag})"))
+        };
+        let file = of_kind(ObjectKind::File);
+        assert_eq!(file.address.as_str(), "gs://bkt/team/file.txt");
+        assert_eq!(
+            versioned(file),
+            Some("gs://bkt/team/file.txt?generation=42"),
+            "flag={flag}"
+        );
+        assert_eq!(of_kind(ObjectKind::DirectoryMarker).versioned_address, None);
+        assert_eq!(
+            of_kind(ObjectKind::DirectoryInferred).versioned_address,
+            None
+        );
+        assert_eq!(server.hits(), 1, "the pins cost no extra RPC (flag={flag})");
+    }
+}
+
+/// A version item's address is already the pin, so `versioned_address`
+/// equals it.
+#[tokio::test]
+async fn list_versions_and_get_latest_version_carry_their_own_address() {
+    let (layer, _server) = anonymous_layer("200 OK", VERSIONS_BODY).await;
+    let page = layer
+        .list_versions(
+            Request::new(ListVersionsRequest {
+                address: object_address("obj.txt"),
+                options: ListVersionsOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    let addresses: Vec<&str> = page
+        .items
+        .iter()
+        .map(|item| item.address.as_str())
+        .collect();
+    assert_eq!(
+        addresses,
+        vec![
+            "gs://bkt/obj.txt?generation=41",
+            "gs://bkt/obj.txt?generation=42"
+        ]
+    );
+    for item in &page.items {
+        assert_eq!(item.versioned_address.as_ref(), Some(&item.address));
+    }
+
+    let (layer, _server) = anonymous_layer("200 OK", VERSIONED_OBJECT_BODY).await;
+    let latest = layer
+        .get_latest_version(
+            Request::new(ReadRequest {
+                address: object_address("obj.txt"),
+                options: ReadOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(latest.address.as_str(), "gs://bkt/obj.txt?generation=42");
+    assert_eq!(latest.versioned_address.as_ref(), Some(&latest.address));
+}
+
 // === Registry sweep ===
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -745,6 +941,10 @@ async fn conformance_scenarios_cover_the_registry() {
             "list-one-level-vs-recursive" => {
                 driven.push(scenario.name);
                 drive_list_one_level_vs_recursive(scenario).await
+            }
+            "list-stream-parity-and-cancel" => {
+                driven.push(scenario.name);
+                drive_list_stream_parity_and_cancel(scenario).await
             }
             "write-no-overwrite-existing" => {
                 driven.push(scenario.name);
@@ -818,7 +1018,8 @@ async fn conformance_scenarios_cover_the_registry() {
             ),
             "write-redirect-commits-on-done"
             | "retry-never-replays-continue-write"
-            | "protocol-slots-pass-through" => runner.skip(
+            | "protocol-slots-pass-through"
+            | "materialize-unsupported-without-cache" => runner.skip(
                 scenario.name,
                 "host/wrapper-side protocol-slot contract; driven in ovstorage's \
                  conformance_protocol_slots.rs",
@@ -867,6 +1068,7 @@ async fn conformance_scenarios_cover_the_registry() {
             "capability-gate-watch-directory-unsupported",
             "delete-existing-object",
             "list-one-level-vs-recursive",
+            "list-stream-parity-and-cancel",
             "rename-no-overwrite-existing",
             "stat-basic-objectinfo",
             "stat-not-found",

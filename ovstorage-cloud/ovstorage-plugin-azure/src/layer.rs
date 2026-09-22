@@ -14,6 +14,11 @@
 //! there is no shared live cell, unlike s3), so every
 //! `update_connection_credentials` is rejected with remove-and-re-add
 //! guidance because the client owns no live credential cell to update.
+//!
+//! With `anonymous_fallback = ["azure"]` on the layer table the route table
+//! carries one more entry, the hidden `azure:///` scheme root bound to an
+//! [`AzureSchemeFallback`]: an `azure://` address no connection serves routes
+//! there and is attempted anonymously and read-only (see `crate::fallback`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +26,11 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use ovstorage_plugin::connection::{ConnectionSet, ProbeOutcome};
+use ovstorage_plugin::fallback::{
+    ANONYMOUS_FALLBACK_KEY, decode_anonymous_fallback, is_anonymous_fallback_key, schemes_for_kind,
+    split_anonymous_fallback_keys,
+};
+use ovstorage_plugin::instance_metadata::is_instance_metadata_url;
 use ovstorage_plugin::*;
 use parking_lot::RwLock;
 
@@ -29,6 +39,10 @@ use crate::backend::{AzureBackend, azure_capabilities};
 use crate::client::{OperationEvidence, with_operation_evidence};
 use crate::config::{self, AzureConnectionConfig};
 use crate::driver::AzureDriver;
+use crate::fallback::{AZURE_SCHEME, AzureFallbackPolicy, AzureSchemeFallback};
+
+/// The loopback-only test hook a layer table may carry for the fallback.
+const TEST_ENDPOINT_KEY: &str = "__test_endpoint";
 
 /// The static backend descriptor; converted to the v2 `LayerKindDescriptor`
 /// via [`descriptor_to_layer_kind`] at the factory/layer surface.
@@ -76,23 +90,64 @@ impl BackendFactory for AzureLayerFactory {
         config: &LayerConfig,
         cancel: Option<CancellationToken>,
     ) -> Result<LayerHandle> {
+        // The fallback keys are policy for this layer, not a connection to
+        // seed, so they come off the table before the seed check below reads
+        // it. The tunables are validated whether or not the grant names this
+        // kind's scheme, so a misplaced key is refused at startup rather than
+        // sitting inert.
+        let (policy, mut connection) = split_anonymous_fallback_keys(config);
+        let grant = decode_anonymous_fallback(&policy)?;
+        let served = schemes_for_kind(&self.descriptor.kind);
+        if let Some(scheme) = grant
+            .iter()
+            .find(|scheme| !served.contains(&scheme.as_str()))
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "`{ANONYMOUS_FALLBACK_KEY}` on layer `{name}` (kind {}) names scheme \
+                     `{scheme}`, which this kind does not serve; it serves {}",
+                    self.descriptor.kind,
+                    served.join(", ")
+                ),
+            ));
+        }
+        let tunables = AzureFallbackPolicy::parse(&policy)?;
+        let fallback = if grant.contains(AZURE_SCHEME) {
+            // The loopback-only `__test_endpoint` hook is shared with the
+            // connection the table may also describe. When the table holds
+            // nothing else, the hook is the fallback's alone and no static
+            // connection is seeded from it.
+            let test_endpoint = config::layer_test_endpoint(&connection)?;
+            if connection.keys().all(|key| key == TEST_ENDPOINT_KEY) {
+                connection.clear();
+            }
+            Some(Arc::new(AzureSchemeFallback::new(
+                &self.descriptor,
+                tunables,
+                test_endpoint,
+            )?))
+        } else {
+            None
+        };
         let layer = Arc::new(AzureLayer {
             name: name.to_string(),
             descriptor: self.descriptor.clone(),
             connection_set: Arc::new(ConnectionSet::with_defaults()),
             state: RwLock::new(AzureLayerState {
                 instances: Vec::new(),
-                routes: RouteTable::empty(),
+                routes: build_routes(&[], fallback.as_ref()),
             }),
+            fallback,
             next_instance_counter: AtomicU64::new(0),
         });
-        // A non-empty layer config seeds one static connection (the
+        // A non-empty connection table seeds one static connection (the
         // config-as-Stack path); runtime connections arrive via
         // `add_connection`.
-        if !config.is_empty() {
+        if !connection.is_empty() {
             let request = ConnectionRequest {
                 backend_kind: self.descriptor.kind.clone(),
-                config: config.clone(),
+                config: connection,
                 credentials: SecretBundle::default(),
                 persist: false,
                 display_name: None,
@@ -126,6 +181,9 @@ pub(crate) struct AzureLayer {
     /// under a single lock so a mutation and its route-table rebuild are
     /// published atomically.
     state: RwLock<AzureLayerState>,
+    /// The anonymous `azure://` fallback, when the layer table grants it.
+    /// Fixed at construction; every route-table rebuild re-appends its root.
+    fallback: Option<Arc<AzureSchemeFallback>>,
     /// Disambiguates trace/routing-only `BackendId`s for byte-identical configs;
     /// connection identity is the `ConnectionId`.
     next_instance_counter: AtomicU64,
@@ -133,7 +191,35 @@ pub(crate) struct AzureLayer {
 
 struct AzureLayerState {
     instances: Vec<Arc<AzureInstance>>,
-    routes: RouteTable<Arc<AzureInstance>>,
+    routes: RouteTable<AzureRoute>,
+}
+
+/// What a route-table entry binds an address to: a configured connection's
+/// instance, or the scheme fallback that answers an address no connection
+/// serves.
+#[derive(Clone)]
+enum AzureRoute {
+    Connection(Arc<AzureInstance>),
+    Fallback(Arc<AzureSchemeFallback>),
+}
+
+/// What an operation needs from whichever route answered it: the backend to
+/// call and the namespace model that drives the `list` fold. A connection's
+/// instance supplies both; the fallback supplies an anonymous backend over a
+/// flat namespace.
+#[derive(Clone)]
+struct Routed {
+    backend: Arc<AzureBackend>,
+    has_real_directories: bool,
+}
+
+impl Routed {
+    fn of(instance: &AzureInstance) -> Self {
+        Self {
+            backend: instance.backend.clone(),
+            has_real_directories: instance.has_real_directories,
+        }
+    }
 }
 
 /// One backend instance serving one connection. Routing/dispatch state only —
@@ -238,23 +324,104 @@ impl AcceptanceWitness {
     }
 }
 
-/// Longest-prefix route table over the current instance set.
-fn build_routes(instances: &[Arc<AzureInstance>]) -> RouteTable<Arc<AzureInstance>> {
-    let items: Vec<(RootInfo, Arc<AzureInstance>)> = instances
+/// Longest-prefix route table over the current instance set, plus the scheme
+/// root when the fallback is granted. The table ranks the depth-0 scheme root
+/// last on its own; appending it last keeps the input in the same order.
+fn build_routes(
+    instances: &[Arc<AzureInstance>],
+    fallback: Option<&Arc<AzureSchemeFallback>>,
+) -> RouteTable<AzureRoute> {
+    let mut items: Vec<(RootInfo, AzureRoute)> = instances
         .iter()
         .flat_map(|instance| {
             instance
                 .roots
                 .iter()
                 .cloned()
-                .map(|root| (root, instance.clone()))
+                .map(|root| (root, AzureRoute::Connection(instance.clone())))
                 .collect::<Vec<_>>()
         })
         .collect();
+    if let Some(fallback) = fallback {
+        items.push((
+            fallback.root().clone(),
+            AzureRoute::Fallback(fallback.clone()),
+        ));
+    }
     RouteTable::build(items)
 }
 
+/// Advisory only, in the same spirit as the cleartext-endpoint warning: an
+/// operator who points a connection at a cloud instance-metadata host chose
+/// to, so the connection is honoured, and the warning names the exposure once
+/// at construction. The unconditional refusal applies only to hosts derived
+/// from a caller's address, which no configured connection has.
+fn warn_on_instance_metadata_endpoint(config: &AzureConnectionConfig) {
+    let mut bases = vec![config.blob_url_base()];
+    if config.hierarchical_namespace {
+        bases.push(config.dfs_url_base());
+    }
+    if config.change_feed_enabled {
+        bases.push(config.change_feed_base_url());
+    }
+    for base in bases {
+        let Ok(url) = Url::parse(&format!("{base}/")) else {
+            continue;
+        };
+        if is_instance_metadata_url(&url) {
+            tracing::warn!(
+                plugin = "azure",
+                endpoint = %origin_only(&url),
+                "Azure connection endpoint is a cloud instance-metadata host; it is honoured \
+                 because an operator configured it, but every request this connection signs \
+                 goes to that host"
+            );
+        }
+    }
+}
+
+/// The `user_metadata` every connection row derived from `config` carries:
+/// the container's ordinary cloud-URL spellings under
+/// [`ACCEPTED_URL_SPELLINGS_METADATA_KEY`], so an alias wrapper above can
+/// auto-generate hidden alias rules for them. Shared by
+/// `instantiate_connection` and `probe` — like `owning_target`, the contract
+/// is stamped on BOTH row-construction sites, so the preview row a probe
+/// returns matches the row the subsequent add produces.
+fn spellings_metadata(config: &AzureConnectionConfig) -> UserMetadata {
+    let mut user_metadata = UserMetadata::new();
+    let url_spellings = config.alternate_url_prefixes();
+    if !url_spellings.is_empty() {
+        user_metadata.insert(
+            ACCEPTED_URL_SPELLINGS_METADATA_KEY.to_string(),
+            encode_url_spellings(&url_spellings),
+        );
+    }
+    user_metadata
+}
+
 impl AzureLayer {
+    /// Refuse a connection request that carries a fallback layer key. The
+    /// parser would refuse it as an unknown field anyway; it gets its own
+    /// message here because the operator's mistake is one of placement rather
+    /// than spelling, and this is where the layer table's name is known.
+    fn refuse_fallback_keys(&self, config: &LayerConfig) -> Result<()> {
+        if let Some(key) = config
+            .keys()
+            .filter(|key| is_anonymous_fallback_key(key))
+            .min()
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "`{key}` is a layer key, not connection config; set it on \
+                     [ovstorage.layers.{}]",
+                    self.name
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Build a connection: parse the config, resolve+freeze the auth into an
     /// [`AzureBackend`], hand an [`AzureDriver`] to the `ConnectionSet`
     /// (which validates + owns the lifecycle), then publish the
@@ -279,7 +446,9 @@ impl AzureLayer {
                 ),
             ));
         }
+        self.refuse_fallback_keys(&request.config)?;
         let config = AzureConnectionConfig::from_request(&request)?;
+        warn_on_instance_metadata_endpoint(&config);
         let counter = self.next_instance_counter.fetch_add(1, Ordering::Relaxed);
         // The label is the effective endpoint, not the raw suffix, so two
         // connections that differ only by `blob_endpoint` stay
@@ -303,6 +472,7 @@ impl AzureLayer {
         let display_name = request.display_name.clone().unwrap_or_else(|| {
             format!("Azure Blob Storage {}/{}", config.account, config.container)
         });
+        let user_metadata = spellings_metadata(&config);
         let connection = Connection {
             id: connection_id.clone(),
             backend_kind: self.descriptor.kind.clone(),
@@ -315,7 +485,13 @@ impl AzureLayer {
                 last_attempt: None,
             },
             last_probed: None,
-            user_metadata: UserMetadata::new(),
+            user_metadata,
+            // This layer owns the connection, and its instance name is the
+            // `ConnectionKey::target` that reaches it -- the same name
+            // `owned_targets` reports and `remove_connection` gates on. Stamped
+            // at construction so the row carries it wherever it goes, including
+            // out of `ConnectionSet`'s change stream.
+            owning_target: Some(self.name.clone()),
         };
         // `ConnectionSet` validates (via the driver) and records auth state; a
         // soft obtain/verify failure parks the connection (`AwaitingAuth`)
@@ -376,26 +552,52 @@ impl AzureLayer {
         }
     }
 
-    /// Install `instance` and republish the route table atomically.
+    /// Install `instance` and republish the route table atomically. Any
+    /// fallback backend cached for a node the connection publishes is
+    /// evicted: the prefix tier answers that node from now on.
     fn install(&self, instance: Arc<AzureInstance>) {
+        if let Some(fallback) = &self.fallback {
+            for root in &instance.roots {
+                fallback.evict_node(&root.root);
+            }
+        }
         let mut state = self.state.write();
         state.instances.push(instance);
-        state.routes = build_routes(&state.instances);
+        state.routes = build_routes(&state.instances, self.fallback.as_ref());
     }
 
-    fn target(&self, url: &Url) -> Result<(Arc<AzureInstance>, ResolvedTarget)> {
-        let instance = self
+    /// Route `url`: the connection whose root is its longest prefix, or the
+    /// fallback when nothing is and the layer grants one. A fallback hit
+    /// resolves the node from the address here, so an address that names no
+    /// account is refused on every slot before anything else happens.
+    fn target(&self, url: &Url) -> Result<(AzureRoute, ResolvedTarget)> {
+        let route = self
             .state
             .read()
             .routes
             .lookup(url)
-            .map(|(_, instance)| instance.clone())
+            .map(|(_, route)| route.clone())
             .ok_or_else(|| Error::new(ErrorCode::NoRoute, "no route matches address"))?;
-        let target = ResolvedTarget {
-            backend_id: instance.backend_id.clone(),
-            resolved_address: url.clone(),
+        let target = match &route {
+            AzureRoute::Connection(instance) => ResolvedTarget {
+                backend_id: instance.backend_id.clone(),
+                resolved_address: url.clone(),
+            },
+            AzureRoute::Fallback(fallback) => fallback.resolved_target(url)?,
         };
-        Ok((instance, target))
+        Ok((route, target))
+    }
+
+    /// The instance a mutating slot may act on. A fallback route is refused
+    /// here — before any witness is taken, any body is read or any request is
+    /// built — because the fallback is read-only by construction.
+    fn mutable_instance(route: AzureRoute, target: &ResolvedTarget) -> Result<Arc<AzureInstance>> {
+        match route {
+            AzureRoute::Connection(instance) => Ok(instance),
+            AzureRoute::Fallback(fallback) => {
+                Err(fallback.mutation_refused(&target.resolved_address))
+            }
+        }
     }
 
     /// Route `url` to its instance and run `op` under the connection's
@@ -428,19 +630,69 @@ impl AzureLayer {
     /// reuse an id here and the `ConnectionSet`'s own identity fence would
     /// catch that case anyway — this check is the cheap local one for plain
     /// removal.
-    async fn recover<T, F, Fut>(&self, url: &Url, op: F) -> Result<T>
+    ///
+    /// A fallback route has none of this: no connection to park or promote,
+    /// no credential to prove. The anonymous backend is resolved (built on
+    /// first touch, under `cancel`) and `op` runs against it directly.
+    async fn recover<T, F, Fut>(
+        &self,
+        url: &Url,
+        cancel: Option<CancellationToken>,
+        op: F,
+    ) -> Result<T>
     where
-        F: Fn(Arc<AzureInstance>, ResolvedTarget) -> Fut,
+        F: Fn(Routed, ResolvedTarget) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let (instance, target) = self.target(url)?;
+        match self.target(url)? {
+            (AzureRoute::Connection(instance), target) => {
+                self.recover_on(instance, target, op).await
+            }
+            (AzureRoute::Fallback(fallback), _) => {
+                let (backend, target) = fallback.backend_for(url, cancel).await?;
+                op(
+                    Routed {
+                        backend,
+                        has_real_directories: false,
+                    },
+                    target,
+                )
+                .await
+            }
+        }
+    }
+
+    /// [`Self::recover`] for a mutating slot: a connection runs `op` under the
+    /// same recovery loop; the fallback is refused before anything runs.
+    async fn recover_mutation<T, F, Fut>(&self, url: &Url, op: F) -> Result<T>
+    where
+        F: Fn(Routed, ResolvedTarget) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let (route, target) = self.target(url)?;
+        let instance = Self::mutable_instance(route, &target)?;
+        self.recover_on(instance, target, op).await
+    }
+
+    /// The connection half of [`Self::recover`]: the witness, the recovery
+    /// loop and the promotion rule described there.
+    async fn recover_on<T, F, Fut>(
+        &self,
+        instance: Arc<AzureInstance>,
+        target: ResolvedTarget,
+        op: F,
+    ) -> Result<T>
+    where
+        F: Fn(Routed, ResolvedTarget) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         let id = instance.connection_id.clone();
         let witness = AcceptanceWitness::take(&instance);
         self.connection_set
             .with_recovery_promoting_if(
                 &id,
                 || witness.proved(self),
-                || witness.scope(op(instance.clone(), target.clone())),
+                || witness.scope(op(Routed::of(&instance), target.clone())),
             )
             .await
     }
@@ -529,11 +781,15 @@ impl Layer for AzureLayer {
         cancel: Option<CancellationToken>,
     ) -> Result<ObjectInfo> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
-            let options = options.clone();
-            let cancel = cancel.clone();
-            async move { instance.backend.stat(target, options, cancel).await }
-        })
+        self.recover(
+            &request.input.address,
+            cancel.clone(),
+            move |routed, target| {
+                let options = options.clone();
+                let cancel = cancel.clone();
+                async move { routed.backend.stat(target, options, cancel).await }
+            },
+        )
         .await
     }
 
@@ -543,11 +799,15 @@ impl Layer for AzureLayer {
         cancel: Option<CancellationToken>,
     ) -> Result<ReadResult> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
-            let options = options.clone();
-            let cancel = cancel.clone();
-            async move { instance.backend.read(target, options, cancel).await }
-        })
+        self.recover(
+            &request.input.address,
+            cancel.clone(),
+            move |routed, target| {
+                let options = options.clone();
+                let cancel = cancel.clone();
+                async move { routed.backend.read(target, options, cancel).await }
+            },
+        )
         .await
     }
 
@@ -561,7 +821,8 @@ impl Layer for AzureLayer {
         // to the caller. The acceptance an inline write earns still counts,
         // though — a connection whose `Put Blob` the service answered has
         // proved its credentials as surely as any other operation.
-        let (instance, target) = self.target(&request.input.address)?;
+        let (route, target) = self.target(&request.input.address)?;
+        let instance = Self::mutable_instance(route, &target)?;
         let id = instance.connection_id.clone();
         let witness = AcceptanceWitness::take(&instance);
         let options = request.input.options;
@@ -607,7 +868,8 @@ impl Layer for AzureLayer {
         request: Request<WriteRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<WriteRedirectBatch> {
-        let (instance, target) = self.target(&request.input.address)?;
+        let (route, target) = self.target(&request.input.address)?;
+        let instance = Self::mutable_instance(route, &target)?;
         instance
             .backend
             .write_redirect(target, request.input.options, cancel)
@@ -619,7 +881,8 @@ impl Layer for AzureLayer {
         request: Request<ContinueWriteRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<WriteStep> {
-        let (instance, target) = self.target(&request.input.address)?;
+        let (route, target) = self.target(&request.input.address)?;
+        let instance = Self::mutable_instance(route, &target)?;
         // The staged path commits with a signed `Put Block List` of our own, so
         // the client sees that response and it counts like any other.
         //
@@ -658,10 +921,10 @@ impl Layer for AzureLayer {
         cancel: Option<CancellationToken>,
     ) -> Result<()> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
+        self.recover_mutation(&request.input.address, move |routed, target| {
             let options = options.clone();
             let cancel = cancel.clone();
-            async move { instance.backend.delete(target, options, cancel).await }
+            async move { routed.backend.delete(target, options, cancel).await }
         })
         .await
     }
@@ -691,18 +954,66 @@ impl Layer for AzureLayer {
         // remove/re-add with a different `hierarchical_namespace` can't fold
         // one instance's items with another's flag.
         let (items, has_real_directories) = self
-            .recover(&request.input.prefix, move |instance, target| {
-                let options = backend_options.clone();
-                let cancel = cancel.clone();
-                async move {
-                    let items = instance.backend.list(target, options, cancel).await?;
-                    Ok((items, instance.has_real_directories))
-                }
-            })
+            .recover(
+                &request.input.prefix,
+                cancel.clone(),
+                move |routed, target| {
+                    let options = backend_options.clone();
+                    let cancel = cancel.clone();
+                    async move {
+                        let items = routed.backend.list(target, options, cancel).await?;
+                        Ok((items, routed.has_real_directories))
+                    }
+                },
+            )
             .await?;
         let items =
             fold_markers_and_infer_subdir_kinds(&prefix, items, has_real_directories, recursive);
         paginate_list_items(items, max_results, page_token)
+    }
+
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        let prefix = request.input.prefix;
+        let options = request.input.options;
+        if options.max_results.is_some() || options.page_token.is_some() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+
+        let recursive = options.recursive;
+        let backend_options = ListOptions {
+            max_results: None,
+            page_token: None,
+            ..options
+        };
+        let stream_cancel = cancel.clone();
+        // Read the namespace model from the same routed instance that opens
+        // the stream, exactly as buffered `list` does for its whole-set fold.
+        let (stream, has_real_directories) = self
+            .recover(&prefix, cancel.clone(), move |routed, target| {
+                let options = backend_options.clone();
+                let cancel = cancel.clone();
+                async move {
+                    let stream = routed.backend.list_stream(target, options, cancel).await?;
+                    Ok((stream, routed.has_real_directories))
+                }
+            })
+            .await?;
+        Ok(cancel_list_stream(
+            Box::pin(IncrementalListFold::new(
+                stream,
+                &prefix,
+                has_real_directories,
+                recursive,
+            )),
+            stream_cancel,
+        ))
     }
 
     async fn list_versions(
@@ -712,16 +1023,15 @@ impl Layer for AzureLayer {
     ) -> Result<VersionPage> {
         let options = request.input.options;
         let items = self
-            .recover(&request.input.address, move |instance, target| {
-                let options = options.clone();
-                let cancel = cancel.clone();
-                async move {
-                    instance
-                        .backend
-                        .list_versions(target, options, cancel)
-                        .await
-                }
-            })
+            .recover(
+                &request.input.address,
+                cancel.clone(),
+                move |routed, target| {
+                    let options = options.clone();
+                    let cancel = cancel.clone();
+                    async move { routed.backend.list_versions(target, options, cancel).await }
+                },
+            )
             .await?;
         // Current behavior: the backend paginates natively and internally;
         // the host never chained pages.
@@ -736,10 +1046,14 @@ impl Layer for AzureLayer {
         request: Request<ReadRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<ObjectInfo> {
-        self.recover(&request.input.address, move |instance, target| {
-            let cancel = cancel.clone();
-            async move { instance.backend.get_latest_version(target, cancel).await }
-        })
+        self.recover(
+            &request.input.address,
+            cancel.clone(),
+            move |routed, target| {
+                let cancel = cancel.clone();
+                async move { routed.backend.get_latest_version(target, cancel).await }
+            },
+        )
         .await
     }
 
@@ -750,14 +1064,16 @@ impl Layer for AzureLayer {
     ) -> Result<ChangeStream> {
         // Establish the change-feed subscription under `recover`
         // (establishment is replayable); mid-stream errors surface via the
-        // mapped stream.
+        // mapped stream. The fallback is refused like a mutation: a watch is
+        // a standing subscription on a node nobody configured, and the
+        // fallback's read-only root withholds the watch bit.
         let options = request.input.options;
         let stream = self
-            .recover(&request.input.prefix, move |instance, target| {
+            .recover_mutation(&request.input.prefix, move |routed, target| {
                 let options = options.clone();
                 let cancel = cancel.clone();
                 async move {
-                    instance
+                    routed
                         .backend
                         .watch_directory(target, options, cancel)
                         .await
@@ -775,11 +1091,11 @@ impl Layer for AzureLayer {
         cancel: Option<CancellationToken>,
     ) -> Result<BackendItemInfo> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
+        self.recover_mutation(&request.input.address, move |routed, target| {
             let options = options.clone();
             let cancel = cancel.clone();
             async move {
-                instance
+                routed
                     .backend
                     .create_directory(target, options, cancel)
                     .await
@@ -794,11 +1110,11 @@ impl Layer for AzureLayer {
         cancel: Option<CancellationToken>,
     ) -> Result<()> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
+        self.recover_mutation(&request.input.address, move |routed, target| {
             let options = options.clone();
             let cancel = cancel.clone();
             async move {
-                instance
+                routed
                     .backend
                     .delete_directory(target, options, cancel)
                     .await
@@ -812,8 +1128,14 @@ impl Layer for AzureLayer {
         request: Request<CopyRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<WriteStep> {
-        let (source_instance, source) = self.target(&request.input.source)?;
-        let (dest_instance, destination) = self.target(&request.input.destination)?;
+        let (source_route, source) = self.target(&request.input.source)?;
+        let (dest_route, destination) = self.target(&request.input.destination)?;
+        // Both ends are resolved before anything runs, and either end on the
+        // fallback refuses the whole operation before any read of the source:
+        // the fallback performs no mutation, and a copy is one whichever side
+        // of it the fallback node is on. The refusal names that node.
+        let source_instance = Self::mutable_instance(source_route, &source)?;
+        let dest_instance = Self::mutable_instance(dest_route, &destination)?;
         if !Arc::ptr_eq(&source_instance, &dest_instance) {
             return Err(Error::new(
                 ErrorCode::Unsupported,
@@ -853,8 +1175,12 @@ impl Layer for AzureLayer {
         request: Request<RenameRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<()> {
-        let (source_instance, source) = self.target(&request.input.source)?;
-        let (dest_instance, destination) = self.target(&request.input.destination)?;
+        let (source_route, source) = self.target(&request.input.source)?;
+        let (dest_route, destination) = self.target(&request.input.destination)?;
+        // Both ends are checked, as in `copy`: a rename deletes its source,
+        // so a fallback source is as much a mutation as a fallback destination.
+        let source_instance = Self::mutable_instance(source_route, &source)?;
+        let dest_instance = Self::mutable_instance(dest_route, &destination)?;
         if !Arc::ptr_eq(&source_instance, &dest_instance) {
             return Err(Error::new(
                 ErrorCode::Unsupported,
@@ -895,11 +1221,11 @@ impl Layer for AzureLayer {
         cancel: Option<CancellationToken>,
     ) -> Result<BackendItemInfo> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
+        self.recover_mutation(&request.input.address, move |routed, target| {
             let options = options.clone();
             let cancel = cancel.clone();
             async move {
-                instance
+                routed
                     .backend
                     .update_metadata(target, options, cancel)
                     .await
@@ -914,16 +1240,20 @@ impl Layer for AzureLayer {
         cancel: Option<CancellationToken>,
     ) -> Result<AccessDecision> {
         let operations = request.input.operations;
-        self.recover(&request.input.address, move |instance, target| {
-            let operations = operations.clone();
-            let cancel = cancel.clone();
-            async move {
-                instance
-                    .backend
-                    .check_access(target, operations, cancel)
-                    .await
-            }
-        })
+        self.recover(
+            &request.input.address,
+            cancel.clone(),
+            move |routed, target| {
+                let operations = operations.clone();
+                let cancel = cancel.clone();
+                async move {
+                    routed
+                        .backend
+                        .check_access(target, operations, cancel)
+                        .await
+                }
+            },
+        )
         .await
     }
 
@@ -948,6 +1278,7 @@ impl Layer for AzureLayer {
                 ),
             ));
         }
+        self.refuse_fallback_keys(&req.config)?;
         let config = AzureConnectionConfig::from_request(&req)?;
         let is_anonymous = matches!(
             AzureAuth::resolve(&req.credentials)?.source(),
@@ -974,7 +1305,16 @@ impl Layer for AzureLayer {
                 last_attempt: None,
             },
             last_probed: None,
-            user_metadata: UserMetadata::new(),
+            // The preview row carries the same spellings contract the
+            // registered row will, so a host can show "these URLs will also
+            // resolve" before the caller commits.
+            user_metadata: spellings_metadata(&config),
+            // This layer owns the connection, and its instance name is the
+            // `ConnectionKey::target` that reaches it -- the same name
+            // `owned_targets` reports and `remove_connection` gates on. Stamped
+            // at construction so the row carries it wherever it goes, including
+            // out of `ConnectionSet`'s change stream.
+            owning_target: Some(self.name.clone()),
         };
         let outcome = self
             .connection_set
@@ -1053,7 +1393,7 @@ impl Layer for AzureLayer {
             state
                 .instances
                 .retain(|instance| instance.connection_id != id);
-            state.routes = build_routes(&state.instances);
+            state.routes = build_routes(&state.instances, self.fallback.as_ref());
             Error::new(
                 ErrorCode::Internal,
                 "add_connection did not create a connection",
@@ -1089,7 +1429,7 @@ impl Layer for AzureLayer {
         state
             .instances
             .retain(|instance| instance.connection_id != id);
-        state.routes = build_routes(&state.instances);
+        state.routes = build_routes(&state.instances, self.fallback.as_ref());
         Ok(())
     }
 

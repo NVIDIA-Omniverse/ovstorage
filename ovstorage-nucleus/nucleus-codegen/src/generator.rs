@@ -584,7 +584,13 @@ fn method_param_tokens(m: &Method) -> Vec<TokenStream> {
         .filter(|p| !is_version_param(p))
         .map(|p| {
             let pname = format_ident!("{}", sanitize_field_name(&to_snake_case(&p.name)));
-            let pty = map_type_ref(&p.ty);
+            // A bytes parameter is the binary frame the transport borrows to
+            // build the wire message, so callers keep ownership of the body.
+            let pty = if is_bytes_type(&p.ty) {
+                quote! { &[u8] }
+            } else {
+                map_type_ref(&p.ty)
+            };
             if p.optional {
                 quote! { #pname: Option<#pty> }
             } else {

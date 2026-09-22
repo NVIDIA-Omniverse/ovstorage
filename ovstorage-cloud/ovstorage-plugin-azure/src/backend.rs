@@ -9,18 +9,21 @@
 //! `ReadResult::Redirect` / `WriteStep::Redirects` so the host follower runs
 //! the byte-bearing hops directly against Azure.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use futures::{Stream, StreamExt as _};
 use ovstorage_plugin::{
     AccessDecision, AccessOps, CancellationToken, Capabilities, ChangeKindSet, ChecksumAlgorithm,
     ChecksumSet, CopyOptions, CreateDirectoryOptions, DeleteDirectoryOptions, DeleteOptions, Error,
-    ErrorCode, ErrorContext, HttpRequest, IfDestExists, ListOptions, ListVersionsOptions,
-    MtimeFormat, ObjectInfo, ObjectKind, ReadOptions, ReadRedirect, RedirectBodySource,
-    RedirectCredential, RedirectResultBatch, RedirectScope, RenameOptions, ResolvedTarget,
-    ResponseParsing, Result, ResultCapture, StatOptions, UpdateMetadataOptions, VersionListOrder,
-    WatchDirectoryOptions, WriteOptions, WriteRedirect, WriteRedirectBatch, WriteResult, address,
-    race_cancel, reject_pinned_for_mutation, validate_redirect_results,
+    ErrorCode, ErrorContext, EtagStrength, HttpRequest, IfDestExists, ListOptions,
+    ListVersionsOptions, MESSAGE_METADATA_KEY, MtimeFormat, ObjectInfo, ObjectKind, ReadOptions,
+    ReadRedirect, RedirectBodySource, RedirectCredential, RedirectResultBatch, RedirectScope,
+    RenameOptions, ResolvedTarget, ResponseParsing, Result, ResultCapture, StatOptions,
+    UpdateMetadataOptions, VersionListOrder, WatchDirectoryOptions, WriteOptions, WriteRedirect,
+    WriteRedirectBatch, WriteResult, address, normalize_optional_wire_etag, race_cancel,
+    reject_pinned_for_mutation, validate_redirect_results,
 };
 
 /// Pull the legacy `(if_match_etag, no_overwrite)` pair out of the new
@@ -100,7 +103,7 @@ impl std::fmt::Display for RedactedUrl<'_> {
 use crate::parse::{
     HNS_SYSTEM_METADATA_HEADERS, SYSTEM_METADATA_HEADERS, blob_to_object_info,
     blob_to_version_item, dfs_paths_to_object_infos, list_xml_to_object_infos, parse_blob_list_xml,
-    parse_dfs_path_list_json, parse_object_info,
+    parse_dfs_path_list_json, parse_object_info, version_address,
 };
 use crate::signing::{DEFAULT_SAS_VERSION, SasPermission, ServiceSasRequest, service_sas_query};
 
@@ -149,6 +152,21 @@ const AZURE_HNS_KIND_PROBE_DEADLINE: Duration = Duration::from_secs(5);
 
 const AZURE_COPY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const AZURE_COPY_POLL_DEADLINE: Duration = Duration::from_secs(60 * 30);
+
+/// Continuation tokens retained by the unbudgeted streaming list walk.
+///
+/// Buffered listing keeps its historical no-guard behavior. The streaming
+/// surface remembers only a small recent window, so a broken service cannot
+/// grow client-side token state with the number of pages consumed.
+const LIST_STREAM_TOKEN_WINDOW: usize = 32;
+
+struct AzureListPage {
+    items: Vec<ObjectInfo>,
+    next_continuation_token: Option<String>,
+}
+
+type AzureListPageStream =
+    std::pin::Pin<Box<dyn Stream<Item = Result<AzureListPage>> + Send + 'static>>;
 
 /// Single-`Put Blob` ceiling; above this, switch to staged `Put Block` + `Put Block List`.
 /// Conservative vs the modern 5000 MiB cap to keep headroom for older API versions
@@ -269,8 +287,9 @@ impl AzureBackend {
         }
         let parsed = parse_blob_list_xml(response.body_str()?)?;
         if let Some(marker) = parsed.items.iter().find(|blob| blob.name == prefix) {
-            let mut info = blob_to_object_info(marker, address.clone());
+            let mut info = blob_to_object_info(marker, address.clone())?;
             info.kind = ObjectKind::DirectoryMarker;
+            info.versioned_address = None;
             return Ok(FlatDirectoryProbe::Marker(Box::new(info)));
         }
         let mut descendant_seen = false;
@@ -559,6 +578,7 @@ pub(crate) fn azure_capabilities(
     caps.version_list_order = Some(VersionListOrder::Oldest);
     caps.has_real_directories = hierarchical_namespace;
     caps.supports_list = true;
+    caps.supports_list_stream = true;
     caps.wants_list_backed_stat = true;
     caps.supports_recursive_list = true;
     caps.supports_create_directory = true;
@@ -627,6 +647,42 @@ impl AzureBackend {
         self.client.refusal_epoch()
     }
 
+    /// `Get Blob Properties` (`HEAD Blob`) for `blob_key`, at `version_id`
+    /// when one is given. One request shape for `stat`, `get_latest_version`
+    /// and the per-blob pin lookup of a flagged non-recursive `list`.
+    async fn head_blob(
+        &self,
+        blob_key: &str,
+        version_id: Option<&str>,
+    ) -> Result<crate::client::AzureResponse> {
+        let mut canonical_query: Vec<(String, String)> = Vec::new();
+        let url = if let Some(vid) = version_id {
+            canonical_query.push(("versionid".into(), vid.to_string()));
+            format!(
+                "{}?versionid={}",
+                self.blob_url(blob_key),
+                urlencoding::encode(vid)
+            )
+        } else {
+            self.blob_url(blob_key)
+        };
+        let canonical_path = self.canonical_path_for_blob(blob_key);
+        let req = AzureRequest {
+            method: reqwest::Method::HEAD,
+            url,
+            canonical_path: &canonical_path,
+            canonical_query,
+            extra_headers: vec![],
+            content_type: None,
+            content_md5: None,
+            if_match: None,
+            if_none_match: None,
+            range: None,
+            body: None,
+        };
+        self.client.send(req).await
+    }
+
     pub async fn stat(
         &self,
         target: ResolvedTarget,
@@ -654,32 +710,7 @@ impl AzureBackend {
                     }
                     parse_object_info(target.resolved_address.clone(), &response.headers, true)
                 } else {
-                    let mut canonical_query: Vec<(String, String)> = Vec::new();
-                    let url = if let Some(vid) = version_id.as_ref() {
-                        canonical_query.push(("versionid".into(), vid.clone()));
-                        format!(
-                            "{}?versionid={}",
-                            self.blob_url(&blob_key),
-                            urlencoding::encode(vid)
-                        )
-                    } else {
-                        self.blob_url(&blob_key)
-                    };
-                    let canonical_path = self.canonical_path_for_blob(&blob_key);
-                    let req = AzureRequest {
-                        method: reqwest::Method::HEAD,
-                        url,
-                        canonical_path: &canonical_path,
-                        canonical_query,
-                        extra_headers: vec![],
-                        content_type: None,
-                        content_md5: None,
-                        if_match: None,
-                        if_none_match: None,
-                        range: None,
-                        body: None,
-                    };
-                    let response = self.client.send(req).await?;
+                    let response = self.head_blob(&blob_key, version_id.as_deref()).await?;
                     // Flat Azure-Blob is a prefix namespace: the
                     // dispatcher folds directory markers on `list`, but
                     // `stat` runs here. For a trailing-slash address,
@@ -698,6 +729,7 @@ impl AzureBackend {
                                 FlatDirectoryProbe::Marker(info) => return Ok(*info),
                                 FlatDirectoryProbe::Inferred => {
                                     return Ok(ObjectInfo {
+                                        etag_strength: Default::default(),
                                         address: target.resolved_address.clone(),
                                         kind: ObjectKind::DirectoryInferred,
                                         etag: None,
@@ -709,6 +741,7 @@ impl AzureBackend {
                                         system_metadata: None,
                                         user_metadata: None,
                                         modified_by: None,
+                                        versioned_address: None,
                                     });
                                 }
                                 FlatDirectoryProbe::Missing => {}
@@ -724,8 +757,19 @@ impl AzureBackend {
                         &response.headers,
                         false,
                     )?;
+                    // `x-ms-version-id` rides on every `Get Blob Properties`
+                    // answer from a versioned container, so the pin is free
+                    // and populated whatever the flag says; a caller pin is
+                    // echoed as its canonical spelling.
+                    info.versioned_address = version_id
+                        .as_deref()
+                        .or(info.version.as_deref())
+                        .map(|vid| version_address(&target.resolved_address, vid))
+                        .transpose()?;
                     if trailing_slash {
+                        // A directory kind carries no pin.
                         info.kind = ObjectKind::DirectoryMarker;
+                        info.versioned_address = None;
                     }
                     Ok(info)
                 }
@@ -928,6 +972,7 @@ impl AzureBackend {
                 checksum_headers.insert(ChecksumAlgorithm::md5(), "Content-MD5".into());
                 let mut response_parsing = ResponseParsing {
                     etag_header: Some("etag".into()),
+                    etag_strength: EtagStrength::Unspecified,
                     version_header: Some("x-ms-version-id".into()),
                     size_header: Some("content-length".into()),
                     mtime_header: Some("last-modified".into()),
@@ -1006,9 +1051,7 @@ impl AzureBackend {
                 let blob_url = self.blob_url(&blob_key);
                 let canonical_path = self.canonical_path_for_blob(&blob_key);
                 let mut user_metadata = opts.user_metadata.clone().unwrap_or_default();
-                if let Some(message) = opts.message.as_deref().filter(|m| !m.is_empty()) {
-                    user_metadata.insert("x-ov-message".to_string(), message.to_string());
-                }
+                stash_message(&mut user_metadata, opts.message.as_deref());
                 let mut extra_headers: Vec<(String, String)> =
                     vec![("x-ms-blob-type".into(), "BlockBlob".into())];
                 extra_headers.extend(self.user_metadata_headers(Some(&user_metadata)));
@@ -1095,9 +1138,7 @@ impl AzureBackend {
                 let canonical_path = self.canonical_path_for_blob(&blob_key);
 
                 let mut user_metadata = opts.user_metadata.clone().unwrap_or_default();
-                if let Some(message) = opts.message.as_deref().filter(|m| !m.is_empty()) {
-                    user_metadata.insert("x-ov-message".to_string(), message.to_string());
-                }
+                stash_message(&mut user_metadata, opts.message.as_deref());
                 let (if_match, no_overwrite) = split_if_dest(&opts.if_dest);
                 let if_none_match = if no_overwrite { Some("*".to_string()) } else { None };
 
@@ -1384,9 +1425,7 @@ impl AzureBackend {
                     Some(n) if n > AZURE_STAGED_THRESHOLD_BYTES
                 );
                 let mut user_metadata = opts.user_metadata.clone().unwrap_or_default();
-                if let Some(message) = opts.message.as_deref().filter(|m| !m.is_empty()) {
-                    user_metadata.insert("x-ov-message".to_string(), message.to_string());
-                }
+                stash_message(&mut user_metadata, opts.message.as_deref());
                 if staged {
                     let total = opts.size_hint.expect("matched Some above");
                     if total > AZURE_STAGED_MAX_BYTES {
@@ -1638,11 +1677,13 @@ impl AzureBackend {
                 }
                 let mut continuation = WriteContinuation::decode(&redirects.continuation)?;
                 // Derive the blob from the authorized request address rather
-                // than reading it out of the continuation: on the broker's
-                // client-driven route the whole batch is echoed back by the
-                // remote caller, while the address is what authorization was
-                // decided on. Deriving here also applies the account/container
-                // containment check to both branches below.
+                // than reading it out of the continuation. The broker's
+                // client-driven RPC authenticates the continuation and its
+                // address binding, but direct SPI callers, follower routes, and
+                // unsealed hosts have no equivalent Layer guarantee. The
+                // address is what authorization was decided on for every route.
+                // Deriving here also applies the account/container containment
+                // check to both branches below.
                 let blob_key = self.require_blob_address(&target)?.key;
                 if continuation.block_ids.is_empty() {
                     // Single PutBlob: the redirect itself committed; build ObjectInfo from captured headers.
@@ -1805,6 +1846,115 @@ impl AzureBackend {
         .await
     }
 
+    /// Build the shared lazy Azure listing page walk.
+    ///
+    /// Each poll past a yielded page issues at most one further request. Flat
+    /// pages preserve Azure's established emission order: blobs first, then
+    /// blob prefixes, with marker/prefix duplicates removed within that page.
+    /// HNS pages preserve the order returned by `Filesystem - List Paths`.
+    /// Both Azure list APIs cap a response at 5,000 entries, so retaining one
+    /// converted response bounds residency independently of prefix size.
+    async fn list_pages(
+        &self,
+        prefix: ResolvedTarget,
+        opts: ListOptions,
+        cancel: Option<CancellationToken>,
+    ) -> Result<AzureListPageStream> {
+        // Make cancellation before open observable before constructing the
+        // first request. The same token is raced around every later page fetch.
+        race_cancel(cancel.as_ref(), async { Ok(()) }).await?;
+        self.validate_target(&prefix)?;
+        let parsed = AzureAddress::parse(&prefix.resolved_address)?;
+        // The blob branch takes a BYTE prefix, so it needs the directory form:
+        // the host does not rewrite a directory-verb address, and a verbatim
+        // prefix would also match siblings whose names merely start with it.
+        //
+        // The HNS `directory=` filter is hierarchical and uses the single node
+        // spelling selected by `dfs_path_key`.
+        let prefix_str = if self.config.hierarchical_namespace {
+            dfs_path_key(&parsed.key).to_string()
+        } else {
+            address::directory_key(&parsed.key)
+        };
+        let backend = AzureBackend {
+            config: self.config.clone(),
+            client: self.client.clone(),
+        };
+        // The service refuses `include=versions` together with a `delimiter`,
+        // so only a recursive flagged listing can carry version ids in the
+        // page itself; a non-recursive one buys each pin with a `Get Blob
+        // Properties` call inside `list_blob_page`.
+        let include_versions = opts.versioned_address && opts.recursive;
+
+        Ok(Box::pin(async_stream::try_stream! {
+            let mut continuation = opts.page_token.clone();
+            let mut remaining = opts.max_results;
+            loop {
+                let mut page = race_cancel(cancel.as_ref(), async {
+                    if backend.config.hierarchical_namespace {
+                        list_hns_page(
+                            &backend,
+                            &prefix_str,
+                            &opts,
+                            continuation.as_deref(),
+                            remaining,
+                        )
+                        .await
+                    } else {
+                        list_blob_page(
+                            &backend,
+                            &prefix_str,
+                            &opts,
+                            include_versions,
+                            continuation.as_deref(),
+                            remaining,
+                        )
+                        .await
+                    }
+                })
+                .await?;
+
+                let stop_after_page = if let Some(rem) = remaining.as_mut() {
+                    if (page.items.len() as u32) >= *rem {
+                        page.items.truncate(*rem as usize);
+                        true
+                    } else {
+                        *rem -= page.items.len() as u32;
+                        false
+                    }
+                } else {
+                    false
+                };
+                let next = page.next_continuation_token.clone();
+                yield page;
+
+                if stop_after_page {
+                    break;
+                }
+                match next {
+                    Some(next) if !next.is_empty() => continuation = Some(next),
+                    _ => break,
+                }
+            }
+        }))
+    }
+
+    /// Materialize one prefix by draining the shared Azure page walk.
+    ///
+    /// The truncation and continuation behavior remains owned by
+    /// `Self::list_pages`, so buffered callers retain their existing native
+    /// paging behavior. `list_stream` is the bounded-residency surface.
+    ///
+    /// `ListOptions.versioned_address` costs differ by shape. A recursive
+    /// flagged listing adds `include=versions` to each page request: every
+    /// version of every blob under the prefix travels in the response and
+    /// only the current one is kept, so a page carries fewer items than
+    /// `maxresults`. A non-recursive flagged listing keeps the delimiter
+    /// request (the service refuses `include=versions` alongside a
+    /// `delimiter`) and buys one `Get Blob Properties` call per `File` it
+    /// lists; a failed lookup fails the page. `BlobPrefix` entries and
+    /// markers carry no pin, and HNS listings never do. Without the flag a
+    /// listing carries no version ids and `versioned_address` is `None`.
     pub async fn list(
         &self,
         prefix: ResolvedTarget,
@@ -1817,34 +1967,46 @@ impl AzureBackend {
             plugin = "azure",
             object.address = %RedactedUrl(&prefix.resolved_address),
         );
+        let cancel_for_race = cancel.clone();
         race_cancel(
-            cancel.as_ref(),
+            cancel_for_race.as_ref(),
             async move {
-                self.validate_target(&prefix)?;
-                let parsed = AzureAddress::parse(&prefix.resolved_address)?;
-                // The blob branch takes a BYTE prefix, so it needs the
-                // directory form: the host does not rewrite a directory-verb
-                // address, and a prefix taken verbatim matches every sibling
-                // whose name starts with this directory's.
-                //
-                // The HNS branch takes ADLS Gen2's `directory=` filter, which is
-                // hierarchical rather than a byte prefix — `directory=docs`
-                // never returned `docsx` — so it does not need the directory
-                // form. It does need ONE spelling: see [`dfs_path_key`].
-                let prefix_str = if self.config.hierarchical_namespace {
-                    dfs_path_key(&parsed.key).to_string()
-                } else {
-                    address::directory_key(&parsed.key)
-                };
-                if self.config.hierarchical_namespace {
-                    list_hns(self, &prefix_str, &opts).await
-                } else {
-                    list_blob(self, &prefix_str, &opts, false).await
+                let mut pages = self.list_pages(prefix, opts, cancel).await?;
+                let mut items = Vec::new();
+                while let Some(page) = pages.next().await {
+                    items.extend(page?.items);
                 }
+                Ok(items)
             }
             .instrument(span),
         )
         .await
+    }
+
+    /// Stream an Azure listing in the service's native emission order.
+    ///
+    /// Flat non-recursive pages emit blobs before blob prefixes, which is not
+    /// a global byte sort and is preserved verbatim. Flat recursive requests
+    /// omit the delimiter, so Azure returns only blob names in lexicographic
+    /// order, satisfying the incremental flat-fold precondition across pages.
+    /// HNS listings preserve the path service's response order. The next page
+    /// is fetched only after the consumer polls past the current page.
+    pub async fn list_stream(
+        &self,
+        prefix: ResolvedTarget,
+        opts: ListOptions,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ovstorage_plugin::ListStream> {
+        if opts.max_results.is_some() || opts.page_token.is_some() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+        let requested_prefix = prefix.resolved_address.clone();
+        let stream_cancel = cancel.clone();
+        let pages = self.list_pages(prefix, opts, cancel).await?;
+        Ok(flatten_list_pages(pages, requested_prefix, stream_cancel))
     }
 
     pub async fn list_versions(
@@ -1944,32 +2106,7 @@ impl AzureBackend {
                 let parsed = self.require_blob_address(&target)?;
                 let blob_key = parsed.key.clone();
                 let pinned = parsed.version_id.clone();
-                let mut canonical_query: Vec<(String, String)> = Vec::new();
-                let url = if let Some(vid) = pinned.as_ref() {
-                    canonical_query.push(("versionid".into(), vid.clone()));
-                    format!(
-                        "{}?versionid={}",
-                        self.blob_url(&blob_key),
-                        urlencoding::encode(vid)
-                    )
-                } else {
-                    self.blob_url(&blob_key)
-                };
-                let canonical_path = self.canonical_path_for_blob(&blob_key);
-                let req = AzureRequest {
-                    method: reqwest::Method::HEAD,
-                    url,
-                    canonical_path: &canonical_path,
-                    canonical_query,
-                    extra_headers: vec![],
-                    content_type: None,
-                    content_md5: None,
-                    if_match: None,
-                    if_none_match: None,
-                    range: None,
-                    body: None,
-                };
-                let response = self.client.send(req).await?;
+                let response = self.head_blob(&blob_key, pinned.as_deref()).await?;
                 if !response.ok() {
                     return Err(map_status_to_error(&response, "get_latest_version"));
                 }
@@ -1987,7 +2124,11 @@ impl AzureBackend {
                         )
                     })?;
                 let address = version_address(&target.resolved_address, &value)?;
-                Ok(ObjectInfo { address, ..info })
+                Ok(ObjectInfo {
+                    versioned_address: Some(address.clone()),
+                    address,
+                    ..info
+                })
             }
             .instrument(span),
         )
@@ -2069,12 +2210,12 @@ impl AzureBackend {
                     if !response.ok() {
                         return Err(map_status_to_error(&response, "create_directory"));
                     }
+                    let (etag, etag_strength) =
+                        normalize_optional_wire_etag(response.headers.first("etag"));
                     return Ok(BackendItemInfo {
+                        etag_strength,
                         kind: ObjectKind::Directory,
-                        etag: response
-                            .headers
-                            .first("etag")
-                            .map(|s| s.trim_matches('"').to_string()),
+                        etag,
                         version: None,
                         size: None,
                         mtime: response
@@ -2502,24 +2643,21 @@ impl AzureBackend {
                 .first("etag")
                 .map(|s| s.trim_matches('"').to_string());
 
-            let mut metadata = ovstorage_plugin::UserMetadata::new();
+            let mut existing = ovstorage_plugin::UserMetadata::new();
             for (name, value) in head_response.headers.iter() {
                 let lower = name.to_ascii_lowercase();
                 if let Some(rest) = lower.strip_prefix("x-ms-meta-")
                     && !rest.is_empty()
                 {
-                    metadata.insert(rest.to_string(), value.to_string());
+                    existing.insert(rest.to_string(), value.to_string());
                 }
             }
-            for key in &opts.user_metadata_remove {
-                metadata.remove(key);
-            }
-            for (k, v) in opts.user_metadata_set {
-                metadata.insert(k, v);
-            }
-            if let Some(message) = opts.message.as_deref().filter(|m| !m.is_empty()) {
-                metadata.insert("x-ov-message".to_string(), message.to_string());
-            }
+            let metadata = merged_update_metadata(
+                existing,
+                &opts.user_metadata_set,
+                &opts.user_metadata_remove,
+                opts.message.as_deref(),
+            );
 
             let if_match = opts.if_match.or(existing_etag);
             let url = format!("{}?comp=metadata", self.blob_url(&blob_key));
@@ -2542,12 +2680,12 @@ impl AzureBackend {
             if !response.ok() {
                 return Err(map_status_to_error(&response, "update_metadata"));
             }
+            let (etag, etag_strength) =
+                normalize_optional_wire_etag(response.headers.first("etag"));
             Ok(BackendItemInfo {
+                etag_strength,
                 kind: ObjectKind::File,
-                etag: response
-                    .headers
-                    .first("etag")
-                    .map(|s| s.trim_matches('"').to_string()),
+                etag,
                 version: response
                     .headers
                     .first("x-ms-version-id")
@@ -2562,6 +2700,7 @@ impl AzureBackend {
                 system_metadata: None,
                 user_metadata: Some(metadata),
                 modified_by: None,
+                versioned_address: None,
             })
         }.instrument(span))
         .await
@@ -2661,83 +2800,103 @@ fn copy_failure_detail(headers: &crate::parse::HeaderMap) -> String {
     }
 }
 
-fn version_address(
-    addr: &ovstorage_plugin::Url,
-    version_id: &str,
-) -> Result<ovstorage_plugin::Url> {
-    let mut base = addr.clone();
-    base.set_query(None);
-    base.set_fragment(None);
-    address::with_query_pair(&base, "versionid", version_id)
-}
-
-async fn list_blob(
+async fn list_blob_page(
     backend: &AzureBackend,
     prefix: &str,
     opts: &ListOptions,
     include_versions: bool,
-) -> Result<Vec<ObjectInfo>> {
+    marker: Option<&str>,
+    remaining: Option<u32>,
+) -> Result<AzureListPage> {
     let base_url = format!(
         "{}/{}",
         backend.config.blob_url_base(),
         backend.config.container
     );
     let canonical_path = backend.canonical_path_for_blob_container();
-    let mut items: Vec<ObjectInfo> = Vec::new();
-    let mut marker: Option<String> = opts.page_token.clone();
-    let mut remaining: Option<u32> = opts.max_results;
-    loop {
-        let mut query: Vec<(String, String)> = vec![
-            ("restype".into(), "container".into()),
-            ("comp".into(), "list".into()),
-            ("prefix".into(), prefix.to_string()),
-        ];
-        if !opts.recursive {
-            query.push(("delimiter".into(), "/".into()));
-        }
-        if let Some(rem) = remaining {
-            query.push(("maxresults".into(), rem.to_string()));
-        }
-        if let Some(m) = &marker {
-            query.push(("marker".into(), m.clone()));
-        }
-        if include_versions {
-            query.push(("include".into(), "versions".into()));
-        }
-        let url_with_query = format!("{}?{}", base_url, encode_query(&query));
-        let req = AzureRequest {
-            method: reqwest::Method::GET,
-            url: url_with_query,
-            canonical_path: &canonical_path,
-            canonical_query: query,
-            extra_headers: vec![],
-            content_type: None,
-            content_md5: None,
-            if_match: None,
-            if_none_match: None,
-            range: None,
-            body: None,
-        };
-        let response = backend.client.send(req).await?;
-        if !response.ok() {
-            return Err(map_status_to_error(&response, "list"));
-        }
-        let parsed = parse_blob_list_xml(response.body_str()?)?;
-        let mut page = list_xml_to_object_infos(&parsed, &backend.config.address_root)?;
-        if let Some(rem) = remaining.as_mut() {
-            if (page.len() as u32) >= *rem {
-                page.truncate(*rem as usize);
-                items.extend(page);
-                return Ok(items);
-            }
-            *rem -= page.len() as u32;
-        }
-        items.extend(page);
-        match parsed.next_marker {
-            Some(next) if !next.is_empty() => marker = Some(next),
-            _ => return Ok(items),
-        }
+    let mut query: Vec<(String, String)> = vec![
+        ("restype".into(), "container".into()),
+        ("comp".into(), "list".into()),
+        ("prefix".into(), prefix.to_string()),
+    ];
+    if !opts.recursive {
+        query.push(("delimiter".into(), "/".into()));
     }
+    if let Some(rem) = remaining {
+        query.push(("maxresults".into(), rem.to_string()));
+    }
+    if let Some(marker) = marker {
+        query.push(("marker".into(), marker.to_string()));
+    }
+    if include_versions {
+        query.push(("include".into(), "versions".into()));
+    }
+    let url_with_query = format!("{}?{}", base_url, encode_query(&query));
+    let req = AzureRequest {
+        method: reqwest::Method::GET,
+        url: url_with_query,
+        canonical_path: &canonical_path,
+        canonical_query: query,
+        extra_headers: vec![],
+        content_type: None,
+        content_md5: None,
+        if_match: None,
+        if_none_match: None,
+        range: None,
+        body: None,
+    };
+    let response = backend.client.send(req).await?;
+    if !response.ok() {
+        return Err(map_status_to_error(&response, "list"));
+    }
+    let parsed = parse_blob_list_xml(response.body_str()?)?;
+    let mut items = list_xml_to_object_infos(&parsed, &backend.config.address_root)?;
+    if opts.versioned_address && !include_versions {
+        pin_listed_blobs(backend, &mut items).await?;
+    }
+    Ok(AzureListPage {
+        items,
+        next_continuation_token: parsed.next_marker.filter(|next| !next.is_empty()),
+    })
+}
+
+/// Pin every `File` item of a delimiter listing with one `Get Blob
+/// Properties` call each.
+///
+/// A delimiter listing cannot carry version ids (`include=versions` and
+/// `delimiter` are mutually exclusive on the service), so a flagged
+/// non-recursive page pays one HEAD per blob it lists. The lookup goes
+/// through `stat`'s header parsing and its answer replaces the listed facts,
+/// so etag, size, mtime and `version` describe the same version the pin
+/// names. A failed lookup fails the page.
+async fn pin_listed_blobs(backend: &AzureBackend, items: &mut [ObjectInfo]) -> Result<()> {
+    for item in items
+        .iter_mut()
+        .filter(|item| item.kind == ObjectKind::File)
+    {
+        let blob_key = AzureAddress::parse(&item.address)?.key;
+        let response = backend.head_blob(&blob_key, None).await?;
+        if !response.ok() {
+            return Err(map_status_to_error(&response, "list blob properties"));
+        }
+        let properties = parse_object_info(item.address.clone(), &response.headers, false)?;
+        // The HEAD describes the blob at one moment and its version id names
+        // that moment, so its facts replace the listing's: pin and metadata
+        // describe one version even when the blob was overwritten between the
+        // two calls.
+        let versioned_address = properties
+            .version
+            .as_deref()
+            .map(|version_id| version_address(&item.address, version_id))
+            .transpose()?;
+        *item = ObjectInfo {
+            address: item.address.clone(),
+            kind: item.kind,
+            versioned_address,
+            ..properties
+        };
+    }
+    Ok(())
 }
 
 /// The DFS spelling of a path key: no trailing separator.
@@ -2772,72 +2931,130 @@ fn dfs_path_key(key: &str) -> &str {
     if trimmed.is_empty() { key } else { trimmed }
 }
 
-async fn list_hns(
+async fn list_hns_page(
     backend: &AzureBackend,
     prefix: &str,
     opts: &ListOptions,
-) -> Result<Vec<ObjectInfo>> {
+    continuation: Option<&str>,
+    remaining: Option<u32>,
+) -> Result<AzureListPage> {
     let base_url = format!(
         "{}/{}",
         backend.config.dfs_url_base(),
         backend.config.container
     );
     let canonical_path = backend.canonical_path_for_dfs_container();
-    let mut items: Vec<ObjectInfo> = Vec::new();
-    let mut continuation: Option<String> = opts.page_token.clone();
-    let mut remaining: Option<u32> = opts.max_results;
-    loop {
-        let mut query: Vec<(String, String)> = vec![
-            ("resource".into(), "filesystem".into()),
-            ("recursive".into(), opts.recursive.to_string()),
-        ];
-        if !prefix.is_empty() {
-            query.push(("directory".into(), prefix.to_string()));
-        }
-        if let Some(rem) = remaining {
-            query.push(("maxresults".into(), rem.to_string()));
-        }
-        if let Some(token) = &continuation {
-            query.push(("continuation".into(), token.clone()));
-        }
-        let url = format!("{}?{}", base_url, encode_query(&query));
-        let req = AzureRequest {
-            method: reqwest::Method::GET,
-            url,
-            canonical_path: &canonical_path,
-            canonical_query: query,
-            extra_headers: vec![],
-            content_type: None,
-            content_md5: None,
-            if_match: None,
-            if_none_match: None,
-            range: None,
-            body: None,
-        };
-        let response = backend.client.send(req).await?;
-        if !response.ok() {
-            return Err(map_status_to_error(&response, "list (HNS)"));
-        }
-        let next_continuation = response
-            .headers
-            .first("x-ms-continuation")
-            .map(str::to_string);
-        let parsed = parse_dfs_path_list_json(response.body_str()?, next_continuation.clone())?;
-        let mut page = dfs_paths_to_object_infos(&parsed, &backend.config.address_root)?;
-        if let Some(rem) = remaining.as_mut() {
-            if (page.len() as u32) >= *rem {
-                page.truncate(*rem as usize);
-                items.extend(page);
-                return Ok(items);
-            }
-            *rem -= page.len() as u32;
-        }
-        items.extend(page);
-        match next_continuation {
-            Some(next) if !next.is_empty() => continuation = Some(next),
-            _ => return Ok(items),
-        }
+    let mut query: Vec<(String, String)> = vec![
+        ("resource".into(), "filesystem".into()),
+        ("recursive".into(), opts.recursive.to_string()),
+    ];
+    if !prefix.is_empty() {
+        query.push(("directory".into(), prefix.to_string()));
     }
+    if let Some(rem) = remaining {
+        query.push(("maxresults".into(), rem.to_string()));
+    }
+    if let Some(continuation) = continuation {
+        query.push(("continuation".into(), continuation.to_string()));
+    }
+    let url = format!("{}?{}", base_url, encode_query(&query));
+    let req = AzureRequest {
+        method: reqwest::Method::GET,
+        url,
+        canonical_path: &canonical_path,
+        canonical_query: query,
+        extra_headers: vec![],
+        content_type: None,
+        content_md5: None,
+        if_match: None,
+        if_none_match: None,
+        range: None,
+        body: None,
+    };
+    let response = backend.client.send(req).await?;
+    if !response.ok() {
+        return Err(map_status_to_error(&response, "list (HNS)"));
+    }
+    let next_continuation_token = response
+        .headers
+        .first("x-ms-continuation")
+        .filter(|next| !next.is_empty())
+        .map(str::to_string);
+    let parsed = parse_dfs_path_list_json(response.body_str()?, next_continuation_token.clone())?;
+    let items = dfs_paths_to_object_infos(&parsed, &backend.config.address_root)?;
+    Ok(AzureListPage {
+        items,
+        next_continuation_token,
+    })
+}
+
+/// Flatten Azure pages without reading ahead of the current response.
+///
+/// Unlike buffered `list`, this walk has no cumulative item or page limit: the
+/// consumer controls progress and the open-time cancellation token bounds an
+/// abandoned walk. The continuation guard is fixed-size, so stream residency
+/// remains one response plus a constant amount of pagination state.
+fn flatten_list_pages(
+    mut pages: AzureListPageStream,
+    requested_prefix: ovstorage_plugin::Url,
+    cancel: Option<CancellationToken>,
+) -> ovstorage_plugin::ListStream {
+    Box::pin(async_stream::stream! {
+        let mut continuation = None;
+        let mut recent_tokens = VecDeque::<String>::new();
+
+        'walk: while let Some(page) = pages.next().await {
+            let page = match page {
+                Ok(page) => page,
+                Err(error) => {
+                    yield Err(error);
+                    break;
+                }
+            };
+            let AzureListPage {
+                items,
+                next_continuation_token,
+            } = page;
+
+            for item in items {
+                if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                    yield Err(Error::new(ErrorCode::Cancelled, "list_stream cancelled"));
+                    break 'walk;
+                }
+                yield Ok(item);
+            }
+            if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                yield Err(Error::new(ErrorCode::Cancelled, "list_stream cancelled"));
+                break;
+            }
+
+            match next_continuation_token {
+                Some(token) => {
+                    let no_progress = continuation.as_deref() == Some(token.as_str());
+                    let recent_cycle = recent_tokens.iter().any(|seen| seen == &token);
+                    if no_progress || recent_cycle {
+                        yield Err(Error::new(
+                            ErrorCode::Transient,
+                            format!(
+                                "Azure list of '{}' could not be completed: the service reissued \
+                                 a continuation token it had already handed back, so the listing \
+                                 cannot be advanced; refusing to return a partial listing that \
+                                 would read as complete",
+                                RedactedUrl(&requested_prefix)
+                            ),
+                        ));
+                        break;
+                    }
+                    if recent_tokens.len() == LIST_STREAM_TOKEN_WINDOW {
+                        recent_tokens.pop_front();
+                    }
+                    recent_tokens.push_back(token.clone());
+                    continuation = Some(token);
+                }
+                None => break,
+            }
+        }
+    })
 }
 
 /// Deterministic block ID for a blob's `seq`-th block. Layout:
@@ -2998,12 +3215,27 @@ fn synthesize_redirect_response(
     }
 }
 
+/// Format a SAS `se`/`st` timestamp.
+///
+/// Azure accepts only the documented ISO-8601 forms for these fields
+/// (`YYYY-MM-DD`, `YYYY-MM-DDThh:mmZ`, `YYYY-MM-DDThh:mm:ssZ`). Sub-second
+/// precision is rejected with `AuthenticationFailed` /
+/// "Signature fields not well formed".
+///
+/// `time`'s `Iso8601::DEFAULT` and `Rfc3339` both emit nanoseconds, so neither
+/// can be used here: `OffsetDateTime::now_utc()` practically always carries a
+/// non-zero nanosecond component, so every SAS minted through them is
+/// malformed. That failed every redirect-backed read and write while `stat`
+/// -- which is SharedKey-signed and mints no SAS -- kept working, which is
+/// what made this look like a partial outage rather than a formatting bug.
 fn format_sas_expiry(seconds_from_now: i64) -> String {
     use time::OffsetDateTime;
-    use time::format_description::well_known::Iso8601;
+    use time::macros::format_description;
     let target = OffsetDateTime::now_utc() + time::Duration::seconds(seconds_from_now);
     target
-        .format(&Iso8601::DEFAULT)
+        .format(format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second]Z"
+        ))
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
@@ -3016,6 +3248,70 @@ fn monotonic_id() -> u128 {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     nanos ^ ((n as u128) << 64)
+}
+
+/// Whether a caller-supplied metadata map spells [`MESSAGE_METADATA_KEY`] under
+/// any ASCII case. Azure compares metadata names case-insensitively and the
+/// HTTP client lower-cases header names on the wire, so every spelling lands on
+/// the same stored entry.
+fn carries_message_key<'a>(keys: impl IntoIterator<Item = &'a String>) -> bool {
+    keys.into_iter()
+        .any(|key| key.eq_ignore_ascii_case(MESSAGE_METADATA_KEY))
+}
+
+/// Whether `value` can travel as an HTTP header value: visible ASCII, space,
+/// tab, or bytes above 0x7F. Metadata rides in `x-ms-meta-*` headers here, so a
+/// message outside that set cannot be stored as is, and the annotation is
+/// droppable by contract: the stash declines it rather than turning the call
+/// into a request-construction failure.
+fn is_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte == b'\t' || (0x20..0x7F).contains(&byte) || byte >= 0x80)
+}
+
+/// Stash `message` under [`MESSAGE_METADATA_KEY`] when `user_metadata` leaves
+/// that key unset under every ASCII case. The caller's own entry under the key
+/// stands, whatever its case: user metadata is persisted, the per-operation
+/// annotation is droppable. A message that is absent, empty, or not a header
+/// value per [`is_header_value`] leaves the map as is.
+fn stash_message(user_metadata: &mut ovstorage_plugin::UserMetadata, message: Option<&str>) {
+    let Some(message) = message.filter(|m| !m.is_empty() && is_header_value(m)) else {
+        return;
+    };
+    if !carries_message_key(user_metadata.keys()) {
+        user_metadata.insert(MESSAGE_METADATA_KEY.to_string(), message.to_string());
+    }
+}
+
+/// The full metadata set a `Set Blob Metadata` PUT carries. Azure replaces
+/// rather than patches, so `existing` is the blob's stored set with `remove`
+/// and then `set` applied; `message` lands under [`MESSAGE_METADATA_KEY`]
+/// afterwards unless `set` spells that key under any ASCII case. A `set` entry
+/// under the key stands; otherwise the message replaces whatever the blob holds
+/// under it, a removal of the key in the same call included.
+///
+/// Stored names read back lower-cased and the HTTP client lower-cases header
+/// names on the wire, so the caller's keys fold onto the stored entries instead
+/// of landing beside them as a second spelling of one name.
+fn merged_update_metadata(
+    mut existing: ovstorage_plugin::UserMetadata,
+    set: &ovstorage_plugin::UserMetadata,
+    remove: &[String],
+    message: Option<&str>,
+) -> ovstorage_plugin::UserMetadata {
+    for key in remove {
+        existing.remove(&key.to_ascii_lowercase());
+    }
+    for (key, value) in set {
+        existing.insert(key.to_ascii_lowercase(), value.clone());
+    }
+    if !carries_message_key(set.keys())
+        && let Some(message) = message.filter(|m| !m.is_empty() && is_header_value(m))
+    {
+        existing.insert(MESSAGE_METADATA_KEY.to_string(), message.to_string());
+    }
+    existing
 }
 
 #[cfg(test)]
@@ -3180,6 +3476,38 @@ mod tests {
         }
     }
 
+    /// Azure rejects a SAS whose `se` carries sub-second precision with
+    /// `AuthenticationFailed` / "Signature fields not well formed". This pins
+    /// the whole-seconds shape; `Iso8601::DEFAULT` (the previous formatter)
+    /// fails it, because `now_utc()` practically always has nanoseconds.
+    #[test]
+    fn format_sas_expiry_emits_whole_seconds_with_a_literal_z() {
+        let formatted = format_sas_expiry(3600);
+
+        assert!(
+            !formatted.contains('.'),
+            "SAS expiry must carry no sub-second component: {formatted}"
+        );
+        assert!(
+            formatted.ends_with('Z'),
+            "SAS expiry must end with a literal Z: {formatted}"
+        );
+        // YYYY-MM-DDThh:mm:ssZ
+        assert_eq!(
+            formatted.len(),
+            20,
+            "SAS expiry must be exactly YYYY-MM-DDThh:mm:ssZ: {formatted}"
+        );
+        assert!(
+            time::OffsetDateTime::parse(
+                &formatted,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .is_ok(),
+            "SAS expiry must still be a valid RFC 3339 instant: {formatted}"
+        );
+    }
+
     fn fixture_config() -> AzureConnectionConfig {
         AzureConnectionConfig {
             account: "acct".into(),
@@ -3246,6 +3574,143 @@ mod tests {
             }
         });
         (endpoint, seen)
+    }
+
+    fn azure_list_body(names: &[&str], next_marker: Option<&str>) -> String {
+        let mut body = String::from(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+             <EnumerationResults><Blobs>",
+        );
+        for name in names {
+            body.push_str(&format!(
+                "<Blob><Name>{name}</Name><Properties>\
+                 <Etag>0x8DCF</Etag><Content-Length>1</Content-Length>\
+                 </Properties></Blob>"
+            ));
+        }
+        body.push_str("</Blobs>");
+        if let Some(next) = next_marker {
+            body.push_str(&format!("<NextMarker>{next}</NextMarker>"));
+        } else {
+            body.push_str("<NextMarker />");
+        }
+        body.push_str("</EnumerationResults>");
+        body
+    }
+
+    fn azure_list_response(body: String) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\n\
+             x-ms-request-id: 5e4d6c0e-201e-0042-3a1f-1f0b7c000000\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    #[tokio::test]
+    async fn list_stream_keeps_one_native_page_and_does_not_read_ahead() {
+        let (endpoint, seen) = spawn_recording_listener(vec![
+            azure_list_response(azure_list_body(&["a.txt", "b.txt"], Some("NEXT"))),
+            azure_list_response(azure_list_body(&["c.txt"], None)),
+        ])
+        .await;
+        let backend = shared_key_backend_with(AzureConnectionConfig {
+            test_endpoint_override: Some(
+                AzureEndpoint::parse(&endpoint, "__test_endpoint")
+                    .expect("recording listener endpoint parses"),
+            ),
+            ..fixture_config()
+        });
+        let mut stream = backend
+            .list_stream(
+                ResolvedTarget {
+                    backend_id: ovstorage_plugin::BackendId("azure:test".into()),
+                    resolved_address: address::parse("azure://acct/container/").unwrap(),
+                },
+                ListOptions::default(),
+                None,
+            )
+            .await
+            .expect("open list stream");
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "open must not fetch a page"
+        );
+        let first = stream
+            .next()
+            .await
+            .expect("first stream item")
+            .expect("first page succeeds");
+        assert!(first.address.path().ends_with("a.txt"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        let second = stream
+            .next()
+            .await
+            .expect("second stream item")
+            .expect("second item succeeds");
+        assert!(second.address.path().ends_with("b.txt"));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "a slow consumer must not trigger the next page while this page has entries"
+        );
+
+        let third = stream
+            .next()
+            .await
+            .expect("third stream item")
+            .expect("second page succeeds");
+        assert!(third.address.path().ends_with("c.txt"));
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("marker=NEXT"), "{requests:?}");
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_stream_cancellation_while_draining_final_page_is_terminal() {
+        let (endpoint, seen) = spawn_recording_listener(vec![azure_list_response(
+            azure_list_body(&["a.txt", "b.txt"], None),
+        )])
+        .await;
+        let backend = shared_key_backend_with(AzureConnectionConfig {
+            test_endpoint_override: Some(
+                AzureEndpoint::parse(&endpoint, "__test_endpoint")
+                    .expect("recording listener endpoint parses"),
+            ),
+            ..fixture_config()
+        });
+        let cancel = CancellationToken::new();
+        let mut stream = backend
+            .list_stream(
+                ResolvedTarget {
+                    backend_id: ovstorage_plugin::BackendId("azure:test".into()),
+                    resolved_address: address::parse("azure://acct/container/").unwrap(),
+                },
+                ListOptions::default(),
+                Some(cancel.clone()),
+            )
+            .await
+            .expect("open list stream");
+
+        let first = stream
+            .next()
+            .await
+            .expect("first item")
+            .expect("first item succeeds");
+        assert!(first.address.path().ends_with("a.txt"));
+        cancel.cancel();
+        let error = stream
+            .next()
+            .await
+            .expect("terminal cancellation")
+            .expect_err("cancelled stream must not drain the fetched page");
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert!(stream.next().await.is_none());
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     /// One node, one `directory=` filter value.
@@ -3754,6 +4219,7 @@ mod tests {
         assert!(hns.supports_server_side_rename);
         assert!(!flat.supports_server_side_rename);
         assert!(flat.supports_list);
+        assert!(flat.supports_list_stream);
         assert!(flat.supports_native_metadata_patch);
         assert!(flat.supports_version_listing);
         assert_eq!(flat.version_list_order, Some(VersionListOrder::Oldest));
@@ -4213,6 +4679,185 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    }
+
+    /// A message that cannot travel as an `x-ms-meta-*` header value is
+    /// dropped rather than stashed, so the call proceeds without it; a
+    /// header-legal non-ASCII message is kept. The patch path keeps the
+    /// blob's earlier annotation under the same rule.
+    #[test]
+    fn stash_message_drops_a_message_that_cannot_travel_as_a_header() {
+        let mut user_metadata = ovstorage_plugin::UserMetadata::new();
+        user_metadata.insert("owner".into(), "alice".into());
+        stash_message(
+            &mut user_metadata,
+            Some("line one\r\nx-ms-meta-injected: yes"),
+        );
+        assert_eq!(user_metadata.len(), 1, "{user_metadata:?}");
+        stash_message(&mut user_metadata, Some("café ☕"));
+        assert_eq!(
+            user_metadata.get(MESSAGE_METADATA_KEY).map(String::as_str),
+            Some("café ☕")
+        );
+
+        let mut existing = ovstorage_plugin::UserMetadata::new();
+        existing.insert(MESSAGE_METADATA_KEY.into(), "old".into());
+        let merged = merged_update_metadata(
+            existing,
+            &ovstorage_plugin::UserMetadata::new(),
+            &[],
+            Some("line one\r\nline two"),
+        );
+        assert_eq!(
+            merged.get(MESSAGE_METADATA_KEY).map(String::as_str),
+            Some("old")
+        );
+    }
+
+    #[test]
+    fn stash_message_fills_an_unset_message_key() {
+        let mut user_metadata = ovstorage_plugin::UserMetadata::new();
+        user_metadata.insert("owner".into(), "alice".into());
+        stash_message(&mut user_metadata, Some("commit note"));
+        assert_eq!(user_metadata.len(), 2, "{user_metadata:?}");
+        assert_eq!(
+            user_metadata.get("owner").map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            user_metadata.get(MESSAGE_METADATA_KEY).map(String::as_str),
+            Some("commit note")
+        );
+    }
+
+    /// Azure compares metadata names case-insensitively and the HTTP client
+    /// lower-cases header names on the wire, so every spelling of the key is
+    /// the same stored entry and the caller's wins under each of them.
+    #[test]
+    fn stash_message_keeps_the_callers_entry_under_the_key_in_any_case() {
+        for caller_key in [
+            MESSAGE_METADATA_KEY.to_string(),
+            MESSAGE_METADATA_KEY.to_ascii_uppercase(),
+        ] {
+            let mut user_metadata = ovstorage_plugin::UserMetadata::new();
+            user_metadata.insert(caller_key.clone(), "caller".into());
+            stash_message(&mut user_metadata, Some("real"));
+            assert_eq!(
+                user_metadata.len(),
+                1,
+                "{caller_key}: no second spelling of the key is added: {user_metadata:?}"
+            );
+            assert_eq!(
+                user_metadata.get(&caller_key).map(String::as_str),
+                Some("caller"),
+                "{caller_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn stash_message_leaves_the_map_untouched_without_a_message() {
+        for message in [None, Some("")] {
+            let mut user_metadata = ovstorage_plugin::UserMetadata::new();
+            user_metadata.insert("owner".into(), "alice".into());
+            let before = user_metadata.clone();
+            stash_message(&mut user_metadata, message);
+            assert_eq!(user_metadata, before, "message {message:?}");
+        }
+    }
+
+    /// A blob's stored metadata as `update_metadata` reads it back: names
+    /// lower-cased, an earlier annotation under the key.
+    fn stored_annotation(value: &str) -> ovstorage_plugin::UserMetadata {
+        let mut existing = ovstorage_plugin::UserMetadata::new();
+        existing.insert("owner".into(), "alice".into());
+        existing.insert(MESSAGE_METADATA_KEY.into(), value.into());
+        existing
+    }
+
+    /// A `user_metadata_set` entry under the key stands over the message under
+    /// every ASCII case: the caller's spelling folds onto the one stored entry
+    /// instead of landing beside it as a second header of the same wire name.
+    #[test]
+    fn merged_update_metadata_keeps_the_callers_set_entry_over_the_message() {
+        for caller_key in [
+            MESSAGE_METADATA_KEY.to_string(),
+            MESSAGE_METADATA_KEY.to_ascii_uppercase(),
+        ] {
+            let mut set = ovstorage_plugin::UserMetadata::new();
+            set.insert(caller_key.clone(), "caller".into());
+            let merged = merged_update_metadata(stored_annotation("old"), &set, &[], Some("real"));
+            let mut expected = ovstorage_plugin::UserMetadata::new();
+            expected.insert("owner".into(), "alice".into());
+            expected.insert(MESSAGE_METADATA_KEY.into(), "caller".into());
+            assert_eq!(merged, expected, "{caller_key}");
+        }
+    }
+
+    #[test]
+    fn merged_update_metadata_replaces_an_earlier_annotation_with_the_message() {
+        let merged = merged_update_metadata(
+            stored_annotation("old"),
+            &ovstorage_plugin::UserMetadata::new(),
+            &[],
+            Some("real"),
+        );
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert_eq!(merged.get("owner").map(String::as_str), Some("alice"));
+        assert_eq!(
+            merged.get(MESSAGE_METADATA_KEY).map(String::as_str),
+            Some("real")
+        );
+    }
+
+    /// Removing the key in the same call does not keep the message off the
+    /// blob: the removal clears the earlier annotation, the message lands.
+    #[test]
+    fn merged_update_metadata_lands_the_message_when_the_same_call_removes_the_key() {
+        let merged = merged_update_metadata(
+            stored_annotation("old"),
+            &ovstorage_plugin::UserMetadata::new(),
+            &[MESSAGE_METADATA_KEY.to_string()],
+            Some("real"),
+        );
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert_eq!(
+            merged.get(MESSAGE_METADATA_KEY).map(String::as_str),
+            Some("real")
+        );
+    }
+
+    /// A key named in both `set` and `remove` of one patch is set: `remove`
+    /// applies first, so the `set` entry stands.
+    #[test]
+    fn merged_update_metadata_sets_a_key_the_same_call_also_removes() {
+        let mut set = ovstorage_plugin::UserMetadata::new();
+        set.insert("owner".into(), "bob".into());
+        let merged =
+            merged_update_metadata(stored_annotation("old"), &set, &["owner".to_string()], None);
+        assert_eq!(
+            merged.get("owner").map(String::as_str),
+            Some("bob"),
+            "{merged:?}"
+        );
+        assert_eq!(merged.len(), 2, "{merged:?}");
+    }
+
+    /// Without a message, a removal spelled in any ASCII case clears the
+    /// stored (lower-cased) annotation.
+    #[test]
+    fn merged_update_metadata_drops_a_removed_annotation_without_a_message() {
+        for message in [None, Some("")] {
+            let merged = merged_update_metadata(
+                stored_annotation("old"),
+                &ovstorage_plugin::UserMetadata::new(),
+                &[MESSAGE_METADATA_KEY.to_ascii_uppercase()],
+                message,
+            );
+            let mut expected = ovstorage_plugin::UserMetadata::new();
+            expected.insert("owner".into(), "alice".into());
+            assert_eq!(merged, expected, "message {message:?}");
+        }
     }
 
     #[tokio::test]

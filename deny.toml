@@ -47,6 +47,16 @@ ignore = [
     # tracked separately, not silently dropped.
     { id = "RUSTSEC-2026-0194", reason = "DoS-only; XML parsed from the configured storage endpoint; quick-xml >=0.41 needs the opendal/reqsign upgrade tracked separately" },
     { id = "RUSTSEC-2026-0195", reason = "DoS-only; XML parsed from the configured storage endpoint; quick-xml >=0.41 needs the opendal/reqsign upgrade tracked separately" },
+    # `rsa` (Marvin timing side channel, no upstream fix) arrives through
+    # jsonwebtoken's pure-Rust `rust_crypto` backend. The only RSA private-key
+    # operations in the workspace are the GCS plugin signing its own
+    # service-account JWTs and V4 URL signatures locally, before any request
+    # leaves the process; the authz layer verifies bearer JWTs with public
+    # keys only. Neither exposes private-key timing to a network observer.
+    # The alternative `aws_lc_rs` backend has no advisory but adds a C/CMake
+    # (and NASM on Windows) build dependency to the broker, REST gateway, and
+    # GCS plugin.
+    { id = "RUSTSEC-2023-0071", reason = "rsa private key only signs the operator's own GCS service-account credentials locally; no network-observable timing; aws_lc_rs backend would add a C toolchain requirement" },
 ]
 
 [licenses]

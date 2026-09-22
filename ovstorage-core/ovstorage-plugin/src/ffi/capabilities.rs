@@ -58,6 +58,7 @@ pub struct Capabilities {
     pub supports_write_redirect: bool,
     pub supports_delete: bool,
     pub supports_list: bool,
+    pub supports_list_stream: bool,
     pub wants_list_backed_stat: bool,
     pub supports_recursive_list: bool,
     pub populates_subdirectory_metadata: bool,

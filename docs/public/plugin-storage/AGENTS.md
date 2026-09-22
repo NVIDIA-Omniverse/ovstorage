@@ -2,7 +2,7 @@
 
 Persona: plugin author writing a new storage backend. The in-repo
 reference backends are `file`, `http`, `omniverse-storage-service`,
-`s3`, `gcs`, `azure`, `opendal`, `nucleus`, `broker`
+`s3`, `gcs`, `azure`, `huggingface`, `opendal`, `nucleus`, `broker`
 (broker-client), and the test-only `ovstorage-plugin-test`
 conformance plugin.
 Foundation lives in
@@ -24,8 +24,9 @@ build, ABI stability). This page is the storage-specific routing.
   the matching wrapper/router factory trait). The macro emits the two
   cdylib symbols (`ovstorage_plugin_manifest_v1` and
   `ovstorage_plugin_init_v1` — the symbol names are frozen; the manifest
-  they emit selects the Layer ABI version, 13 in ovstorage 0.2.1) and
-  pulls `name` / `version` from `CARGO_PKG_*`. Use
+  they emit selects the current Layer ABI version, 19 in the source tree;
+  ovstorage 0.2.1 artifacts use ABI 15) and pulls `name` / `version` from
+  `CARGO_PKG_*`. Use
   `ovstorage_layer_plugin!(((backend, BackendFactory::default), (wrapper,
   WrapperFactory::default)))` to export multiple factories from one cdylib.
   Kind names in a bundle must be unique, `file` is reserved for the built-in
@@ -43,6 +44,19 @@ build, ABI stability). This page is the storage-specific routing.
   introspection (`root_info_for`, `list_address_roots`). Slots you
   don't implement default to `Unsupported`. Behavioral source of
   truth: [`CONFORMANCE.md`](CONFORMANCE.md).
+
+## Layer ownership comes first
+
+Some vtable slots belong to host wrapper Layers, not to your
+backend: [`OWNERSHIP.md`](OWNERSHIP.md) is the registry, and it is
+checked against the source tree by `make lint-layer-ownership`.
+`materialize` is the one that costs the most to get wrong — the byte
+cache and the redirect follower produce local files, a backend leaves
+the trait default in place, and there is no `supports_materialize`
+bit to add. Before you implement a slot you have not implemented
+before, add a `Capabilities` bit, or move behavior between a wrapper
+and a backend, read the registry row and state which Layer owns the
+concern.
 
 ## Capability matrix is mandatory
 
@@ -134,20 +148,23 @@ valid branch of the contracts spelled out there.
    uploads.
 6. [plugin-azure](plugin-azure.md) — Azure Blob Storage and ADLS Gen2
    (HNS-aware). Shared-key/SAS/Entra OAuth2 auth paths.
-7. [plugin-opendal](plugin-opendal.md) — long-tail backends fronted by
+7. [plugin-huggingface](plugin-huggingface.md) — read-only Hugging Face
+   Hub repositories (models, datasets, spaces). Revision-pinned
+   addresses, LFS reads via signed CDN redirects.
+8. [plugin-opendal](plugin-opendal.md) — long-tail backends fronted by
    Apache OpenDAL (`fs`, `s3`, `webdav` services).
-8. [plugin-nucleus](plugin-nucleus.md) — NVIDIA Omniverse Nucleus
+9. [plugin-nucleus](plugin-nucleus.md) — NVIDIA Omniverse Nucleus
    content-collaboration server. `omniverse://` URL scheme, omni1
    protocol over SOWS/ConnLib WebSocket + LFT HTTP side-channel,
    checkpoint versioning, ACL-aware permissions.
-9. [plugin-broker](plugin-broker.md) — `broker-client` cdylib for
-   the brokered topology. No scheme of its own; address roots come
-   from the upstream `ovstorage-broker` daemon via
-   `ListAddressRoots`. Forwards every Layer call across the library
-   <-> broker gRPC protocol with `if_match` (etag),
-   `if_source` (etag), and `if_dest` (`IfDestExists`)
-   pass-through.
-10. [plugin-test](plugin-test.md) — the in-tree test plugin
+10. [plugin-broker](plugin-broker.md) — `broker-client` cdylib for
+    the brokered topology. No scheme of its own; address roots come
+    from the upstream `ovstorage-broker` daemon via
+    `ListAddressRoots`. Forwards every Layer call across the library
+    <-> broker gRPC protocol with `if_match` (etag),
+    `if_source` (etag), and `if_dest` (`IfDestExists`)
+    pass-through.
+11. [plugin-test](plugin-test.md) — the in-tree test plugin
     (`test_only = true`; production hosts refuse to load it),
     controllable test backend used by host conformance scenarios.
 
@@ -167,3 +184,13 @@ valid branch of the contracts spelled out there.
   in-process trust; operators restart the host to pick up a new
   `.so`.
 - Don't advertise a capability you don't implement (or vice versa).
+- Don't implement a host-owned concern in a backend Layer:
+  `materialize`, retry and backoff, alias rewriting, byte or metadata
+  caching, redirect following, or `copy` / `rename` fallback. Those
+  belong to wrapper Layers the host composes above you; your backend
+  leaves the trait default in place and the composed Stack supplies
+  the behavior. The registry of who owns what is
+  [`OWNERSHIP.md`](OWNERSHIP.md).
+- Don't add a `Capabilities` bit to name an outcome the host can
+  synthesize. The admission rule and the current bit set are in
+  [`OWNERSHIP.md` § Capability bits](OWNERSHIP.md#capability-bits).

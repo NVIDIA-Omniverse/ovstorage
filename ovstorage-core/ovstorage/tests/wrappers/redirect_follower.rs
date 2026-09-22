@@ -16,11 +16,11 @@ use async_trait::async_trait;
 use ovstorage::layers::{BYTE_CACHE_KIND, REDIRECT_FOLLOWER_KIND, RETRY_KIND};
 use ovstorage::{
     AccessOps, Body, BodyStream, CancellationToken, ConfigValue, ContinueWriteRequest, Error,
-    ErrorCode, Extensions, HttpRequest, Layer, LayerConfig, LayerHandle, LayerKindDescriptor,
-    LayerSpec, LayerType, ReadRedirect, ReadRequest, ReadResult, RedirectBodySource,
-    RedirectCredential, RedirectResultBatch, RedirectScope, Request, ResponseParsing, Result,
-    ResultCapture, Stack, StatRequest, Url, WrapperFactory, WriteOptions, WriteRedirect,
-    WriteRedirectBatch, WriteRequest, WriteResult, WriteStep,
+    ErrorCode, EtagStrength, Extensions, HttpRequest, Layer, LayerConfig, LayerHandle,
+    LayerKindDescriptor, LayerSpec, LayerType, ObjectInfo, ReadRedirect, ReadRequest, ReadResult,
+    RedirectBodySource, RedirectCredential, RedirectResultBatch, RedirectScope, Request,
+    ResponseParsing, Result, ResultCapture, Stack, StatRequest, Url, WrapperFactory, WriteOptions,
+    WriteRedirect, WriteRedirectBatch, WriteRequest, WriteResult, WriteStep,
 };
 use ovstorage_plugin_cache::ByteCacheWrapperFactory;
 use ovstorage_plugin_core::RetryWrapperFactory;
@@ -146,6 +146,7 @@ impl Layer for WriteProbe {
     ) -> Result<ovstorage::ObjectInfo> {
         let mut info = object_info(request.input.address, 4);
         info.etag = Some("etag-write".into());
+        info.etag_strength = EtagStrength::Strong;
         Ok(info)
     }
 
@@ -310,6 +311,45 @@ fn read_redirect_to(url: String) -> ReadRedirect {
         },
         audit_id: String::new(),
         policy_epoch: 0,
+    }
+}
+
+/// GCS-shaped redirect backend: stat and redirect response both identify the
+/// bytes with one numeric generation, so a cache above the follower can prove
+/// that the custom-header declaration survives the complete stack.
+struct GenerationRedirectProbe {
+    redirect: ReadRedirect,
+    reads: AtomicUsize,
+}
+
+#[async_trait]
+impl Layer for GenerationRedirectProbe {
+    fn name(&self) -> &str {
+        "backend"
+    }
+
+    fn descriptor(&self) -> LayerKindDescriptor {
+        backend_descriptor(PROBE_KIND)
+    }
+
+    async fn stat(
+        &self,
+        request: Request<StatRequest>,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<ObjectInfo> {
+        let mut info = object_info(request.input.address, 16);
+        info.etag = Some("1600000000000001".into());
+        info.etag_strength = EtagStrength::Strong;
+        Ok(info)
+    }
+
+    async fn read(
+        &self,
+        _request: Request<ReadRequest>,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<ReadResult> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(ReadResult::Redirect(self.redirect.clone()))
     }
 }
 
@@ -583,6 +623,66 @@ async fn redirect_follower_follows_read_redirect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_custom_redirect_validator_is_admitted_to_byte_cache() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/obj"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-goog-generation", "1600000000000001")
+                .set_body_bytes(b"redirected-bytes".to_vec()),
+        )
+        .mount(&server)
+        .await;
+
+    let mut redirect = read_redirect_to(format!("{}/obj", server.uri()));
+    redirect.response_parsing.etag_header = Some("x-goog-generation".into());
+    redirect.response_parsing.etag_strength = EtagStrength::Strong;
+    let backend = Arc::new(GenerationRedirectProbe {
+        redirect,
+        reads: AtomicUsize::new(0),
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let stack = build_two_wrapper_stack(
+        BYTE_CACHE_KIND,
+        Arc::new(ByteCacheWrapperFactory::default()),
+        byte_cache_config(tmp.path()),
+        REDIRECT_FOLLOWER_KIND,
+        Arc::new(RedirectFollowerWrapperFactory),
+        LayerConfig::new(),
+        backend.clone(),
+    )
+    .await
+    .unwrap();
+
+    let first = stack
+        .read(read_request("probe:///obj"), None)
+        .await
+        .unwrap();
+    let ReadResult::Stream { info, .. } = &first else {
+        panic!("redirect follower must return a stream");
+    };
+    assert_eq!(info.etag.as_deref(), Some("1600000000000001"));
+    assert_eq!(info.etag_strength, EtagStrength::Strong);
+    assert_eq!(collect(first).await, b"redirected-bytes");
+
+    let second = stack
+        .read(read_request("probe:///obj"), None)
+        .await
+        .unwrap();
+    assert_eq!(collect(second).await, b"redirected-bytes");
+    assert_eq!(
+        backend.reads.load(Ordering::SeqCst),
+        1,
+        "the second read must use the Strong generation-keyed cache entry",
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redirected_read_mtime_matches_backend_stat() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -829,6 +929,7 @@ async fn byte_cache_write_through_survives_redirect_follower() {
     };
     let mut info = object_info(Url::parse("probe:///obj").unwrap(), 4);
     info.etag = Some("etag-write".into());
+    info.etag_strength = EtagStrength::Strong;
     let backend = WriteProbe::redirect(
         batch,
         VecDeque::from([WriteStep::Done(WriteResult { info })]),
@@ -891,6 +992,7 @@ async fn byte_cache_write_through_survives_extension_stripping_boundary() {
     };
     let mut info = object_info(Url::parse("probe:///obj").unwrap(), 4);
     info.etag = Some("etag-write".into());
+    info.etag_strength = EtagStrength::Strong;
     let backend = WriteProbe::redirect(
         batch,
         VecDeque::from([WriteStep::Done(WriteResult { info })]),
@@ -2398,7 +2500,14 @@ async fn follow_reads_false_with_max_bytes_is_rejected() {
     )
     .await;
     match result {
-        Err(error) => assert_eq!(error.code(), ErrorCode::InvalidArgument),
+        Err(error) => {
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert!(
+                error.message().contains("`follow_reads_max_bytes`")
+                    && error.message().contains("`follow_reads = false`"),
+                "the build error must identify the contradictory settings: {error}"
+            );
+        }
         Ok(_) => panic!("follow_reads=false + follow_reads_max_bytes must be rejected at build"),
     }
 }

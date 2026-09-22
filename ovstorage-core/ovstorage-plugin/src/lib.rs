@@ -7,8 +7,10 @@ pub mod address;
 pub mod cancel;
 pub mod connection;
 pub mod consume_v2;
+pub mod fallback_cache;
 pub mod ffi;
 mod ffi_runtime;
+pub mod list_stream;
 pub mod log_layer;
 pub mod marshal;
 pub mod oauth_binding;
@@ -22,6 +24,7 @@ mod types;
 pub mod url_helpers;
 
 pub use cancel::{CancelOnDrop, cancel_on_drop, race_cancel};
+pub use list_stream::IncrementalListFold;
 pub use ovstorage_plugin_macros::ovstorage_layer_plugin;
 pub use routing::{RouteTable, fold_markers_and_infer_subdir_kinds, fresh_id, paginate_list_items};
 // The cross-language live-handoff verbs are crate-root
@@ -37,6 +40,20 @@ pub use url_helpers::{extract_pinned_value, reject_pinned_for_mutation};
 
 pub mod redact {
     pub use ovstorage_layer::redact::*;
+}
+
+/// The scheme-fallback contract: the layer key a host grants, the marker a
+/// backend stamps on its hidden scheme root, and the predicate the route
+/// table's second tier reads. Plugins reach it here because they depend on
+/// this crate, not on `ovstorage-layer`.
+pub mod fallback {
+    pub use ovstorage_layer::fallback::*;
+}
+
+/// The instance-metadata refusal every fallback-derived host and every
+/// redirect destination passes through before a socket opens.
+pub mod instance_metadata {
+    pub use ovstorage_layer::instance_metadata::*;
 }
 
 // Migration aid: canonical home for these is `ffi::*`.

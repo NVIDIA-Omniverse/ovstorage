@@ -12,6 +12,14 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// Trust declaration attached to an object etag.
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum EtagStrengthResponse {
+    Strong,
+    Weak,
+}
+
 /// Metadata describing a single object.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ObjectInfoResponse {
@@ -24,6 +32,11 @@ pub(crate) struct ObjectInfoResponse {
     /// destination side of write/copy/rename; `X-OV-If-Source-Match:
     /// <etag>` on the source side of copy/rename).
     pub etag: Option<String>,
+    /// Declared validator strength: `strong` or `weak`. Omitted when the
+    /// producer makes no declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = EtagStrengthResponse, inline)]
+    pub etag_strength: Option<EtagStrengthResponse>,
     /// Backend-assigned version identifier (descriptive; not a precondition).
     pub version: Option<String>,
     /// Object size in bytes. `None` for directories of any kind.
@@ -37,6 +50,11 @@ pub(crate) struct ObjectInfoResponse {
     /// User-set metadata; round-trips unchanged through ovstorage.
     #[schema(value_type = Option<Object>)]
     pub user_metadata: Option<HashMap<String, String>>,
+    /// Address that names this version of the object (a pin, not an
+    /// identity). Omitted when the backend does not version it or the
+    /// caller did not ask.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub versioned_address: Option<String>,
 }
 
 /// Bit-set of operations a check-access call can ask about.
@@ -128,6 +146,17 @@ pub(crate) struct AddressRootResponse {
     pub connection_id: Option<String>,
     /// Capabilities of the backing backend.
     pub capabilities: CapabilitiesResponse,
+    /// Advertised visibility. Suppressed roots are omitted from the response.
+    pub visibility: AddressVisibilityResponse,
+}
+
+/// Visibility carried by an advertised address root.
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AddressVisibilityResponse {
+    Visible,
+    Hidden,
+    Suppressed,
 }
 
 /// One backend kind installed in this gateway.
@@ -165,7 +194,7 @@ pub(crate) struct MetadataPatchBody {
     pub allow_rewrite_emulation: bool,
     /// Optional annotation attached to this operation; backends that
     /// support per-operation annotations stash it under the
-    /// `x-ov-message` user-metadata key.
+    /// `x_ov_message` user-metadata key.
     #[serde(default)]
     pub message: Option<String>,
 }

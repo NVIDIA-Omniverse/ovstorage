@@ -9,7 +9,7 @@ import importlib.util
 import pathlib
 import sys
 from io import BytesIO
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from urllib.error import HTTPError
 
 import pytest
@@ -51,6 +51,60 @@ async def test_offline_progressive_examples_run(
     example = _load_example(monkeypatch, filename)
     await example.main()
     assert expected_output in capsys.readouterr().out
+
+
+async def test_services_probe_rejects_legacy_empty_config(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    example = _load_example(monkeypatch, "services_config_probe.py")
+    registry = object()
+
+    class _EmptyStorage:
+        async def list_connections(self) -> list[object]:
+            return []
+
+        async def list_address_roots(self) -> list[object]:
+            return []
+
+    class _Composer:
+        def with_registry(self, configured: object) -> _Composer:
+            assert configured is registry
+            return self
+
+        async def build(self) -> _EmptyStorage:
+            return _EmptyStorage()
+
+    class _Stack:
+        @staticmethod
+        def from_config(*, path: str) -> _Composer:
+            assert path == "legacy.toml"
+            return _Composer()
+
+    monkeypatch.setattr(example, "ovstorage", SimpleNamespace(Stack=_Stack))
+    monkeypatch.setattr(
+        example,
+        "plugin_registry",
+        lambda plugin_dir, *kinds: registry,
+    )
+    args = SimpleNamespace(
+        config="legacy.toml",
+        plugin_dir=None,
+        address=None,
+        operation="stat",
+        max_results=25,
+        max_bytes=1024,
+        preview_lines=12,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        await example._run(args)
+
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "declared no [ovstorage] stack" in captured.err
+    assert "Legacy top-level\n[[connections]] entries are ignored" in captured.err
 
 
 async def test_native_github_backend_and_logger_compose(

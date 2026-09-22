@@ -218,6 +218,100 @@ async fn continue_write_aborts_multipart_when_part_etag_is_missing() {
     );
 }
 
+#[tokio::test]
+async fn continue_write_maps_captured_part_error_and_aborts_multipart() {
+    const SIGNING_MATERIAL: &str =
+        "StringToSign=FAKE-STRING-TO-SIGN; AWSAccessKeyId=AKIAFAKESIGNINGKEY";
+
+    let fixture = spawn_s3_fixture(None, true);
+    let endpoint = format!("http://{}", fixture.addr());
+
+    let mut config = HashMap::new();
+    config.insert("bucket".into(), ConfigValue::String("bkt".into()));
+    config.insert("region".into(), ConfigValue::String("us-east-1".into()));
+    config.insert("endpoint".into(), ConfigValue::String(endpoint));
+    config.insert(
+        "compatibility_profile".into(),
+        ConfigValue::String("custom".into()),
+    );
+    config.insert("force_path_style".into(), ConfigValue::Bool(true));
+    let parsed = ovstorage_plugin_s3::__test_only_parse_config(&config).expect("parse config");
+    let credentials = AwsCredentials {
+        access_key_id: "AKIATESTFIXTURE".into(),
+        secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
+        session_token: None,
+    };
+    let backend = Arc::new(S3Backend::with_credentials(parsed, credentials).expect("backend init"));
+
+    let target = ResolvedTarget {
+        backend_id: BackendId("s3:s3://bkt/".into()),
+        resolved_address: address::parse("s3://bkt/big.bin").unwrap(),
+    };
+    let opts = WriteOptions {
+        size_hint: Some(128 * 1024 * 1024_u64),
+        ..WriteOptions::default()
+    };
+    let batch = backend
+        .write_redirect(target.clone(), opts, None)
+        .await
+        .expect("write_redirect should return a multipart batch");
+    assert!(batch.redirects.len() >= 2, "expected multiple parts");
+    assert!(
+        batch
+            .redirects
+            .iter()
+            .all(|redirect| redirect.result_capture.body_max_bytes > 0),
+        "every UploadPart redirect must capture a bounded error body"
+    );
+
+    let error_body = format!(
+        "<Error><Code>SignatureDoesNotMatch</Code><Message>{SIGNING_MATERIAL}</Message></Error>"
+    );
+    let results: Vec<RedirectResult> = batch
+        .redirects
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| {
+            if idx == 0 {
+                RedirectResult {
+                    status_code: 403,
+                    captured_headers: Vec::new(),
+                    captured_body: error_body.as_bytes().to_vec(),
+                }
+            } else {
+                RedirectResult {
+                    status_code: 200,
+                    captured_headers: vec![("etag".into(), format!("\"part-etag-{}\"", idx + 1))],
+                    captured_body: Vec::new(),
+                }
+            }
+        })
+        .collect();
+
+    let err = backend
+        .continue_write(target, batch, RedirectResultBatch { results }, None)
+        .await
+        .expect_err("a failed UploadPart must surface as an error");
+    assert_eq!(err.code(), ErrorCode::PermissionDenied);
+    assert!(
+        err.message().contains("SignatureDoesNotMatch"),
+        "the provider error code must be preserved; got: {err}"
+    );
+    assert!(
+        !err.message().contains(SIGNING_MATERIAL),
+        "the provider Message must not escape; got: {err}"
+    );
+
+    assert!(
+        wait_for_request(&fixture, |request| {
+            request.method == "DELETE" && request.path.contains(UPLOAD_ID_QUERY)
+        })
+        .await,
+        "AbortMultipartUpload (DELETE ?uploadId=) must fire after a failed part; captures: {:?}",
+        fixture.captures(),
+    );
+}
+
 /// S3 can answer `CompleteMultipartUpload` with HTTP 200 carrying an embedded
 /// `<Error>` envelope. `InvalidPart` is a terminal commit failure, so it must
 /// surface as `ObjectModified` — not a retryable `Transient` (the regression
@@ -385,10 +479,10 @@ async fn no_overwrite_complete_multipart_412_maps_already_exists() {
 
 /// Substitution, not modification: a caller holding a *genuine* multipart
 /// continuation minted for `big.bin` presents it against the request address
-/// `victim.bin`. Under the broker's client-driven `ContinueWrite` RPC the whole
-/// batch is echoed back by the remote caller, while the address is the value
-/// authorization was decided on — so `CompleteMultipartUpload` must name the
-/// authorized key and never the one recorded in the blob.
+/// `victim.bin`. This direct-plugin test represents an SPI caller or unsealed
+/// host; the broker's client-driven RPC rejects the address substitution at its
+/// seal boundary. `CompleteMultipartUpload` must still name the authorized key
+/// and never the one recorded in the blob on every supported route.
 #[tokio::test]
 async fn continue_write_commits_to_the_authorized_key_not_the_continuations() {
     let complete_body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\

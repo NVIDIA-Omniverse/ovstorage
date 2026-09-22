@@ -88,7 +88,44 @@ fn scan_env_ref(bytes: &[u8], start: usize) -> Option<(&str, usize)> {
 }
 
 pub type SystemMetadata = HashMap<String, String>;
+
+/// Caller-owned string-to-string metadata.
+///
+/// On an object it is set by `write` and patched by `update_metadata`. A key
+/// matching `[a-z_][a-z0-9_]*` — lowercase ASCII letters, digits and
+/// underscores, with a letter or underscore first — is accepted by every
+/// backend that stores user metadata. A backend may accept more, but a wider
+/// name is not portable across routes: S3 lowercases keys, Azure refuses any
+/// name that is not a C# identifier, and GCS preserves case and stores
+/// `Author` and `author` as two keys. Per-key, per-value and per-object size
+/// limits are backend-specific, and a backend with no user-metadata facet
+/// rejects a non-empty map with `Unsupported`.
+///
+/// The [`crate::attribution::RESERVED_METADATA_PREFIX`] namespace
+/// (`ovstorage_`) sits inside the portable subset and is reserved for
+/// host-attested keys such as
+/// [`crate::attribution::ATTRIBUTION_KEY_MODIFIED_BY`]; an attributing host
+/// strips it from caller-supplied maps, matching the prefix
+/// case-insensitively ([`crate::attribution::is_reserved_metadata_key`]).
 pub type UserMetadata = HashMap<String, String>;
+
+/// Conventional `user_metadata` key under which a backend with no native
+/// annotation slot stores the caller's per-operation `message` (from
+/// [`WriteOptions`], [`UpdateMetadataOptions`], [`CopyOptions`] and
+/// [`RenameOptions`]), so the annotation reads back beside the caller's own
+/// keys. A caller-supplied value under this key wins and the message is
+/// dropped: caller metadata is never silently dropped, the annotation is
+/// droppable by contract. `message` fills the key only when the call's own
+/// map leaves it unset. On a patch a `user_metadata_set` entry under the key
+/// stands; otherwise the message replaces the object's earlier annotation,
+/// and a removal of the key in the same patch does not prevent that. Which
+/// of copy and rename record the annotation is per backend.
+/// It is spelled inside the portable subset documented on [`UserMetadata`] so
+/// every backend accepts the name, and it sits outside the
+/// reserved `ovstorage_` namespace so an attributing host neither strips nor
+/// hides it. Every in-tree backend that stashes the annotation uses this one
+/// constant.
+pub const MESSAGE_METADATA_KEY: &str = "x_ov_message";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ChecksumAlgorithm(String);
@@ -248,6 +285,25 @@ impl std::ops::BitAndAssign for EffectivePermissions {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BackendId(pub String);
+
+/// Declared trust level of an etag.
+///
+/// `Strong` is an RFC 9110 strong validator: equal etags imply byte-identical
+/// content, so consumers may safely key cached bytes on it. `Weak` may survive
+/// a byte-level change and is valid for preconditions, but not for establishing
+/// byte identity. `Unspecified` means the producer made no declaration, and
+/// consumers MUST treat it as `Weak` for trust decisions.
+///
+/// This value is meaningful only when the associated etag is `Some` and MUST
+/// be `Unspecified` when the etag is `None`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum EtagStrength {
+    #[default]
+    Unspecified = 0,
+    Strong = 1,
+    Weak = 2,
+}
 
 /// File / directory discriminator for `ObjectInfo`.
 ///
@@ -544,6 +600,53 @@ pub struct Connection {
     pub auth_state: ConnectionAuthState,
     pub last_probed: Option<SystemTime>,
     pub user_metadata: UserMetadata,
+    /// The instance name of the Layer that owns this connection — the
+    /// [`ConnectionKey::target`] a connection op (`add`/`remove`/`authenticate`/
+    /// `update_credentials`) must address to reach [`Connection::id`]. The other
+    /// half of the key, reported beside the id so a caller holding a row can
+    /// address it without recovering the owner first.
+    ///
+    /// Distinct from [`backend_kind`](Connection::backend_kind), which is a kind
+    /// and not an instance: a graph with two layers of one kind — a router over
+    /// two HTTP tenants — has no answer there, and a backend Layer named
+    /// differently from its kind (`s3_prod` of kind `s3`) is still reachable
+    /// here. The connection counterpart of [`RootInfo::owning_target`], and it
+    /// answers where that one cannot: a connection parked in
+    /// [`ConnectionAuthState::AwaitingAuth`] or refused into
+    /// [`ConnectionAuthState::AuthFailed`] may publish no root at all, and those
+    /// are the connections the lifecycle commands exist to repair.
+    ///
+    /// **`None` means this row could not be attributed here, never that it has
+    /// no owner.** Stated as a rule rather than a list of shapes, which goes
+    /// stale as mechanisms are added: the owning layer sets it, the host fills
+    /// it only for a layer declaring exactly one
+    /// [`owned_targets`](crate::Layer::owned_targets) entry, and a `Router`
+    /// replaces or clears a name it routes to a different child. `None` is what
+    /// is left when none of those produced one.
+    ///
+    /// Note that the host fill is keyed on `owned_targets` reporting exactly
+    /// one entry, which is a narrower question than "can this layer be
+    /// addressed" — a layer whose `owned_targets` is gated on something else
+    /// answers ops by a name the fill never sees. Such a layer stamps its own
+    /// rows, and `Some(name)` there is the true answer under this field's own
+    /// definition even though `owned_targets` is empty. **Under a `Router` that
+    /// name is nonetheless unaddressable**, because every connection op routes
+    /// by a table built only from `owned_targets` and is refused before the
+    /// layer is reached; through a plain wrapper chain the ops forward down to
+    /// the layer and the stamped name does reach its slot.
+    ///
+    /// Do not substitute a proxy for a `None`; `display_name` is free-form and
+    /// may be backend-synthesized, and `backend_kind` cannot tell two same-kind
+    /// layers apart. Recover it instead: where the connection publishes an
+    /// address, [`Layer::root_info_for`](crate::Layer::root_info_for) gives a
+    /// [`RootInfo`] whose `owning_target` and `connection_id` are one answer
+    /// about one route — guard it with `address::same_node`, since lookup is
+    /// longest-prefix and a broader root that merely contains the address comes
+    /// back as a hit. Where it publishes none, attempt the operation against
+    /// each [`Layer::owned_targets`](crate::Layer::owned_targets) entry in turn,
+    /// treating `NotFound` as "not mine, try the next", and withdraw that scan
+    /// entirely where the id is not unique in the graph.
+    pub owning_target: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -576,6 +679,20 @@ pub enum ConnectionSource {
 /// A forwarder — an FFI bridge, an authz pass-through, a language binding —
 /// relays its inner producer's order and introduces none of its own. It owns no
 /// state, so it has no commit to be ordered against.
+///
+/// ## Attribution
+///
+/// `Added`, `Updated` and `Snapshot` carry a [`Connection`], so they carry its
+/// [`owning_target`](Connection::owning_target), under the same rule as the
+/// snapshot from that same producer — a producer's two halves agree, so a
+/// consumer keyed by `(target, id)` never sees one connection under two keys
+/// depending on which half it arrived through.
+///
+/// `Removed` carries no `Connection` and so carries no target. A consumer keys
+/// it against what it retained from the `Added`/`Updated`/`Snapshot` that
+/// introduced the row. On a **merged** stream a bare `Removed { id }` is
+/// ambiguous whenever both merged id-spaces hold that id — an id is unique only
+/// within its owning target — and this field does not close that.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionChange {
     Added(Connection),
@@ -733,6 +850,10 @@ pub enum AuthEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// The capability bit set is curated, not open. A bit is admitted only under
+/// the four-part admission rule in
+/// [`docs/public/plugin-storage/OWNERSHIP.md`](../../../docs/public/plugin-storage/OWNERSHIP.md),
+/// and a slot owned by a host wrapper never gets one.
 pub struct Capabilities {
     pub supports_if_match_write: bool,
     pub supports_no_overwrite_write: bool,
@@ -790,6 +911,13 @@ pub struct Capabilities {
     /// Gates `delete`.
     pub supports_delete: bool,
     pub supports_list: bool,
+    /// Gates the unpaged, pull-based `list_stream` surface. This is a hint that
+    /// the layer streams natively instead of using the buffered `list` adapter.
+    ///
+    /// A stream does not return a mid-stream resumption cursor. Resumable
+    /// streaming remains a future, separately advertised capability, analogous
+    /// to [`Capabilities::watch_directory_resumable`].
+    pub supports_list_stream: bool,
     pub wants_list_backed_stat: bool,
     pub supports_recursive_list: bool,
     pub populates_subdirectory_metadata: bool,
@@ -814,6 +942,8 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
+    /// The all-false floor a backend starts from, so every bit is an explicit
+    /// opt-in claim.
     pub fn empty() -> Self {
         Self {
             supports_if_match_write: false,
@@ -832,6 +962,7 @@ impl Capabilities {
             supports_write_redirect: false,
             supports_delete: false,
             supports_list: false,
+            supports_list_stream: false,
             wants_list_backed_stat: false,
             supports_recursive_list: false,
             populates_subdirectory_metadata: false,
@@ -874,6 +1005,73 @@ impl ChangeKindSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capability_bits_are_curated() {
+        // The bit set is curated; a change here requires a matching row in
+        // OWNERSHIP.md and design review per GOVERNANCE.md.
+        let Capabilities {
+            supports_if_match_write,
+            supports_no_overwrite_write,
+            supports_native_metadata_patch,
+            supports_metadata_rewrite_emulation,
+            writes_are_atomic,
+            supports_copy,
+            supports_rename,
+            supports_server_side_copy,
+            supports_server_side_rename,
+            supports_atomic_rename,
+            has_real_directories,
+            supports_write,
+            supports_write_stream,
+            supports_write_redirect,
+            supports_delete,
+            supports_list,
+            supports_list_stream,
+            wants_list_backed_stat,
+            supports_recursive_list,
+            populates_subdirectory_metadata,
+            supports_create_directory,
+            supports_delete_directory,
+            supports_version_listing,
+            version_list_order: _,
+            populates_effective_permissions_on_stat,
+            supports_access_check,
+            supports_watch_directory,
+            watch_directory_kinds: _,
+            watch_directory_resumable,
+            watch_directory_max_lag: _,
+            redirect_size_threshold: _,
+        } = Capabilities::empty();
+
+        assert!(!supports_if_match_write);
+        assert!(!supports_no_overwrite_write);
+        assert!(!supports_native_metadata_patch);
+        assert!(!supports_metadata_rewrite_emulation);
+        assert!(!writes_are_atomic);
+        assert!(!supports_copy);
+        assert!(!supports_rename);
+        assert!(!supports_server_side_copy);
+        assert!(!supports_server_side_rename);
+        assert!(!supports_atomic_rename);
+        assert!(!has_real_directories);
+        assert!(!supports_write);
+        assert!(!supports_write_stream);
+        assert!(!supports_write_redirect);
+        assert!(!supports_delete);
+        assert!(!supports_list);
+        assert!(!supports_list_stream);
+        assert!(!wants_list_backed_stat);
+        assert!(!supports_recursive_list);
+        assert!(!populates_subdirectory_metadata);
+        assert!(!supports_create_directory);
+        assert!(!supports_delete_directory);
+        assert!(!supports_version_listing);
+        assert!(!populates_effective_permissions_on_stat);
+        assert!(!supports_access_check);
+        assert!(!supports_watch_directory);
+        assert!(!watch_directory_resumable);
+    }
 
     /// Every `RedirectScope` literal in the workspace names `credential`.
     ///
@@ -1430,6 +1628,7 @@ pub struct LayerKindDescriptor {
 /// `ReadResult`. Peak memory is bounded by chunk size × channel
 /// capacity, never by object size.
 pub type ReadStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes>> + Send>>;
+pub type ListStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<ObjectInfo>> + Send>>;
 pub type ChangeStream = Box<dyn Iterator<Item = Result<ChangeEvent>> + Send>;
 
 /// What the plugin or Layer's `read` returned.
@@ -1513,6 +1712,7 @@ pub enum BackendChangeEvent {
 pub struct BackendItemInfo {
     pub kind: ObjectKind,
     pub etag: Option<String>,
+    pub etag_strength: EtagStrength,
     pub version: Option<String>,
     pub size: Option<u64>,
     pub mtime: Option<std::time::SystemTime>,
@@ -1521,6 +1721,11 @@ pub struct BackendItemInfo {
     pub system_metadata: Option<SystemMetadata>,
     pub user_metadata: Option<UserMetadata>,
     pub modified_by: Option<String>,
+    /// The pinned address for this version of the item; see
+    /// [`ObjectInfo::versioned_address`]. It travels on the address-less
+    /// result types too, because a pin is the backend's answer and not the
+    /// caller's question.
+    pub versioned_address: Option<Url>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1542,6 +1747,14 @@ pub struct WriteRequest {
     pub options: WriteOptions,
 }
 
+/// Continues a redirected write with the outcomes observed by its executor.
+///
+/// An in-process redirect follower may send the original non-empty redirect
+/// batch with an empty result batch after redirect execution fails and exhausts
+/// its retries. That cardinality mismatch is a best-effort abandonment
+/// notification: implementations must not finalize the write or report success.
+/// They may release staged provider resources that can be identified safely,
+/// then return an error. Other cardinality mismatches remain invalid input.
 #[derive(Debug)]
 pub struct ContinueWriteRequest {
     pub address: Url,
@@ -1631,14 +1844,18 @@ pub enum IfDestExists {
 pub struct ObjectInfo {
     pub address: Url,
     pub kind: ObjectKind,
-    /// Opaque token that changes when the object's content changes. The
-    /// only field used for precondition checks (see `if_match` on
+    /// Opaque backend-issued token used for precondition checks (see `if_match` on
     /// `ReadOptions` / `DeleteOptions` / `UpdateMetadataOptions` /
     /// `CopyOptions::if_source` / `RenameOptions::if_source`, and
     /// `IfDestExists::MatchEtag`). Plugins may encode whatever they
     /// need into this string (e.g., the file plugin synthesizes
-    /// `"size:N,mtime:T"`).
+    /// `"size:N,mtime:T"`). Equality proves byte-identical content only when
+    /// `etag_strength` is [`EtagStrength::Strong`]; weak or undeclared tokens
+    /// may remain equal across a byte-level change.
     pub etag: Option<String>,
+    /// Backend declaration governing whether equal `etag` values prove byte
+    /// identity. Consumers treat [`EtagStrength::Unspecified`] as weak.
+    pub etag_strength: EtagStrength,
     /// Backend-specific version identifier when the backend supports
     /// versioning (e.g., S3 versionId, GCS generation). Descriptive
     /// only — not used as a precondition.
@@ -1676,20 +1893,46 @@ pub struct ObjectInfo {
     /// not strictly *modifier* — neither kernel records who performed
     /// the last `write()`. On most single-user systems they coincide.
     pub modified_by: Option<String>,
+    /// The address that names *this* version of the object, in the
+    /// backend's own pin spelling: S3 `?versionId=`, Azure `?versionid=`,
+    /// GCS `?generation=`, Hugging Face `?revision=<commit sha>`, Nucleus
+    /// `?<branch>&<checkpoint>`, and the Omniverse Storage Service's
+    /// `VersionInfo.resource_address` verbatim. A read at this address
+    /// serves these bytes for as long as the backend retains the version.
+    ///
+    /// A pin, not an identity: it is not a capability, not a durable key
+    /// (retention and alias rules decide how long it resolves), and never a
+    /// mutation target — plugins refuse writes through a pinned address. The
+    /// alias wrapper projects it into caller space like any other address.
+    ///
+    /// **Population is a cost knob via [`StatOptions::versioned_address`] /
+    /// [`ListOptions::versioned_address`]**, with the same shape as
+    /// `full_metadata`: `false` returns the pin when the backend already has
+    /// it in hand, `true` pays for the version lookup where one is needed.
+    /// `None` means the backend does not version this object, or the caller
+    /// did not ask and the answer was not free. A `stat` of an address that
+    /// already carries an immutable pin echoes that pin whatever the flag
+    /// says; `list_versions` and `get_latest_version` entries carry their
+    /// own, already pinned, address here; every directory kind carries
+    /// `None`, as do write, `update_metadata` and `create_directory` results.
+    pub versioned_address: Option<Url>,
 }
 
 impl From<(Url, BackendItemInfo)> for ObjectInfo {
-    /// An [`ObjectInfo`] is a [`BackendItemInfo`] plus its address. The
-    /// Layer directory/metadata ops return the address-less
-    /// `BackendItemInfo`, so re-attach the request `address` the caller
-    /// supplied. This is the single conversion the host-side introspection
-    /// readers delegate to, so a new `ObjectInfo` field is forced to be
-    /// handled in exactly one place.
+    /// An [`ObjectInfo`] is a [`BackendItemInfo`] plus the address the
+    /// caller asked about. The Layer directory/metadata ops return the
+    /// address-less `BackendItemInfo`, so re-attach the request `address`
+    /// the caller supplied; `versioned_address` is the backend's answer
+    /// rather than the caller's question, so it travels on both types and
+    /// is copied here like every other field. This is the single conversion
+    /// the host-side introspection readers delegate to, so a new
+    /// `ObjectInfo` field is forced to be handled in exactly one place.
     fn from((address, info): (Url, BackendItemInfo)) -> Self {
         ObjectInfo {
             address,
             kind: info.kind,
             etag: info.etag,
+            etag_strength: info.etag_strength,
             version: info.version,
             size: info.size,
             mtime: info.mtime,
@@ -1698,6 +1941,7 @@ impl From<(Url, BackendItemInfo)> for ObjectInfo {
             system_metadata: info.system_metadata,
             user_metadata: info.user_metadata,
             modified_by: info.modified_by,
+            versioned_address: info.versioned_address,
         }
     }
 }
@@ -1707,6 +1951,7 @@ impl From<ObjectInfo> for BackendItemInfo {
         Self {
             kind: info.kind,
             etag: info.etag,
+            etag_strength: info.etag_strength,
             version: info.version,
             size: info.size,
             mtime: info.mtime,
@@ -1715,6 +1960,7 @@ impl From<ObjectInfo> for BackendItemInfo {
             system_metadata: info.system_metadata,
             user_metadata: info.user_metadata,
             modified_by: info.modified_by,
+            versioned_address: info.versioned_address,
         }
     }
 }
@@ -1727,6 +1973,9 @@ pub struct LocalDelegate {
     /// `Box`) so `Clone` preserves the lease. Host-only state;
     /// plugins set this to `None`. Type-erased to keep the SPI free
     /// of an `ovstorage-cache` dependency.
+    /// A `None` guard does not mean the producing layer is a backend: a host
+    /// wrapper that materializes without pinning a cache entry also returns
+    /// `None`. The guard indicates cache-eviction pinning, not ownership.
     pub guard: Option<std::sync::Arc<dyn Send + Sync>>,
 }
 
@@ -1820,6 +2069,13 @@ pub struct WriteResult {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct StatOptions {
     pub full_metadata: bool,
+    /// Ask for [`ObjectInfo::versioned_address`] even when the backend must
+    /// pay for it (S3 `list` switches to `ListObjectVersions`, Azure `list`
+    /// adds `include=versions` or a per-blob properties call, the Omniverse
+    /// Storage Service and Nucleus make their version lookup). A cost knob,
+    /// not an inclusion list, like `full_metadata`: a backend may still
+    /// populate the field when it is free.
+    pub versioned_address: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -1837,11 +2093,19 @@ pub struct WriteOptions {
     /// Destination-side precondition. See [`IfDestExists`].
     pub if_dest: IfDestExists,
     pub size_hint: Option<u64>,
+    /// Caller-owned metadata stored with the object; key portability and the
+    /// reserved namespace are documented on [`UserMetadata`].
     pub user_metadata: Option<UserMetadata>,
     /// Optional human-readable annotation attached to this operation.
     /// Backends that version objects (e.g. Nucleus checkpoints) treat
-    /// this as the version commit message; backends without per-operation
-    /// annotation drop it silently.
+    /// this as the version commit message; backends without a native
+    /// annotation slot store it as user metadata under
+    /// [`MESSAGE_METADATA_KEY`] where they can keep user metadata at all
+    /// and the caller's own map leaves that key unset; otherwise the
+    /// annotation is dropped — it is droppable by contract, unlike
+    /// `user_metadata`. A backend that cannot store a given message as it
+    /// is (one that is not a legal header value where metadata travels in
+    /// headers, say) drops it rather than failing the call.
     pub message: Option<String>,
 }
 
@@ -1859,6 +2123,10 @@ pub struct ListOptions {
     pub max_results: Option<u32>,
     pub page_token: Option<String>,
     pub full_metadata: bool,
+    /// Ask for [`ObjectInfo::versioned_address`] on every file entry even
+    /// when the backend must pay for it; see
+    /// [`StatOptions::versioned_address`]. Directory entries carry `None`.
+    pub versioned_address: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -1910,6 +2178,12 @@ pub struct UpdateMetadataOptions {
     pub allow_rewrite_emulation: bool,
     pub user_metadata_set: HashMap<String, String>,
     pub user_metadata_remove: Vec<String>,
+    /// Per-operation annotation; see [`WriteOptions::message`]. A backend
+    /// without a native annotation slot stores it under
+    /// [`MESSAGE_METADATA_KEY`]: a `user_metadata_set` entry under that key
+    /// stands and the message is dropped; otherwise the message replaces the
+    /// object's earlier annotation, and listing the key in
+    /// `user_metadata_remove` in the same patch does not stop it landing.
     pub message: Option<String>,
 }
 
@@ -2129,6 +2403,12 @@ pub struct WriteRedirect {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResponseParsing {
     pub etag_header: Option<String>,
+    /// Producer declaration for a custom `etag_header`. The redirect follower
+    /// derives strength from the wire syntax when `etag_header` names the
+    /// standard HTTP `ETag` header; custom headers have no such grammar, so
+    /// their producer must declare what equality promises. `Unspecified` is
+    /// the fail-safe default.
+    pub etag_strength: EtagStrength,
     pub version_header: Option<String>,
     pub size_header: Option<String>,
     pub mtime_header: Option<String>,
@@ -2153,6 +2433,7 @@ impl Default for ResponseParsing {
     fn default() -> Self {
         Self {
             etag_header: Some("etag".into()),
+            etag_strength: EtagStrength::Unspecified,
             version_header: None,
             size_header: Some("content-length".into()),
             mtime_header: Some("last-modified".into()),
@@ -2226,19 +2507,23 @@ pub struct WriteRedirectBatch {
 /// the method is not idempotent, or because the write body was streamed and so
 /// could not be replayed. Nothing validates the header set or the body.
 ///
-/// The same is true of the `continuation` blob echoed back alongside these
-/// results. The plugin minted it, but what returns is what the caller sent,
-/// with no signature binding it to the operation it was issued for.
+/// On a follower route, the same is true of the `continuation` blob echoed back
+/// alongside these results. The plugin minted it, but what returns has no
+/// signature binding it to the operation it was issued for. The broker's
+/// client-driven RPC is different: every continuation it emits is wrapped in
+/// an HMAC-SHA256 envelope bound to the parsed request address. The broker
+/// verifies and strips that envelope at the top of `continue_write`, before
+/// Stack dispatch, so the plugin receives the original continuation bytes.
+/// Malformed, edited, foreign-key, or different-address envelopes fail closed.
 ///
-/// **The request address is the only authenticated part of the call.**
+/// **The request address is the only authenticated input on every route.**
 /// Authorization is decided on it, so the object the operation acts on must be
 /// *derived from* it rather than taken from the continuation — recomputed from
-/// the address, with the blob's copy never read. Comparing the blob's copy
-/// against the address is weaker and, on the route where a remote caller
-/// supplies the batch, establishes nothing: it presents an address it is
-/// authorized for beside a continuation whose recorded copy it rewrote to
-/// match. Selecting the target from unauthenticated input is the caller
-/// choosing its own authorization.
+/// the address, with the blob's copy never read. The broker seal protects a
+/// comparison on that one client-driven route, but follower routes, direct SPI
+/// callers, and non-broker hosts provide no such guarantee. Selecting the
+/// target from input that is unauthenticated on any supported route is the
+/// caller choosing its own authorization.
 ///
 /// Some values cannot come from the address — a server-issued upload id or
 /// resumable-session handle, and the preconditions the original write requested.
@@ -2247,15 +2532,20 @@ pub struct WriteRedirectBatch {
 /// the key to the address makes the request commit to the authorized object by
 /// construction and the id rides along. A resumable-session handle names the
 /// object by itself, and any check confined to the continuation — a recorded
-/// address, or the session URL against the redirect batch — compares
-/// caller-supplied data with caller-supplied data, so it is worth only what the
-/// blob's integrity is worth, and nothing here provides that. Resolve such a
-/// session from the address or from backend-held state, or make the blob
-/// tamper-evident first. Re-validating the object named in the finalize
-/// response is a backstop where the response carries one, but it is detection
-/// after the commit, not prevention. Treat the rest as caller-chosen: nothing
-/// makes the blob tamper-evident, so a precondition arriving this way must not
-/// carry a guarantee another principal depends on.
+/// address, or the session URL against the redirect batch — is worth only what
+/// the blob's integrity is worth. The broker seal supplies address-bound
+/// integrity only for its client-driven RPC; this Layer contract supplies none
+/// on follower routes or in non-broker hosts. Resolve such a session from the
+/// address or from backend-held state, or add a tamper-evident boundary.
+/// Re-validating the object named in the finalize response is a backstop where
+/// the response carries one, but it is detection after the commit, not
+/// prevention.
+///
+/// The broker seal covers only the continuation bytes and request address. It
+/// does not authenticate the redirect results, prevent replay of a genuine
+/// continuation to its own address, or bind the continuation to a principal.
+/// On routes without that seal, treat the rest as caller-chosen: a precondition
+/// arriving this way must not carry a guarantee another principal depends on.
 ///
 /// Beyond that, these fields must never be evidence for anything the plugin
 /// persists, shares, or grants: whether a connection is authenticated, whether
@@ -2287,6 +2577,12 @@ pub struct RedirectResultBatch {
 ///
 /// - [`ErrorCode::InvalidArgument`] — the redirect result batch cardinality
 ///   does not match the preceding redirect batch.
+///
+/// An empty result batch paired with a non-empty redirect batch may be the
+/// redirect follower's best-effort abandonment notification. This validator
+/// still rejects it: a backend that owns staged provider resources may release
+/// them before returning the cardinality error, but must never finalize the
+/// write on a mismatch.
 pub fn validate_redirect_results(
     batch: &WriteRedirectBatch,
     results: &RedirectResultBatch,

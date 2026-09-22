@@ -75,6 +75,10 @@ enum WatchOpen {
     /// recursion onto a wider remote filter.
     RefuseRecursive {
         code: ErrorCode,
+        /// Hold the non-recursive retry at this prefix until released. This lets
+        /// a test put a cache fill strictly before the successful open and its
+        /// activation sweep.
+        stall_non_recursive_at: Option<(Url, Arc<std::sync::atomic::AtomicBool>)>,
     },
     /// Refuses any open whose prefix is not strictly under `allowed`, and parks
     /// the rest. Models a least-privilege policy that grants `watch_directory`
@@ -356,9 +360,19 @@ impl Layer for CountingWatchBackend {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
-            WatchOpen::RefuseRecursive { code } => {
+            WatchOpen::RefuseRecursive {
+                code,
+                stall_non_recursive_at,
+            } => {
                 if request.input.options.recursive {
                     return Err(ovstorage::Error::new(*code, "scripted recursive refusal"));
+                }
+                if let Some((prefix, release)) = stall_non_recursive_at
+                    && request.input.prefix == *prefix
+                {
+                    while !release.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
                 }
             }
             WatchOpen::RefuseUnlessUnder {
@@ -1743,6 +1757,51 @@ async fn the_drain_owning_layer_registers_where_a_body_commits() {
     drop(stack);
 }
 
+/// A `full_metadata` stat is a cache entry too: the metadata layer below
+/// stores it under the flags it was fetched with, so the drain-owning layer
+/// registers its directory exactly as it does for a default stat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_drain_owning_layer_registers_a_full_metadata_stat() {
+    let backend = CountingWatchBackend::with_watch_behavior(
+        CacheProbe::new(b"payload", Vec::new()),
+        true,
+        WatchOpen::RefuseUnlessUnder {
+            allowed: Url::parse("mem:///folder/").unwrap(),
+            code: ErrorCode::PermissionDenied,
+            stall: None,
+        },
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let stack = cache_stack(backend.clone(), dir.path()).await;
+    wait_for(&backend.queue.opens, 1, "refused root watch").await;
+
+    stack
+        .stat(
+            Request::new(StatRequest {
+                address: Url::parse("mem:///folder/full").unwrap(),
+                options: StatOptions {
+                    full_metadata: true,
+                    versioned_address: false,
+                },
+            }),
+            None,
+        )
+        .await
+        .expect("the probe answers a full_metadata stat");
+    wait_for(
+        &backend.queue.active,
+        1,
+        "scoped watch from a full_metadata stat",
+    )
+    .await;
+    assert!(
+        watched_prefixes(&backend).contains(&"mem:///folder/".to_string()),
+        "a full_metadata stat fills a row below, so its directory is watched, got {:?}",
+        watched_prefixes(&backend)
+    );
+    drop(stack);
+}
+
 /// A negative answer is a cache entry too. The metadata layer below caches a
 /// list-backed miss as a live entry and *then* returns `NotFound`, so the
 /// drain-owning layer has to register the directory on that path as well —
@@ -1788,17 +1847,12 @@ async fn the_drain_owning_layer_registers_a_stat_that_answers_not_found() {
     );
 
     // The negative half of the cacheability predicate, which decides whether
-    // registering is worth a candidate slot at all: a `full_metadata` stat and a
+    // registering is worth a candidate slot at all: a directory-form stat and a
     // paginated list produce no cache entry below, so neither may open a watch.
     let opens_before = backend.queue.opens.load(Ordering::SeqCst);
     stack
         .stat(
-            Request::new(StatRequest {
-                address: Url::parse("mem:///other/missing").unwrap(),
-                options: StatOptions {
-                    full_metadata: true,
-                },
-            }),
+            stat_request(&Url::parse("mem:///other/missing/").unwrap()),
             None,
         )
         .await
@@ -2114,23 +2168,28 @@ async fn retiring_a_scope_that_never_opened_does_not_sweep() {
 /// grant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_recursive_scope_is_watched_narrowly_rather_than_denied() {
+    let address = Url::parse("mem:///folder/obj").unwrap();
+    let folder = Url::parse("mem:///folder/").unwrap();
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let backend = CountingWatchBackend::with_watch_behavior(
         CacheProbe::new(b"payload", Vec::new()),
         true,
         WatchOpen::RefuseRecursive {
             code: ErrorCode::PermissionDenied,
+            stall_non_recursive_at: Some((folder.clone(), Arc::clone(&release))),
         },
     );
     let stack = metadata_stack(backend.clone()).await;
     wait_for(&backend.queue.opens, 1, "the refused recursive root watch").await;
 
-    let address = Url::parse("mem:///folder/obj").unwrap();
+    // The successful non-recursive retry for this scope is held inside the
+    // backend, so these fills are strictly before its activation sweep.
     stack.stat(stat_request(&address), None).await.unwrap();
     stack.stat(stat_request(&address), None).await.unwrap();
 
     // The scope is asked recursively, refused, and asked again for its
-    // immediate children — which this backend grants.
-    wait_for(&backend.queue.active, 1, "the narrowed scope watch").await;
+    // immediate children — which this backend grants once released.
+    wait_for(&backend.queue.opens, 3, "the held narrowed scope watch").await;
     let opens: Vec<(String, bool)> = {
         let prefixes = backend.queue.prefixes.lock().unwrap();
         let options = backend.queue.options.lock().unwrap();
@@ -2148,15 +2207,13 @@ async fn a_refused_recursive_scope_is_watched_narrowly_rather_than_denied() {
         opens.contains(&("mem:///folder/".to_string(), false)),
         "and the refusal must be retried with the smaller ask, got {opens:?}"
     );
+    release.store(true, Ordering::SeqCst);
 
     // And the narrowed watch is a real invalidation path, not just an open
     // stream. Fill AFTER it is live AND after its activation sweep: the stats
-    // above ran before the open, whose sweep removes their entry before any
-    // event is consumed. `active` does not order against that sweep, so filling
-    // on it alone lets the sweep land later and clear the entry — and the loop
-    // below cannot tell a swept entry from an invalidated one, so that is a
-    // false green rather than a flake. Waiting for the earlier entry to
-    // disappear is the barrier.
+    // above ran while the successful open was held, whose sweep removes their
+    // entry before any event is consumed. Waiting for that entry to disappear
+    // is the barrier.
     await_activation_sweep(&stack, &backend, &address).await;
     stack.stat(stat_request(&address), None).await.unwrap();
     stack.stat(stat_request(&address), None).await.unwrap();

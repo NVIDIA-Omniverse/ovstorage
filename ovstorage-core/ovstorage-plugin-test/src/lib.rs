@@ -161,14 +161,11 @@ impl TestFactory {
             // attribution layer over a declaring kind's branches. (A
             // `__test_meta/...` write is the knob channel rather than an object
             // write, and stores none.)
-            // The declaration answers for the kind, not for one write slot, and
-            // this backend's slots disagree — the redirect path does not keep
-            // the key: `write_redirect` does not read its options and
-            // `continue_write` commits an object rebuilt from the
-            // continuation's bytes. Dropping the key rather than refusing the
-            // write is the part that breaks the conformance rule, and it is
-            // tracked separately. Declaring `false` would not fix it; it would
-            // give up attribution on the two slots that do keep the key.
+            // The redirect path carries metadata in its continuation and
+            // applies it at the terminal commit, re-asserting any writer
+            // identity attested by the host after the continuation has
+            // travelled through the caller. The rejection test knob refuses
+            // non-empty metadata with `Unsupported` instead of dropping it.
             supports_user_metadata: true,
         }
     }
@@ -423,7 +420,7 @@ impl TestBackend {
                 }
             }
             IfDestExists::MatchEtag(expected) => match store.current(&key) {
-                Some(existing) => check_etag(expected, &existing.etag())?,
+                Some(existing) => check_etag(expected, existing.etag())?,
                 None => {
                     return Err(Error::new(
                         ErrorCode::NotFound,
@@ -432,8 +429,15 @@ impl TestBackend {
                 }
             },
         }
-        let object =
-            StoredObject::new(bytes).with_user_metadata(opts.user_metadata.unwrap_or_default());
+        // The annotation lands under the shared key unless the caller's own
+        // map carries it: user metadata is persisted, the message is droppable.
+        let mut user_metadata = opts.user_metadata.unwrap_or_default();
+        if let Some(message) = opts.message.as_deref().filter(|m| !m.is_empty())
+            && !user_metadata.contains_key(MESSAGE_METADATA_KEY)
+        {
+            user_metadata.insert(MESSAGE_METADATA_KEY.to_string(), message.to_string());
+        }
+        let object = StoredObject::new(bytes).with_user_metadata(user_metadata);
         let info = object.info(address);
         store.put(key, object);
         Ok(WriteResult { info })
@@ -454,17 +458,38 @@ impl TestBackend {
                 target: target.resolved_address.clone(),
             }),
         )?;
-        let key = self.relative_key(&target.resolved_address)?;
+        // The key is the path; a `?version=vN` pin selects within the chain.
+        let mut path_only = target.resolved_address.clone();
+        path_only.set_query(None);
+        path_only.set_fragment(None);
+        let key = self.relative_key(&path_only)?;
         if let Some(bytes) = self.meta_payload(&key) {
             let synthetic = StoredObject::new(bytes);
             return Ok(synthetic.info(target.resolved_address));
         }
         self.check_credential_gate()?;
         let store = self.instance.store.lock().expect("store");
-        store
-            .current(&key)
-            .map(|obj| obj.info(target.resolved_address.clone()))
-            .ok_or_else(|| Error::new(ErrorCode::NotFound, format!("test://.../{key}")))
+        // A pinned address names one version; the answer is that version and
+        // the pin comes back as the versioned address. Unpinned, the current
+        // version answers and its pin is free to report.
+        let chain = store
+            .objects
+            .get(&key)
+            .filter(|chain| !chain.is_empty())
+            .ok_or_else(|| Error::new(ErrorCode::NotFound, format!("test://.../{key}")))?;
+        let index = match test_version_index(&target.resolved_address)? {
+            Some(index) => index,
+            None => chain.len() - 1,
+        };
+        let obj = chain.get(index).ok_or_else(|| {
+            Error::new(
+                ErrorCode::NotFound,
+                format!("test://.../{key}?version=v{index}"),
+            )
+        })?;
+        let mut info = obj.info(target.resolved_address.clone());
+        info.versioned_address = Some(test_version_address(&target.resolved_address, index)?);
+        Ok(info)
     }
 
     async fn read(
@@ -578,11 +603,11 @@ impl TestBackend {
             .current(&key)
             .ok_or_else(|| Error::new(ErrorCode::NotFound, format!("test://.../{key}")))?;
         if let Some(expected) = opts.if_match.as_deref() {
-            check_etag(expected, &obj.etag())?;
+            check_etag(expected, obj.etag())?;
         }
         let bytes = match opts.range {
-            Some(range) => slice_range(&obj.bytes, &range)?,
-            None => obj.bytes.clone(),
+            Some(range) => slice_range(obj.bytes(), &range)?,
+            None => obj.bytes().to_vec(),
         };
         Ok(ReadResult::Bytes {
             bytes,
@@ -658,7 +683,7 @@ impl TestBackend {
     async fn write_redirect(
         &self,
         target: ResolvedTarget,
-        _opts: WriteOptions,
+        opts: WriteOptions,
         cancel: Option<CancellationToken>,
     ) -> Result<WriteRedirectBatch> {
         let _ = &cancel; // conformance plugin op: this method body has no async work to cancel.
@@ -674,6 +699,20 @@ impl TestBackend {
                 ErrorCode::Unsupported,
                 "test-plugin: write_redirect returns Unsupported \
                  (test_write_redirect_returns_unsupported=true)",
+            ));
+        }
+        // CONFORMANCE permits rejecting non-empty metadata with Unsupported,
+        // but never silently dropping it on the redirect path.
+        if cfg.write_redirect_rejects_user_metadata
+            && opts
+                .user_metadata
+                .as_ref()
+                .is_some_and(|metadata| !metadata.is_empty())
+        {
+            return Err(Error::new(
+                ErrorCode::Unsupported,
+                "test-plugin: test_write_redirect_rejects_user_metadata: this connection does not \
+                 keep user_metadata on the redirect path",
             ));
         }
         let key = self.relative_key(&target.resolved_address)?;
@@ -694,6 +733,7 @@ impl TestBackend {
             key: key.clone(),
             bytes: Vec::new(),
             loops_remaining: cfg.continue_write_loops.saturating_sub(1),
+            user_metadata: opts.user_metadata.filter(|metadata| !metadata.is_empty()),
         });
         let redirects = build_multipart_redirects(
             base,
@@ -713,6 +753,7 @@ impl TestBackend {
         target: ResolvedTarget,
         redirects: WriteRedirectBatch,
         results: RedirectResultBatch,
+        attested_modified_by: Option<&str>,
         cancel: Option<CancellationToken>,
     ) -> Result<WriteStep> {
         let _ = &cancel; // conformance plugin op: this method body has no async work to cancel.
@@ -747,9 +788,10 @@ impl TestBackend {
         // Derive the key from the authorized request address rather than
         // reading it back out of the continuation. This plugin is what a
         // third-party author copies, so it has to demonstrate the rule it is
-        // testing them against: on the broker's client-driven route the blob is
-        // echoed back by the remote caller, and only the address has been
-        // through an authorization check.
+        // testing them against: the broker's client-driven RPC authenticates
+        // the blob and its address binding, but the Layer SPI supplies no such
+        // integrity to direct callers, follower routes, or unsealed hosts. The
+        // address is the authenticated input available on every route.
         cont.key = self.relative_key(&target.resolved_address)?;
         if cont.key.starts_with(META_PREFIX) {
             // `write_redirect` refuses these, so a derived target that names one
@@ -781,9 +823,14 @@ impl TestBackend {
                 redirects: next_redirects,
             }));
         }
-        // Redirected writes flow bytes through the URL, not the plugin;
-        // commit an empty placeholder so stat/list see the address.
-        let object = StoredObject::new(cont.bytes);
+        // Redirected writes flow bytes through the URL, not the plugin, so the
+        // bytes remain an empty placeholder. Apply the continuation-travelled
+        // metadata only at this terminal commit, after re-asserting any writer
+        // identity attested by the host.
+        let mut user_metadata = cont.user_metadata.take();
+        ovstorage_plugin::reassert_attribution(attested_modified_by, &mut user_metadata);
+        let object =
+            StoredObject::new(cont.bytes).with_user_metadata(user_metadata.unwrap_or_default());
         let info = object.info(target.resolved_address);
         let mut store = self.instance.store.lock().expect("store");
         store.put(cont.key, object);
@@ -822,7 +869,7 @@ impl TestBackend {
             .current(&key)
             .ok_or_else(|| Error::new(ErrorCode::NotFound, format!("test://.../{key}")))?;
         if let Some(expected) = opts.if_match.as_deref() {
-            check_etag(expected, &existing.etag())?;
+            check_etag(expected, existing.etag())?;
         }
         store.remove(&key);
         Ok(())
@@ -884,7 +931,10 @@ impl TestBackend {
                 continue;
             }
             let address = address::join_relative(&root, key)?;
-            out.push(obj.info(address));
+            let mut info = obj.info(address);
+            // The version index rides the chain, so the pin is free on a list.
+            info.versioned_address = Some(test_version_address(&info.address, chain.len() - 1)?);
+            out.push(info);
         }
         Ok(out)
     }
@@ -948,6 +998,7 @@ impl TestBackend {
         // Directories are otherwise implicit in the in-memory store; return a
         // minimal BackendItemInfo so capability-gated callers don't see Unsupported.
         Ok(BackendItemInfo {
+            etag_strength: Default::default(),
             kind: ObjectKind::Directory,
             etag: None,
             version: None,
@@ -958,6 +1009,7 @@ impl TestBackend {
             system_metadata: None,
             user_metadata: None,
             modified_by: None,
+            versioned_address: None,
         })
     }
 
@@ -1062,6 +1114,7 @@ impl TestBackend {
             .map(|(i, obj)| {
                 let mut info = obj.info(test_version_address(&path_only, i)?);
                 info.version = Some(format!("v{i}"));
+                info.versioned_address = Some(info.address.clone());
                 Ok(info)
             })
             .collect()
@@ -1099,6 +1152,7 @@ impl TestBackend {
         })?;
         let mut info = obj.info(test_version_address(&path_only, index)?);
         info.version = Some(format!("v{index}"));
+        info.versioned_address = Some(info.address.clone());
         Ok(info)
     }
 
@@ -1125,7 +1179,7 @@ impl TestBackend {
             .ok_or_else(|| Error::new(ErrorCode::NotFound, format!("test://.../{src_key}")))?
             .clone();
         if let Some(expected) = opts.if_source.as_deref() {
-            check_etag(expected, &cloned.etag())?;
+            check_etag(expected, cloned.etag())?;
         }
         match &opts.if_dest {
             IfDestExists::Overwrite => {}
@@ -1138,7 +1192,7 @@ impl TestBackend {
                 }
             }
             IfDestExists::MatchEtag(expected) => match store.current(&dest_key) {
-                Some(existing) => check_etag(expected, &existing.etag())?,
+                Some(existing) => check_etag(expected, existing.etag())?,
                 None => {
                     return Err(Error::new(
                         ErrorCode::NotFound,
@@ -1174,7 +1228,7 @@ impl TestBackend {
             let current = store
                 .current(&src_key)
                 .ok_or_else(|| Error::new(ErrorCode::NotFound, format!("test://.../{src_key}")))?;
-            check_etag(expected, &current.etag())?;
+            check_etag(expected, current.etag())?;
         }
         match &opts.if_dest {
             IfDestExists::Overwrite => {}
@@ -1187,7 +1241,7 @@ impl TestBackend {
                 }
             }
             IfDestExists::MatchEtag(expected) => match store.current(&dest_key) {
-                Some(existing) => check_etag(expected, &existing.etag())?,
+                Some(existing) => check_etag(expected, existing.etag())?,
                 None => {
                     return Err(Error::new(
                         ErrorCode::NotFound,
@@ -1227,7 +1281,7 @@ impl TestBackend {
             .last_mut()
             .ok_or_else(|| Error::new(ErrorCode::NotFound, format!("test://.../{key}")))?;
         if let Some(expected) = opts.if_match.as_deref() {
-            check_etag(expected, &object.etag())?;
+            check_etag(expected, object.etag())?;
         }
         for k in &opts.user_metadata_remove {
             object.user_metadata.remove(k);
@@ -1235,10 +1289,15 @@ impl TestBackend {
         for (k, v) in &opts.user_metadata_set {
             object.user_metadata.insert(k.clone(), v.clone());
         }
-        if let Some(message) = opts.message.as_deref().filter(|m| !m.is_empty()) {
+        // The message replaces the previous annotation unless the caller's
+        // own patch sets the key: `user_metadata_set` is persisted, the
+        // message is droppable by contract.
+        if let Some(message) = opts.message.as_deref().filter(|m| !m.is_empty())
+            && !opts.user_metadata_set.contains_key(MESSAGE_METADATA_KEY)
+        {
             object
                 .user_metadata
-                .insert("x-ov-message".to_string(), message.to_string());
+                .insert(MESSAGE_METADATA_KEY.to_string(), message.to_string());
         }
         Ok(object.item_info())
     }
@@ -1677,6 +1736,11 @@ struct MultipartCont {
     #[serde(with = "base64_bytes")]
     bytes: Vec<u8>,
     loops_remaining: u32,
+    /// Caller metadata carried to the terminal commit. The default keeps
+    /// continuations minted by an earlier build decodable, while omitting
+    /// `None` preserves the prior wire shape for metadata-less writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user_metadata: Option<UserMetadata>,
 }
 
 /// Typed mapping for a non-2xx redirect result. Deliberately not a blanket
@@ -1863,7 +1927,8 @@ fn json_string(value: &str) -> String {
 /// Despite the name, this does **not** produce base64: it widens each byte to a
 /// `u16` and serialises the result, so the encoded form is a JSON array of
 /// numbers rather than a string. Worth knowing before reasoning about what the
-/// encoded continuation contains — `key` is the only string field in it.
+/// encoded continuation contains — without metadata, `key` is the only string
+/// field in it.
 mod base64_bytes {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> std::result::Result<S::Ok, S::Error> {
@@ -2318,7 +2383,7 @@ mod tests {
                 .collect(),
         };
         let step = backend
-            .continue_write(target("big.bin"), batch, results, None)
+            .continue_write(target("big.bin"), batch, results, None, None)
             .await
             .unwrap();
         let WriteStep::Done(_) = step else {
@@ -2326,6 +2391,269 @@ mod tests {
         };
         let store = backend.instance.store.lock().unwrap();
         assert!(store.current("big.bin").is_some());
+    }
+
+    #[tokio::test]
+    async fn redirect_continuation_omits_absent_and_empty_user_metadata() {
+        let backend = fixture(&[(
+            "test_redirect_url",
+            ConfigValue::String("https://test.example".into()),
+        )]);
+
+        for user_metadata in [None, Some(UserMetadata::new())] {
+            let batch = backend
+                .write_redirect(
+                    target("metadata-less.bin"),
+                    WriteOptions {
+                        user_metadata,
+                        ..WriteOptions::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            let json = String::from_utf8(batch.continuation).unwrap();
+            assert!(!json.contains("user_metadata"), "{json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_redirect_round_trips_user_metadata_through_stat() {
+        let backend = fixture(&[(
+            "test_redirect_url",
+            ConfigValue::String("https://test.example".into()),
+        )]);
+        let metadata = UserMetadata::from([("k".to_string(), "v".to_string())]);
+        let batch = backend
+            .write_redirect(
+                target("with-metadata.bin"),
+                WriteOptions {
+                    user_metadata: Some(metadata.clone()),
+                    ..WriteOptions::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let results = synthesize_results(&batch);
+
+        let step = backend
+            .continue_write(target("with-metadata.bin"), batch, results, None, None)
+            .await
+            .unwrap();
+        let WriteStep::Done(_) = step else {
+            panic!("expected Done from continue_write");
+        };
+        let info = backend
+            .stat(target("with-metadata.bin"), StatOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(info.user_metadata, Some(metadata));
+    }
+
+    #[tokio::test]
+    async fn redirect_user_metadata_survives_continue_write_loops() {
+        let backend = fixture(&[
+            (
+                "test_redirect_url",
+                ConfigValue::String("https://test.example".into()),
+            ),
+            ("test_continue_write_loops", ConfigValue::Int(2)),
+        ]);
+        let metadata = UserMetadata::from([("k".to_string(), "v".to_string())]);
+        let batch1 = backend
+            .write_redirect(
+                target("looped-metadata.bin"),
+                WriteOptions {
+                    user_metadata: Some(metadata.clone()),
+                    ..WriteOptions::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let results1 = synthesize_results(&batch1);
+
+        let step = backend
+            .continue_write(target("looped-metadata.bin"), batch1, results1, None, None)
+            .await
+            .unwrap();
+        let WriteStep::Redirects(batch2) = step else {
+            panic!("expected a second redirect round");
+        };
+        let continuation = decode_continuation(&batch2.continuation).unwrap();
+        assert_eq!(continuation.user_metadata, Some(metadata.clone()));
+
+        let results2 = synthesize_results(&batch2);
+        let step = backend
+            .continue_write(target("looped-metadata.bin"), batch2, results2, None, None)
+            .await
+            .unwrap();
+        let WriteStep::Done(_) = step else {
+            panic!("expected Done after the final round");
+        };
+        let info = backend
+            .stat(target("looped-metadata.bin"), StatOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(info.user_metadata, Some(metadata));
+    }
+
+    #[tokio::test]
+    async fn continue_write_reasserts_attested_attribution_before_commit() {
+        let backend = fixture(&[(
+            "test_redirect_url",
+            ConfigValue::String("https://test.example".into()),
+        )]);
+        let metadata = UserMetadata::from([
+            ("ordinary".to_string(), "keep-me".to_string()),
+            (
+                ATTRIBUTION_KEY_MODIFIED_BY.to_string(),
+                "caller-forged".to_string(),
+            ),
+            ("ovstorage_forged".to_string(), "remove-me".to_string()),
+        ]);
+        let batch = backend
+            .write_redirect(
+                target("attributed-metadata.bin"),
+                WriteOptions {
+                    user_metadata: Some(metadata),
+                    ..WriteOptions::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let results = synthesize_results(&batch);
+
+        let step = backend
+            .continue_write(
+                target("attributed-metadata.bin"),
+                batch,
+                results,
+                Some("host-principal"),
+                None,
+            )
+            .await
+            .unwrap();
+        let WriteStep::Done(_) = step else {
+            panic!("expected Done from continue_write");
+        };
+        let info = backend
+            .stat(
+                target("attributed-metadata.bin"),
+                StatOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let expected = UserMetadata::from([
+            ("ordinary".to_string(), "keep-me".to_string()),
+            (
+                ATTRIBUTION_KEY_MODIFIED_BY.to_string(),
+                "host-principal".to_string(),
+            ),
+        ]);
+        assert_eq!(info.user_metadata, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn continue_write_without_attestation_keeps_travelled_metadata_unchanged() {
+        let backend = fixture(&[(
+            "test_redirect_url",
+            ConfigValue::String("https://test.example".into()),
+        )]);
+        let metadata = UserMetadata::from([
+            ("ordinary".to_string(), "keep-me".to_string()),
+            (
+                ATTRIBUTION_KEY_MODIFIED_BY.to_string(),
+                "unattested-value".to_string(),
+            ),
+        ]);
+        let batch = backend
+            .write_redirect(
+                target("unattested-metadata.bin"),
+                WriteOptions {
+                    user_metadata: Some(metadata.clone()),
+                    ..WriteOptions::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let results = synthesize_results(&batch);
+
+        let step = backend
+            .continue_write(
+                target("unattested-metadata.bin"),
+                batch,
+                results,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let WriteStep::Done(_) = step else {
+            panic!("expected Done from continue_write");
+        };
+        let info = backend
+            .stat(
+                target("unattested-metadata.bin"),
+                StatOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.user_metadata, Some(metadata));
+    }
+
+    #[tokio::test]
+    async fn write_redirect_can_reject_only_non_empty_user_metadata() {
+        let backend = fixture(&[
+            (
+                "test_redirect_url",
+                ConfigValue::String("https://test.example".into()),
+            ),
+            (
+                "test_write_redirect_rejects_user_metadata",
+                ConfigValue::Bool(true),
+            ),
+        ]);
+
+        backend
+            .write_redirect(target("default-options.bin"), WriteOptions::default(), None)
+            .await
+            .expect("default options should still mint redirects");
+        backend
+            .write_redirect(
+                target("empty-metadata.bin"),
+                WriteOptions {
+                    user_metadata: Some(UserMetadata::new()),
+                    ..WriteOptions::default()
+                },
+                None,
+            )
+            .await
+            .expect("empty metadata should still mint redirects");
+
+        let mut user_metadata = UserMetadata::new();
+        user_metadata.insert("project".into(), "test".into());
+        let err = backend
+            .write_redirect(
+                target("with-metadata.bin"),
+                WriteOptions {
+                    user_metadata: Some(user_metadata),
+                    ..WriteOptions::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Unsupported);
+        assert!(
+            err.message()
+                .contains("test_write_redirect_rejects_user_metadata")
+        );
     }
 
     /// Substitution, not modification: a caller holding a genuine continuation
@@ -2358,7 +2686,7 @@ mod tests {
                 .collect(),
         };
         let step = backend
-            .continue_write(target("victim.bin"), batch, results, None)
+            .continue_write(target("victim.bin"), batch, results, None, None)
             .await
             .unwrap();
         let WriteStep::Done(_) = step else {
@@ -2397,7 +2725,7 @@ mod tests {
             }],
         };
         let err = backend
-            .continue_write(target("big.bin"), batch, results, None)
+            .continue_write(target("big.bin"), batch, results, None, None)
             .await
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::Transient);
@@ -2447,7 +2775,7 @@ mod tests {
                 }],
             };
             let err = backend
-                .continue_write(target("big.bin"), batch, results, None)
+                .continue_write(target("big.bin"), batch, results, None, None)
                 .await
                 .unwrap_err();
             assert_eq!(err.code(), expected, "HTTP {status}");
@@ -2465,11 +2793,12 @@ mod tests {
     }
 
     /// The multi-round loop is the only decode-then-re-encode path in the tree.
-    /// What this pins is that round two re-encodes the *derived* key rather than
-    /// an empty one — the re-encoded blob has to stay decodable by a peer
-    /// running an earlier build, which reads that field. It does not pin
-    /// substitution-resistance: `#[serde(skip_deserializing)]` already makes the
-    /// caller's key unreachable, so a negative assertion here could not fail.
+    /// Without metadata, what this pins is that round two re-encodes the
+    /// *derived* key rather than an empty one — the re-encoded blob has to stay
+    /// decodable by a peer running an earlier build, which reads that field. It
+    /// does not pin substitution-resistance: `#[serde(skip_deserializing)]`
+    /// already makes the caller's key unreachable, so a negative assertion
+    /// here could not fail.
     #[tokio::test]
     async fn continue_write_loop_rederives_on_every_round() {
         let backend = fixture(&[
@@ -2492,19 +2821,19 @@ mod tests {
             }],
         };
         let step = backend
-            .continue_write(target("victim.bin"), batch1, results(), None)
+            .continue_write(target("victim.bin"), batch1, results(), None, None)
             .await
             .unwrap();
         let WriteStep::Redirects(batch2) = step else {
             panic!("expected a second redirect round");
         };
-        // `key` is the only string field in this blob, so a match can only be
-        // the key itself.
+        // No metadata was supplied, so `key` is the only string field in this
+        // blob and a match can only be the key itself.
         let json = String::from_utf8(batch2.continuation.clone()).unwrap();
         assert!(json.contains("victim.bin"), "{json}");
 
         let step = backend
-            .continue_write(target("victim.bin"), batch2, results(), None)
+            .continue_write(target("victim.bin"), batch2, results(), None, None)
             .await
             .unwrap();
         let WriteStep::Done(_) = step else {
@@ -2530,7 +2859,7 @@ mod tests {
             .unwrap();
         let results1 = synthesize_results(&batch1);
         let step = backend
-            .continue_write(target("two-stage.bin"), batch1, results1, None)
+            .continue_write(target("two-stage.bin"), batch1, results1, None, None)
             .await
             .unwrap();
         let WriteStep::Redirects(batch2) = step else {
@@ -2538,7 +2867,7 @@ mod tests {
         };
         let results2 = synthesize_results(&batch2);
         let step = backend
-            .continue_write(target("two-stage.bin"), batch2, results2, None)
+            .continue_write(target("two-stage.bin"), batch2, results2, None, None)
             .await
             .unwrap();
         let WriteStep::Done(_) = step else {
@@ -2717,6 +3046,7 @@ mod tests {
                 v.address.as_str(),
                 format!("test://demo/doc.txt?version=v{i}")
             );
+            assert_eq!(v.versioned_address.as_ref(), Some(&v.address));
         }
     }
 
@@ -2774,6 +3104,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(latest.address.as_str(), "test://demo/doc.txt?version=v1");
+        assert_eq!(latest.versioned_address.as_ref(), Some(&latest.address));
+    }
+
+    /// `stat` and `list` report the current version's pin for free, a stat
+    /// of a pinned address answers that version and echoes the pin, and a
+    /// directory entry carries none.
+    #[tokio::test]
+    async fn stat_and_list_report_the_current_version_pin() {
+        let backend = fixture(&[]);
+        for v in 0..2 {
+            backend
+                .write(
+                    target("dir/doc.txt"),
+                    format!("v{v}-").repeat(v + 1).into_bytes(),
+                    WriteOptions::default(),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let head = backend
+            .stat(target("dir/doc.txt"), StatOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(head.address.as_str(), "test://demo/dir/doc.txt");
+        assert_eq!(
+            head.versioned_address.as_ref().map(Url::as_str),
+            Some("test://demo/dir/doc.txt?version=v1")
+        );
+
+        let pinned = ResolvedTarget {
+            backend_id: BackendId("test".into()),
+            resolved_address: address::parse("test://demo/dir/doc.txt?version=v0").unwrap(),
+        };
+        let first = backend
+            .stat(pinned, StatOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(first.size, Some(3), "a pinned stat answers that version");
+        assert_eq!(
+            first.versioned_address.as_ref().map(Url::as_str),
+            Some("test://demo/dir/doc.txt?version=v0")
+        );
+
+        let listed = backend
+            .list(
+                target("dir/"),
+                ListOptions {
+                    versioned_address: true,
+                    ..ListOptions::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].versioned_address.as_ref().map(Url::as_str),
+            Some("test://demo/dir/doc.txt?version=v1")
+        );
     }
 
     #[tokio::test]
@@ -3156,6 +3546,7 @@ mod tests {
             auth_state: ConnectionAuthState::Anonymous,
             last_probed: None,
             user_metadata: UserMetadata::default(),
+            owning_target: None,
         }
     }
 
@@ -3391,23 +3782,20 @@ mod user_metadata_declaration_tests {
     /// crate, and two plugin rlibs in one test binary are a duplicate-symbol
     /// link error under `rust-lld`.
     ///
-    /// **`true` is the coarse answer, and this backend is the shape that makes
-    /// it coarse.** The buffered and streaming write slots store what they are
-    /// handed and `stat` returns it; the redirect slot flows bytes through the
-    /// URL and commits a placeholder built from the continuation alone, so a
-    /// `user_metadata` map handed to `write_redirect` is not persisted. A
-    /// declaration answers for the kind rather than for one write path, so a
-    /// backend whose paths disagree has to pick one answer for all of them.
-    /// This one picks `true`; `opendal` faces the same disagreement across its
-    /// drivers and picks `false`.
+    /// The buffered and streaming write slots store what they are handed and
+    /// `stat` returns it. The redirect slot carries metadata in its continuation
+    /// and applies it at the terminal commit with host attribution re-asserted,
+    /// so every successful object-write path agrees with the kind-level
+    /// declaration. The rejection knob returns `Unsupported` for non-empty
+    /// metadata instead of dropping it.
     #[test]
     fn the_conformance_backend_declares_its_user_metadata_support() {
         let descriptor = TestFactory::new().descriptor();
         assert!(
             descriptor.supports_user_metadata,
-            "the conformance backend's buffered write stores user metadata and \
-             stat returns it, so a host composes its attribution layer over \
-             that branch"
+            "every successful conformance-backend write path stores user \
+             metadata and stat returns it, so a host composes its attribution \
+             layer over that branch"
         );
     }
 }

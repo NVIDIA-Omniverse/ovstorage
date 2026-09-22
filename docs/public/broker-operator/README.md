@@ -113,6 +113,20 @@ attribution_strategy = "user_metadata"
 # See "What a forwarded redirect discloses" below before setting "allow".
 redirect_credential_disclosure = "refuse"
 
+# Cloud schemes an address no connection serves may fall back to, anonymously
+# and read-only; see "What an anonymous fallback reaches" below. [] = NoRoute.
+anonymous_fallback_schemes = []          # any of "s3", "gs", "azure"
+
+# Anonymous fetch of unrouted http:// and https:// addresses from this broker's
+# network position. "allow" is refused at startup in this release.
+anonymous_http_fallback = "refuse"
+
+# Client-driven write continuations are sealed automatically. Omit this table
+# for a random process-local key carried across SIGHUP reloads. Configure a raw
+# shared key file for replicas or restart-tolerant in-flight uploads.
+# [continuation_seal]
+# key_path = "/etc/ovstorage/continuation-seal.key"
+
 # ---- Listener ----
 [listener]
 bind = "0.0.0.0:8787"
@@ -182,15 +196,23 @@ prometheus_bind = "127.0.0.1:9090"      # opt-in /metrics endpoint
 # otlp_endpoint = "..."                 # reserved; surfaces Unsupported today
 
 # ---- The shared inner data-plane Stack ----
-# upstream_credential → alias → copy_rename_fallback → byte_cache →
+# upstream_credential → watch_limit → alias → copy_rename_fallback → byte_cache →
 # metadata_cache → redirect_follower → retry → router → attribution_s3 → s3
 [ovstorage]
 root = "upstream_credential"
 
+# Broker-native, process-wide watch admission guard. The broker injects this
+# shared data-plane wrapper with these defaults when it is omitted; declaring it makes the
+# limits explicit and permits operator overrides. Both values must be positive.
+[ovstorage.layers.watch_limit]
+inner                     = "alias"
+max_watches_per_principal = 256
+max_watches_total         = 4096
+
 # Per-principal broker-side upstream OAuth credential handling. The broker
 # also inserts this security boundary when an operator graph omits it.
 [ovstorage.layers.upstream_credential]
-inner = "alias"
+inner = "watch_limit"
 
 [ovstorage.layers.alias]
 inner = "copy_rename_fallback"
@@ -221,6 +243,11 @@ state_root = "/var/lib/ovstorage/broker/auth"
 # An oversize read surfaces the redirect when the disclosure policy permits it,
 # and is served as a stream — fetched here — when it does not. The size cap
 # decides what is worth caching, not what is readable.
+# A copy or rename the broker must emulate reports `Unsupported` when its source
+# read surfaces an over-cap delegable redirect, because the fallback needs bytes
+# this follower declined to fetch. A client composing its own
+# `copy_rename_fallback` above the broker connection catches that `Unsupported`
+# and performs the copy client-side, following the forwarded redirect itself.
 [ovstorage.layers.redirect_follower]
 inner                  = "retry"
 follow_reads           = true
@@ -251,6 +278,15 @@ display_name = "prod-assets"
 config       = { bucket = "prod-assets", region = "us-east-1" }
 credentials  = { access_key_id = "${AWS_ACCESS_KEY_ID}", secret_access_key = "${AWS_SECRET_ACCESS_KEY}" }
 ```
+
+Without a byte cache, the canonical broker graph sets `follow_reads = false`
+and omits `follow_reads_max_bytes`. Every delegable read redirect then surfaces
+unfollowed. A copy or rename the broker must emulate reports `Unsupported` when
+its source returns one, just as an over-cap read does in the cached graph above.
+Enable `follow_reads` before configuring a cap, or retain a client-side
+`copy_rename_fallback` so the client can emulate the transfer and follow the
+forwarded redirect; `follow_reads = false` with a cap is rejected at stack
+construction.
 
 ### Upstream OAuth endpoint transport
 
@@ -313,17 +349,32 @@ PKCE locally and invokes the authenticated `RegisterCredential` RPC explicitly.
 Local UDS and named-pipe callers can use the daemon-owned loopback PKCE flow
 directly.
 
-The `[ovstorage]` stack is the same schema the CLI and REST gateway read,
-so one `ovstorage.toml` can feed broker + CLI + REST (each host layers
-only its own top-level sections — `[listener]`/`[server]`, auth,
-attribution — on top). `[[ovstorage.connections]]` registers backends at
-startup on the composed Stack.
+The `[ovstorage]` stack uses the same base schema the CLI and REST gateway
+read. The `watch_limit` kind is the broker-only exception: omit its table when
+one `ovstorage.toml` must feed broker + CLI + REST, and broker preparation still
+injects the wrapper with its defaults. Each host layers only its own top-level
+sections — `[listener]`/`[server]`, auth, attribution — on top.
+`[[ovstorage.connections]]` registers backends at startup on the composed Stack.
 
-`make verify` from the repo root validates this config shape against
-`cargo run -p ovstorage-cli -- list-routes` (which loads the same TOML, resolves
-credentials, and exits non-zero on bad routes / unresolvable secret
-refs without binding any sockets). Use it before deploying a config
-change.
+`watch_limit` is a broker-native Layer compiled into the daemon, not a loadable
+storage plugin. Broker stack preparation registers its factory and injects it
+at the shared data-plane root, immediately inside the `upstream_credential`
+security boundary, even when `[ovstorage.layers.watch_limit]` is undeclared, so
+every listener, connection, route, and backend in the process shares one
+admission budget. An explicit table must already occupy that position; startup
+rejects an orphan or branch-local declaration and names both the declared layer
+and the current data-plane root rather than relocating it. Custom positive
+values for `max_watches_per_principal` and `max_watches_total` remain intact at
+the required position. The authenticated
+principal stamped by the auth Layer selects the per-principal bucket; requests
+without one share the anonymous bucket. The REST gateway's embedded Stack does
+not receive this broker-only injection.
+
+For a shared config without the broker-only table, `make verify` from the repo
+root validates this base shape against `cargo run -p ovstorage-cli --
+list-routes` (which resolves credentials and exits non-zero on bad routes /
+unresolvable secret refs without binding any sockets). Validate an explicit
+`watch_limit` table by starting the broker, whose graph builder owns that kind.
 
 ### Where credentials are stored
 
@@ -342,7 +393,7 @@ The directory is created `0700` and the database `0600`, with an owner-only DACL
 ## Where attribution sits
 
 The attribution overlay stamps the authenticated principal into the
-reserved `user_metadata` key `ovstorage-modified-by` on every mutating
+reserved `user_metadata` key `ovstorage_modified_by` on every mutating
 call **that carries caller metadata** — `write`, `write_stream`,
 `write_redirect` and `update_metadata` — and harvests it back into the
 typed `modified_by` on read. It sits **below the router, one instance
@@ -405,8 +456,8 @@ The table below records what each shipped backend kind declares and why.
 
 **That omission has a second effect, and it is not protective.** The
 attribution layer is also the only thing on the path that strips inbound
-`ovstorage-*` keys, so a branch without it does no sanitizing: a client's
-own value for the reserved `ovstorage-modified-by` key reaches the backend
+`ovstorage_*` keys, so a branch without it does no sanitizing: a client's
+own value for the reserved `ovstorage_modified_by` key reaches the backend
 unaltered. Whether it is stored is that backend's business, and the
 declaration does not settle it — declining says the kind will not take the
 host's stamp, not that it refuses metadata a caller supplies. Read
@@ -443,9 +494,9 @@ only lever is process-wide:
 **`attribution_strategy = "passthrough"`, and it costs more than it
 looks.** Every stamp function returns early under
 `passthrough`, and the inbound sanitizer has no other caller — so the
-flag disables the stamp, the harvest **and** the inbound `ovstorage-*`
+flag disables the stamp, the harvest **and** the inbound `ovstorage_*`
 sanitizing for every branch in the process, not just the one with the
-problem. Clients on your `file`, `s3`, `gcs` and `azure` branches can
+problem. Clients on your `s3`, `gcs` and `azure` branches can
 then plant reserved keys of their own. Reaching for it to fix an
 availability problem on one branch trades a much larger guarantee for it.
 The branch with the problem need not be a third-party one: the declaration
@@ -469,9 +520,9 @@ its destination is attributed to whoever asked for the copy. A transfer
 the backend performs **natively** carries whatever that backend's own
 copy carries, which is not uniform:
 
-- `file` copies its metadata sidecar, and `s3` and `azure` use their
-  services' default copy semantics, so the destination keeps the
-  *source's* stamp and reads as written by whoever wrote the source.
+- `s3` and `azure` use their services' default copy semantics, so the
+  destination keeps the *source's* stamp and reads as written by
+  whoever wrote the source.
 - `gcs` is the odd one. Its rewrite normally preserves source metadata,
   but when the operation carries a `message` the plugin sends a body
   containing only that message — and the service treats a supplied
@@ -493,7 +544,7 @@ have.
 
 | Branch kind | Carries attribution | Why |
 | --- | --- | --- |
-| `file` | yes | Persists user metadata in a sidecar and returns it on `stat` and `list`. |
+| `file` | **no** | Stores no user metadata and refuses a non-empty map with `Unsupported`, so the branch carries no attribution layer: a brokered write's principal is not stamped as `ovstorage_modified_by`, and `modified_by` on `file` reflects the filesystem owner of the file — the broker process's user, for a brokered write. |
 | `s3` | yes | `x-amz-meta-*` on `PutObject`, on multipart, and signed into the presigned URL. What a multipart redirect write persists is bound when the upload is created and a single-PUT redirect's is bound by the presign signature, so the client never holds either, and this branch owes nothing at the finalize. For the multipart shape the `ObjectInfo` the finalize call reports is rebuilt from the continuation the client echoed back, and the overlay stamps it with the principal the broker authenticated on that call; the single-PUT shape reports no user metadata at all. Where one principal drives the whole upload those are the same value; where a different principal finalizes, the report names the finalizer and the object keeps the minter. |
 | `gcs` | yes | Object `metadata` on upload and on the resumable-session initiation behind a redirect write, so what a redirect write persists is committed before the client uploads at all and the client never holds it. The `ObjectInfo` the finalize call reports is parsed from the response body the client captured and handed back, and the overlay stamps it with the principal the broker authenticated on that call. Where one principal drives the whole upload those are the same value; where a different principal finalizes, the report names the finalizer and the object keeps the minter. |
 | `azure` | yes | `x-ms-meta-*` on Put Blob, on the presigned PUT, and at Put Block List. A **staged** redirect write commits through the broker's own `Put Block List`. Under `user_metadata` that commit stamps the principal the broker authenticated on the finalize call, so the metadata the client held cannot decide it; under `passthrough` — including on the deeper brokers of a chain, which this page tells you to set that way — nothing is stamped there and the metadata the client held is what lands. **Caveat, on the inline redirect only:** those headers accompany the presigned request, Azure's SAS signs no headers, and the client's own PUT is the commit — there is no later call of the broker's to write with, so a client taking that redirect can rewrite or drop the stamp on the object. Under `user_metadata` the `modified_by` the finalize call reports for such a write is stamped by the overlay, so a report cannot name a writer that broker did not authenticate even though the object can; under `passthrough` nothing is stamped there either. S3 signs its metadata into the presigned URL and GCS commits it server-side at session start; Azure does neither. This is a property of the plugin's presign, not of where the layer sits. |
@@ -502,6 +553,7 @@ have.
 | `nucleus` | **no** | Rejects a non-empty `user_metadata` with `Unsupported` on `write`, `write_stream` and `write_redirect`. It also never returns user metadata, so the branch gives up no harvest. |
 | `opendal` | **no** | Rejects a non-empty `user_metadata` on presigned writes outright, so a stamped branch loses the redirect path for every OpenDAL connection whose driver presigns at all — silently, because the follower catches `Unsupported` and falls back to an ordinary write, pulling every byte through the broker. On the buffered and streaming slots it keeps the key when the connection's driver supports it and **refuses the write otherwise**, per the reject-rather-than-drop rule cited above. Whether a stamp survives is therefore a per-connection fact one branch cannot settle: stamping costs a metadata-capable driver its presigned path and fails every write to a driver without metadata support. |
 | `http` | **no** | Read-only: every mutating verb is unsupported, and `stat` reports an empty user-metadata map. |
+| `huggingface` | **no** | Read-only: every mutating verb is unsupported, so there is no write for a stamp to ride on. |
 | anything else | whatever it declares | A kind that declares nothing carries no attribution layer. |
 
 For a **chained broker** — this broker fronting another one — the branch
@@ -526,7 +578,7 @@ a direct `nucleus` branch would have raised.
 The layer is the only sanitizer and the only harvester on the path. A
 branch that omits it gives up both:
 
-- **Harvest.** A reserved `ovstorage-*` key already stored on one of that
+- **Harvest.** A reserved `ovstorage_*` key already stored on one of that
   branch's objects is surfaced to clients verbatim inside
   `user_metadata`, instead of being promoted to the typed `modified_by`
   and hidden.
@@ -584,12 +636,12 @@ is logged at `WARN` rather than refused. Refusing there would take a
 broker down over a leftover table with no effect on anything, on an
 ordinary restart.
 
-Refusing rather than quietly relocating is deliberate. The only change
-the broker makes to a declared graph is to add an attribution layer to a
-branch that has none, re-pointing the one edge that must now point at
-it. It never removes, reorders or reconfigures anything you wrote, so a
-configuration the stack builder would have rejected can never be turned
-into a working host that behaves differently from what you declared.
+Refusing rather than quietly relocating attribution is deliberate. The broker
+may add an attribution layer to a branch that has none, re-pointing the one edge
+that must now point at it, but it never moves a declared attribution layer. The
+broker-native `watch_limit` guard follows the same refuse-don't-relocate rule:
+omit its table to accept broker injection, or declare it at the shared
+data-plane root immediately inside `upstream_credential`.
 
 A single `attribution` table declared at the root, over the router, is
 one such refusal: it would stamp the very branches this layout exempts,
@@ -597,12 +649,12 @@ so a `nucleus` branch would refuse every write.
 
 **Correcting it is two edits, not one.** Delete the
 `[ovstorage.layers.attribution]` table, **and** re-point whatever named
-it at the layer it wrapped — for the shipped graph that means
-`root = "alias"` in place of `root = "attribution"`. Deleting the table
-on its own leaves `root` naming a layer that does not exist, and you get
-a second startup failure on the same restart, about a missing root, with
-no mention of attribution. With both edits done, an instance is placed
-on every branch that can carry the key, which is what you want.
+it at the layer it wrapped — in the canonical chain, restore
+`watch_limit.inner = "alias"`. Deleting the table on its own leaves an
+`inner` edge naming a layer that does not exist, and you get a second startup
+failure on the same restart, about a missing layer, with no mention of
+attribution. With both edits done, an instance is placed on every branch that
+can carry the key, which is what you want.
 Declaring them yourself works too, one directly above each capable
 backend.
 
@@ -932,6 +984,13 @@ answering — so a credential-bearing visibility prefix logs a warning at
 load whichever direction it takes. Only the direction that publishes is
 worth refusing to start over.
 
+Visibility remains three-way across the broker boundary. The broker advertises
+a `hidden` root to clients marked `hidden`; clients keep it addressable while
+omitting it from ordinary route listings, so hiding a prefix does not sever
+remote reachability. A `suppressed` root is absent from the wire entirely, and
+a caller that supplies its address receives `NoRoute` without learning that the
+prefix exists.
+
 Making such a rule visible later is refused too, not only at load: a
 `hidden` rule with credentials in its prefix cannot be patched to
 `visible` through `update_connection_attributes`, since that reaches the
@@ -986,6 +1045,66 @@ envelope is the backend saying when it wants the redirect re-minted.
 The lever over the exfiltration window is
 `redirect_credential_disclosure`, which decides whether a redirect
 broader than the request reaches the client at all.
+
+### Continuation seals for client-driven writes
+
+The broker seals every write continuation it hands to a remote client, on by
+default with no configuration. The versioned envelope uses HMAC-SHA256 to bind
+the opaque plugin continuation bytes to the parsed request address. At the top
+of the client-driven `continue_write` RPC, before cardinality and status checks
+or Stack dispatch, the broker verifies and removes the envelope. Invalid,
+edited, foreign-key, and different-address continuations fail as
+`InvalidArgument`; the plugin receives only its original continuation bytes.
+Later redirect rounds are sealed in the same way.
+
+With no `[continuation_seal]` table, the broker generates a random key for the
+process. Unix SIGHUP rebuilds carry that key into the replacement `Broker`, so
+an in-flight upload survives an ordinary config reload. A process restart
+generates a different key. Configure `key_path` when either of these is true:
+
+- Any replica can receive a `continue_write` for a batch another replica
+  issued. Every replica in that broker deployment must read the same key.
+- In-flight redirected writes must continue across a process restart. The
+  restarted process must read the same stable key.
+
+The file contains at least 32 raw random bytes; the broker uses the first 32.
+Do not store hex or base64 text in it. Generate an owner-readable key before
+starting the service, for example:
+
+```sh
+umask 077
+openssl rand 32 > /etc/ovstorage/continuation-seal.key
+chown ovstorage:ovstorage /etc/ovstorage/continuation-seal.key
+```
+
+Then configure:
+
+```toml
+[continuation_seal]
+key_path = "/etc/ovstorage/continuation-seal.key"
+```
+
+Keep the key inside one broker trust boundary. Separate single-tenant broker
+deployments use separate keys. Rotating the file or switching from the implicit
+key invalidates every continuation issued under the previous key; clients must
+restart those writes.
+
+The seal authenticates only the continuation bytes and their request-address
+binding. It does not authenticate the redirect result batch, provide freshness,
+prevent replay of a genuine continuation to its own address, or bind the
+principal that starts a write to the principal that continues it. Stack-internal
+follower routes do not use it. In a broker chain, each broker seals and verifies
+its own client-facing hop; this does not prove deeper-host attribution or
+replace the operator's trusted-upstream decision.
+
+During a rolling upgrade, keep every RPC for an in-flight redirected write on
+replicas that use a compatible continuation-envelope format and seal key. If
+`write_redirect` and a later `continue_write` reach incompatible replicas,
+`continue_write` fails as `InvalidArgument` and the client must restart the
+write. Drain redirected writes before mixing versions, or use version-sticky
+routing that keeps the initial `write_redirect` and every `continue_write` round
+on compatible replicas until the rollout completes. Every sealed-format replica
+that may continue another replica's write must read the same shared key.
 
 ### What a forwarded redirect discloses
 
@@ -1189,6 +1308,195 @@ The per-mode detail is on each plugin page, under "Redirect credential
 scope" — for example the
 [Azure plugin page](../plugin-storage/plugin-azure.md#redirect-credential-scope).
 
+### What an anonymous fallback reaches
+
+An `s3://`, `gs://` or `azure://` address that no configured connection
+serves answers `NoRoute`, and nothing is attempted. That is the default,
+and `anonymous_fallback_schemes` is the list of schemes for which the
+broker does something else: it routes such an address to the backend
+layer of its scheme, which attempts it **anonymously** — no credential
+of any kind is attached, not this process's ambient identity, not a
+credentials file, not an instance-metadata service — and serves reads
+only. A public bucket becomes readable through the broker without a
+connection per bucket.
+
+Whether that is acceptable is a property of your deployment, not of any
+connection, which is why the key is yours to set. A brokered fetch runs
+from **this broker's network position** and reaches whatever that
+position reaches: a bucket behind a VPC endpoint, a MinIO on the same
+subnet, an origin your callers cannot see from where they sit. With the
+list empty the broker contacts exactly the endpoints its connections
+name; with a scheme listed, any caller the auth layer admits chooses
+which bucket of that scheme the broker contacts next. For the cloud
+schemes that choice is bounded — the host is derived from the bucket
+name and the region, and the transport is anonymous — but only you can
+say whether clients of this broker should be able to point it at
+buckets you did not configure.
+
+| Scheme | What the caller controls | What the broker contacts | Credential on the wire |
+|---|---|---|---|
+| `s3` | Bucket and key | `{bucket}.s3.{region}.amazonaws.com` (path-style `s3.{region}.amazonaws.com` for a bucket name containing a dot), or the layer's `anonymous_fallback_endpoint` | None |
+| `gs` | Bucket and object | `storage.googleapis.com`, or the layer's `anonymous_fallback_endpoint` | None |
+| `azure` | Account, container and blob | `{account}.blob.{suffix}`, with `anonymous_fallback_endpoint_suffix` (default `core.windows.net`) | None |
+
+`http://` and `https://` are a separate key because they are a
+different proposition. An http fallback is not a public bucket but an
+arbitrary origin: the caller controls the whole host, so turning it on
+makes the broker an anonymous proxy for its callers — every client the
+policy admits reaches anything this broker can reach. That switch is
+`anonymous_http_fallback`, default `refuse`, and **`allow` is refused at
+startup in this release**, in which the http tier is not available: a
+grant that did nothing would be worse than one that fails loud.
+
+The graph must be able to carry a granted scheme. The backend layer of
+each listed scheme's kind (`[ovstorage.layers.s3]`,
+`[ovstorage.layers.gcs]`, `[ovstorage.layers.azure]`) must be declared
+and reachable from `root` — through the router's `children`, through a
+wrapper's `inner`, or as the root itself. The carrier is resolved
+against that routed graph, not the declaration table, because the Stack
+builder instantiates exactly the layers `root` reaches. A grant whose
+kind has no layer refuses startup with `InvalidArgument` naming the
+table to declare; one whose only layer of the kind is declared but not
+routed is refused naming that layer (`` `anonymous_fallback_schemes`
+grants `gs`, but layer `gcs` of kind `gcs` is declared and not reachable
+from the graph's root, so the grant would sit inert: add it to the
+router's `children` (or make it the root, or a wrapper's `inner`) ``);
+and two routed layers of one kind are refused as well, because two
+scheme roots for one scheme shadow each other silently. Only routed
+layers are counted, so a declared-but-unrouted duplicate does not trip
+that refusal. The broker stamps the grant onto that layer as its
+`anonymous_fallback` key — the same way it stamps
+`redirect_credential_disclosure` onto the follower — and a graph that
+writes that layer key by hand is refused at startup rather than
+honoured as a second spelling of this policy. The shipped
+`ovstorage-broker.toml` declares only `file`, so its list stays empty
+until a cloud layer is added.
+
+What a granted layer publishes is one hidden address root per scheme,
+spelled `s3:///`, `gs:///` or `azure:///` and carrying the
+`org.omniverse.ovstorage/scheme-fallback` metadata key. It is a route,
+not a connection: `list_connections` does not show it, nothing is
+persisted, and `root_info_for` on a bucket reached this way answers
+that scheme root, never a synthesized per-bucket root. A configured
+connection for a bucket outranks the fallback for that bucket. An
+address whose query carries a credential — an S3 presign, an Azure SAS
+— never takes the fallback and answers `NoRoute` exactly as with the
+grant off; only a version selector — `versionId`, `versionid`,
+`generation` or `revision` — rides along.
+Every mutation — write, delete, copy, rename, directory and metadata
+changes, `watch_directory` — answers `Unsupported` naming the fallback
+before any request is sent, with a `next_action` that points at adding
+a connection for the bucket.
+
+#### What is refused whatever you set
+
+Every major cloud runs an HTTP service on a fixed address that hands an
+instance its own identity: AWS IMDS at `169.254.169.254` and
+`fd00:ec2::254`, the ECS task-credential endpoint at `169.254.170.2`,
+GCE at `metadata.google.internal`, Azure IMDS at the same IPv4 address
+again and the Azure wireserver at `168.63.129.16`, Alibaba Cloud ECS at
+`100.100.100.200`.
+A process that can be talked into fetching from one of those on a
+caller's behalf hands the caller the instance's role credentials, and a
+fallback whose host the caller chooses is exactly that surface. So the
+host the fallback derives from an address, a configured fallback
+endpoint, and every redirect destination on every http connection is
+judged **before any socket opens**: any IPv4 address in
+`169.254.0.0/16`, `100.100.100.200`, `168.63.129.16`, any IPv6 address
+in `fe80::/10`, `fd00:ec2::254`, the IPv4-mapped and IPv4-compatible
+IPv6 embeddings of a refused IPv4 address, and the exact names
+`metadata.google.internal`, `metadata.goog` and `metadata` are refused
+with `PermissionDenied` naming only the origin:
+
+```
+PermissionDenied: refusing to contact http://169.254.169.254: it is a cloud instance-metadata endpoint, and ovstorage never fetches from one on a caller's behalf
+```
+
+No grant, no policy rule and no `redirect_policy` — an allow-listed
+host included — reopens it. Names match exactly, never by suffix:
+`metadata.google.internal.evil.test` is somebody else's host, and so is
+`evil.metadata.goog`. One trailing dot is stripped, because
+`metadata.google.internal.` is the fully qualified spelling of the
+same name.
+
+Two limits are worth knowing. The predicate judges the host as written,
+so a DNS name that resolves to a link-local address passes it; only a
+connector that resolves and then checks the resolved address before
+dialing closes that gap, and none does in this release. And a
+configured connection whose endpoint names one of these hosts is
+honoured with a warning, because an operator wrote it. This refusal is
+a guard against the literal forms every published exploit reaches for
+first, not a substitute for egress policy: a broker that must not reach
+a network should be unable to reach it.
+
+#### What it costs
+
+One anonymous client is built per distinct bucket (S3, GCS) or
+account-and-container pair (Azure) the fallback serves, on first touch,
+and kept in a bounded cache: `anonymous_fallback_max_backends` on the
+layer, default 64, least-recently-used eviction. Builds are metered by
+`anonymous_fallback_mints_per_minute`, default 120, and a first touch
+beyond the budget answers `ResourceExhausted` ("anonymous fallback mint
+budget exhausted; retry later"), retryable, so a caller inventing bucket
+names cannot make the broker build clients without bound. Concurrent
+first touches of one bucket build once. S3 adds one unsigned
+`HeadBucket` per cold bucket to learn its region from
+`x-amz-bucket-region` — sent to `anonymous_fallback_region`, default
+`us-east-1`, remembered per bucket, skipped when
+`anonymous_fallback_endpoint` is set — and a bucket that does not exist
+answers `NotFound` without being remembered. A probe the store did not
+judge — a `3xx` naming no region, a `429` or `5xx`, a transport failure
+— is remembered for one minute, during which the bucket answers
+`ResourceExhausted` naming the wait ("the region probe for this bucket
+failed recently; it is not sent again for another N s") before any
+build is charged. GCS and Azure build with no request at all. Nothing
+is persisted: the cache, the learned regions and the hidden root exist
+only in the running process and regenerate from the grant.
+
+Each first build is logged once at `INFO` under the `ovstorage.fallback`
+target with the scheme and the origin (`s3://bucket-name`), never the
+key; the routing tier's own hit is a `DEBUG` line with the same
+redaction.
+
+#### Authorization
+
+A fallback grants **routability, never authority**. The listener's auth
+layer evaluates the caller's address before routing, and a caller the
+policy does not cover is denied before the fallback is consulted — no
+outbound request, no client build, no region probe. A bucket nobody
+configured is denied until a rule whose prefix pins its scheme, host
+and path (`s3://public-bucket/`) allows it, and no rule is generated for
+a fallback-reached address. `root_info_for` on an address the caller
+holds no rule for answers `NoRoute` with the router's own message,
+exactly as for an address no route serves: a hidden root the caller may
+not see is indistinguishable from an absent one. A rule on
+`s3://public-bucket/` does not cover the scheme root `s3:///`, so
+`list_address_roots` withholds the hidden root from a principal holding
+only bucket-scoped rules; a rule whose prefix is the bare scheme,
+`prefix = "s3://"`, lists it and grants nothing on any bucket. The
+[authorization policy guide](../authz-policy/README.md) carries the
+matching rules.
+
+#### Brokered clients
+
+A `broker-client` layer routes by the roots this broker advertises, and
+it honours an advertised scheme root only when its **own** layer table
+grants the scheme — `anonymous_fallback = ["s3"]` under
+`[ovstorage.layers.broker]` in the client's config. Without the local
+grant the root is dropped at ingestion (a `DEBUG` line names the
+scheme) and the client answers `NoRoute` itself, whatever this broker
+would do. With it, the client ingests the root read-only whatever
+capability bits the wire asserted, and refuses every mutation and
+`watch_directory` on an address the root answers before any request
+reaches this broker, with the same `Unsupported` the cloud layers
+return and a `next_action` naming the address's origin
+(`s3://public-bucket/`). And this broker advertises the hidden root
+only to a principal whose rules cover the bare scheme root with `read`
+or `list`, since that is what root visibility checks. So a brokered
+fallback read needs three things in place: this broker's grant, the
+client's grant, and a principal who holds both a bare-scheme rule, to
+receive the root, and a bucket rule, to read through it.
+
 ### Serving through a backing-store outage
 
 The shipped `ovstorage-broker.toml` sets `lost_backing_fallback = true`
@@ -1198,6 +1506,14 @@ content it proved for the address rather than failing the read, and
 with this key set that includes a `stat` answering `NotFound`. See
 [`configuration.md`](../configuration.md#byte_cache-availability-fallback)
 for the full error-shape breakdown.
+
+The fallback requires a nonempty etag declared `Strong`, because only strong
+validators can publish the availability row that identifies the last proven
+content. Backends returning `Weak` or `Unspecified` validators bypass byte-cache
+lookup and fill, so they have no fallback row to serve. In particular, the
+built-in `file:` backend declares its synthesized size-plus-mtime validator
+`Weak`; a broker serving a `file:` root returns the backing-store error during
+an outage, including `NotFound`, instead of stale cached bytes.
 
 One bound is worth an operator's attention. A backend mutation and the
 cache invalidation that follows it are two stores with no shared
@@ -1286,7 +1602,8 @@ Prometheus `/metrics` is opt-in via `[observability] prometheus_bind =
 "HOST:PORT"`; when set, the broker spawns an axum listener and serves
 `text/plain; version=0.0.4` exposition.
 
-Ten metric families register at startup:
+The broker defines eleven metric families. Event-driven series appear after
+their first observation unless noted otherwise:
 
 - `broker_rpc_seconds` (histogram, label `op`) — RPC latency. Dormant
   (no observation sites in the current broker).
@@ -1299,6 +1616,12 @@ Ten metric families register at startup:
 - `broker_watch_fanout` (gauge) — dormant.
 - `broker_redirect_emissions_total` (label `kind` in `read|write`) —
   increments at every fixture-driven and plugin-driven redirect.
+- `broker_continuation_seal_refusals_total` (label `reason` in
+  `malformed|tag|mac`) — all three reasons register at zero during startup,
+  then increment when the client-driven `continue_write` RPC refuses an
+  invalid continuation seal. A sustained `mac` rate on only part of a replica
+  fleet can indicate mismatched shared keys; address substitution and edited
+  continuations also fail MAC verification.
 - `broker_lifecycle_events_total` (label `event` in
   `reload_ok|reload_failed|drain_start|drain_complete`).
 - `broker_uptime_seconds`.
@@ -1396,6 +1719,16 @@ raw bearer tokens, credential bytes, or usable signed URLs.
    a missing or misnamed plugin manifest fails startup.
 3. Confirm the embedded Stack publishes the expected address roots through the
    broker's `ListAddressRoots` RPC.
+4. A hidden scheme root (`s3:///`, `gs:///`, `azure:///`) reaches a brokered
+   client only for a principal whose rules cover the bare scheme root
+   (`prefix = "s3://"` with `read` or `list`) and only when the client's own
+   `broker` layer grants the scheme; otherwise the client drops the root at
+   ingestion and answers `NoRoute` itself.
+5. `NoRoute` on a scheme that `anonymous_fallback_schemes` grants means the
+   address carried a credential-bearing query — an S3 presign or an Azure SAS
+   never takes the fallback. A graph with no layer of that kind, or whose
+   only layer of that kind is declared but not reachable from `root`, is
+   refused at startup, so neither can be the running broker's cause.
 
 ### "Streaming writes are slow / corrupted / aborted"
 
@@ -1434,14 +1767,15 @@ to the longest legitimate request your workload tolerates.
 
 ## Implementation gaps
 
-- **Per-principal connection / RPC / watch limits.** A competing-consumer
-  backend's SDK `WatchCoalescer` bounds each subscriber's queue depth (overflow
-  injects a `Lapsed`) but enforces **no** per-principal watcher limit — a
-  per-principal limit belongs at a central chokepoint (the broker or a limit
-  layer), not in each backend's coalescer (where it would be
-  per-principal-per-backend). There is no global per-watch-key fan-out cap
-  either. Broader per-principal
-  connection and RPC quotas mapped to `ResourceExhausted` are not implemented.
+- **Watch admission is bounded; broader quotas are not.** The broker-native
+  `watch_limit` Layer centrally admits at most 256 watches per principal and
+  4096 total by default, globally across listeners, connections, routes, and
+  backends. Operators can override both positive limits under
+  `[ovstorage.layers.watch_limit]`; an exhausted dimension returns
+  `ResourceExhausted`. The SDK `WatchCoalescer` separately bounds each logical
+  subscriber's queue at 256 and injects `Lapsed` on overflow. There is no
+  separate global per-watch-key fan-out cap. Broader per-principal connection
+  and RPC quotas remain unimplemented.
 - **Durable audit sinks.** No `AuditRecord` / `AuditEvent` type,
   durable sink, or operator-facing `explain-decision` tool is
   provided. Diagnostic fields land in tracing spans, error details,

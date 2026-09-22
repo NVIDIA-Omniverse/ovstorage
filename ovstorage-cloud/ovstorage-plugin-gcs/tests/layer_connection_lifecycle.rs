@@ -9,19 +9,22 @@
 //! service-account JSON's `token_uri` points at a mock IdP, so only synthetic
 //! tokens ever travel; no real network).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::Duration;
 
+use ovstorage_plugin::fallback::{SCHEME_FALLBACK_METADATA_KEY, is_scheme_fallback_root};
 use ovstorage_plugin::{
-    AuthenticateRequest, BackendFactory, Body, ConfigValue, ConnectionAuthState, ConnectionKey,
-    ConnectionRequest, ErrorCode, InteractiveAuthCapability, LayerConfig, LayerConnectionRequest,
-    LayerHandle, ListOptions, ListRequest, ObjectInfo, ObjectKind, ReadOptions, ReadRequest,
-    ReadResult, Request, SecretBundle, SecretBytes, SecretValue, StatOptions, StatRequest,
-    UpdateConnectionCredentialsRequest, WriteOptions, WriteRequest, address,
+    AddressVisibility, AuthenticateRequest, BackendFactory, Body, ConfigValue, ConnectionAuthState,
+    ConnectionKey, ConnectionRequest, ErrorCode, InteractiveAuthCapability, LayerConfig,
+    LayerConnectionRequest, LayerHandle, ListOptions, ListRequest, ObjectInfo, ObjectKind,
+    RangeReadStrategy, ReadOptions, ReadRequest, ReadResult, Request, RootInfo, SecretBundle,
+    SecretBytes, SecretValue, StatOptions, StatRequest, UpdateConnectionCredentialsRequest,
+    WriteOptions, WriteRequest, address,
 };
 use ovstorage_plugin_gcs::GcsLayerFactory;
 use ovstorage_plugin_test::{CannedHttpResponse, ScriptedHttpServer};
@@ -1354,4 +1357,649 @@ async fn minting_a_read_redirect_does_not_promote_a_parked_connection() {
         matches!(state, ConnectionAuthState::AwaitingAuth { .. }),
         "a locally-minted redirect is not proof of a working credential, got {state:?}"
     );
+}
+
+// === anonymous gs:// scheme fallback ===
+//
+// A layer granted `anonymous_fallback = ["gs"]` publishes one hidden, marked
+// `gs:///` root and serves any `gs://bucket/...` address no connection routes
+// through an anonymous per-bucket backend. Everything below drives the layer
+// the way a host does; the fixture endpoint is the shared scripted server,
+// reached through the `anonymous_fallback_endpoint` layer key.
+
+const FALLBACK_KEY: &str = "anonymous_fallback";
+const FALLBACK_ENDPOINT_KEY: &str = "anonymous_fallback_endpoint";
+
+/// The host's wrapper shape for an array-valued layer key: the array
+/// reserialized under its own key.
+fn fallback_grant(schemes: &[&str]) -> ConfigValue {
+    let list = schemes
+        .iter()
+        .map(|scheme| format!("\"{scheme}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    ConfigValue::Toml(format!("{FALLBACK_KEY} = [{list}]\n"))
+}
+
+async fn create_layer(config: LayerConfig) -> ovstorage_plugin::Result<LayerHandle> {
+    GcsLayerFactory::default()
+        .create_backend("gcs", &config, None)
+        .await
+}
+
+/// The refusal `create_backend` answers for `config`; panics if it builds.
+async fn create_layer_error(config: LayerConfig) -> ovstorage_plugin::Error {
+    match create_layer(config).await {
+        Err(error) => error,
+        Ok(_) => panic!("create_backend must refuse this layer config"),
+    }
+}
+
+/// A layer whose only configuration is the `gs` grant pointed at `endpoint`.
+fn fallback_config(endpoint: &str) -> LayerConfig {
+    let mut config = LayerConfig::new();
+    config.insert(FALLBACK_KEY.into(), fallback_grant(&["gs"]));
+    config.insert(
+        FALLBACK_ENDPOINT_KEY.into(),
+        ConfigValue::String(endpoint.into()),
+    );
+    config
+}
+
+async fn fallback_layer(endpoint: &str) -> LayerHandle {
+    create_layer(fallback_config(endpoint))
+        .await
+        .expect("a granted layer builds")
+}
+
+async fn roots_of(layer: &LayerHandle) -> Vec<RootInfo> {
+    let (snapshot, _) = layer
+        .list_address_roots(&ovstorage_plugin::Extensions::new(), None)
+        .await
+        .unwrap();
+    snapshot.roots
+}
+
+async fn connection_count(layer: &LayerHandle) -> usize {
+    let (snapshot, _) = layer
+        .list_connections(&ovstorage_plugin::Extensions::new(), None)
+        .await
+        .unwrap();
+    snapshot.connections.len()
+}
+
+async fn root_for(layer: &LayerHandle, address: &str) -> ovstorage_plugin::Result<RootInfo> {
+    layer
+        .root_info_for(
+            &address::parse(address).unwrap(),
+            &ovstorage_plugin::Extensions::new(),
+            None,
+        )
+        .await
+}
+
+/// Rendered `tracing` events captured for the duration of one test. Hand-rolled
+/// on `tracing` alone: this crate carries no subscriber crate, and the two
+/// facts these tests need — how many backends were minted, and what the
+/// first-touch line names — are legible from the rendered fields.
+///
+/// The subscriber is installed ONCE as the process-global default and fans
+/// events out to a thread-local sink, rather than being set per test as a
+/// scoped default. A scoped default is not enough here: `tracing` registers a
+/// callsite lazily, the first time it fires anywhere in the process, and
+/// computes its interest from the registering thread's dispatcher when only
+/// one scoped dispatcher is alive. Tests run in parallel, so the mint line's
+/// callsite can first fire on a thread with no subscriber, be cached as
+/// "never", and stay silent for the test that installed a capture — measured,
+/// roughly one run in ten. A global dispatcher is always the one consulted, so
+/// the interest is always "sometimes" and every thread's events reach it; the
+/// thread-local sink keeps each test's lines its own, because a
+/// `#[tokio::test]` runs its whole future on the test's thread.
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<String>>>);
+
+/// The message the fallback logs once per minted backend.
+const BUILT_MESSAGE: &str = "anonymous fallback backend built";
+
+thread_local! {
+    static SINK: RefCell<Option<CapturedLogs>> = const { RefCell::new(None) };
+}
+
+static INSTALL_CAPTURE: Once = Once::new();
+
+impl CapturedLogs {
+    fn install(&self) -> CaptureGuard {
+        INSTALL_CAPTURE.call_once(|| {
+            // Nothing else in this binary sets a global subscriber; if that
+            // changes, the capture sees nothing and the assertions on it say so.
+            let _ = tracing::subscriber::set_global_default(CaptureSubscriber);
+        });
+        SINK.with(|sink| *sink.borrow_mut() = Some(self.clone()));
+        CaptureGuard
+    }
+
+    fn lines(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .expect("the capture lock is not poisoned")
+            .clone()
+    }
+
+    fn built_lines(&self) -> Vec<String> {
+        self.lines()
+            .into_iter()
+            .filter(|line| line.contains(BUILT_MESSAGE))
+            .collect()
+    }
+}
+
+/// Detaches this thread's sink when the test ends.
+struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        SINK.with(|sink| sink.borrow_mut().take());
+    }
+}
+
+struct CaptureSubscriber;
+
+impl tracing::Subscriber for CaptureSubscriber {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        SINK.with(|sink| {
+            let Some(logs) = sink.borrow().clone() else {
+                return;
+            };
+            let mut rendered = format!("{} ", event.metadata().target());
+            event.record(&mut RenderVisitor(&mut rendered));
+            logs.0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .push(rendered);
+        });
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+struct RenderVisitor<'a>(&'a mut String);
+
+impl tracing::field::Visit for RenderVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, "{}={value:?} ", field.name());
+    }
+}
+
+/// Without a grant nothing changes: an unconfigured bucket is `NoRoute`, and
+/// the message is the one every host already matches on.
+#[tokio::test]
+async fn fallback_is_off_by_default() {
+    let layer = empty_layer().await;
+    let err = stat_at(&layer, "gs://x/y").await.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::NoRoute);
+    assert_eq!(err.message(), "no route matches address");
+    assert!(roots_of(&layer).await.is_empty());
+
+    // An explicit empty grant is off too, and publishes no root.
+    let mut config = LayerConfig::new();
+    config.insert(FALLBACK_KEY.into(), fallback_grant(&[]));
+    let layer = create_layer(config).await.unwrap();
+    let err = stat_at(&layer, "gs://x/y").await.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::NoRoute);
+    assert!(roots_of(&layer).await.is_empty());
+    assert_eq!(connection_count(&layer).await, 0);
+}
+
+/// The grant is layer policy, not a connection: a table holding only the
+/// fallback keys seeds nothing, and the one root it publishes is the hidden,
+/// marked scheme root with no connection behind it.
+#[tokio::test]
+async fn a_layer_holding_only_the_fallback_key_seeds_no_static_connection() {
+    let mut config = LayerConfig::new();
+    config.insert(FALLBACK_KEY.into(), fallback_grant(&["gs"]));
+    let layer = create_layer(config).await.unwrap();
+
+    assert_eq!(connection_count(&layer).await, 0, "no static connection");
+    let roots = roots_of(&layer).await;
+    let [root] = roots.as_slice() else {
+        panic!("exactly the scheme root is published, got {roots:?}");
+    };
+    assert_eq!(root.root.as_str(), "gs:///");
+    assert!(is_scheme_fallback_root(root));
+    assert_eq!(root.layer_kind, "gcs");
+    assert_eq!(root.visibility, AddressVisibility::Hidden);
+    assert!(!root.visible);
+    assert!(root.connection_id.is_none());
+    assert!(root.owning_target.is_none());
+    assert_eq!(
+        root.user_metadata
+            .get(SCHEME_FALLBACK_METADATA_KEY)
+            .map(String::as_str),
+        Some("anonymous")
+    );
+    // `root_info_for` on an unconfigured address answers that same root
+    // verbatim — never a synthesized per-bucket root.
+    let via_address = root_for(&layer, "gs://bkt/obj.txt").await.unwrap();
+    assert_eq!(&via_address, root);
+    // The fallback runs the same client a connection does, so the strategy a
+    // consumer reads off a fallback-served address is the one a connection
+    // root advertises for the same store.
+    assert_eq!(via_address.range_read_strategy, RangeReadStrategy::Native);
+}
+
+/// The fallback root clamps the plugin's auth-agnostic capability set to its
+/// read side: every mutation and watch bit is off, every read bit is on.
+#[tokio::test]
+async fn the_fallback_root_advertises_no_write_bits() {
+    let mut config = LayerConfig::new();
+    config.insert(FALLBACK_KEY.into(), fallback_grant(&["gs"]));
+    let layer = create_layer(config).await.unwrap();
+    let roots = roots_of(&layer).await;
+    let caps = &roots[0].capabilities;
+
+    assert!(!caps.supports_write);
+    assert!(!caps.supports_write_stream);
+    assert!(!caps.supports_write_redirect);
+    assert!(!caps.supports_delete);
+    assert!(!caps.supports_copy);
+    assert!(!caps.supports_server_side_copy);
+    assert!(!caps.supports_rename);
+    assert!(!caps.supports_create_directory);
+    assert!(!caps.supports_delete_directory);
+    assert!(!caps.supports_native_metadata_patch);
+    assert!(!caps.supports_if_match_write);
+    assert!(!caps.supports_no_overwrite_write);
+    assert!(!caps.supports_watch_directory);
+    assert!(caps.watch_directory_max_lag.is_none());
+
+    assert!(caps.supports_list);
+    assert!(caps.supports_list_stream);
+    assert!(caps.supports_recursive_list);
+    assert!(caps.wants_list_backed_stat);
+    assert!(caps.supports_version_listing);
+    assert!(caps.supports_access_check);
+    assert!(
+        !caps.has_real_directories,
+        "GCS is flat under the fallback too"
+    );
+}
+
+/// The GCS kind serves `gs` and nothing else; a grant naming another scheme
+/// is a configuration error, not a silent no-op.
+#[tokio::test]
+async fn a_fallback_key_naming_a_scheme_this_layer_does_not_serve_is_refused() {
+    for schemes in [&["s3"][..], &["gs", "azure"][..], &["https"][..]] {
+        let mut config = LayerConfig::new();
+        config.insert(FALLBACK_KEY.into(), fallback_grant(schemes));
+        let err = create_layer_error(config).await;
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{schemes:?}");
+        let foreign = schemes.iter().find(|scheme| **scheme != "gs").unwrap();
+        assert!(
+            err.message().contains(&format!(
+                "names scheme `{foreign}`, which this kind does not serve"
+            )),
+            "{}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("it serves gs"),
+            "the refusal names what the kind does serve: {}",
+            err.message()
+        );
+    }
+}
+
+/// A grant is a security decision, so its shape is strict: a bare string is
+/// not read as a one-element array.
+#[tokio::test]
+async fn a_non_array_fallback_key_is_refused_at_create_backend() {
+    for value in [
+        ConfigValue::String("gs".into()),
+        ConfigValue::Bool(true),
+        ConfigValue::Int(1),
+        ConfigValue::Toml("anonymous_fallback = \"gs\"\n".into()),
+    ] {
+        let mut config = LayerConfig::new();
+        config.insert(FALLBACK_KEY.into(), value.clone());
+        let err = create_layer_error(config).await;
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{value:?}");
+        assert_eq!(
+            err.message(),
+            "`anonymous_fallback` must be a TOML array of scheme strings"
+        );
+    }
+}
+
+/// A misspelled tunable is refused by name rather than parsed as nothing.
+#[tokio::test]
+async fn an_unknown_fallback_tunable_is_refused_at_create_backend() {
+    let mut config = LayerConfig::new();
+    config.insert(FALLBACK_KEY.into(), fallback_grant(&["gs"]));
+    config.insert("anonymous_fallback_max_backend".into(), ConfigValue::Int(3));
+    let err = create_layer_error(config).await;
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    assert!(
+        err.message()
+            .contains("`anonymous_fallback_max_backend` on layer `gcs`"),
+        "{}",
+        err.message()
+    );
+}
+
+/// A fallback endpoint on a cloud instance-metadata host is refused when the
+/// layer is built, before any backend could be pointed at it.
+#[tokio::test]
+async fn a_link_local_fallback_endpoint_is_refused_at_create_backend() {
+    for endpoint in ["http://169.254.169.254", "http://metadata.google.internal"] {
+        let err = create_layer_error(fallback_config(endpoint)).await;
+        assert_eq!(err.code(), ErrorCode::PermissionDenied, "{endpoint}");
+        assert!(
+            err.message().contains("instance-metadata"),
+            "{}",
+            err.message()
+        );
+    }
+}
+
+/// A fallback endpoint that embeds a credential, or carries a query or
+/// fragment, is refused when the layer is built. The tier's promise is that no
+/// credential travels; a URL-embedded one would ride every request as a Basic
+/// `Authorization` header and come back to the caller in the `read` redirect.
+/// The refusal names the key and the layer and never echoes the value.
+#[tokio::test]
+async fn a_credential_bearing_fallback_endpoint_is_refused_at_create_backend() {
+    for endpoint in [
+        "http://reader:hunter2@127.0.0.1:1",
+        "http://@127.0.0.1:1",
+        "http://127.0.0.1:1/?alt=media",
+        "http://127.0.0.1:1/#anchor",
+    ] {
+        let err = create_layer_error(fallback_config(endpoint)).await;
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{endpoint}");
+        assert!(
+            err.message()
+                .contains("`anonymous_fallback_endpoint` on layer `gcs`"),
+            "{}",
+            err.message()
+        );
+        assert!(
+            !err.message().contains("hunter2"),
+            "the refusal never echoes the credential: {}",
+            err.message()
+        );
+    }
+}
+
+/// Fallback keys belong to the layer table. On a connection request — probe or
+/// add — they are refused with guidance, and nothing is registered.
+#[tokio::test]
+async fn a_connection_request_carrying_a_fallback_key_is_refused() {
+    let storage = spawn_scripted_server("200 OK", EMPTY_LIST_BODY);
+    let layer = empty_layer().await;
+    for (key, value) in [
+        (FALLBACK_KEY, fallback_grant(&["gs"])),
+        (
+            FALLBACK_ENDPOINT_KEY,
+            ConfigValue::String(storage.endpoint().into()),
+        ),
+    ] {
+        let mut request = connection_request("bkt", storage.endpoint(), SecretBundle::default());
+        request.config.insert(key.into(), value);
+        let expected = format!(
+            "`{key}` is a layer key, not connection config; set it on [ovstorage.layers.gcs]"
+        );
+
+        let probe_err = layer
+            .probe(
+                Request::new(LayerConnectionRequest {
+                    target: "gcs".into(),
+                    connection: request.clone(),
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(probe_err.code(), ErrorCode::InvalidArgument, "probe {key}");
+        assert_eq!(probe_err.message(), expected);
+
+        let add_err = layer
+            .add_connection(
+                Request::new(LayerConnectionRequest {
+                    target: "gcs".into(),
+                    connection: request,
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(add_err.code(), ErrorCode::InvalidArgument, "add {key}");
+        assert_eq!(add_err.message(), expected);
+    }
+    assert_eq!(connection_count(&layer).await, 0);
+    assert_eq!(storage.hits(), 0, "a refused request reaches no service");
+}
+
+/// Both spellings of a hostless address — the bare scheme root and a hostless
+/// path — are first-tier hits under `gs:///`; the fallback refuses them because
+/// there is no bucket to mint for, and nothing reaches the wire.
+#[tokio::test]
+async fn the_scheme_root_itself_is_invalid_argument() {
+    let storage = spawn_scripted_server("200 OK", OBJECT_BODY);
+    let layer = fallback_layer(storage.endpoint()).await;
+    for spelling in ["gs:///", "gs:///k", "gs:///a/b.txt"] {
+        let err = stat_at(&layer, spelling).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{spelling}");
+        assert_eq!(err.message(), "a gs:// address names no bucket");
+    }
+    let err = layer
+        .list(
+            Request::new(ListRequest {
+                prefix: address::parse("gs:///").unwrap(),
+                options: ListOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    assert_eq!(storage.hits(), 0);
+}
+
+/// A query that carries anything but a version selector authenticates itself
+/// (a signed URL's signature, say), so the second tier never answers it: the
+/// caller sees the byte-identical `NoRoute`.
+#[tokio::test]
+async fn a_presigned_or_sas_query_falls_through_to_no_route() {
+    let storage = spawn_scripted_server("200 OK", OBJECT_BODY);
+    let layer = fallback_layer(storage.endpoint()).await;
+    for address in [
+        "gs://bkt/obj.txt?X-Goog-Signature=abc",
+        "gs://bkt/obj.txt?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=x",
+        "gs://bkt/obj.txt?sig=abc",
+    ] {
+        let err = stat_at(&layer, address).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NoRoute, "{address}");
+        assert_eq!(err.message(), "no route matches address");
+    }
+    assert_eq!(storage.hits(), 0);
+    // Control: the same object without the query is served.
+    stat_at(&layer, "gs://bkt/obj.txt")
+        .await
+        .expect("the unsigned spelling reaches the fallback");
+    assert_eq!(storage.hits(), 1);
+}
+
+/// A configured connection for a bucket outranks the fallback for that bucket
+/// alone, and installing it evicts the anonymous backend the fallback had
+/// cached — measured by the mint log: after the connection is removed the
+/// bucket is minted again rather than served from a stale resident.
+#[tokio::test]
+async fn a_configured_root_outranks_the_fallback_and_install_evicts_the_cached_backend() {
+    let logs = CapturedLogs::default();
+    let _guard = logs.install();
+    let fallback_store = spawn_scripted_server("200 OK", OBJECT_BODY);
+    let configured_store = spawn_scripted_server("200 OK", OBJECT_BODY);
+    let layer = fallback_layer(fallback_store.endpoint()).await;
+
+    stat_at(&layer, "gs://bkt/obj.txt").await.unwrap();
+    assert_eq!(fallback_store.hits(), 1);
+    assert_eq!(logs.built_lines().len(), 1, "first touch mints bkt");
+    // A hit does not mint again.
+    stat_at(&layer, "gs://bkt/obj.txt").await.unwrap();
+    assert_eq!(logs.built_lines().len(), 1);
+
+    let connection = add(
+        &layer,
+        connection_request("bkt", configured_store.endpoint(), SecretBundle::default()),
+    )
+    .await;
+    let root = root_for(&layer, "gs://bkt/obj.txt").await.unwrap();
+    assert_eq!(root.root.as_str(), "gs://bkt/");
+    assert_eq!(root.connection_id, Some(connection.id.clone()));
+    stat_at(&layer, "gs://bkt/obj.txt").await.unwrap();
+    assert_eq!(
+        configured_store.hits(),
+        1,
+        "the connection serves its bucket"
+    );
+    assert_eq!(
+        fallback_store.hits(),
+        2,
+        "the fallback is not consulted for it"
+    );
+    // Other buckets still fall back.
+    stat_at(&layer, "gs://other/obj.txt").await.unwrap();
+    assert_eq!(fallback_store.hits(), 3);
+    assert_eq!(logs.built_lines().len(), 2);
+    let scheme_root = root_for(&layer, "gs://other/obj.txt").await.unwrap();
+    assert_eq!(scheme_root.root.as_str(), "gs:///");
+    // The scheme root is published beside the connection's root, ranked last.
+    let roots = roots_of(&layer).await;
+    assert_eq!(roots.len(), 2, "{roots:?}");
+    assert!(roots.iter().any(|root| root.root.as_str() == "gs://bkt/"));
+    assert!(roots.iter().any(|root| root.root.as_str() == "gs:///"));
+
+    layer
+        .remove_connection(
+            Request::new(ConnectionKey {
+                target: "gcs".into(),
+                id: connection.id.clone(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    stat_at(&layer, "gs://bkt/obj.txt").await.unwrap();
+    assert_eq!(fallback_store.hits(), 4, "the fallback serves bkt again");
+    assert_eq!(
+        logs.built_lines().len(),
+        3,
+        "installing the connection evicted the cached backend, so bkt is minted anew"
+    );
+}
+
+/// `anonymous_fallback_max_backends` bounds the resident set: with a bound of
+/// one, touching a second bucket evicts the first, which is minted again on
+/// its next touch.
+#[tokio::test]
+async fn cached_backends_are_bounded() {
+    let logs = CapturedLogs::default();
+    let _guard = logs.install();
+    let storage = spawn_scripted_server("200 OK", OBJECT_BODY);
+    let mut config = fallback_config(storage.endpoint());
+    config.insert(
+        "anonymous_fallback_max_backends".into(),
+        ConfigValue::Int(1),
+    );
+    let layer = create_layer(config).await.unwrap();
+
+    stat_at(&layer, "gs://alpha/obj.txt").await.unwrap();
+    stat_at(&layer, "gs://alpha/other.txt").await.unwrap();
+    assert_eq!(logs.built_lines().len(), 1, "alpha is resident");
+    stat_at(&layer, "gs://beta/obj.txt").await.unwrap();
+    assert_eq!(logs.built_lines().len(), 2, "beta evicts alpha");
+    stat_at(&layer, "gs://alpha/obj.txt").await.unwrap();
+    assert_eq!(logs.built_lines().len(), 3, "alpha is minted again");
+    assert_eq!(storage.hits(), 4, "every stat was served");
+}
+
+/// `anonymous_fallback_mints_per_minute` bounds how many buckets are minted
+/// per sliding minute; past it a cold bucket answers a retryable
+/// `ResourceExhausted` while resident buckets keep answering.
+#[tokio::test]
+async fn the_mint_budget_answers_resource_exhausted() {
+    let storage = spawn_scripted_server("200 OK", OBJECT_BODY);
+    let mut config = fallback_config(storage.endpoint());
+    config.insert(
+        "anonymous_fallback_mints_per_minute".into(),
+        ConfigValue::Int(1),
+    );
+    let layer = create_layer(config).await.unwrap();
+
+    stat_at(&layer, "gs://alpha/obj.txt").await.unwrap();
+    let err = stat_at(&layer, "gs://beta/obj.txt").await.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ResourceExhausted);
+    assert_eq!(
+        err.message(),
+        "anonymous fallback mint budget exhausted; retry later"
+    );
+    assert!(err.code().retryable());
+    assert!(err.next_action().is_some());
+    assert_eq!(storage.hits(), 1, "the refused bucket reaches no service");
+    stat_at(&layer, "gs://alpha/other.txt")
+        .await
+        .expect("a resident bucket keeps answering");
+    assert_eq!(storage.hits(), 2);
+}
+
+/// The first-touch line names the bucket origin and nothing else: no object
+/// key, no query.
+#[tokio::test]
+async fn first_touch_logs_the_origin_and_not_the_key() {
+    let logs = CapturedLogs::default();
+    let _guard = logs.install();
+    let storage = spawn_scripted_server("200 OK", OBJECT_BODY);
+    let layer = fallback_layer(storage.endpoint()).await;
+
+    stat_at(&layer, "gs://bucket-name/secret/path.bin")
+        .await
+        .unwrap();
+
+    let built = logs.built_lines();
+    assert_eq!(built.len(), 1, "one mint for the bucket: {built:?}");
+    let line = &built[0];
+    assert!(line.starts_with("ovstorage.fallback "), "{line}");
+    assert!(line.contains("scheme=\"gs\""), "{line}");
+    assert!(line.contains("gs://bucket-name"), "{line}");
+    for withheld in ["secret", "path.bin"] {
+        assert!(!line.contains(withheld), "`{withheld}` leaked into: {line}");
+    }
+    // The route table's own tier-two line is equally reticent.
+    let routed: Vec<String> = logs
+        .lines()
+        .into_iter()
+        .filter(|line| line.contains("routing by scheme fallback"))
+        .collect();
+    assert!(!routed.is_empty(), "the second tier logged the hit");
+    for line in &routed {
+        assert!(line.contains("gs://bucket-name"), "{line}");
+        for withheld in ["secret", "path.bin"] {
+            assert!(!line.contains(withheld), "`{withheld}` leaked into: {line}");
+        }
+    }
 }

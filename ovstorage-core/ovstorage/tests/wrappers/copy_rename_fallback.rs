@@ -8,19 +8,22 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
 
-use ovstorage::layers::COPY_RENAME_FALLBACK_KIND;
+use ovstorage::layers::{COPY_RENAME_FALLBACK_KIND, REDIRECT_FOLLOWER_KIND};
 use ovstorage::{
-    Body, CancellationToken, Capabilities, ConfigValue, CopyOptions, CopyRequest, DeleteRequest,
-    Error, ErrorCode, ErrorContext, IfDestExists, Layer, LayerConfig, LayerKindDescriptor,
-    LocalDelegate, ReadRequest, ReadResult, ReadStream, RenameOptions, RenameRequest, Request,
-    Result, RootInfo, Url, WriteRequest, WriteResult, WriteStep,
+    AccessOps, Body, CancellationToken, Capabilities, ConfigValue, CopyOptions, CopyRequest,
+    DeleteRequest, Error, ErrorCode, ErrorContext, HttpRequest, IfDestExists, Layer, LayerConfig,
+    LayerKindDescriptor, LayerSpec, LocalDelegate, ReadRedirect, ReadRequest, ReadResult,
+    ReadStream, RedirectCredential, RedirectScope, RenameOptions, RenameRequest, Request,
+    ResponseParsing, Result, RootInfo, Stack, Url, WriteRequest, WriteResult, WriteStep,
 };
 use ovstorage_plugin_core::CopyRenameFallbackWrapperFactory;
 use ovstorage_plugin_core::MAX_BUFFERED_TRANSFER_BYTES;
+use ovstorage_plugin_http::RedirectFollowerWrapperFactory;
 
 use crate::common::*;
 
@@ -33,6 +36,8 @@ use crate::common::*;
 enum SourceBody {
     /// `ReadResult::Bytes` with this content.
     Bytes(Vec<u8>),
+    /// `ReadResult::Redirect` with this delegable redirect.
+    Redirect(Box<ReadRedirect>),
     /// `ReadResult::Stream` yielding `chunks`, then optionally failing with
     /// `trailing_error`, then optionally never terminating (`pend`, for the
     /// cancellation test).
@@ -138,6 +143,32 @@ fn transfer_root(prefix: &str) -> RootInfo {
     // rename must advertise delete too.
     root.capabilities.supports_delete = true;
     root
+}
+
+/// A fresh request-scoped read redirect that a host may safely delegate.
+fn delegable_read_redirect(url: impl Into<String>) -> ReadRedirect {
+    let url = url.into();
+    let expires_at = SystemTime::now() + Duration::from_secs(60);
+    ReadRedirect {
+        request: HttpRequest {
+            method: "GET".into(),
+            url: url.clone(),
+            headers: Vec::new(),
+        },
+        response_parsing: ResponseParsing::default(),
+        expires_at,
+        scope: RedirectScope {
+            physical_url_prefix: url,
+            operations: AccessOps {
+                read: true,
+                ..Default::default()
+            },
+            expires_at,
+            credential: RedirectCredential::None,
+        },
+        audit_id: String::new(),
+        policy_epoch: 0,
+    }
 }
 
 impl FallbackProbe {
@@ -265,6 +296,7 @@ impl Layer for FallbackProbe {
                 bytes: bytes.clone(),
                 info: object_info(address, bytes.len() as u64),
             }),
+            SourceBody::Redirect(redirect) => Ok(ReadResult::Redirect(redirect.as_ref().clone())),
             SourceBody::Stream {
                 chunks,
                 trailing_error,
@@ -541,6 +573,160 @@ async fn copy_rename_fallback_falls_back_to_read_write() {
     assert_eq!(written.len(), 1);
     assert_eq!(written[0].0, destination);
     assert_eq!(written[0].1, b"payload");
+}
+
+fn assert_unfollowed_redirect_contract(error: &Error) {
+    assert_eq!(error.code(), ErrorCode::Unsupported, "{error}");
+    assert!(
+        !error.message().contains("must compose below"),
+        "the error must not assert a composition-rule cause: {error}"
+    );
+    let guidance = format!(
+        "{} {}",
+        error.message(),
+        error.next_action().unwrap_or_default()
+    );
+    assert!(
+        guidance.contains("follow_reads_max_bytes"),
+        "the error must point at the redirect follower's size cap: {error}"
+    );
+    assert!(
+        guidance.contains("follow_reads = false") && guidance.contains("follow_reads = true"),
+        "the error must name and remedy a deliberately disabled follower: {error}"
+    );
+}
+
+#[tokio::test]
+async fn buffered_fallback_reports_an_unfollowed_read_redirect() {
+    let backend = FallbackProbe::with_source(
+        SourceBody::Redirect(Box::new(delegable_read_redirect(
+            "https://storage.example/source",
+        ))),
+        true,
+        write_only_roots(),
+    );
+    let stack = build_stack(
+        COPY_RENAME_FALLBACK_KIND,
+        Arc::new(CopyRenameFallbackWrapperFactory),
+        backend.clone(),
+        LayerConfig::new(),
+    )
+    .await
+    .unwrap();
+
+    let error = stack
+        .copy(
+            Request::new(CopyRequest {
+                source: Url::parse("file:///src/obj").unwrap(),
+                destination: Url::parse("file:///dst/obj").unwrap(),
+                options: CopyOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    assert_unfollowed_redirect_contract(&error);
+    assert_eq!(backend.write_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn streaming_fallback_reports_an_unfollowed_read_redirect() {
+    let mut dst = transfer_root("file:///dst/");
+    dst.capabilities.supports_write_stream = true;
+    let backend = FallbackProbe::with_source(
+        SourceBody::Redirect(Box::new(delegable_read_redirect(
+            "https://storage.example/source",
+        ))),
+        true,
+        vec![transfer_root("file:///src/"), dst],
+    );
+    let stack = build_stack(
+        COPY_RENAME_FALLBACK_KIND,
+        Arc::new(CopyRenameFallbackWrapperFactory),
+        backend.clone(),
+        LayerConfig::new(),
+    )
+    .await
+    .unwrap();
+
+    let error = stack
+        .copy(
+            Request::new(CopyRequest {
+                source: Url::parse("file:///src/obj").unwrap(),
+                destination: Url::parse("file:///dst/obj").unwrap(),
+                options: CopyOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    assert_unfollowed_redirect_contract(&error);
+    assert_eq!(backend.write_stream_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_cap_redirect_follower_surfaces_the_fallback_error() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/obj"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 4096]))
+        .mount(&server)
+        .await;
+
+    let backend = FallbackProbe::with_source(
+        SourceBody::Redirect(Box::new(delegable_read_redirect(format!(
+            "{}/obj",
+            server.uri()
+        )))),
+        true,
+        write_only_roots(),
+    );
+    let mut follower_config = LayerConfig::new();
+    follower_config.insert("follow_reads".into(), ConfigValue::Bool(true));
+    follower_config.insert("follow_reads_max_bytes".into(), ConfigValue::Int(16));
+    let mut follower_spec = LayerSpec::wrapper("follower", REDIRECT_FOLLOWER_KIND, "backend");
+    follower_spec.config = follower_config;
+    let stack = Stack::builder("fallback")
+        .wrapper_factory(Arc::new(CopyRenameFallbackWrapperFactory))
+        .wrapper_factory(Arc::new(RedirectFollowerWrapperFactory))
+        .backend_factory(Arc::new(SharedBackendFactory {
+            backend: backend.clone(),
+        }))
+        .layer(LayerSpec::wrapper(
+            "fallback",
+            COPY_RENAME_FALLBACK_KIND,
+            "follower",
+        ))
+        .layer(follower_spec)
+        .layer(LayerSpec::backend("backend", PROBE_KIND))
+        .build()
+        .await
+        .unwrap();
+
+    let error = stack
+        .copy(
+            Request::new(CopyRequest {
+                source: Url::parse("file:///src/obj").unwrap(),
+                destination: Url::parse("file:///dst/obj").unwrap(),
+                options: CopyOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    assert_unfollowed_redirect_contract(&error);
+    assert_eq!(backend.write_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "the redirect follower must inspect the response before declining it"
+    );
 }
 
 #[tokio::test]

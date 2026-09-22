@@ -100,13 +100,16 @@ impl BrokerClientTransport for Broker {
         Broker::get_latest_version(self, &context, address).await
     }
 
-    async fn watch_directory(
+    async fn watch_directory_with_cancel(
         &self,
         prefix: Url,
         opts: ovstorage::WatchDirectoryOptions,
+        cancel: Option<ovstorage::CancellationToken>,
     ) -> ovstorage::Result<BrokerClientWatchDirectoryStream> {
         let context = default_context();
-        Broker::watch_directory(self, &context, prefix, opts).await
+        let (stream, _rpc_cancel) =
+            Broker::watch_directory_with_cancel(self, &context, prefix, opts, cancel).await?;
+        Ok(stream)
     }
 
     async fn create_directory(

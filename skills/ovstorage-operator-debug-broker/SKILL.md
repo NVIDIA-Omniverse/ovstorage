@@ -53,7 +53,14 @@ any backend dispatch.
 6. For "broker is up but no routes are visible," check
    `[[connections]]` blocks: backends register at startup; a
    missing or misnamed plugin manifest fails startup. Confirm
-   `OVSTORAGE_PLUGIN_DIR` is set and readable.
+   `OVSTORAGE_PLUGIN_DIR` is set and readable. Remember that
+   `list-routes` shows only roots marked `visible`: the broker carries a
+   `hidden` root to clients marked hidden, and the client keeps it routable
+   without listing it. A `suppressed` root is absent from the wire and a direct
+   caller receives `NoRoute`, as does an address whose scheme is not in
+   `anonymous_fallback_schemes` when no connection serves it. A granted scheme
+   reaches clients as a hidden `s3:///` root, and a brokered client honours it
+   only when its own `[ovstorage.layers.broker]` table grants the scheme too.
 7. For streaming-write issues (slow, corrupted, aborted),
    distinguish:
    - **Graceful EOF** (`Ok(None)` from the inbound stream) —

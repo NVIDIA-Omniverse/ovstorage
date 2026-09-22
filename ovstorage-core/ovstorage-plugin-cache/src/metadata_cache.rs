@@ -120,8 +120,14 @@ impl WrapperFactory for MetadataCacheWrapperFactory {
 
 /// Caches `stat`/`list` metadata, preserving the host metadata-cache
 /// behavior over the [`MetadataCache`]. `stat` is served
-/// from the `Stat` cache (non-directory, non-`full_metadata`); `list` fills a
-/// `List` entry plus a per-file `Stat` entry (so later `stat`s hit). Mutations
+/// from the `Stat` cache (non-directory; the row's cost flags must cover the
+/// request's); `list` fills a `List` entry plus a per-file `Stat` entry (so
+/// later `stat`s hit). Rows are one per address and record the cost flags
+/// (`full_metadata`, `versioned_address`) they were fetched under; a request
+/// the row covers is served, a wider one goes upstream once under the union
+/// and replaces the row. Rows a listing fills record only the
+/// `versioned_address` flag the listing was asked to carry, never
+/// `full_metadata`, which only a direct `stat` can vouch for. Mutations
 /// (`write`/`delete`/`copy`/`rename`/`create_directory`/`delete_directory`/
 /// `update_metadata`) invalidate the affected address and any parent listings,
 /// including parent listings.
@@ -211,6 +217,16 @@ impl MetadataCacheWrapper {
         if !crate::routing::list_is_cacheable(prefix, options) {
             return;
         }
+        // A listing vouches only for the pin it was asked to carry: under the
+        // flag every versioning backend pays for the pin on each file entry,
+        // so its rows may answer a flagged stat. No listing carries the
+        // per-object metadata a `full_metadata` stat pays for (S3
+        // `ListObjectsV2` and Azure `List Blobs` return none), so its rows
+        // never claim that flag and such a stat reaches the backend.
+        let flags = CostFlags {
+            full_metadata: false,
+            versioned_address: options.versioned_address,
+        };
         let mut retained = self.cache.insert(
             MetadataCacheKey {
                 kind: MetadataKind::List,
@@ -223,9 +239,9 @@ impl MetadataCacheWrapper {
                 // nothing could read.
                 address: ovstorage_layer::node_spellings(prefix).1,
                 credential_scope: credential_scope(prefix),
-                options_hash: hash_list_options(options),
             },
             MetadataCachePayload::List(page.clone()),
+            flags,
         );
         for item in &page.items {
             if item.kind == ObjectKind::File {
@@ -246,9 +262,9 @@ impl MetadataCacheWrapper {
                         // the credential the backend answered under, and only
                         // the request carries that.
                         credential_scope: credential_scope(prefix),
-                        options_hash: hash_stat_options(&StatOptions::default()),
                     },
                     MetadataCachePayload::Stat(item.clone()),
+                    flags,
                 );
             }
         }
@@ -280,6 +296,7 @@ impl MetadataCacheWrapper {
     async fn stat_from_parent_list(
         &self,
         request: &Request<StatRequest>,
+        requested: CostFlags,
         cancel: Option<CancellationToken>,
     ) -> ListBackedStat {
         let addr = &request.input.address;
@@ -298,8 +315,8 @@ impl MetadataCacheWrapper {
         let Some((parent, _name)) = address::parent_and_name(addr) else {
             return ListBackedStat::Unavailable;
         };
-        // A cached parent listing answers unconditionally: the
-        // list is already paid for, whatever route it came from.
+        // A cached parent listing answers when its flags cover the stat's:
+        // the list is already paid for, whatever route it came from.
         let principal = Self::principal_of(&request.extensions);
         let list_key = MetadataCacheKey {
             kind: MetadataKind::List,
@@ -308,10 +325,17 @@ impl MetadataCacheWrapper {
             // caller's own list cached is found whichever spelling they used.
             address: ovstorage_layer::node_spellings(&parent).1,
             credential_scope: credential_scope(&parent),
-            options_hash: hash_list_options(&ListOptions::default()),
         };
-        if let Some(MetadataCachePayload::List(page)) = self.cache.get(&list_key) {
+        if let MetadataLookup::Hit(MetadataCachePayload::List(page)) =
+            self.cache.get(&list_key, requested)
+        {
             return Self::find_in_page(&page, addr);
+        }
+        // A flag means the caller pays for THIS object, not for a listing of
+        // its directory: a flagged stat never buys a listing of its own, and
+        // the backend stat is the cheaper answer.
+        if !requested.is_empty() {
+            return ListBackedStat::Unavailable;
         }
         // A fresh listing is fetched only for routes that opt in.
         let opted_in = self
@@ -458,28 +482,41 @@ impl Layer for MetadataCacheWrapper {
             return self.inner.stat(request, cancel).await;
         }
         let address = request.input.address.clone();
-        let cacheable = crate::routing::stat_is_cacheable(&address, &request.input.options);
-        let cache_key = cacheable.then(|| MetadataCacheKey {
+        let requested = CostFlags::from(&request.input.options);
+        let cache_key = crate::routing::stat_is_cacheable(&address).then(|| MetadataCacheKey {
             kind: MetadataKind::Stat,
             principal_id: Self::principal_of(&request.extensions),
             address: ovstorage_layer::node_address(&address),
             credential_scope: credential_scope(&address),
-            options_hash: hash_stat_options(&request.input.options),
         });
-        if let Some(key) = &cache_key
-            && let Some(MetadataCachePayload::Stat(mut info)) = self.cache.get(key)
-        {
-            // A hit registers too: a directory read constantly but always
-            // served from cache would otherwise be the least-recently-used
-            // scope and lose the very watch keeping it hittable.
-            self.watch_state.note_cached(&address);
-            info.address = address;
-            return Ok(info);
+        // The flags the backend call carries: the request's own, widened to a
+        // narrower row's when one exists, so one refetch replaces the row with
+        // one that answers both.
+        let mut upstream = requested;
+        if let Some(key) = &cache_key {
+            match self.cache.get(key, requested) {
+                MetadataLookup::Hit(MetadataCachePayload::Stat(mut info)) => {
+                    // A hit registers too: a directory read constantly but
+                    // always served from cache would otherwise be the
+                    // least-recently-used scope and lose the very watch keeping
+                    // it hittable.
+                    self.watch_state.note_cached(&address);
+                    // Only the address is the caller's spelling; the pin is the
+                    // row's own answer and stays.
+                    info.address = address;
+                    return Ok(info);
+                }
+                MetadataLookup::Narrower { stored } => upstream = stored.union(requested),
+                MetadataLookup::Hit(_) | MetadataLookup::Miss => {}
+            }
         }
         // List-backed fallback for eligible object-form stats that
         // missed the Stat cache (directory forms delegate inside the probe).
         if cache_key.is_some() {
-            match self.stat_from_parent_list(&request, cancel.clone()).await {
+            match self
+                .stat_from_parent_list(&request, requested, cancel.clone())
+                .await
+            {
                 ListBackedStat::Found(info) => {
                     self.watch_state.note_cached(&address);
                     return Ok(*info);
@@ -498,16 +535,20 @@ impl Layer for MetadataCacheWrapper {
                 ListBackedStat::Unavailable => {}
             }
         }
+        let mut request = request;
+        upstream.widen_stat(&mut request.input.options);
         let info = self.inner.stat(request, cancel).await?;
         // Fill the `Stat` cache from an eligible successful direct stat
-        // under exactly the key the lookup above uses. List also fills
+        // under exactly the key the lookup above uses, stored under the flags
+        // the call went upstream with — the union when a narrower row was
+        // found — so the row only widens between refreshes. List also fills
         // `Stat` entries only from `list`, so every repeated direct stat
         // re-delegated; the layered cache closes that hole. The mutation
         // invalidation below removes these entries the same way it removes
         // list-filled ones (identical key space).
         if let Some(key) = cache_key {
             self.cache
-                .insert(key, MetadataCachePayload::Stat(info.clone()));
+                .insert(key, MetadataCachePayload::Stat(info.clone()), upstream);
             self.watch_state.note_cached(&address);
         }
         Ok(info)
@@ -535,6 +576,21 @@ impl Layer for MetadataCacheWrapper {
         let page = self.inner.list(request, cancel).await?;
         self.store_list(&prefix, &options, &page, principal.as_deref());
         Ok(page)
+    }
+
+    /// Pass streaming listings through without populating metadata-cache rows.
+    ///
+    /// Gen1 list-backed stat treats a cached, terminal [`ListPage`] as an
+    /// authoritative view of a directory. A stream may be dropped after any
+    /// entry, so caching entries as they pass would let a partial listing
+    /// answer a later stat with a false `NotFound`. Streaming entries therefore
+    /// remain uncached until the cache has a completeness-aware representation.
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        self.inner.list_stream(request, cancel).await
     }
 
     // --- mutations: invalidate after success --------------------------------
@@ -708,5 +764,149 @@ impl Layer for MetadataCacheWrapper {
                 gap_cache.invalidate_lists_containing(&gap_prefix);
             },
         )))
+    }
+}
+
+#[cfg(test)]
+mod list_stream_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::StreamExt as _;
+
+    use super::*;
+
+    const STREAM_ITEMS: usize = 128;
+    const CONSUMED_ITEMS: usize = 3;
+
+    #[derive(Clone, Default)]
+    struct FlowCounters {
+        produced: Arc<AtomicUsize>,
+        released: Arc<AtomicUsize>,
+        peak_in_flight: Arc<AtomicUsize>,
+    }
+
+    struct PullListingLayer {
+        counters: FlowCounters,
+    }
+
+    #[async_trait]
+    impl Layer for PullListingLayer {
+        fn name(&self) -> &str {
+            "pull-listing"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            descriptor("pull-listing", LayerType::Backend, false)
+        }
+
+        async fn list_stream(
+            &self,
+            _request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ListStream> {
+            let counters = self.counters.clone();
+            Ok(Box::pin(futures::stream::unfold(0usize, move |index| {
+                let counters = counters.clone();
+                async move {
+                    if index == STREAM_ITEMS {
+                        return None;
+                    }
+                    let produced = counters.produced.fetch_add(1, Ordering::SeqCst) + 1;
+                    let in_flight =
+                        produced.saturating_sub(counters.released.load(Ordering::SeqCst));
+                    counters
+                        .peak_in_flight
+                        .fetch_max(in_flight, Ordering::SeqCst);
+                    Some((Ok(item(index)), index + 1))
+                }
+            })))
+        }
+    }
+
+    fn item(index: usize) -> ObjectInfo {
+        ObjectInfo::from((
+            Url::parse(&format!("test:///root/item-{index}")).unwrap(),
+            BackendItemInfo {
+                kind: ObjectKind::File,
+                ..BackendItemInfo::default()
+            },
+        ))
+    }
+
+    fn request() -> Request<ListRequest> {
+        Request::new(ListRequest {
+            prefix: Url::parse("test:///root/").unwrap(),
+            options: ListOptions::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn streaming_invariant_passes_entries_without_caching_partial_state() {
+        let counters = FlowCounters::default();
+        let cache = Arc::new(MetadataCache::new(&MetadataCacheConfig::default()));
+        let wrapper = MetadataCacheWrapperFactory::with_cache(Arc::clone(&cache))
+            .create_wrapper(
+                "metadata-cache",
+                &LayerConfig::new(),
+                Arc::new(PullListingLayer {
+                    counters: counters.clone(),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut stream = wrapper.list_stream(request(), None).await.unwrap();
+        assert_eq!(
+            counters.produced.load(Ordering::SeqCst),
+            0,
+            "opening the wrapper must not prefetch the inner stream"
+        );
+
+        for index in 0..CONSUMED_ITEMS {
+            assert_eq!(stream.next().await.unwrap().unwrap(), item(index));
+            assert_eq!(
+                counters.produced.load(Ordering::SeqCst),
+                index + 1,
+                "one consumer pull must produce exactly one inner entry"
+            );
+            counters.released.fetch_add(1, Ordering::SeqCst);
+        }
+        drop(stream);
+
+        assert_eq!(
+            counters.produced.load(Ordering::SeqCst),
+            CONSUMED_ITEMS,
+            "dropping a partial stream must stop inner production"
+        );
+        assert!(
+            counters.peak_in_flight.load(Ordering::SeqCst) <= 1,
+            "the wrapper accumulated more than one entry"
+        );
+
+        let prefix = Url::parse("test:///root/").unwrap();
+        let list_key = MetadataCacheKey {
+            kind: MetadataKind::List,
+            principal_id: None,
+            address: ovstorage_layer::node_spellings(&prefix).1,
+            credential_scope: credential_scope(&prefix),
+        };
+        assert!(
+            cache.get(&list_key, CostFlags::default()).hit().is_none(),
+            "a partial stream must not seed an authoritative List row"
+        );
+        for index in 0..CONSUMED_ITEMS {
+            let address = item(index).address;
+            let stat_key = MetadataCacheKey {
+                kind: MetadataKind::Stat,
+                principal_id: None,
+                address: ovstorage_layer::node_address(&address),
+                credential_scope: credential_scope(&prefix),
+            };
+            assert!(
+                cache.get(&stat_key, CostFlags::default()).hit().is_none(),
+                "a streamed entry must not seed list-backed Stat state"
+            );
+        }
     }
 }

@@ -19,21 +19,27 @@ PYTHON ?= python3
 endif
 OV := $(PYTHON) tools/ovtasks
 
-.PHONY: verify help validate-skills lint-public-docs lint-source-headers lint-abi-mint-chokepoint lint-bridge-gil \
+.PHONY: verify help validate-skills lint-public-docs lint-source-headers lint-abi-mint-chokepoint lint-layer-ownership lint-bridge-gil \
         lint-comment-hygiene lint-auth-test-root lint-auth-root-delegation lint-no-keyring-dependency \
            \
         regenerate-headers verify-headers-clean \
         c-source-examples regenerate-third-party-notices verify-third-party-notices-clean \
         fmt fmt-check fmt-toml fmt-toml-check cargo-deny cargo-machete \
-        clippy doc test test-ci test-python build-test-plugins install-tools build dist dist-wheel release-archive
+        clippy doc test test-ci python-test-env test-python \
+        test-integration test-integration-live \
+        test-integration-python test-integration-python-live \
+        test-hub-live \
+        bench perf-live perf-smoke \
+        build-test-plugins install-tools build dist dist-wheel release-archive
 
 help:
 	@echo "Available targets:"
-	@echo "  verify                 — non-test gate: skills + public-doc lint + source notices + ABI mint chokepoint + headers + Rust/TOML format checks + cargo-deny + cargo-machete + clippy + doc"
+	@echo "  verify                 — non-test gate: skills + public-doc lint + source notices + ABI mint chokepoint + Layer ownership + headers + Rust/TOML format checks + cargo-deny + cargo-machete + clippy + doc"
 	@echo "  validate-skills        — validate publication frontmatter on repo-root agent skills"
 	@echo "  lint-public-docs       — fail if any markdown link in docs/public/ escapes the public surface"
 	@echo "  lint-source-headers    — fail if active source files lack SPDX/copyright notices"
 	@echo "  lint-abi-mint-chokepoint — fail if an async plugin slot completes outside the ABI mint chokepoint"
+	@echo "  lint-layer-ownership  — fail if the Layer ownership registry drifts from Rust"
 	@echo "  lint-bridge-gil          — fail if the Python bridge attaches to the interpreter outside its gate"
 	@echo "  lint-comment-hygiene   — fail if a code comment cites a GitHub issue number"
 	@echo "  lint-auth-test-root    — fail if a test recipe stops pinning OVSTORAGE_AUTH_DIR away from \$$HOME"
@@ -54,7 +60,16 @@ help:
 	@echo "  doc                    — cargo doc --workspace --document-private-items, -D on all three rustdoc link lints"
 	@echo "  test                   — cargo test --workspace (pre-builds test plugins to skip nested-cargo)"
 	@echo "  test-ci                — cargo test --workspace for hosted CI"
+	@echo "  python-test-env        — create target/python-test-venv and install the extension into it (shared by every Python gate)"
 	@echo "  test-python            — build/install the Python extension and run its pytest + stubtest gate"
+	@echo "  test-integration       — app-level integration suite, hermetic: file backend required, cloud backends forbidden"
+	@echo "  test-integration-live  — app-level integration suite against live cloud backends (sources LIVE_ENV_SCRIPT)"
+	@echo "  test-integration-python  — Python leg of the app-level integration suite, hermetic"
+	@echo "  test-integration-python-live — Python leg against live cloud backends (sources LIVE_ENV_SCRIPT)"
+	@echo "  test-hub-live          — hub_cache live tier against a real hub: reuses one on 14093 or launches one (OVSTORAGE_HUB_LIVE_EXE or a sibling omni-hub checkout)"
+	@echo "  bench                  — criterion micro-benchmarks, whole workspace"
+	@echo "  perf-live              — live read-perf harness against cloud backends (sources LIVE_ENV_SCRIPT)"
+	@echo "  perf-smoke             — read-perf harness, hermetic smoke run (file backend; plus emulators when configured)"
 	@echo "  build-test-plugins     — stage cdylib plugins under target/test-plugins/ for the OVSTORAGE_*_OVERRIDE env vars"
 	@echo "  install-tools          — cargo install taplo-cli, cargo-deny, cargo-machete, maturin, cbindgen; pip install tooling deps"
 	@echo "  build                  — cargo build --workspace"
@@ -63,7 +78,7 @@ help:
 	@echo "  release-archive        — full dist + tar.gz/zip at dist/ovstorage-vX.Y.Z-<platform>; PLATFORM=<name> overrides auto-detect"
 
 # --- Composite gate ---------------------------------------------------------
-verify: validate-skills lint-public-docs lint-source-headers lint-abi-mint-chokepoint lint-bridge-gil \
+verify: validate-skills lint-public-docs lint-source-headers lint-abi-mint-chokepoint lint-layer-ownership lint-bridge-gil \
         lint-comment-hygiene lint-auth-test-root lint-auth-root-delegation lint-no-keyring-dependency \
            \
         verify-third-party-notices-clean \
@@ -81,6 +96,9 @@ lint-source-headers:
 
 lint-abi-mint-chokepoint:
 	$(OV)/lint_abi_mint_chokepoint.py
+
+lint-layer-ownership:
+	$(OV)/lint_layer_ownership.py
 
 lint-bridge-gil:
 	$(OV)/lint_bridge_gil.py
@@ -211,17 +229,30 @@ TEST_ENV := \
   OVSTORAGE_S3_PLUGIN_SO_OVERRIDE=$(TEST_PLUGIN_DIR)/libovstorage_plugin_s3.so \
   OVSTORAGE_AZURE_PLUGIN_SO_OVERRIDE=$(TEST_PLUGIN_DIR)/libovstorage_plugin_azure.so \
   OVSTORAGE_GCS_PLUGIN_SO_OVERRIDE=$(TEST_PLUGIN_DIR)/libovstorage_plugin_gcs.so \
+  OVSTORAGE_HUGGINGFACE_PLUGIN_SO_OVERRIDE=$(TEST_PLUGIN_DIR)/libovstorage_plugin_huggingface.so \
   OVSTORAGE_OPENDAL_PLUGIN_SO_OVERRIDE=$(TEST_PLUGIN_DIR)/libovstorage_plugin_opendal.so \
   OVSTORAGE_NUCLEUS_PLUGIN_SO_OVERRIDE=$(TEST_PLUGIN_DIR)/libovstorage_plugin_nucleus.so \
   OVSTORAGE_REQUIRE_TEST_PLUGINS=1
 
+# `cargo test --workspace` includes `ovstorage-integration-tests`, whose
+# cases connect to whatever backends the *ambient shell* has credentials for. On
+# a developer machine that has sourced the live env, a plain `make test` would
+# silently do live cloud I/O against shared fixture buckets — slow, chargeable,
+# and mutating storage nobody asked it to touch. So the workspace gate pins the
+# same hermetic guard pair `test-integration` uses (defined below with the rest
+# of the integration knobs): `file` must connect, azure/s3/gcs/huggingface
+# must not, and an ambient credential (or, for the anonymous-capable
+# huggingface backend, its fixture variable alone) is a hard failure rather
+# than an invisible mode switch.
+# `test-integration-live` deliberately does NOT take this — it reads
+# OVSTORAGE_REQUIRE_LIVE_BACKENDS from the caller instead.
 test: build-test-plugins
-	$(TEST_ENV) cargo test --workspace
+	$(INTEGRATION_GUARD_ENV) $(TEST_ENV) cargo test --workspace
 
 # Single workspace, single target/ dir — the former per-workspace `cargo clean`
 # loop (a disk-pressure workaround for five duplicated dep graphs) is gone.
 test-ci: build-test-plugins
-	$(TEST_ENV) cargo test --workspace
+	$(INTEGRATION_GUARD_ENV) $(TEST_ENV) cargo test --workspace
 
 # The venv path carries the interpreter's full `major.minor.micro`. Creation is
 # guarded by `test -x $(PYTHON_TEST_VENV)/bin/python`, so an untagged path is
@@ -280,10 +311,14 @@ PYTHON_TEST_MATURIN = $(PYTHON_TEST_VENV)/bin/maturin
 PYTHON_TEST_PYTEST = $(PYTHON_TEST_VENV)/bin/python -m pytest
 PYTHON_CRATE_DIR := $(CURDIR)/ovstorage-core/ovstorage-python
 
-# Exercise the installed extension, including async tests and mypy.stubtest.
-# conftest.py honors OVSTORAGE_REQUIRE_TEST_PLUGINS by checking the test cdylib
-# before collection, so missing plugin coverage fails directly rather than
-# skipping or otherwise turning vacuously green.
+# Shared prerequisite of every Python gate (`test-python` and both integration
+# legs): one venv holding one `maturin develop --features test-probes` build of
+# the extension. Factored out because three targets need it and each of them is
+# reachable on its own from a clean tree — CI runs `test-python` and
+# `test-integration-python` in different jobs, and `test-integration-python-live`
+# in a third — so the setup cannot live in any one of them. Running two of them
+# in the same invocation still builds the extension once: make honors a phony
+# prerequisite at most once per run.
 #
 # `maturin develop` installs the pyproject `[dependency-groups]` dev group via
 # `pip install --group`, which needs pip >= 25.1; CI runner images can ship an
@@ -298,7 +333,7 @@ PYTHON_CRATE_DIR := $(CURDIR)/ovstorage-core/ovstorage-python
 # nothing. With `override` the recipe always sees the snapshot, which is the
 # only value any guard has inspected.
 test-python: export override OVSTORAGE_EXPECT_PYTHON := $(PYTHON_TEST_EXPECT_SNAPSHOT)
-test-python: build-test-plugins
+python-test-env: build-test-plugins
 	@test -n "$(PYTHON_TEST_TAG)" || { \
 	  echo "make test-python: PYTHON=$(PYTHON) is not runnable, so the venv path has no interpreter tag"; \
 	  exit 1; \
@@ -332,7 +367,189 @@ test-python: build-test-plugins
 	$(PYTHON_TEST_PIP) install --upgrade pip
 	$(PYTHON_TEST_PIP) install -r $(PYTHON_CRATE_DIR)/requirements-dev.txt maturin
 	cd $(PYTHON_CRATE_DIR) && VIRTUAL_ENV=$(PYTHON_TEST_VENV) $(PYTHON_TEST_MATURIN) develop --features test-probes
+
+# Exercise the installed extension, including async tests and mypy.stubtest.
+# conftest.py honors OVSTORAGE_REQUIRE_TEST_PLUGINS by checking the test cdylib
+# before collection, so missing plugin coverage fails directly rather than
+# skipping or otherwise turning vacuously green.
+test-python: python-test-env
 	cd $(PYTHON_CRATE_DIR) && NO_PROXY='$(NO_PROXY_ALL)' no_proxy='$(NO_PROXY_ALL)' OVSTORAGE_AUTH_DIR=$(TEST_AUTH_ROOT) OVSTORAGE_REQUIRE_TEST_PLUGINS=1 $(PYTHON_TEST_PYTEST) tests
+
+# --- App-level integration suite --------------------------------------------
+# `ovstorage-integration-tests` drives the shipped Stack/Layer API the way an
+# application does: build the default stack, dlopen the staged plugin cdylibs,
+# register one connection per backend, and operate by address. One scenario
+# contract, run from Rust (`--test live`) and from Python (tests/python).
+#
+# Backend selection is environment-driven, so both directions of "wrong
+# environment" have to be errors rather than a quietly smaller run:
+#
+# - OVSTORAGE_REQUIRE_HERMETIC_BACKENDS — a listed local/emulator backend that
+#   is not configured fails the run instead of skipping. The default local run
+#   requires only file; CI overrides the list after starting its emulators.
+# - OVSTORAGE_REQUIRE_LIVE_BACKENDS — the corresponding guard for live cloud
+#   fixtures. It is intentionally independent of the hermetic guard.
+# - OVSTORAGE_FORBID_LIVE_BACKENDS — a listed live cloud fixture that IS
+#   configured fails the run. Emulator targets of the same backend kind remain
+#   allowed. This keeps `test-integration` hermetic on a developer machine that
+#   already exports cloud credentials in its shell.
+INTEGRATION_PACKAGE := ovstorage-integration-tests
+INTEGRATION_PYTHON_TESTS := $(CURDIR)/ovstorage-integration-tests/tests/python
+
+# Guard env for the hermetic legs — `test` and `test-ci` above included, since
+# `cargo test --workspace` sweeps this package in. The live legs have their own
+# targets (`test-integration-live`, `test-integration-python-live`) and do not
+# reference this variable at all. Use those targets to reach live backends;
+# command-line overrides remain available for harness development.
+INTEGRATION_HERMETIC_REQUIRE ?= file
+INTEGRATION_GUARD_ENV := \
+  OVSTORAGE_REQUIRE_LIVE_BACKENDS= \
+  OVSTORAGE_REQUIRE_HERMETIC_BACKENDS=$(INTEGRATION_HERMETIC_REQUIRE) \
+  OVSTORAGE_FORBID_LIVE_BACKENDS=azure,s3,gcs,huggingface
+
+# `--nocapture`: the suite prints one line per scenario/backend, including the
+# visible skip lines. Capturing them makes a run that exercised nothing look
+# identical to a run that exercised everything.
+#
+# `--test cpp` alongside `--test live`: the C++ leg runs the same matrix as
+# `live` through the C++20 wrapper over a Rust->C++ handoff, and naming only
+# `live` here would leave it running nowhere but a bare `cargo test`. It skips
+# visibly, per case, when `build-test-plugins` could not build its driver.
+#
+# The C++ leg is Unix-only BY DESIGN, not by accident: `tests/cpp.rs` locates
+# its driver as `libovsx_cloud_cpp_driver.{so,dylib}` and dlopens it directly,
+# with no `.dll` name, no import-library link step, and no PATH/DLL-directory
+# staging for the transitive dependencies a Windows load would need. So on
+# Windows every C++ case fails the `OVSTORAGE_REQUIRE_TEST_PLUGINS=1` assertion
+# instead of running. The Rust and Python legs are portable; only this one is
+# gated, which is why the integration jobs in CI are Linux-only. Adding Windows
+# is a driver-packaging effort (DLL naming plus dependent-DLL staging), not a
+# runner change.
+INTEGRATION_TEST_TARGETS := --test live --test cpp
+
+test-integration: build-test-plugins
+	$(INTEGRATION_GUARD_ENV) $(TEST_ENV) \
+	  cargo test -p $(INTEGRATION_PACKAGE) $(INTEGRATION_TEST_TARGETS) -- --nocapture
+
+# Live counterpart: same suite, no FORBID guard, and OVSTORAGE_REQUIRE_LIVE_BACKENDS
+# comes from the caller's environment (CI sets it from a secret; locally you
+# pick which backends must be present). The credential script is `source`d into
+# one bash invocation because make gives each recipe line its own shell, and
+# `/bin/sh` cannot source it.
+#
+# Set OVSTORAGE_LIVE_AUTO_ENV=0 when the credentials are already exported in
+# your shell (or supplied by CI) and the script should not run at all. When
+# every required selector is anonymous (huggingface only), the prelude skips
+# the mapper on its own: sourcing it would export the other clouds' fixtures
+# and credentials and take them live in a run nobody asked to touch them. To
+# combine an anonymous selector with credentialed ones, just name both — any
+# azure/s3/gcs selector brings the mapper back; to force-source it for an
+# hf-only run, source it in your shell first.
+#
+# Private staging checkouts carry this credential mapper, while the public
+# source tree excludes it. A missing script is therefore normal for a public
+# consumer: the prelude prints a notice and uses the caller's exported
+# credentials. Set this hook explicitly to select another trusted mapper.
+LIVE_ENV_SCRIPT ?= $(CURDIR)/tools/vault/local_env.sh
+
+# The credential prelude both live targets share. It is a variable rather than
+# a target because `source` only affects the shell that runs it: the sourcing
+# and the test command have to be one `bash -c`, and make gives each recipe
+# line its own shell (`/bin/sh`, which has no `source`). `$$` survives make
+# expansion as a single `$` for that shell. Backslash-newlines collapse to
+# spaces inside a variable assignment, so this expands to one shell line.
+LIVE_ENV_PRELUDE = set -euo pipefail; \
+  live_cloud_selector=; \
+  live_credentialed_selector=; \
+  IFS=',' read -ra live_required_selectors <<< "$${OVSTORAGE_REQUIRE_LIVE_BACKENDS:-}"; \
+  for selector in "$${live_required_selectors[@]+"$${live_required_selectors[@]}"}"; do \
+    if [[ "$$selector" =~ ^[[:space:]]*(azure|s3|gcs|huggingface)(:(default|versioned|hns))?[[:space:]]*$$ ]]; then \
+      live_cloud_selector="$$selector"; \
+    fi; \
+    if [[ "$$selector" =~ ^[[:space:]]*(azure|s3|gcs)(:(default|versioned|hns))?[[:space:]]*$$ ]]; then \
+      live_credentialed_selector="$$selector"; \
+    fi; \
+  done; \
+  if [ -z "$$live_cloud_selector" ]; then \
+    echo "OVSTORAGE_REQUIRE_LIVE_BACKENDS must name at least one live cloud target (azure, s3, gcs, or huggingface, optionally followed by :default, :versioned, or :hns)" >&2; \
+    exit 2; \
+  fi; \
+  if [ "$${OVSTORAGE_LIVE_AUTO_ENV:-1}" = "0" ]; then \
+    echo "OVSTORAGE_LIVE_AUTO_ENV=0: using the credentials already in the environment"; \
+  elif [ -z "$$live_credentialed_selector" ]; then \
+    echo "OVSTORAGE_REQUIRE_LIVE_BACKENDS names only anonymous targets; skipping the credential mapper"; \
+  elif [ -r "$(LIVE_ENV_SCRIPT)" ]; then \
+    source "$(LIVE_ENV_SCRIPT)"; \
+  else \
+    echo "no credential script at $(LIVE_ENV_SCRIPT); using the credentials already in the environment"; \
+  fi
+
+test-integration-live: build-test-plugins
+	bash -c '$(LIVE_ENV_PRELUDE); \
+	  OVSTORAGE_REQUIRE_HERMETIC_BACKENDS= OVSTORAGE_FORBID_LIVE_BACKENDS= \
+	    $(TEST_ENV) cargo test -p $(INTEGRATION_PACKAGE) $(INTEGRATION_TEST_TARGETS) -- --nocapture'
+
+# The hub_cache live tier is connect-only, so this launches (or reuses) a
+# real hub for it — the one behavior a fixture cannot vouch for is the real
+# daemon's wire.
+test-hub-live:
+	$(OV)/hub_live.py test
+
+# Python leg, hermetic: the same guard pair as `test-integration`, applied to
+# the same scenario contract through the binding. OVSTORAGE_PLUGIN_DIR points
+# pytest at the same staged cdylibs the Rust leg dlopens.
+test-integration-python: python-test-env
+	$(INTEGRATION_GUARD_ENV) OVSTORAGE_PLUGIN_DIR=$(TEST_PLUGIN_DIR) \
+	  $(PYTHON_TEST_PYTEST) $(INTEGRATION_PYTHON_TESTS)
+
+# Live counterpart of the Python leg, standing in the same relation to
+# `test-integration-python` that `test-integration-live` does to
+# `test-integration`: no FORBID guard, OVSTORAGE_REQUIRE_LIVE_BACKENDS supplied
+# by the caller (CI sets it on the job; locally you pick), and the same
+# LIVE_ENV_SCRIPT sourcing. Without this target the Python scenarios only ever
+# ran against `file`, so every Python-side cloud path — the whole reason the
+# scenario contract is cross-binding — went unexercised.
+#
+# OVSTORAGE_REQUIRE_TEST_PLUGINS=1 matters more here than in the hermetic leg:
+# the cloud backends are reached through the staged plugin cdylibs, so a
+# staging regression would otherwise leave every cloud target unconfigured, and
+# unconfigured targets are exactly what REQUIRE turns into a failure. Setting
+# it makes the diagnosis "the plugins are missing" rather than "azure did not
+# connect".
+test-integration-python-live: python-test-env
+	bash -c '$(LIVE_ENV_PRELUDE); \
+	  OVSTORAGE_REQUIRE_HERMETIC_BACKENDS= OVSTORAGE_FORBID_LIVE_BACKENDS= \
+	    OVSTORAGE_PLUGIN_DIR=$(TEST_PLUGIN_DIR) OVSTORAGE_REQUIRE_TEST_PLUGINS=1 \
+	    $(PYTHON_TEST_PYTEST) $(INTEGRATION_PYTHON_TESTS)'
+
+# --- Performance ------------------------------------------------------------
+# Criterion micro-benchmarks (hermetic, in-process; no plugin staging — the
+# bench registers its backend factory directly). Keep this a lone cargo
+# invocation: `ovstorage`'s build script runs a nested cargo build, so a
+# second concurrent cargo command in this workspace can contend with it.
+bench:
+	cargo bench --workspace
+
+# Live read-perf harness: the perf counterpart of `test-integration-live`,
+# sharing its credential prelude and guard semantics (REQUIRE comes from the
+# caller, FORBID cleared). Dev profile on purpose: the staged plugin cdylibs
+# it dlopens are dev-profile, and keeping both sides of the ABI on one profile
+# makes runs comparable with each other, which is all trend tracking needs.
+# OVSTORAGE_PERF_OUTPUT (optional) names the JSON report path.
+perf-live: build-test-plugins
+	bash -c '$(LIVE_ENV_PRELUDE); \
+	  OVSTORAGE_REQUIRE_HERMETIC_BACKENDS= OVSTORAGE_FORBID_LIVE_BACKENDS= \
+	    $(TEST_ENV) cargo run -p ovstorage-perf --bin ovstorage-perf-live -- --profile nightly'
+
+# Hermetic smoke of the same binary: live backends forbidden by the same
+# guard pair `test-integration` pins, so it can run on any machine (and in
+# credential-free CI) to prove the harness has not rotted. It measures every
+# hermetic backend the environment configures: file only by default, file
+# plus the Azurite/fake-GCS emulators where CI (or a developer) exports their
+# endpoints.
+perf-smoke: build-test-plugins
+	$(INTEGRATION_GUARD_ENV) $(TEST_ENV) \
+	  cargo run -p ovstorage-perf --bin ovstorage-perf-live -- --profile smoke
 
 install-tools:
 	cargo install taplo-cli --features lsp

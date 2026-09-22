@@ -94,15 +94,23 @@ pub fn init_tracing(config: TracingConfig) -> Result<TracingGuard> {
     let otel_layer = tracer_provider
         .as_ref()
         .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer("ovstorage")));
-    let filter = tracing_subscriber::EnvFilter::try_from_env("OVSTORAGE_LOG")
-        .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER));
+    let directives = std::env::var("OVSTORAGE_LOG")
+        .ok()
+        .filter(|value| tracing_subscriber::EnvFilter::try_new(value).is_ok())
+        .or_else(|| {
+            std::env::var("RUST_LOG")
+                .ok()
+                .filter(|value| tracing_subscriber::EnvFilter::try_new(value).is_ok())
+        })
+        .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_owned());
+    let filter = tracing_subscriber::EnvFilter::new(&directives);
     // Suppress per-keystroke / per-frame chatter from UI / transport
     // crates that's almost never what someone debugging ovstorage
     // wants. Appending these directives last makes them override any
-    // catch-all in the user's RUST_LOG (e.g. `RUST_LOG=debug`). To
-    // see them anyway, override explicitly: `RUST_LOG=...,rustyline=debug`.
-    let filter = noisy_silenced(filter);
+    // catch-all (e.g. `RUST_LOG=debug`). A directive that explicitly
+    // names the crate root is left untouched and wins, as does a more
+    // specific sub-target directive.
+    let filter = noisy_silenced(filter, &directives);
     let registry = tracing_subscriber::registry().with(filter).with(otel_layer);
     match resolve_log_format() {
         LogFormat::Json => registry
@@ -138,12 +146,16 @@ enum LogFormat {
     Pretty,
 }
 
-/// Append `<crate>=warn` directives to silence crates whose `debug`
-/// output is interactive-UI noise that drowns out the actual diagnostic
-/// signal a user wanted. Each directive overrides any earlier match for
-/// that target; explicitly setting `<crate>=debug` later in `RUST_LOG`
-/// still wins.
-fn noisy_silenced(filter: tracing_subscriber::EnvFilter) -> tracing_subscriber::EnvFilter {
+/// Appends `<crate>=warn` directives to silence crates whose `debug` output is
+/// interactive-UI noise that drowns out the requested diagnostic signal.
+/// These directives override catch-alls such as `debug`. A directive that
+/// explicitly names the crate root (`tungstenite=trace`, `rustls=debug`, or
+/// bare `tungstenite`) is left untouched and wins; sub-target directives also
+/// win because they are more specific.
+fn noisy_silenced(
+    filter: tracing_subscriber::EnvFilter,
+    directives: &str,
+) -> tracing_subscriber::EnvFilter {
     // Crates whose `debug`/`trace` output is per-keystroke / per-frame /
     // per-poll plumbing chatter. Flooding from any of these drowns the
     // signal a debugger is actually looking for. Override explicitly to
@@ -169,7 +181,34 @@ fn noisy_silenced(filter: tracing_subscriber::EnvFilter) -> tracing_subscriber::
         // mio's `poll()` loop trace lines.
         "mio=warn",
     ];
+    let explicitly_named = directives
+        .split(',')
+        .filter_map(|piece| {
+            let piece = piece.trim();
+            let before_span = piece
+                .find('[')
+                .map_or(piece, |span_start| &piece[..span_start]);
+            match before_span.split_once('=') {
+                Some((target, _)) => {
+                    let target = target.trim();
+                    (!target.is_empty()).then_some(target)
+                }
+                None if is_level_directive(before_span) => None,
+                None => {
+                    let target = before_span.trim();
+                    (!target.is_empty()).then_some(target)
+                }
+            }
+        })
+        .collect::<std::collections::HashSet<_>>();
+
     NOISY.iter().fold(filter, |acc, directive| {
+        let target = directive
+            .split_once('=')
+            .map_or(*directive, |(target, _)| target);
+        if explicitly_named.contains(target) {
+            return acc;
+        }
         match directive.parse() {
             Ok(d) => acc.add_directive(d),
             // Static strings; if a parse error ever surfaces, it's a
@@ -177,6 +216,13 @@ fn noisy_silenced(filter: tracing_subscriber::EnvFilter) -> tracing_subscriber::
             Err(_) => acc,
         }
     })
+}
+
+fn is_level_directive(value: &str) -> bool {
+    matches!(value, "0" | "1" | "2" | "3" | "4" | "5")
+        || ["off", "error", "warn", "info", "debug", "trace"]
+            .iter()
+            .any(|level| value.eq_ignore_ascii_case(level))
 }
 
 /// `OVSTORAGE_LOG_FORMAT=json|compact|pretty` overrides; otherwise pick
@@ -204,6 +250,7 @@ fn resolve_log_format() -> LogFormat {
 pub(crate) fn build_tracer_provider(
     config: &TracingConfig,
 ) -> Result<opentelemetry_sdk::trace::SdkTracerProvider> {
+    install_default_tls_provider();
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
@@ -220,6 +267,15 @@ pub(crate) fn build_tracer_provider(
         .with_resource(resource)
         .with_batch_exporter(exporter)
         .build())
+}
+
+/// The OTLP exporter's HTTP client is a reqwest copy linked without a rustls
+/// crypto provider (see `reqwest-otlp` in `Cargo.toml`); it resolves the
+/// process-wide default at connect time. Install `ring`, the provider behind
+/// every other TLS client in this binary, unless the host process installed
+/// one first — in which case the exporter follows the host's choice.
+fn install_default_tls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 /// `OVSTORAGE_PLUGIN_DIR` if set; else `<exe-dir>/plugins/`. `None`
@@ -332,6 +388,86 @@ pub(crate) fn env_is_false(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reqwest copy behind the OTLP exporter must speak TLS: an `https://`
+    /// URL to a closed local port has to fail at connect, not at scheme
+    /// validation (what reqwest reports when built without a TLS backend) and
+    /// not by panicking over a missing crypto provider.
+    #[test]
+    fn otlp_http_client_speaks_tls() {
+        install_default_tls_provider();
+        let client = reqwest_otlp::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("reqwest 0.13 client builds");
+        let error = client
+            .get("https://127.0.0.1:1/")
+            .send()
+            .expect_err("nothing listens on port 1");
+        assert!(
+            error.is_connect(),
+            "expected a connect error, got {error:?}"
+        );
+    }
+
+    fn enabled_with(directives: &str, probe: impl FnOnce() -> bool) -> bool {
+        let subscriber = tracing_subscriber::registry().with(noisy_silenced(
+            tracing_subscriber::EnvFilter::new(directives),
+            directives,
+        ));
+        let enabled = tracing::subscriber::with_default(subscriber, probe);
+        tracing::callsite::rebuild_interest_cache();
+        enabled
+    }
+
+    #[test]
+    fn noisy_silencing_respects_explicit_target_directives() {
+        assert!(enabled_with("tungstenite=trace", || {
+            tracing::event_enabled!(
+                target: "tungstenite::handshake::client",
+                tracing::Level::TRACE
+            )
+        }));
+        assert!(enabled_with("info,tungstenite=trace", || {
+            tracing::event_enabled!(
+                target: "tungstenite::handshake::client",
+                tracing::Level::TRACE
+            )
+        }));
+        assert!(!enabled_with("trace", || {
+            tracing::event_enabled!(
+                target: "tungstenite::handshake::client",
+                tracing::Level::TRACE
+            )
+        }));
+        assert!(enabled_with("tungstenite::handshake=trace", || {
+            tracing::event_enabled!(
+                target: "tungstenite::handshake::client",
+                tracing::Level::TRACE
+            )
+        }));
+        assert!(!enabled_with(DEFAULT_LOG_FILTER, || {
+            tracing::event_enabled!(
+                target: "tungstenite::handshake::client",
+                tracing::Level::TRACE
+            )
+        }));
+        assert!(enabled_with("rustls=debug", || {
+            tracing::event_enabled!(target: "rustls::client", tracing::Level::DEBUG)
+        }));
+        assert!(!enabled_with("debug", || {
+            tracing::event_enabled!(target: "h2::proto::connection", tracing::Level::DEBUG)
+        }));
+        assert!(enabled_with("h2=trace", || {
+            tracing::event_enabled!(target: "h2::proto::connection", tracing::Level::TRACE)
+        }));
+        assert!(enabled_with("tungstenite", || {
+            tracing::event_enabled!(
+                target: "tungstenite::handshake::client",
+                tracing::Level::TRACE
+            )
+        }));
+    }
 
     /// The three bulk-discovery skip classifiers must partition the error space
     /// correctly: each recognizes only its own case, and a genuine load failure

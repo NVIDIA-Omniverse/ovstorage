@@ -24,8 +24,9 @@ match the storage task.
 | `http` | Data is read from an HTTP(S) endpoint | `https://host/path` | Read-oriented and URL-shaped; confirm write/list support before depending on it. |
 | `omniverse-storage-service` | Targeting a deployed Omniverse Storage Service | gRPC; configured via `address` | Needs `address` — either a discovery root (host of `/api/v1/services` and `/api/v1/auth-config`) with OIDC credentials, or a `grpc://` / `grpcs://` storage endpoint dialed directly. See per-backend section below. |
 | `s3` | AWS S3 or S3-compatible object stores (MinIO, R2, B2, custom endpoint) | `s3://<bucket>/<key>` | `aws_access_key_id` + `aws_secret_access_key` (+ optional `aws_session_token`); env vars and `~/.aws/credentials` honoured. |
-| `gcs` | Google Cloud Storage | `gs://<bucket>/<object>` | `service_account_key` (JSON blob) or ADC `file_path`; no IMDS, no impersonation. |
+| `gcs` | Google Cloud Storage | `gs://<bucket>/<object>` | `service_account_key` (JSON blob) or ADC `file_path`; accepts `service_account`, `authorized_user`, `external_account` (WIF), and `impersonated_service_account` JSON; no IMDS. |
 | `azure` | Azure Blob and ADLS Gen2 (HNS-aware accounts) | `azure://<account>/<container>/<path>` | One of `account_key`, `sas_token`, service principal, or workload identity. |
+| `huggingface` | Hugging Face Hub repositories, read-only (models, datasets, spaces) | `hf://{models\|datasets\|spaces}/<namespace>/<name>/<path>` (optional `?revision=<ref>` pin); under an `alias` layer also the Hub's own `https://huggingface.co/<namespace>/<name>/<path>` URL | Single `token` (descriptor default `${HF_TOKEN}`); anonymous serves public repositories. |
 | `opendal` | Long-tail backends fronted by OpenDAL (services compiled in: `fs`, `s3`, `webdav`) | `opendal://<service>/<path>` (configurable prefix) | Driver-specific; `s3` uses bare `access_key_id` / `secret_access_key`, `webdav` uses `password`. |
 | `nucleus` | NVIDIA Omniverse Nucleus content-collaboration server | `omniverse://server[:port]/path` (with optional `?<branch>&<checkpoint>` selector) | Three credential methods (`sso`, `userpass`, `api_token`); refresh token persisted in OS keyring for warm-continue. |
 | `broker` | Routing traffic through an upstream `ovstorage-broker` daemon (per-call authz, broker-side caching, credential isolation) | No scheme of its own — address roots are published by the upstream broker (typically `s3://`, `gs://`, `azure://`, `omniverse://`, `file://`) | Single config key `address` (HTTPS discovery, direct gRPC, UDS, or named pipe). One credential method: `client_credentials` (OIDC client ID + secret) for headless deployments; interactive PKCE / device flow drives via `Factory::authenticate`. |
@@ -97,14 +98,16 @@ keys:
   `fake-gcs-server`).
 - `pubsub_subscription` /  `pubsub_pull_max` for `watch_directory`.
 
-Credentials are `service_account_key` (the JSON blob from Google's
-IAM console, accepting either `type: service_account` or
-`type: authorized_user`) or `file_path` (ADC JSON file on disk;
-defaults to `~/.config/gcloud/application_default_credentials.json`).
-Authorized-user creds cannot mint V4 signed URLs, so reads under
-that credential type pull bytes through the JSON download endpoint
-instead. GCE/GKE metadata server, workload-identity federation, and
-service-account impersonation are not implemented in-process.
+Credentials are `service_account_key` (an ADC JSON blob of `type:
+service_account`, `authorized_user`, `external_account`, or
+`impersonated_service_account`) or `file_path` (ADC JSON file on
+disk, same four types; defaults to
+`~/.config/gcloud/application_default_credentials.json`).
+Only `service_account` creds can mint V4 signed URLs; reads under
+every other credential type pull bytes through the JSON download
+endpoint instead. The GCE/GKE metadata server, the AWS /
+`executable` `external_account` source flavors, and workforce
+(user-identity) federation are not implemented in-process.
 
 ### `azure`
 
@@ -148,6 +151,30 @@ resolution order: `account_key` (Shared Key signing) → `sas_token`
 `client_secret` + `tenant_id`). Managed Identity / IMDS, Azure CLI
 session reuse, and the rest of the `DefaultAzureCredential` chain
 are not implemented in-process.
+
+### `huggingface`
+
+Hugging Face Hub repositories, **read-only**. One connection serves
+one repository; addresses are
+`hf://{models|datasets|spaces}/<namespace>/<name>/<path>`, with an
+optional `?revision=<ref>` query pinning any address to a git
+revision. When an `alias` layer sits above the backend, the Hub's own
+repository URL resolves as well — `https://` or `http://`, on
+`huggingface.co`, `www.huggingface.co` or `hf.co`, prefixed `datasets/` or
+`spaces/` for those repository types — with `?revision=` carrying
+through; the Hub's `/blob/`, `/resolve/` and `/tree/` web-view links are
+not unwrapped. Config keys:
+
+- `repo_id` (**required**; `namespace/name`).
+- `repo_type` — optional; `model` (default), `dataset`, or `space`.
+- `revision` — optional; the connection's default revision
+  (default `main`).
+
+The single credential is `token` (a `hf_…` access token; read scope
+is sufficient), with a descriptor default of `${HF_TOKEN}`; an empty
+bundle connects anonymously and serves public repositories. Writes,
+deletes, metadata updates, and directory watches all answer
+`Unsupported`; version listing walks the repository's commit history.
 
 ### `opendal`
 
@@ -253,9 +280,14 @@ broker-driven interactive PKCE / device flow.
    stack declares, so a kind you know the library supports — `file` included —
    is absent until the config declares a layer for it.
 2. Match the address root you need to the backend's URL scheme and configured
-   `address_roots`.
+   `address_roots`. A public `s3://`, `gs://` or `azure://` address may be
+   readable with no route of its own when the host grants an anonymous
+   fallback for that scheme — read-only, and anonymous in the strict sense
+   (no credential of any kind is attached); the sign is a hidden `s3:///`
+   root in the doctor report. Every mutation through it answers
+   `Unsupported`, so configure a connection when you need to write.
 3. Check capabilities before relying on writes, recursive list, directory
-   delete, watches, materialize, or optimistic concurrency.
+   delete, watches, or optimistic concurrency.
 4. Follow [`ovstorage-user-authenticate-to-backend`](../ovstorage-user-authenticate-to-backend/SKILL.md)
    before first use if the descriptor has credential fields.
 

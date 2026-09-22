@@ -126,6 +126,16 @@ impl BrokerClientBackend {
         discovery_url: impl Into<String>,
         transport: Arc<dyn BrokerClientTransport>,
     ) -> Self {
+        Self::new_for_tests_with_auth_state(discovery_url, transport, DiscoveryState::new("test"))
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "_test_support")]
+    pub fn new_for_tests_with_auth_state(
+        discovery_url: impl Into<String>,
+        transport: Arc<dyn BrokerClientTransport>,
+        auth_state: DiscoveryState,
+    ) -> Self {
         let cell = tokio::sync::OnceCell::new();
         // OnceCell::set returns Err only if the cell is already full;
         // we just created it, so this is infallible.
@@ -133,9 +143,41 @@ impl BrokerClientBackend {
         Self {
             discovery_url: discovery_url.into(),
             transport: cell,
-            auth_state: DiscoveryState::new("test"),
+            auth_state,
         }
     }
+}
+
+/// Build the real broker-client Layer around an injected transport and its
+/// published roots. Integration tests use this to exercise per-connection
+/// routing and watch coalescing without opening a daemon socket.
+#[doc(hidden)]
+#[cfg(feature = "_test_support")]
+pub async fn new_layer_for_tests(transport: Arc<dyn BrokerClientTransport>) -> Result<LayerHandle> {
+    layer::BrokerClientLayer::new_for_tests(transport, DiscoveryState::new("test"), None).await
+}
+
+/// Test-only variant that exposes the same identity state to a controlled
+/// transport so credential-rotation authorization boundaries are falsifiable.
+#[doc(hidden)]
+#[cfg(feature = "_test_support")]
+pub async fn new_layer_for_tests_with_auth_state(
+    transport: Arc<dyn BrokerClientTransport>,
+    auth_state: DiscoveryState,
+) -> Result<LayerHandle> {
+    layer::BrokerClientLayer::new_for_tests(transport, auth_state, None).await
+}
+
+/// Test-only variant whose synthetic connection reads a real direct-endpoint
+/// token file while verifying acceptance through the injected transport.
+#[doc(hidden)]
+#[cfg(feature = "_test_support")]
+pub async fn new_layer_for_tests_with_token_file(
+    transport: Arc<dyn BrokerClientTransport>,
+    auth_state: DiscoveryState,
+    token_file: String,
+) -> Result<LayerHandle> {
+    layer::BrokerClientLayer::new_for_tests(transport, auth_state, Some(token_file)).await
 }
 
 /// Per-connection object operations used by `BrokerClientLayer`, with
@@ -393,11 +435,12 @@ impl BrokerClientBackend {
             object.address = %RedactedUrl(&prefix.resolved_address),
         );
         let _guard = span.enter();
+        let transport_cancel = cancel.clone();
         race_cancel(cancel.as_ref(), async move {
             let stream = self
                 .transport()
                 .await?
-                .watch_directory(prefix.resolved_address, opts)
+                .watch_directory_with_cancel(prefix.resolved_address, opts, transport_cancel)
                 .await?;
             let translated: BackendChangeStream =
                 Box::new(stream.map(|event| event.map(broker_watch_directory_event_to_backend)));
@@ -952,7 +995,8 @@ impl TonicBrokerClient {
             pb::broker_service_client::BrokerServiceClient::with_interceptor(
                 channel,
                 AuthorizationInterceptor::new(self.auth_state.clone()),
-            ),
+            )
+            .max_decoding_message_size(protocol::BROKER_GRPC_MAX_DECODING_MESSAGE_SIZE),
         )
     }
 }
@@ -986,7 +1030,8 @@ async fn connect_unix_socket(path: &str, auth_state: DiscoveryState) -> Result<C
         pb::broker_service_client::BrokerServiceClient::with_interceptor(
             channel,
             AuthorizationInterceptor::new(auth_state),
-        ),
+        )
+        .max_decoding_message_size(protocol::BROKER_GRPC_MAX_DECODING_MESSAGE_SIZE),
     )
 }
 
@@ -1026,7 +1071,8 @@ async fn connect_named_pipe(name: &str, auth_state: DiscoveryState) -> Result<Ca
                     pb::broker_service_client::BrokerServiceClient::with_interceptor(
                         channel,
                         AuthorizationInterceptor::new(auth_state),
-                    ),
+                    )
+                    .max_decoding_message_size(protocol::BROKER_GRPC_MAX_DECODING_MESSAGE_SIZE),
                 );
             }
             Err(error) => {
@@ -1439,13 +1485,25 @@ impl BrokerClientTransport for TonicBrokerClient {
         prefix: Url,
         opts: WatchDirectoryOptions,
     ) -> Result<BrokerClientWatchDirectoryStream> {
+        self.watch_directory_with_cancel(prefix, opts, None).await
+    }
+
+    async fn watch_directory_with_cancel(
+        &self,
+        prefix: Url,
+        opts: WatchDirectoryOptions,
+        cancel: Option<CancellationToken>,
+    ) -> Result<BrokerClientWatchDirectoryStream> {
         let endpoint = self.endpoint.clone();
         let auth_state = self.auth_state.clone();
         let (sender, receiver) = mpsc::channel();
-        // Cancel is shared with the returned iterator's Drop guard: when
-        // the host drops the iterator, the bridge thread leaves plugin
-        // code before the host can unload this cdylib.
-        let cancel = CancellationToken::new();
+        // The coalescer supplies its upstream token here. For a direct,
+        // resumable watch there is no coalescer, so the stream owns a fresh
+        // token as before. In both cases the returned iterator's Drop guard
+        // cancels the same token and joins the bridge before plugin unload.
+        let cancel = cancel
+            .map(|parent| parent.child_token())
+            .unwrap_or_default();
         let bridge_cancel = cancel.clone();
         // Watch is a sync-Iterator FFI surface; the host drains via
         // blocking `recv`. `tokio::spawn` onto the plugin's runtime would
@@ -2028,6 +2086,7 @@ fn empty_read_stream() -> ovstorage::ReadStream {
 
 fn backend_item_info(info: ObjectInfo) -> BackendItemInfo {
     BackendItemInfo {
+        etag_strength: info.etag_strength,
         kind: info.kind,
         etag: info.etag,
         version: info.version,
@@ -2038,6 +2097,7 @@ fn backend_item_info(info: ObjectInfo) -> BackendItemInfo {
         system_metadata: info.system_metadata,
         user_metadata: info.user_metadata,
         modified_by: info.modified_by,
+        versioned_address: info.versioned_address,
     }
 }
 
@@ -2075,6 +2135,52 @@ ovstorage_plugin::ovstorage_layer_plugin!(backend, layer::BrokerClientLayerFacto
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_item_info_preserves_etag_strength() {
+        let info = ObjectInfo {
+            address: ovstorage::address::parse("test://broker/object").unwrap(),
+            kind: ObjectKind::File,
+            etag: Some("validator".into()),
+            etag_strength: ovstorage::EtagStrength::Weak,
+            version: None,
+            size: Some(1),
+            mtime: None,
+            checksums: Default::default(),
+            effective_permissions: None,
+            system_metadata: None,
+            user_metadata: None,
+            modified_by: None,
+            versioned_address: None,
+        };
+
+        let item = backend_item_info(info);
+        assert_eq!(item.etag_strength, ovstorage::EtagStrength::Weak);
+    }
+
+    #[test]
+    fn backend_item_info_preserves_versioned_address() {
+        let pin = ovstorage::address::parse("test://broker/object?versionId=v1").unwrap();
+        let info = ObjectInfo {
+            address: ovstorage::address::parse("test://broker/object").unwrap(),
+            kind: ObjectKind::File,
+            etag: None,
+            etag_strength: Default::default(),
+            version: None,
+            size: Some(1),
+            mtime: None,
+            checksums: Default::default(),
+            effective_permissions: None,
+            system_metadata: None,
+            user_metadata: None,
+            modified_by: None,
+            versioned_address: Some(pin.clone()),
+        };
+
+        let item = backend_item_info(info);
+        assert_eq!(item.versioned_address, Some(pin));
+    }
+
     #[allow(unused_imports)]
     #[test]
     fn broker_watch_directory_stream_drop_cancels_and_joins_bridge_thread() {

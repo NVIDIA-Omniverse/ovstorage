@@ -1622,6 +1622,13 @@ Concrete in-tree Layer kinds under this model:
 | `RedirectFollowerWrapper` | HTTP plugin | executes plugin-returned `Redirect` requests |
 | `PermissionCheckWrapper` | plugin | enforces a host-supplied permission policy on operations for matching routes (e.g. an extra gate on a secrets bucket); used in the "Stack and routing" example |
 
+`RetryWrapper::list_stream` retries two pre-delivery phases: opening the stream
+and establishing its first item when the consumer polls. Each phase receives
+the configured `max_attempts`, and the initially opened stream is the first
+attempt of the second phase, so the total bound is
+`2 * max_attempts - 1` inner opens. Once an item is delivered, the wrapper
+forwards the remainder without replay.
+
 ### Router layers (many children)
 
 | Router layer | Built-in / plugin | What it implements meaningfully |

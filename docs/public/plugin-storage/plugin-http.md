@@ -150,12 +150,34 @@ in-process Rust dependency.
   `[[ovstorage.connections]]` entry is unaffected either way, because a
   host must be able to start with an expired secret in its config.
 
-  **Known limitation.** A route prefix is exclusive *within one layer
-  instance* (see below), and the CLI has no
-  command that removes a connection, so inside one interactive `ovstorage`
-  session a mistyped credential keeps the prefix: re-running `connect`
-  with the corrected credential is refused with `RouteConflict`. Restart
-  the session to clear it.
+  A route prefix a connection *added* through the graph is exclusive (see
+  below), so a mistyped credential keeps the prefix for the rest of an
+  interactive `ovstorage` session. Two commands clear it: re-running `connect` on the same
+  origin with the corrected credential replaces the refused one in place, and
+  `disconnect` removes the connection outright. Rotation needs the corrected
+  value in the credential *bundle* — `--auth basic`, `--auth bearer` — because
+  that is what `update_connection_credentials` replaces; a credential carried
+  as userinfo on `root_url` is not in one, so that spelling answers
+  `RouteConflict` instead of rotating.
+
+  Which command is the way back then depends on where the connection came
+  from, and userinfo on `root_url` is spelled both ways:
+
+  - **From `connect`, or from an `[[ovstorage.connections]]` entry** —
+    `disconnect` removes it, and a fresh `connect` takes the prefix back.
+  - **From a layer's own `[ovstorage.layers.<name>]` block** — neither command
+    finishes the job, and both say so rather than pretending. `disconnect`
+    refuses with `Unsupported`, because the seed is not an
+    `[[ovstorage.connections]]` entry for it to drop and `write-config` would
+    re-serialize the layer block and rebuild the connection on the next start.
+    `connect` has no way in either: re-spelling the credential as userinfo
+    leaves the bundle empty, so there is nothing to rotate and the
+    `RouteConflict` stands, and supplying it as `--auth basic` instead is
+    refused with `InvalidArgument` — the connection keeps the `root_url` it was
+    built with, userinfo and all, and a bundle beside it would write
+    `Authorization` twice. **Correct the credential in the layer block and
+    restart** — that is the change that lasts, and it is what `disconnect`'s own
+    refusal tells you.
 
   Nothing is persisted on its own — `connect` registers with
   `persist: false`, so a one-shot invocation takes the registration with
@@ -167,70 +189,47 @@ in-process Rust dependency.
   Two separate mechanisms produce the collision. Publishing the
   userinfo-*stripped* address gives two spellings of one origin the same
   prefix. And a second connection on a root another
-  already serves *on the same layer instance* is *refused* rather than
+  already serves anywhere in the graph is *refused* rather than
   silently shadowed — so a mistyped `bearer_token`
   or `password`, which submits an identical `root_url` both times and is
   unaffected by userinfo at all, hits the same wall.
 
-- **Two connections on one `[ovstorage.layers.<name>]` instance cannot
-  publish the same root**, and which one loses depends on where
-  the duplicate came from. The check is per **layer instance**, not
-  graph-wide — `install` compares against the connections that instance
-  holds, and each `[ovstorage.layers.*]` entry gets its own. Two `http`
-  backend layers can therefore each accept a connection publishing the
-  same root; see the limitation below. The comparison is exact-root
-  equality, not containment — one instance may hold `https://h/` and
-  `https://h/sub/` at once, and both are routable, because lookup is
-  longest-prefix-wins. A runtime
+- **Two connections ADDED to one composed graph cannot publish the same root.**
+  The HTTP layer refuses a duplicate held by the same layer instance, and a
+  router refuses a same-node root from a sibling child at the aggregation
+  boundary, then removes the newcomer from that child. **The router's half
+  covers connections that arrive through it** — `[[ovstorage.connections]]`
+  entries, which the host applies with `add_connection`, and `ovstorage
+  connect` — and not one a backend builds from its own
+  `[ovstorage.layers.<name>]` block, which is installed inside the layer before
+  the router exists to be asked. See the layer-instance case below. The comparison is node equality,
+  not containment — connections may publish `https://h/` and
+  `https://h/sub/` at once, including from sibling layers, and both are
+  routable because lookup is longest-prefix-wins. The router's refusal applies
+  when *every* root a connection publishes is already served; a connection that
+  also serves roots of its own keeps them, and only the contested root is
+  shadowed — on the newcomer's side, so the connection already serving an
+  address keeps serving it no matter which child of the router each sits on.
+  An HTTP connection publishes exactly one root, so for this backend
+  any collision is total and the refusal always applies — the distinction
+  matters for the discovery-rooted backends, which publish many. A runtime
   `add_connection` is rejected with `RouteConflict` — the same code
   `nucleus` uses for a duplicate server root, and deliberately not the
   vaguer `AlreadyExists`, which other layers use for a duplicate
   connection *id*. The message names only the origin, because a route
   prefix can carry a secret in its userinfo, its query or its path, and
-  the origin is the part that structurally cannot. Duplicate route prefixes are
-  otherwise resolved first-registered-wins, which would leave the second
-  connection registered, unroutable, and its credential silently unused.
-  A **declared** `[[ovstorage.connections]]` duplicate on that same
-  instance is reported on the tracing channel and skipped instead: the
-  instance that refused it already serves that exact root, so the
-  addresses the newcomer would answer for resolve to the incumbent
-  whatever the host does. It could not be routed however the
-  host reacted, so refusing to start would buy that connection nothing
-  and cost every unrelated backend in the graph — and a host that
+  the origin is the part that structurally cannot. Accepting a duplicate
+  would leave one connection registered, unroutable, and its credential
+  silently unused. A **declared** `[[ovstorage.connections]]` duplicate is
+  reported on the tracing channel and skipped instead: the graph already
+  serves that exact root, so the addresses the newcomer would answer for
+  resolve to the incumbent whatever the host does. It could not be routed
+  however the host reacted, so refusing to start would buy that connection
+  nothing and cost every unrelated backend in the graph — and a host that
   auto-restarts would loop. Because the default prefix strips userinfo,
   two connections to one origin that differ only in their userinfo
-  collapse onto one prefix; the first declared owns it. Use an explicit
-  `prefix` to keep them distinct.
-
-  **If you configure two backend layers of the same kind against one
-  origin, give their connections distinct `prefix` values.** Nothing
-  refuses a collision across layer instances, and the consequence is a
-  silently unused credential.
-
-  Root exclusivity is enforced per layer instance — `install` compares
-  against the connections *that* instance holds — so
-  `[ovstorage.layers.http_prod]` and `[ovstorage.layers.http_stage]` may
-  each hold a connection publishing the same root. Measured: the host
-  starts, both connections register and probe `Authenticated`,
-  `list-routes` prints the root twice, and every read on it goes out with
-  one connection's credential while the other's is never used.
-
-  It is *detected*, just not refused. The router aggregates its children's
-  roots and `RouteTable::build` logs
-  `overlapping address root shadowed; first-registered route wins (FIFO)`
-  — but it keeps both entries. That is a `WARN` on the tracing channel,
-  which the CLI does not display unless `RUST_LOG`/`OVSTORAGE_LOG` is
-  set, so an operator watching only the terminal sees a clean start.
-
-  **Which connection wins is not the declaration order.** The router
-  aggregates in the order of its `children` array and the table is a
-  stable sort by descending root length, so for equal roots the winner is
-  the connection on the layer named *first in `children`* — reordering
-  the `[[ovstorage.connections]]` entries does not change it.
-
-  The userinfo-stripped default prefix makes it easy to reach: it
-  collapses two connections to one origin that are distinguished only by
-  their userinfo onto a single root.
+  collapse onto one prefix; the incumbent owns it. Use distinct explicit
+  `prefix` values when two connections need separate address spaces.
 - **Header-credential scope is the origin, not the path.** `root_url` is a URL
   *prefix*, but the only header scope enforced on a redirect is the origin:
   with `root_url = https://host/private/` and the default
@@ -279,7 +278,16 @@ in-process Rust dependency.
 Operators control which URLs the plugin handles entirely through
 routing. Each connection declares a concrete HTTP(S) origin or narrower URL
 prefix such as `https://datasets.example.com/`; with no route bound to the
-plugin, no URL reaches it and the library returns `NoRoute`.
+plugin, no URL reaches it and the library returns `NoRoute`, unless the host
+grants an anonymous `http`/`https` fallback — the top-level
+`anonymous_http_fallback` key on the broker and the REST gateway, whose default
+`"refuse"` keeps that answer and whose `"allow"` is refused at startup in this
+release, because the per-origin tier that would honour it is not available and
+a grant that did nothing would be worse than one that fails loud. It is a
+separate switch from the cloud schemes' `anonymous_fallback_schemes` because it
+means something different: an http fallback is not a public bucket but an
+arbitrary origin, fetched from the host's own network position. See the
+`anonymous_fallback` section of [`../configuration.md`](../configuration.md).
 
 The plugin is wired into an `[ovstorage]` Stack: a `router` layer with an
 `http` backend-layer child, plus one connection per origin. A connection's
@@ -396,9 +404,30 @@ the caller-facing URL.
 **Two connections cannot publish one address space.** Only one connection can
 own a caller-facing prefix, so a second `root_url` (or explicit `prefix`) that
 resolves to the same published address is refused with `RouteConflict` naming
-the origin. Registering both would leave the second permanently unroutable
-while every read under the prefix went out over the *first* connection, with
+the origin. The HTTP layer enforces that within one instance, and a router
+enforces it between sibling children — for every connection **added** through
+the graph, which is what an `[[ovstorage.connections]]` entry and `ovstorage
+connect` both are. Registering both would leave one permanently unroutable
+while every read under the prefix went out over the incumbent connection, with
 nothing in the response naming the substitution.
+
+> **A connection seeded by a layer's own config is not covered.** A non-empty
+> `[ovstorage.layers.<name>]` block makes this backend build one connection from
+> it at startup, inside the layer, before any router exists to be asked — so
+> nothing refuses a collision between two such layers. **If you configure two
+> backend layers of the same kind against one origin, give their connections
+> distinct `prefix` values.** Two `http` layers whose `root_url`s differ only in
+> userinfo publish one prefix twice: both register, both probe with their own
+> credential, `list-routes` prints the prefix twice, and every read is served by
+> whichever the router aggregated first while the other credential is silently
+> unused. Nothing refuses it and nothing stops startup, but it is reported
+> rather than left to be discovered: `ovstorage doctor` lists it under
+> **Contested address roots**, naming the origin and how many layers publish it,
+> and the router logs it once per distinct collision when the graph aggregates
+> the roots — at construction and on any later rebuild, since neither path has
+> an add to refuse. `list-routes` printing one prefix twice and
+> `list-connections` showing the shadowed side with an empty `target` are the
+> same fact seen from two other angles.
 
 The comparison is by **node**, not by spelling, so `https://origin/c` and
 `https://origin/c/` collide too — the router treats them as one address space,
@@ -461,6 +490,34 @@ allow-listed host is a deliberate credential recipient. The complete redirect
 chain shares one 30-second deadline rather than restarting the timeout at each
 hop.
 
+**One destination is refused under every policy.** A redirect whose `Location`
+resolves to a cloud instance-metadata endpoint — any IPv4 address in
+`169.254.0.0/16`, `100.100.100.200`, `168.63.129.16`, any IPv6 address in
+`fe80::/10`, `fd00:ec2::254`, an IPv6 address embedding a refused IPv4
+address, or the exact names `metadata.google.internal`, `metadata.goog` and
+`metadata`, never a suffix — answers `PermissionDenied` (`refusing to contact
+<origin>: it is a cloud instance-metadata endpoint, and ovstorage never
+fetches from one on a caller's behalf`) under `none`, under `same_origin`, and
+under `allow_list` with that very host listed in `redirect_allow_hosts`. The
+destination is judged before the follow policy is consulted, which is why the
+answer under `none` is this typed error rather than the `Unsupported` an
+unfollowed 3xx otherwise earns: the payoff of that one fetch is the process's
+own cloud credentials rather than data, no operator setting makes it
+acceptable, and a refusal folded into the policy check would be
+indistinguishable from a hop the policy merely declined. The message names the
+origin only, because the path and query of
+such a URL are the server's and not worth echoing. The same predicate guards
+the host's redirect follower: a `ReadResult::Redirect` or `WriteStep::Redirects`
+that any backend mints — S3, GCS, Azure, Hugging Face, Nucleus — is judged
+before a socket opens on the first attempt, on every re-mint after expiry or a
+`403`, and on every mid-stream resume, for every connection of every kind.
+What the check does not catch is a name that resolves to a link-local address;
+only a connector that checks the resolved address before dialing would close
+that. A configured `root_url` at such a host is the operator's own choice
+rather than a server's, so `instantiate` honours it and logs one `warn`
+(`configured root_url names a cloud instance-metadata endpoint; every request
+on this connection reaches it from this process's network position`).
+
 `stat` uses `HEAD`. When the origin returns 405 and
 `allow_range_stat_fallback = true`, the plugin retries with
 `GET Range: bytes=0-0` capped at a 2-byte budget; if the origin
@@ -469,17 +526,36 @@ returns `200 OK` (i.e., ignores the Range), the fallback returns
 (`ReadOptions.range`) translate to `Range:` headers; a
 `206 Partial Content` response is returned as-is.
 
-`ObjectInfo` fields populate from HTTP validators directly:
-`ObjectInfo.etag` carries the response `ETag` header value exactly as
-returned (including a `W/` weak-marker prefix); `Last-Modified` is
-parsed into `mtime` when present. `size` is populated from
+`ObjectInfo` fields populate from HTTP validators directly. The plugin
+normalizes the response `ETag` into an opaque token by removing surrounding
+quotes and any `W/` marker, and records the evidence separately in
+`ObjectInfo.etag_strength`: a conformant nonempty quoted entity-tag is
+`Strong`, an explicit `W/` value is `Weak`, and a bare or malformed unmarked
+value is `Unspecified`. `Last-Modified` is parsed into `mtime` when present. A
+configured `etag_header` with any other name remains an
+opaque token and carries the explicit `ResponseParsing.etag_strength`
+declaration supplied by the redirect producer. The follower carries that
+custom-header value verbatim, including surrounding quotes or a literal `W/`
+prefix, and callers use that exact spelling for later preconditions. Its
+zero-value default is `Unspecified`, because the header name alone does not
+promise byte identity; only a producer that knows the backend contract may
+declare it `Strong` or `Weak`. A failed response stream resumes when this
+projected validator is nonempty and the resumed response repeats the same
+configured header value. Validator strength does not gate this textual resume
+check. A standard HTTP `ETag`, when present, is captured independently and sent
+as the resume request's `If-Match`. `size` is populated from
 `Content-Range`'s total when present, then from `Content-Length`,
 then from the observed buffered length. Streaming responses without
-`Content-Length` (chunked transfer) leave `size = None`. Weak ETags
-(`W/"…"`) are surfaced for diagnostics but never satisfy an exact
-`ReadOptions::if_match`. The Layer etag string maps to the wire
-`If-Match` header verbatim. `If-None-Match: *` is unsupported because
-the plugin is read-only.
+`Content-Length` (chunked transfer) leave `size = None`. `versioned_address`
+is always `None`; the plugin serves no pinned reads.
+
+`ReadOptions::if_match` accepts that normalized token for both strong and weak
+origins. The plugin does not send a wire `If-Match`, because HTTP forbids a weak
+validator from satisfying that strong comparison. It performs the GET, then
+normalizes and compares the response validator before returning bytes; a
+mismatch is `ObjectModified`. This post-response check fully supports weak
+origins without manufacturing a strong precondition that can never succeed.
+`If-None-Match: *` is unsupported because the plugin is read-only.
 
 No user-metadata facility — reads return an empty `UserMetadata`
 map and `update_metadata` returns `Unsupported`. `watch_directory`
@@ -530,7 +606,9 @@ It is refused over cleartext unless the host is loopback, and a
 redirect that would downgrade `https` to `http` is refused, because the
 HTTP client drops `Authorization` only when the host or port changes and
 would otherwise carry it over the downgrade. Redirect chains are capped
-at 10 hops.
+at 10 hops, and a hop to a cloud instance-metadata endpoint is refused under
+every `redirect_policy`, an allow-listed host included, because the payoff of
+that fetch is the process's own cloud identity.
 
 Credentials never enter an error, a log or a published address. The
 credential is held as a sensitive header value (`set_sensitive`), so it

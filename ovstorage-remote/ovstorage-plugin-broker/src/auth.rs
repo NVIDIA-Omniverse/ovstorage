@@ -1892,6 +1892,7 @@ mod tests {
             },
             last_probed: None,
             user_metadata: ovstorage_plugin::UserMetadata::new(),
+            owning_target: None,
         }
     }
 

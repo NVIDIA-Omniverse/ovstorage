@@ -38,9 +38,10 @@ service BrokerService {
   rpc RegisterCredential(RegisterCredentialRequest) returns (RegisterCredentialResponse);
 }
 
-// Tag order mirrors the SPI `ObjectInfo` field order: identity first
-// (address, kind), then identity-bearing scalars (etag, version, size,
-// mtime, modified_by), then descriptive collections.
+// Stable tags are append-only. Tags 1-11 mirror the SPI `ObjectInfo` field
+// order: identity first, then identity-bearing scalars, then descriptive
+// collections. Later fields take the next available tag; `versioned_address`
+// holds the newest.
 message ObjectInfo {
   string address = 1;
   // File / directory discriminator. Mirrors `ovstorage_plugin::ObjectKind`.
@@ -61,6 +62,18 @@ message ObjectInfo {
   AccessOps effective_permissions = 9;
   map<string, string> user_metadata = 10;
   map<string, string> system_metadata = 11;
+  // Out-of-band trust declaration for `etag`. The zero value means peers that
+  // omit this field decode fail-safe as unspecified.
+  EtagStrength etag_strength = 12;
+  // The address that names this version of the object; absent when the
+  // backend does not version it or the caller did not ask.
+  optional string versioned_address = 13;
+}
+
+enum EtagStrength {
+  ETAG_STRENGTH_UNSPECIFIED = 0;
+  ETAG_STRENGTH_STRONG = 1;
+  ETAG_STRENGTH_WEAK = 2;
 }
 
 enum ObjectKind {
@@ -111,6 +124,9 @@ message ByteRange {
 
 message StatOptions {
   bool full_metadata = 1;
+  // Cost knob: when set, a versioning backend populates
+  // `ObjectInfo.versioned_address` even where the lookup is not free.
+  bool versioned_address = 2;
 }
 
 message ReadOptions {
@@ -138,6 +154,9 @@ message ListOptions {
   optional uint32 max_results = 2;
   string page_token = 3;
   bool full_metadata = 4;
+  // Cost knob: when set, a versioning backend populates
+  // `ObjectInfo.versioned_address` on every item even where it is not free.
+  bool versioned_address = 5;
 }
 
 message ListVersionsOptions {
@@ -307,6 +326,8 @@ message ResponseParsing {
   optional string content_checksum_header = 7;
   optional string content_checksum_algorithm = 8;
   repeated ChecksumHeader checksum_headers = 9;
+  // Declaration for a custom etag_header; zero is the untrusted default.
+  EtagStrength etag_strength = 10;
 }
 
 message ChecksumHeader {

@@ -5,12 +5,17 @@
  */
 
 #include "internal.h"
+#include "temp_dir.h"
 
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(OVC_REGISTRY_TEST_MAIN) && !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 #define OVC_PLUGIN_MANIFEST_MINIMUM_SIZE                                \
     offsetof(OvStoragePlugin_PluginManifestV1, test_only)
@@ -1161,23 +1166,23 @@ static void ovc_registry_test_builtin_drop(void *plugin_state)
 
 static const OvStoragePlugin_PluginVTableV1
     g_ovc_registry_test_builtin_vtable = {
-        sizeof(OvStoragePlugin_PluginVTableV1),
-        OVSTORAGE_PLUGIN_ABI_VERSION,
-        ovc_registry_test_builtin_drop,
-        ovc_registry_test_create_backend,
-        NULL,
-        NULL,
-        {NULL}};
+        .struct_size = sizeof(OvStoragePlugin_PluginVTableV1),
+        .abi_version = OVSTORAGE_PLUGIN_ABI_VERSION,
+        .drop = ovc_registry_test_builtin_drop,
+        .create_backend = ovc_registry_test_create_backend,
+        .create_wrapper = NULL,
+        .create_router = NULL,
+};
 
 static const OvStoragePlugin_PluginVTableV1
     g_ovc_registry_test_plugin_vtable = {
-        sizeof(OvStoragePlugin_PluginVTableV1),
-        OVSTORAGE_PLUGIN_ABI_VERSION,
-        ovc_registry_test_drop,
-        ovc_registry_test_create_backend,
-        NULL,
-        NULL,
-        {NULL}};
+        .struct_size = sizeof(OvStoragePlugin_PluginVTableV1),
+        .abi_version = OVSTORAGE_PLUGIN_ABI_VERSION,
+        .drop = ovc_registry_test_drop,
+        .create_backend = ovc_registry_test_create_backend,
+        .create_wrapper = NULL,
+        .create_router = NULL,
+};
 
 /* Designated, so that a field added to the descriptor lands where it is
    named rather than shifting every member below it. */
@@ -1324,11 +1329,12 @@ ovc_registry_test_duplicate_kind_init(
 static void ovc_registry_test_loaded_lifetimes(void)
 {
     static const OvStoragePlugin_PluginManifestV1 manifest = {
-        sizeof(OvStoragePlugin_PluginManifestV1),
-        OVSTORAGE_PLUGIN_ABI_VERSION,
-        "registry-test-plugin",
-        "1.0.0",
-        false};
+        .struct_size = sizeof(OvStoragePlugin_PluginManifestV1),
+        .abi_version = OVSTORAGE_PLUGIN_ABI_VERSION,
+        .name = "registry-test-plugin",
+        .version = "1.0.0",
+        .test_only = false,
+    };
     OvStorage_Error error;
     OvStorage_Plugin *plugin;
     OvStorage_Registry *registry;
@@ -1436,11 +1442,12 @@ static void ovc_registry_test_inspection_copy(void)
 static void ovc_registry_test_policy_gate(void)
 {
     static const OvStoragePlugin_PluginManifestV1 test_manifest = {
-        sizeof(OvStoragePlugin_PluginManifestV1),
-        OVSTORAGE_PLUGIN_ABI_VERSION,
-        "test-only",
-        "1.0.0",
-        true};
+        .struct_size = sizeof(OvStoragePlugin_PluginManifestV1),
+        .abi_version = OVSTORAGE_PLUGIN_ABI_VERSION,
+        .name = "test-only",
+        .version = "1.0.0",
+        .test_only = true,
+    };
     OvStorage_Error error;
 
     memset(&error, 0, sizeof(error));
@@ -1471,13 +1478,13 @@ ovc_registry_test_undersized_init(
 
 static const OvStoragePlugin_PluginVTableV1
     g_ovc_registry_test_unknown_vtable = {
-        sizeof(OvStoragePlugin_PluginVTableV1),
-        OVSTORAGE_PLUGIN_ABI_VERSION + 1,
-        ovc_registry_test_drop,
-        ovc_registry_test_create_backend,
-        NULL,
-        NULL,
-        {NULL}};
+        .struct_size = sizeof(OvStoragePlugin_PluginVTableV1),
+        .abi_version = OVSTORAGE_PLUGIN_ABI_VERSION + 1,
+        .drop = ovc_registry_test_drop,
+        .create_backend = ovc_registry_test_create_backend,
+        .create_wrapper = NULL,
+        .create_router = NULL,
+};
 
 static OvStoragePlugin_PluginInitResultV1
 ovc_registry_test_unknown_init_abi(
@@ -1583,10 +1590,82 @@ static void ovc_registry_test_shared_utf8_validator(void)
     assert(!ovc_utf8_is_valid(truncated, sizeof(truncated)));
 }
 
+static void ovc_registry_test_remove_auth_dir(const char *auth_dir)
+{
+    char *credential_dir;
+    char *stem;
+    char *record_path;
+    char *lock_path;
+    char record_name[OVC_CRED_NAMESPACE_MAX * 2 + sizeof(".creds")];
+    char lock_name[OVC_CRED_NAMESPACE_MAX * 2 + sizeof(".lock")];
+
+    credential_dir = ovc_path_join(auth_dir, "c-credentials");
+    assert(credential_dir != NULL);
+    stem = ovc_cred_namespace_file_stem("registry-suite");
+    assert(stem != NULL);
+    (void)snprintf(record_name, sizeof(record_name), "%s.creds", stem);
+    (void)snprintf(lock_name, sizeof(lock_name), "%s.lock", stem);
+    record_path = ovc_path_join(credential_dir, record_name);
+    lock_path = ovc_path_join(credential_dir, lock_name);
+    assert(record_path != NULL);
+    assert(lock_path != NULL);
+    assert(remove(record_path) == 0);
+    assert(remove(lock_path) == 0);
+#if defined(_WIN32)
+    assert(RemoveDirectoryA(credential_dir));
+    assert(RemoveDirectoryA(auth_dir));
+#else
+    assert(rmdir(credential_dir) == 0);
+    assert(rmdir(auth_dir) == 0);
+#endif
+    free(lock_path);
+    free(record_path);
+    free(stem);
+    free(credential_dir);
+}
+
 int main(void)
 {
+    char leaf[128];
+    char auth_dir[512];
+    char *temp_root;
+    char *joined;
+    OvStorage_InitAuthSubstrateOptions options;
+    OvStorage_Error error;
     OvStorage_Registry *registry;
     const ovc_layer_factory *file_factory;
+    int path_length;
+
+    /* The substrate refuses a relative auth_dir, so the suite's directory is
+     * an absolute, process-scoped leaf under the temporary root. */
+    path_length = snprintf(leaf,
+                           sizeof(leaf),
+                           "ovstorage-registry-test-auth-%lu-%p",
+#if defined(_WIN32)
+                           (unsigned long)GetCurrentProcessId(),
+#else
+                           (unsigned long)getpid(),
+#endif
+                           (void *)&auth_dir);
+    assert(path_length > 0);
+    assert((size_t)path_length < sizeof(leaf));
+    temp_root = ovc_temp_root_dup();
+    assert(temp_root != NULL);
+    joined = ovc_path_join(temp_root, leaf);
+    assert(joined != NULL);
+    path_length = snprintf(auth_dir, sizeof(auth_dir), "%s", joined);
+    assert(path_length > 0);
+    assert((size_t)path_length < sizeof(auth_dir));
+    free(joined);
+    free(temp_root);
+    memset(&options, 0, sizeof(options));
+    memset(&error, 0, sizeof(error));
+    options.auth_dir = auth_dir;
+    options.credential_namespace = "registry-suite";
+    assert(ovstorage_init_auth_substrate(&options, &error) ==
+           OvStorage_Status_Ok);
+    assert(error.code == OvStorage_Status_Ok);
+    assert(error.message == NULL);
 
     registry = ovstorage_registry_create();
     assert(registry != NULL);
@@ -1602,6 +1681,7 @@ int main(void)
     ovc_registry_test_inspection_copy();
     ovc_registry_test_rejects_reserved_and_duplicate_kinds();
     ovc_registry_test_shared_utf8_validator();
+    ovc_registry_test_remove_auth_dir(auth_dir);
     return 0;
 }
 

@@ -15,15 +15,17 @@ use futures::StreamExt as _;
 use ovstorage::layers::ALIAS_KIND;
 use ovstorage::{
     AddressVisibility, AliasSource, AliasState, AuthEvent, AuthEventStream, AuthenticateRequest,
-    CancellationToken, Capabilities, ChangeEvent, ChangeKind, ChangeStream, ConfigValue,
-    Connection, ConnectionAuthState, ConnectionChange, ConnectionId, ConnectionKey,
-    ConnectionRequest, ConnectionSource, ContinueWriteRequest, CopyRequest, ErrorCode,
-    InteractiveAuthCapability, Layer, LayerConfig, LayerConnectionRequest, LayerHandle,
-    LayerKindDescriptor, LayerSpec, ListPage, ListRequest, ListVersionsRequest, LocalDelegate,
-    ObjectInfo, ReadRequest, ReadResult, Request, Result, RootInfo, RootInfoChange,
-    RootInfoSnapshot, RootInfoUpdateStream, RouteSource, SecretBundle, Stack, StatOptions,
-    StatRequest, UpdateConnectionCredentialsRequest, Url, UserMetadata, VersionPage,
-    WatchDirectoryCursor, WatchDirectoryRequest, WriteRequest, WriteResult, WriteStep,
+    BackendItemInfo, Body, CancellationToken, Capabilities, ChangeEvent, ChangeKind, ChangeStream,
+    ConfigValue, Connection, ConnectionAuthState, ConnectionChange, ConnectionId, ConnectionKey,
+    ConnectionRequest, ConnectionSource, ContinueWriteRequest, CopyRequest, CreateDirectoryOptions,
+    CreateDirectoryRequest, ErrorCode, InteractiveAuthCapability, Layer, LayerConfig,
+    LayerConnectionRequest, LayerHandle, LayerKindDescriptor, LayerSpec, ListOptions, ListPage,
+    ListRequest, ListVersionsOptions, ListVersionsRequest, LocalDelegate, ObjectInfo, ReadOptions,
+    ReadRequest, ReadResult, Request, Result, RootInfo, RootInfoChange, RootInfoSnapshot,
+    RootInfoUpdateStream, RouteSource, SecretBundle, Stack, StatOptions, StatRequest,
+    UpdateConnectionCredentialsRequest, UpdateMetadataOptions, UpdateMetadataRequest, Url,
+    UserMetadata, VersionPage, WatchDirectoryCursor, WatchDirectoryRequest, WriteOptions,
+    WriteRequest, WriteResult, WriteStep,
 };
 use ovstorage_plugin_core::{AliasRules, AliasWrapperFactory};
 
@@ -93,6 +95,17 @@ fn connection_key(target: &str, id: &ConnectionId) -> Request<ConnectionKey> {
     })
 }
 
+/// The connection rows the whole stack reports, alias-wrapper rows included.
+async fn listed_connections(stack: &Stack) -> Vec<Connection> {
+    stack
+        .root()
+        .list_connections(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap()
+        .0
+        .connections
+}
+
 async fn stat_addr(stack: &Stack, addr: &str) -> Result<ObjectInfo> {
     stack
         .stat(
@@ -105,10 +118,32 @@ async fn stat_addr(stack: &Stack, addr: &str) -> Result<ObjectInfo> {
         .await
 }
 
+/// The pin the probe attaches to every info it echoes: the received address
+/// selected at one fixed version, so the reverse projection of the pin is
+/// observable beside that of `address`.
+fn pin_of(address: &Url) -> Url {
+    let mut pin = address.clone();
+    pin.set_query(Some("v=1"));
+    pin
+}
+
+fn probe_info(address: Url, size: u64) -> ObjectInfo {
+    let mut info = object_info(address, size);
+    info.versioned_address = Some(pin_of(&info.address));
+    info
+}
+
+fn probe_item_info(address: &Url) -> BackendItemInfo {
+    let mut info = backend_item_info();
+    info.versioned_address = Some(pin_of(address));
+    info
+}
+
 /// A backend for the address/alias wrapper tests. Records the addresses it is
 /// called with (so a test can prove the inbound `from`→`to` rewrite) and echoes
 /// the received address into results (so the wrapper's reverse `to`→`from`
-/// projection is observable). Advertises `roots` for `list_address_roots` /
+/// projection is observable), pinned at a fixed version so the pin's
+/// projection is observable too. Advertises `roots` for `list_address_roots` /
 /// `root_info_for`.
 struct AddressProbe {
     content: Vec<u8>,
@@ -137,7 +172,7 @@ impl Layer for AddressProbe {
     }
 
     fn descriptor(&self) -> LayerKindDescriptor {
-        backend_descriptor(PROBE_KIND)
+        wrapper_descriptor(PROBE_KIND)
     }
 
     async fn root_info_for(
@@ -180,10 +215,7 @@ impl Layer for AddressProbe {
             .lock()
             .unwrap()
             .push(request.input.address.clone());
-        Ok(object_info(
-            request.input.address,
-            self.content.len() as u64,
-        ))
+        Ok(probe_info(request.input.address, self.content.len() as u64))
     }
 
     async fn read(
@@ -197,7 +229,7 @@ impl Layer for AddressProbe {
             .push(request.input.address.clone());
         Ok(ReadResult::Bytes {
             bytes: self.content.clone(),
-            info: object_info(request.input.address, self.content.len() as u64),
+            info: probe_info(request.input.address, self.content.len() as u64),
         })
     }
 
@@ -212,7 +244,7 @@ impl Layer for AddressProbe {
         // address back to caller space is observable.
         let item = Url::parse(&format!("{prefix}item")).unwrap();
         Ok(ListPage {
-            items: vec![object_info(item, self.content.len() as u64)],
+            items: vec![probe_info(item, self.content.len() as u64)],
             next_page_token: None,
         })
     }
@@ -227,7 +259,7 @@ impl Layer for AddressProbe {
             .unwrap()
             .push(request.input.address.clone());
         Ok(WriteResult {
-            info: object_info(request.input.address, self.content.len() as u64),
+            info: probe_info(request.input.address, self.content.len() as u64),
         })
     }
 
@@ -241,7 +273,7 @@ impl Layer for AddressProbe {
             .unwrap()
             .push(request.input.address.clone());
         Ok(WriteResult {
-            info: object_info(request.input.address, self.content.len() as u64),
+            info: probe_info(request.input.address, self.content.len() as u64),
         })
     }
 
@@ -255,7 +287,7 @@ impl Layer for AddressProbe {
             .unwrap()
             .push(request.input.address.clone());
         Ok(WriteStep::Done(WriteResult {
-            info: object_info(request.input.address, self.content.len() as u64),
+            info: probe_info(request.input.address, self.content.len() as u64),
         }))
     }
 
@@ -277,7 +309,7 @@ impl Layer for AddressProbe {
             received.push(destination.clone());
         }
         Ok(WriteStep::Done(WriteResult {
-            info: object_info(destination, 0),
+            info: probe_info(destination, 0),
         }))
     }
 
@@ -292,7 +324,7 @@ impl Layer for AddressProbe {
             .push(request.input.address.clone());
         Ok(LocalDelegate {
             path: std::path::PathBuf::from("/phys/materialized"),
-            info: object_info(request.input.address, self.content.len() as u64),
+            info: probe_info(request.input.address, self.content.len() as u64),
             guard: None,
         })
     }
@@ -307,7 +339,7 @@ impl Layer for AddressProbe {
         // A single version entry at the (physical) address, so projecting the
         // item address back to caller space is observable.
         Ok(VersionPage {
-            items: vec![object_info(address, self.content.len() as u64)],
+            items: vec![probe_info(address, self.content.len() as u64)],
             next_page_token: None,
         })
     }
@@ -321,10 +353,31 @@ impl Layer for AddressProbe {
             .lock()
             .unwrap()
             .push(request.input.address.clone());
-        Ok(object_info(
-            request.input.address,
-            self.content.len() as u64,
-        ))
+        Ok(probe_info(request.input.address, self.content.len() as u64))
+    }
+
+    async fn update_metadata(
+        &self,
+        request: Request<UpdateMetadataRequest>,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<BackendItemInfo> {
+        self.received
+            .lock()
+            .unwrap()
+            .push(request.input.address.clone());
+        Ok(probe_item_info(&request.input.address))
+    }
+
+    async fn create_directory(
+        &self,
+        request: Request<CreateDirectoryRequest>,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<BackendItemInfo> {
+        self.received
+            .lock()
+            .unwrap()
+            .push(request.input.address.clone());
+        Ok(probe_item_info(&request.input.address))
     }
 
     async fn watch_directory(
@@ -520,6 +573,132 @@ async fn alias_rewrites_request_and_projects_result() {
         .unwrap();
     assert_eq!(backend.last_received().as_str(), "target:///r/obj");
     assert_eq!(info.address.as_str(), "alias:///v/obj");
+}
+
+#[tokio::test]
+async fn alias_projects_versioned_address_pins_to_caller_space() {
+    // A pin is a full backend address of its own, so every result that carries
+    // one is projected exactly like `address`: single answers, list and
+    // version pages, delegates, write results, and the address-less item
+    // results of `update_metadata` / `create_directory`.
+    let backend = AddressProbe::new(b"x", vec![test_root("target:///r/")]);
+    let mut config = LayerConfig::new();
+    config.insert(
+        "aliases".into(),
+        ConfigValue::Toml("[[rule]]\nfrom = \"alias:///v/\"\nto = \"target:///r/\"\n".into()),
+    );
+    let stack = build_stack(
+        ALIAS_KIND,
+        Arc::new(AliasWrapperFactory::default()),
+        backend.clone(),
+        config,
+    )
+    .await
+    .unwrap();
+    let obj = Url::parse("alias:///v/obj").unwrap();
+    let pinned = |address: &str| Some(Url::parse(&format!("{address}?v=1")).unwrap());
+
+    let info = stat_addr(&stack, "alias:///v/obj").await.unwrap();
+    assert_eq!(info.address.as_str(), "alias:///v/obj");
+    assert_eq!(info.versioned_address, pinned("alias:///v/obj"));
+
+    let page = stack
+        .list(
+            Request::new(ListRequest {
+                prefix: Url::parse("alias:///v/").unwrap(),
+                options: ListOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items[0].address.as_str(), "alias:///v/item");
+    assert_eq!(page.items[0].versioned_address, pinned("alias:///v/item"));
+
+    let versions = stack
+        .list_versions(
+            Request::new(ListVersionsRequest {
+                address: obj.clone(),
+                options: ListVersionsOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        versions.items[0].versioned_address,
+        pinned("alias:///v/obj")
+    );
+
+    let latest = stack
+        .get_latest_version(
+            Request::new(ReadRequest {
+                address: obj.clone(),
+                options: ReadOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(latest.versioned_address, pinned("alias:///v/obj"));
+
+    let delegate = stack
+        .materialize(
+            Request::new(ReadRequest {
+                address: obj.clone(),
+                options: ReadOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(delegate.info.versioned_address, pinned("alias:///v/obj"));
+
+    let written = stack
+        .write(
+            Request::new(WriteRequest {
+                address: obj.clone(),
+                body: Body::Bytes(b"x".to_vec()),
+                options: WriteOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(written.info.versioned_address, pinned("alias:///v/obj"));
+
+    let updated = stack
+        .update_metadata(
+            Request::new(UpdateMetadataRequest {
+                address: obj.clone(),
+                options: UpdateMetadataOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.versioned_address, pinned("alias:///v/obj"));
+
+    let created = stack
+        .create_directory(
+            Request::new(CreateDirectoryRequest {
+                address: Url::parse("alias:///v/dir/").unwrap(),
+                options: CreateDirectoryOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.versioned_address, pinned("alias:///v/dir/"));
+
+    // Every request reached the backend in physical space.
+    let received = backend.received.lock().unwrap();
+    assert!(
+        received
+            .iter()
+            .all(|address| address.as_str().starts_with("target:///r/")),
+        "{received:?}"
+    );
 }
 
 #[tokio::test]
@@ -826,10 +1005,7 @@ async fn alias_factory_rejects_over_cap_chain() {
 }
 
 #[tokio::test]
-async fn alias_advertises_dangling_chain() {
-    // An alias whose chain terminates nowhere advertises as Dangling (a bare
-    // alias-facing root), so the misconfiguration is visible in discovery
-    // instead of silently absent.
+async fn alias_excludes_dangling_chain_from_advertised_roots() {
     let backend = AddressProbe::new(b"x", vec![test_root("target:///r/")]);
     let mut config = LayerConfig::new();
     config.insert(
@@ -850,20 +1026,15 @@ async fn alias_advertises_dangling_chain() {
         .list_address_roots(&ovstorage::Extensions::new(), None)
         .await
         .unwrap();
-    let alias = snapshot
-        .roots
-        .iter()
-        .find(|root| root.root.as_str() == "alias:///v/")
-        .expect("dangling alias is advertised");
-    assert_eq!(alias.alias_state, Some(AliasState::Dangling));
-    match &alias.source {
-        RouteSource::Alias { to, .. } => assert_eq!(to.as_str(), "missing:///x/"),
-        other => panic!("expected RouteSource::Alias, got {other:?}"),
-    }
+    assert!(
+        snapshot
+            .roots
+            .iter()
+            .all(|root| root.root.as_str() != "alias:///v/"),
+        "dangling aliases are absent from advertised roots",
+    );
 
-    // root_info_for agrees with the advertisement: it reports the same
-    // synthesized dangling alias root instead of NoRoute, so the two
-    // introspection paths never diverge.
+    // Direct alias introspection retains the terminal-state diagnosis.
     let info = stack
         .root()
         .root_info_for(
@@ -964,10 +1135,10 @@ async fn alias_chain_through_suppressed_intermediate_namespace() {
 }
 
 #[tokio::test]
-async fn alias_synthesizes_live_alias_root_and_drops_hidden() {
+async fn alias_synthesizes_live_alias_root_and_marks_hidden() {
     // Inner roots: target:///r/ (Visible) and target:///h/ (Hidden via rule).
-    // Aliases: alias:///v/ → target:///r/ (synthesized Live), and the Hidden
-    // target's root must be dropped from the snapshot.
+    // Aliases: alias:///v/ → target:///r/ (synthesized Live). The Hidden
+    // target remains in the snapshot with its effective visibility marked.
     let backend = AddressProbe::new(
         b"x",
         vec![test_root("target:///r/"), test_root("target:///h/")],
@@ -997,7 +1168,7 @@ async fn alias_synthesizes_live_alias_root_and_drops_hidden() {
         .list_address_roots(&ovstorage::Extensions::new(), None)
         .await
         .unwrap();
-    // Hidden root dropped; Visible target + synthesized alias remain.
+    // Hidden root retained; Visible target + synthesized alias remain.
     let roots: Vec<&str> = snapshot.roots.iter().map(|r| r.root.as_str()).collect();
     assert!(
         roots.contains(&"target:///r/"),
@@ -1008,9 +1179,17 @@ async fn alias_synthesizes_live_alias_root_and_drops_hidden() {
         "alias synthesized: {roots:?}"
     );
     assert!(
-        !roots.contains(&"target:///h/"),
-        "hidden dropped: {roots:?}"
+        roots.contains(&"target:///h/"),
+        "hidden target retained: {roots:?}"
     );
+
+    let hidden = snapshot
+        .roots
+        .iter()
+        .find(|r| r.root.as_str() == "target:///h/")
+        .unwrap();
+    assert!(!hidden.visible);
+    assert_eq!(hidden.visibility, AddressVisibility::Hidden);
 
     let alias = snapshot
         .roots
@@ -1034,6 +1213,82 @@ async fn alias_synthesizes_live_alias_root_and_drops_hidden() {
         }
         other => panic!("expected RouteSource::Alias, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn hidden_alias_mount_appears_in_snapshot_marked_hidden() {
+    let backend = AddressProbe::new(b"x", vec![test_root("target:///r/")]);
+    let mut config = LayerConfig::new();
+    config.insert(
+        "aliases".into(),
+        ConfigValue::Toml("[[rule]]\nfrom = \"alias:///h/\"\nto = \"target:///r/\"\n".into()),
+    );
+    config.insert(
+        "visibility".into(),
+        ConfigValue::Toml("[[entry]]\naddress = \"alias:///h/\"\nvisibility = \"hidden\"\n".into()),
+    );
+    let stack = build_stack(
+        ALIAS_KIND,
+        Arc::new(AliasWrapperFactory::default()),
+        backend,
+        config,
+    )
+    .await
+    .unwrap();
+
+    let (snapshot, _) = stack
+        .root()
+        .list_address_roots(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap();
+    let alias = snapshot
+        .roots
+        .iter()
+        .find(|root| root.root.as_str() == "alias:///h/")
+        .expect("hidden alias mount remains advertised for routing");
+    assert!(!alias.visible);
+    assert_eq!(alias.visibility, AddressVisibility::Hidden);
+    assert_eq!(alias.alias_state, Some(AliasState::Live));
+}
+
+#[tokio::test]
+async fn alias_preserves_incoming_hidden_and_omits_incoming_suppressed_roots() {
+    let mut hidden = test_root("target:///hidden/");
+    hidden.visible = false;
+    hidden.visibility = AddressVisibility::Hidden;
+    let mut suppressed = test_root("target:///suppressed/");
+    suppressed.visible = false;
+    suppressed.visibility = AddressVisibility::Suppressed;
+    let backend = AddressProbe::new(b"x", vec![hidden, suppressed]);
+    let stack = build_stack(
+        ALIAS_KIND,
+        Arc::new(AliasWrapperFactory::default()),
+        backend,
+        LayerConfig::new(),
+    )
+    .await
+    .unwrap();
+
+    let (snapshot, _) = stack
+        .root()
+        .list_address_roots(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap();
+    let hidden = snapshot
+        .roots
+        .iter()
+        .find(|root| root.root.as_str() == "target:///hidden/")
+        .expect("an incoming Hidden root remains routable");
+    assert!(!hidden.visible);
+    assert_eq!(hidden.visibility, AddressVisibility::Hidden);
+    assert!(
+        snapshot
+            .roots
+            .iter()
+            .all(|root| root.root.as_str() != "target:///suppressed/"),
+        "an incoming Suppressed root must remain secret: {:?}",
+        snapshot.roots,
+    );
 }
 
 #[test]
@@ -1559,9 +1814,8 @@ async fn alias_root_deltas_are_computed_in_rule_swap_order_too() {
     })
     .await;
 
-    // Dangling aliases stay advertised — as `Dangling`. It is the LIVENESS the
-    // stale snapshot corrupts, and nothing will correct it: `inner` has no
-    // update stream, and an aliased root is this wrapper's projection alone.
+    // The consumer must not retain either alias as Live after the terminal root
+    // disappears; projection computes each delta from the inner state it sees.
     let live: Vec<String> = advertised
         .iter()
         .filter(|root| root.alias_state == Some(AliasState::Live))
@@ -1576,16 +1830,27 @@ async fn alias_root_deltas_are_computed_in_rule_swap_order_too() {
     );
 }
 
-/// Backend whose `list_address_roots` returns an empty initial snapshot and an
-/// update stream that emits one `Snapshot` of `roots`. Lets a test observe that
-/// the `AliasWrapper` projects live root updates, not just the first snapshot.
+/// Backend whose `list_address_roots` returns configured initial roots and an
+/// update stream that emits one configured `Snapshot`. Lets tests compare the
+/// `AliasWrapper` projection of initial and live roots.
 struct RootStreamProbe {
-    roots: Vec<RootInfo>,
+    snapshot_roots: Vec<RootInfo>,
+    update_roots: Vec<RootInfo>,
 }
 
 impl RootStreamProbe {
-    fn new(roots: Vec<RootInfo>) -> Arc<Self> {
-        Arc::new(Self { roots })
+    fn new(update_roots: Vec<RootInfo>) -> Arc<Self> {
+        Arc::new(Self {
+            snapshot_roots: Vec::new(),
+            update_roots,
+        })
+    }
+
+    fn with_snapshot(snapshot_roots: Vec<RootInfo>, update_roots: Vec<RootInfo>) -> Arc<Self> {
+        Arc::new(Self {
+            snapshot_roots,
+            update_roots,
+        })
     }
 }
 
@@ -1604,11 +1869,11 @@ impl Layer for RootStreamProbe {
         _cx: &ovstorage::Extensions,
         _cancel: Option<CancellationToken>,
     ) -> Result<(RootInfoSnapshot, Option<RootInfoUpdateStream>)> {
-        let update = RootInfoChange::Snapshot(self.roots.clone());
+        let update = RootInfoChange::Snapshot(self.update_roots.clone());
         let stream: RootInfoUpdateStream = Box::pin(futures::stream::iter(vec![Ok(update)]));
         Ok((
             RootInfoSnapshot {
-                roots: Vec::new(),
+                roots: self.snapshot_roots.clone(),
                 updates: true,
             },
             Some(stream),
@@ -1621,9 +1886,13 @@ async fn alias_projects_live_root_update_stream() {
     // The initial snapshot is empty; roots arrive later via the update stream.
     // The wrapper applies the same visibility filtering + alias synthesis to
     // stream updates as to the snapshot — the streaming projection of updates.
-    // Without it, a later update leaks the Hidden root and skips the
-    // synthesized alias.
-    let backend = RootStreamProbe::new(vec![test_root("target:///r/"), test_root("target:///h/")]);
+    // Hidden roots remain marked, suppressed roots never leak, and the alias
+    // is synthesized from the arriving target root.
+    let backend = RootStreamProbe::new(vec![
+        test_root("target:///r/"),
+        test_root("target:///h/"),
+        test_root("target:///s/"),
+    ]);
     let mut config = LayerConfig::new();
     config.insert(
         "aliases".into(),
@@ -1632,7 +1901,9 @@ async fn alias_projects_live_root_update_stream() {
     config.insert(
         "visibility".into(),
         ConfigValue::Toml(
-            "[[entry]]\naddress = \"target:///h/\"\nvisibility = \"hidden\"\n".into(),
+            "[[entry]]\naddress = \"target:///h/\"\nvisibility = \"hidden\"\n\n\
+             [[entry]]\naddress = \"target:///s/\"\nvisibility = \"suppressed\"\n"
+                .into(),
         ),
     );
     let stack = build_stack(
@@ -1652,23 +1923,74 @@ async fn alias_projects_live_root_update_stream() {
     let mut stream = stream.expect("backend advertises an update stream");
     use futures::StreamExt as _;
     let change = stream.next().await.expect("one root update").unwrap();
-    let roots: Vec<String> = match change {
-        RootInfoChange::Snapshot(roots) => {
-            roots.iter().map(|r| r.root.as_str().to_string()).collect()
-        }
+    let roots = match change {
+        RootInfoChange::Snapshot(roots) => roots,
         other => panic!("expected a projected Snapshot, got {other:?}"),
     };
     assert!(
-        roots.contains(&"target:///r/".to_string()),
+        roots
+            .iter()
+            .any(|root| root.root.as_str() == "target:///r/"),
         "visible target kept on the stream: {roots:?}"
     );
     assert!(
-        roots.contains(&"alias:///v/".to_string()),
+        roots.iter().any(|root| root.root.as_str() == "alias:///v/"),
         "alias synthesized on the stream: {roots:?}"
     );
+    let hidden = roots
+        .iter()
+        .find(|root| root.root.as_str() == "target:///h/")
+        .expect("hidden root retained on the stream");
+    assert!(!hidden.visible);
+    assert_eq!(hidden.visibility, AddressVisibility::Hidden);
     assert!(
-        !roots.contains(&"target:///h/".to_string()),
-        "hidden root dropped on the stream: {roots:?}"
+        roots
+            .iter()
+            .all(|root| root.root.as_str() != "target:///s/"),
+        "suppressed root omitted from the stream: {roots:?}"
+    );
+}
+
+#[tokio::test]
+async fn suppressed_rule_omits_root_from_snapshot_and_stream() {
+    let root = test_root("target:///secret/");
+    let backend = RootStreamProbe::with_snapshot(vec![root.clone()], vec![root]);
+    let mut config = LayerConfig::new();
+    config.insert(
+        "visibility".into(),
+        ConfigValue::Toml(
+            "[[entry]]\naddress = \"target:///secret/\"\nvisibility = \"suppressed\"\n".into(),
+        ),
+    );
+    let stack = build_stack(
+        ALIAS_KIND,
+        Arc::new(AliasWrapperFactory::default()),
+        backend,
+        config,
+    )
+    .await
+    .unwrap();
+
+    let (snapshot, stream) = stack
+        .root()
+        .list_address_roots(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap();
+    assert!(
+        snapshot.roots.is_empty(),
+        "suppressed root omitted from snapshot: {:?}",
+        snapshot.roots,
+    );
+
+    let mut stream = stream.expect("backend advertises an update stream");
+    let change = stream.next().await.expect("one root update").unwrap();
+    let roots = match change {
+        RootInfoChange::Snapshot(roots) => roots,
+        other => panic!("expected a projected Snapshot, got {other:?}"),
+    };
+    assert!(
+        roots.is_empty(),
+        "suppressed root omitted from stream: {roots:?}"
     );
 }
 
@@ -1705,6 +2027,96 @@ async fn alias_root_info_for_reports_alias_facing_root() {
     match &info.source {
         RouteSource::Alias { to, .. } => assert_eq!(to.as_str(), "target:///r/"),
         other => panic!("expected RouteSource::Alias, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn alias_root_info_for_matches_hidden_alias_advertisement() {
+    let backend = AddressProbe::new(b"x", vec![test_root("target:///r/")]);
+    let mut config = LayerConfig::new();
+    config.insert(
+        "aliases".into(),
+        ConfigValue::Toml("[[rule]]\nfrom = \"alias:///h/\"\nto = \"target:///r/\"\n".into()),
+    );
+    config.insert(
+        "visibility".into(),
+        ConfigValue::Toml("[[entry]]\naddress = \"alias:///h/\"\nvisibility = \"hidden\"\n".into()),
+    );
+    let stack = build_stack(
+        ALIAS_KIND,
+        Arc::new(AliasWrapperFactory::default()),
+        backend,
+        config,
+    )
+    .await
+    .unwrap();
+
+    let (snapshot, _) = stack
+        .root()
+        .list_address_roots(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap();
+    let advertised = snapshot
+        .roots
+        .iter()
+        .find(|root| root.root.as_str() == "alias:///h/")
+        .expect("hidden alias remains in the routing snapshot");
+    let info = stack
+        .root()
+        .root_info_for(
+            &Url::parse("alias:///h/object").unwrap(),
+            &ovstorage::Extensions::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(info.root, advertised.root);
+    assert_eq!(info.visibility, advertised.visibility);
+    assert_eq!(info.visibility, AddressVisibility::Hidden);
+    assert!(!info.visible);
+}
+
+#[tokio::test]
+async fn direct_root_info_for_uses_most_restrictive_visibility() {
+    let locally_hidden = test_root("target:///locally-hidden/");
+    let mut upstream_hidden = test_root("target:///upstream-hidden/");
+    upstream_hidden.visibility = AddressVisibility::Hidden;
+    upstream_hidden.visible = false;
+    let backend = AddressProbe::new(b"x", vec![locally_hidden, upstream_hidden]);
+    let mut config = LayerConfig::new();
+    config.insert(
+        "visibility".into(),
+        ConfigValue::Toml(
+            "[[entry]]\naddress = \"target:///locally-hidden/\"\nvisibility = \"hidden\"\n\
+             [[entry]]\naddress = \"target:///upstream-hidden/\"\nvisibility = \"visible\"\n"
+                .into(),
+        ),
+    );
+    let stack = build_stack(
+        ALIAS_KIND,
+        Arc::new(AliasWrapperFactory::default()),
+        backend,
+        config,
+    )
+    .await
+    .unwrap();
+
+    for address in [
+        "target:///locally-hidden/object",
+        "target:///upstream-hidden/object",
+    ] {
+        let info = stack
+            .root()
+            .root_info_for(
+                &Url::parse(address).unwrap(),
+                &ovstorage::Extensions::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.visibility, AddressVisibility::Hidden, "{address}");
+        assert!(!info.visible, "{address}");
     }
 }
 
@@ -1827,6 +2239,157 @@ impl Layer for StallingRoots {
             None,
         ))
     }
+}
+
+/// A backend that reports one connection of its own, so the alias's
+/// `self ∪ inner` union has something on both sides.
+struct ConnectedBackend {
+    roots: Vec<RootInfo>,
+    connection: ovstorage::Connection,
+}
+
+impl ConnectedBackend {
+    /// `id` is caller-supplied so a test can collide it with an alias rule's,
+    /// which is the case the union's flat id-space makes possible.
+    fn new(id: &str) -> Arc<Self> {
+        Arc::new(Self {
+            roots: vec![test_root("target:///r/")],
+            connection: ovstorage::Connection {
+                id: ConnectionId(id.to_string()),
+                backend_kind: PROBE_KIND.to_string(),
+                display_name: "backend".to_string(),
+                source: ovstorage::ConnectionSource::Runtime { persisted: false },
+                capabilities: ovstorage::Capabilities::empty(),
+                current_addresses: vec![Url::parse("target:///r/").unwrap()],
+                auth_state: ConnectionAuthState::Anonymous,
+                last_probed: None,
+                user_metadata: ovstorage::UserMetadata::new(),
+                // The backend stamps its own instance name, as every
+                // connection-owning leaf does.
+                owning_target: Some("backend".to_string()),
+            },
+        })
+    }
+}
+
+#[async_trait]
+impl Layer for ConnectedBackend {
+    fn name(&self) -> &str {
+        "backend"
+    }
+
+    fn descriptor(&self) -> LayerKindDescriptor {
+        backend_descriptor(PROBE_KIND)
+    }
+
+    async fn root_info_for(
+        &self,
+        url: &Url,
+        _cx: &ovstorage::Extensions,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<RootInfo> {
+        self.roots
+            .iter()
+            .filter(|root| ovstorage::address::is_ancestor_or_self(&root.root, url))
+            .max_by_key(|root| root.root.as_str().len())
+            .cloned()
+            .ok_or_else(|| ovstorage::Error::new(ErrorCode::NoRoute, "no route matches address"))
+    }
+
+    async fn list_address_roots(
+        &self,
+        _cx: &ovstorage::Extensions,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<(RootInfoSnapshot, Option<RootInfoUpdateStream>)> {
+        Ok((
+            RootInfoSnapshot {
+                roots: self.roots.clone(),
+                updates: false,
+            },
+            None,
+        ))
+    }
+
+    async fn list_connections(
+        &self,
+        _cx: &ovstorage::Extensions,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<(
+        ovstorage::ConnectionSnapshot,
+        Option<ovstorage::ConnectionUpdateStream>,
+    )> {
+        Ok((
+            ovstorage::ConnectionSnapshot {
+                connections: vec![self.connection.clone()],
+                updates: false,
+            },
+            None,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn alias_rows_name_the_wrapper_and_inner_rows_name_the_backend() {
+    // The alias's `list_connections` is a union of two independent id-spaces,
+    // and an id is unique only WITHIN its owner -- so the wrapper deliberately
+    // takes a caller-supplied id, and `rule` here belongs to both sides at
+    // once. Before the rows carried a target the two were identical in every
+    // field a caller could compare, and a `ConnectionKey` built from the id
+    // could reach either.
+    let backend = ConnectedBackend::new("rule");
+    let stack = empty_alias_stack(backend).await;
+    stack
+        .root()
+        .add_connection(
+            alias_request("wrapper", Some("rule"), "alias:///v/", "target:///r/"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let listed = stack
+        .root()
+        .list_connections(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap()
+        .0
+        .connections;
+    assert_eq!(listed.len(), 2, "the union reports both sides: {listed:?}");
+    assert!(
+        listed.iter().all(|row| row.id.0 == "rule"),
+        "the collision is the point of this test",
+    );
+
+    // The alias projects addresses, not ownership: its own row names the
+    // wrapper, and the backend's row keeps the backend -- which is exactly the
+    // fact the union's own note tells callers to disambiguate by.
+    let mut owners: Vec<Option<&str>> = listed
+        .iter()
+        .map(|row| row.owning_target.as_deref())
+        .collect();
+    owners.sort();
+    assert_eq!(owners, vec![Some("backend"), Some("wrapper")]);
+
+    // And the pair is addressable: removing `(wrapper, rule)` takes the rule
+    // and leaves the backend's namesake alone.
+    let alias_row = listed
+        .iter()
+        .find(|row| row.owning_target.as_deref() == Some("wrapper"))
+        .expect("the alias row");
+    stack
+        .root()
+        .remove_connection(connection_key("wrapper", &alias_row.id), None)
+        .await
+        .unwrap();
+    let after = stack
+        .root()
+        .list_connections(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap()
+        .0
+        .connections;
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].owning_target.as_deref(), Some("backend"));
 }
 
 #[tokio::test]
@@ -2358,8 +2921,8 @@ async fn a_runtime_visibility_add_cannot_collide_with_a_configured_scope() {
 
 #[tokio::test]
 async fn alias_visibility_override_emits_root_change() {
-    // Hiding a live alias's `from` at runtime drops its synthesized root from
-    // the projection — observed as a Removed on the update stream.
+    // Hiding a live alias's `from` at runtime retains its synthesized root and
+    // marks the visibility change as an Updated event.
     let backend = AddressProbe::new(b"x", vec![test_root("target:///r/")]);
     let mut config = LayerConfig::new();
     config.insert(
@@ -2400,16 +2963,94 @@ async fn alias_visibility_override_emits_root_change() {
         .expect("a root change is emitted")
         .expect("stream is not terminated")
         .unwrap();
+    let updated = match change {
+        RootInfoChange::Updated(roots) => roots,
+        other => panic!("expected Updated, got {other:?}"),
+    };
+    let alias = updated
+        .iter()
+        .find(|root| root.root.as_str() == "alias:///v/")
+        .expect("the now-hidden alias root is updated");
+    assert!(!alias.visible);
+    assert_eq!(alias.visibility, AddressVisibility::Hidden);
+    assert_eq!(alias.alias_state, Some(AliasState::Live));
+}
+
+#[tokio::test]
+async fn alias_suppression_override_emits_root_removal() {
+    let backend = AddressProbe::new(b"x", vec![test_root("target:///r/")]);
+    let mut config = LayerConfig::new();
+    config.insert(
+        "aliases".into(),
+        ConfigValue::Toml("[[rule]]\nfrom = \"alias:///v/\"\nto = \"target:///r/\"\n".into()),
+    );
+    let stack = build_stack(
+        ALIAS_KIND,
+        Arc::new(AliasWrapperFactory::default()),
+        backend,
+        config,
+    )
+    .await
+    .unwrap();
+
+    let (snapshot, stream) = stack
+        .root()
+        .list_address_roots(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap();
+    assert!(
+        snapshot
+            .roots
+            .iter()
+            .any(|root| root.root.as_str() == "alias:///v/"),
+        "alias advertised before suppression",
+    );
+    let mut stream = stream.expect("update stream");
+
+    stack
+        .root()
+        .add_connection(visibility_request("wrapper", "alias:///", "hidden"), None)
+        .await
+        .unwrap();
+
+    let change = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("a root change is emitted")
+        .expect("stream is not terminated")
+        .unwrap();
+    let updated = match change {
+        RootInfoChange::Updated(roots) => roots,
+        other => panic!("expected Updated, got {other:?}"),
+    };
+    assert_eq!(updated.len(), 1, "only the alias root changes: {updated:?}");
+    assert_eq!(updated[0].root.as_str(), "alias:///v/");
+    assert_eq!(updated[0].visibility, AddressVisibility::Hidden);
+    assert!(!updated[0].visible);
+
+    stack
+        .root()
+        .add_connection(
+            visibility_request("wrapper", "alias:///v/", "suppressed"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let change = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("a root change is emitted")
+        .expect("stream is not terminated")
+        .unwrap();
     let removed = match change {
         RootInfoChange::Removed(roots) => roots,
         other => panic!("expected Removed, got {other:?}"),
     };
-    assert!(
-        removed
-            .iter()
-            .any(|root| root.root.as_str() == "alias:///v/"),
-        "the now-hidden alias root is removed: {removed:?}",
+    assert_eq!(
+        removed.len(),
+        1,
+        "only the suppressed alias root is removed: {removed:?}"
     );
+    assert_eq!(removed[0].root.as_str(), "alias:///v/");
 }
 
 #[tokio::test]
@@ -3058,6 +3699,7 @@ fn backend_connection(id: &str) -> Connection {
         },
         last_probed: Some(SystemTime::UNIX_EPOCH),
         user_metadata: UserMetadata::default(),
+        owning_target: None,
     }
 }
 
@@ -3761,4 +4403,1907 @@ async fn alias_delegation_reprojects_awaiting_auth_attempt_error() {
     }
     assert!(!attempt_error.message().contains("private-bucket"));
     assert!(!attempt_error.message().contains("s3://"));
+}
+
+// ---------------------------------------------------------------------------
+// Derived rules: hidden aliases auto-generated from a backend connection's
+// accepted-URL-spellings metadata
+// ---------------------------------------------------------------------------
+
+use ovstorage::{ACCEPTED_URL_SPELLINGS_METADATA_KEY, ALIAS_DERIVED_FROM_METADATA_KEY};
+
+/// A connection-owning backend that advertises accepted URL spellings on the
+/// rows it registers — the s3/azure shape. `add_connection` mints a row
+/// stamped with `spellings` whose advertised address is `root`, and starts
+/// serving that root; `remove_connection` withdraws both. `static_roots` are
+/// served unconditionally (a sibling namespace for eviction/collision tests).
+struct SpellingBackend {
+    root: Url,
+    spellings: String,
+    static_roots: Vec<RootInfo>,
+    state: Mutex<SpellingState>,
+    received: Mutex<Vec<Url>>,
+    /// When armed, the next `list_connections` announces its arrival and then
+    /// parks until released — the derivation's await window, held open so a
+    /// test can land a concurrent removal inside it.
+    listing_gate: Mutex<Option<ListingGate>>,
+    /// When set, `list_connections` fails with this code instead of answering.
+    /// Set AFTER the build so the build-time adoption scan is unaffected.
+    listing_error: Mutex<Option<ErrorCode>>,
+    /// When set, `list_connections` never returns — the unresponsive inner
+    /// layer a bounded scan has to survive.
+    listing_hangs: Mutex<bool>,
+    /// When set, `list_connections` also reports an alias-kind row carrying
+    /// the derived-from marker on this scope, and `remove_connection` refuses
+    /// to delete it. Stands in for an inner alias layer holding a derived copy
+    /// that cannot be evicted, without needing a second wrapper to hold it.
+    unevictable_shadow: Mutex<Option<Url>>,
+    /// Inner derived-alias rows that DO accept removal, keyed by scope. Stands
+    /// in for an inner alias layer's evictable copies so a test can observe
+    /// which scopes a takeover actually consumed.
+    evictable_shadows: Mutex<Vec<(ConnectionId, Url)>>,
+}
+
+/// The id of the fixture's unevictable derived-alias row.
+const SHADOW_ROW_ID: &str = "shadow-derived";
+
+/// An inner alias layer's derived-alias row, as `evict_downstream_derived`
+/// recognizes one: alias-kinded, carrying the provenance marker, advertising
+/// its `from` as its first address, and owned by a named target.
+fn shadow_alias_row(id: &str, scope: &Url) -> Connection {
+    let mut user_metadata = UserMetadata::new();
+    user_metadata.insert(
+        ALIAS_DERIVED_FROM_METADATA_KEY.to_string(),
+        "backend/probe-1".to_string(),
+    );
+    Connection {
+        id: ConnectionId(id.to_string()),
+        backend_kind: ALIAS_KIND.to_string(),
+        display_name: "inner derived alias".to_string(),
+        source: ConnectionSource::Runtime { persisted: false },
+        capabilities: Capabilities::empty(),
+        current_addresses: vec![scope.clone()],
+        auth_state: ConnectionAuthState::Anonymous,
+        last_probed: None,
+        user_metadata,
+        owning_target: Some("backend".to_string()),
+    }
+}
+
+/// Parks the next `remaining` listings. The backend adds a permit to
+/// `entered` as each one arrives and then waits for one from `release`, so a
+/// test can hold a chosen number of concurrent calls open at a known point.
+#[derive(Clone)]
+struct ListingGate {
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+    remaining: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ListingGate {
+    /// Wait until one more listing has reached the gate.
+    async fn await_entry(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("gate stays open")
+            .forget();
+    }
+
+    /// Let `count` parked listings through.
+    fn release(&self, count: usize) {
+        self.release.add_permits(count);
+    }
+}
+
+#[derive(Default)]
+struct SpellingState {
+    connections: Vec<Connection>,
+    roots: Vec<RootInfo>,
+    counter: u64,
+}
+
+impl SpellingBackend {
+    fn new(root: &str, spellings: &[&str], static_roots: Vec<RootInfo>) -> Arc<Self> {
+        Arc::new(Self {
+            root: Url::parse(root).unwrap(),
+            spellings: spellings.join("\n"),
+            static_roots,
+            state: Mutex::new(SpellingState::default()),
+            received: Mutex::new(Vec::new()),
+            listing_gate: Mutex::new(None),
+            listing_error: Mutex::new(None),
+            listing_hangs: Mutex::new(false),
+            unevictable_shadow: Mutex::new(None),
+            evictable_shadows: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn hold_evictable_shadows(&self, scopes: &[&str]) {
+        *self.evictable_shadows.lock().unwrap() = scopes
+            .iter()
+            .enumerate()
+            .map(|(index, scope)| {
+                (
+                    ConnectionId(format!("evictable-shadow-{index}")),
+                    Url::parse(scope).unwrap(),
+                )
+            })
+            .collect();
+    }
+
+    /// The scopes whose inner derived copy is still present.
+    fn surviving_shadow_scopes(&self) -> Vec<String> {
+        self.evictable_shadows
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, scope)| scope.as_str().to_string())
+            .collect()
+    }
+
+    fn hold_unevictable_shadow(&self, scope: &str) {
+        *self.unevictable_shadow.lock().unwrap() = Some(Url::parse(scope).unwrap());
+    }
+
+    fn fail_listings_with(&self, code: ErrorCode) {
+        *self.listing_error.lock().unwrap() = Some(code);
+    }
+
+    fn stop_failing_listings(&self) {
+        *self.listing_error.lock().unwrap() = None;
+    }
+
+    fn hang_listings(&self) {
+        *self.listing_hangs.lock().unwrap() = true;
+    }
+
+    /// Arm the listing gate for the next `count` listings.
+    fn arm_listing_gate_for(&self, count: usize) -> ListingGate {
+        let gate = ListingGate {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            remaining: Arc::new(std::sync::atomic::AtomicUsize::new(count)),
+        };
+        *self.listing_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    fn arm_listing_gate(&self) -> ListingGate {
+        self.arm_listing_gate_for(1)
+    }
+
+    /// The config-as-Stack shape: the connection exists BEFORE any wrapper
+    /// wraps this layer, so only the alias wrapper's build-time adoption scan
+    /// can see it.
+    fn with_preexisting(root: &str, spellings: &[&str], static_roots: Vec<RootInfo>) -> Arc<Self> {
+        let backend = Self::new(root, spellings, static_roots);
+        backend.register();
+        backend
+    }
+
+    fn register(&self) -> Connection {
+        let mut state = self.state.lock().unwrap();
+        state.counter += 1;
+        let id = ConnectionId(format!("probe-{}", state.counter));
+        let mut user_metadata = UserMetadata::new();
+        user_metadata.insert(
+            ACCEPTED_URL_SPELLINGS_METADATA_KEY.to_string(),
+            self.spellings.clone(),
+        );
+        let connection = Connection {
+            id,
+            backend_kind: PROBE_KIND.to_string(),
+            display_name: "spelling backend".to_string(),
+            source: ConnectionSource::Runtime { persisted: false },
+            capabilities: Capabilities::empty(),
+            current_addresses: vec![self.root.clone()],
+            auth_state: ConnectionAuthState::Anonymous,
+            last_probed: None,
+            user_metadata,
+            owning_target: Some("backend".to_string()),
+        };
+        state.connections.push(connection.clone());
+        state.roots.push(test_root(self.root.as_str()));
+        connection
+    }
+
+    fn last_received(&self) -> Url {
+        self.received.lock().unwrap().last().cloned().unwrap()
+    }
+
+    fn all_roots(&self) -> Vec<RootInfo> {
+        let mut roots = self.static_roots.clone();
+        roots.extend(self.state.lock().unwrap().roots.clone());
+        roots
+    }
+}
+
+#[async_trait]
+impl Layer for SpellingBackend {
+    fn name(&self) -> &str {
+        "backend"
+    }
+
+    fn descriptor(&self) -> LayerKindDescriptor {
+        backend_descriptor(PROBE_KIND)
+    }
+
+    async fn root_info_for(
+        &self,
+        url: &Url,
+        _cx: &ovstorage::Extensions,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<RootInfo> {
+        self.all_roots()
+            .iter()
+            .filter(|root| ovstorage::address::is_ancestor_or_self(&root.root, url))
+            .max_by_key(|root| root.root.as_str().len())
+            .cloned()
+            .ok_or_else(|| ovstorage::Error::new(ErrorCode::NoRoute, "no route matches address"))
+    }
+
+    async fn list_address_roots(
+        &self,
+        _cx: &ovstorage::Extensions,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<(RootInfoSnapshot, Option<RootInfoUpdateStream>)> {
+        Ok((
+            RootInfoSnapshot {
+                roots: self.all_roots(),
+                updates: false,
+            },
+            None,
+        ))
+    }
+
+    async fn stat(
+        &self,
+        request: Request<StatRequest>,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<ObjectInfo> {
+        self.root_info_for(&request.input.address, &ovstorage::Extensions::new(), None)
+            .await?;
+        self.received
+            .lock()
+            .unwrap()
+            .push(request.input.address.clone());
+        Ok(object_info(request.input.address, 1))
+    }
+
+    async fn list_connections(
+        &self,
+        _cx: &ovstorage::Extensions,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<(
+        ovstorage::ConnectionSnapshot,
+        Option<ovstorage::ConnectionUpdateStream>,
+    )> {
+        // Cloned out before any await, never held across one. Only the armed
+        // number of listings park; everything after passes straight through,
+        // so what a test does while the gate is held cannot deadlock behind it.
+        let gate = self.listing_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            let claimed = gate
+                .remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |left| (left > 0).then(|| left - 1),
+                )
+                .is_ok();
+            if claimed {
+                gate.entered.add_permits(1);
+                gate.release
+                    .acquire()
+                    .await
+                    .expect("gate stays open")
+                    .forget();
+            }
+        }
+        if let Some(code) = *self.listing_error.lock().unwrap() {
+            return Err(ovstorage::Error::new(code, "listing refused by fixture"));
+        }
+        if *self.listing_hangs.lock().unwrap() {
+            std::future::pending::<()>().await;
+        }
+        let mut connections = self.state.lock().unwrap().connections.clone();
+        if let Some(scope) = self.unevictable_shadow.lock().unwrap().clone() {
+            connections.push(shadow_alias_row(SHADOW_ROW_ID, &scope));
+        }
+        for (id, scope) in self.evictable_shadows.lock().unwrap().iter() {
+            connections.push(shadow_alias_row(&id.0, scope));
+        }
+        Ok((
+            ovstorage::ConnectionSnapshot {
+                connections,
+                updates: false,
+            },
+            None,
+        ))
+    }
+
+    async fn add_connection(
+        &self,
+        request: Request<LayerConnectionRequest>,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<Connection> {
+        if request.input.target != self.name() {
+            return Err(ovstorage::Error::new(
+                ErrorCode::NotFound,
+                "target layer not found",
+            ));
+        }
+        Ok(self.register())
+    }
+
+    async fn remove_connection(
+        &self,
+        key: Request<ConnectionKey>,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<()> {
+        if key.input.target != self.name() {
+            return Err(ovstorage::Error::new(
+                ErrorCode::NotFound,
+                "target layer not found",
+            ));
+        }
+        if key.input.id == ConnectionId(SHADOW_ROW_ID.to_string()) {
+            return Err(ovstorage::Error::new(
+                ErrorCode::Transient,
+                "the shadow row refuses removal",
+            ));
+        }
+        {
+            let mut shadows = self.evictable_shadows.lock().unwrap();
+            let before = shadows.len();
+            shadows.retain(|(id, _)| id != &key.input.id);
+            if shadows.len() != before {
+                return Ok(());
+            }
+        }
+        let mut state = self.state.lock().unwrap();
+        let before = state.connections.len();
+        state.connections.retain(|row| row.id != key.input.id);
+        if state.connections.len() == before {
+            return Err(ovstorage::Error::new(
+                ErrorCode::NotFound,
+                "connection does not exist",
+            ));
+        }
+        let root = self.root.clone();
+        state.roots.retain(|row| row.root != root);
+        Ok(())
+    }
+}
+
+/// A `Request<LayerConnectionRequest>` registering the spelling backend's
+/// connection — a delegated registration that crosses the alias wrapper.
+fn backend_connect_request() -> Request<LayerConnectionRequest> {
+    Request::new(LayerConnectionRequest {
+        target: "backend".to_string(),
+        connection: ConnectionRequest {
+            backend_kind: PROBE_KIND.to_string(),
+            config: HashMap::new(),
+            credentials: SecretBundle::default(),
+            persist: false,
+            display_name: None,
+        },
+    })
+}
+
+/// The end-to-end promise of auto-generated aliases: a user pasting an ordinary cloud URL they
+/// already hold gets the object, without translating it to the canonical
+/// form first — for the virtual-hosted and the path-style spelling alike —
+/// and results echo in the address space the caller used.
+#[tokio::test]
+async fn a_registered_connections_url_spellings_resolve() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &[
+            "https://bucket.s3.us-west-2.amazonaws.com/",
+            "https://s3.us-west-2.amazonaws.com/bucket/",
+        ],
+        Vec::new(),
+    );
+    let stack = empty_alias_stack(backend.clone()).await;
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+
+    // Virtual-hosted: the bucket is a subdomain, the key is the whole path.
+    let info = stat_addr(&stack, "https://bucket.s3.us-west-2.amazonaws.com/dir/key")
+        .await
+        .expect("the virtual-hosted spelling resolves");
+    assert_eq!(backend.last_received().as_str(), "probe://bucket/dir/key");
+    assert_eq!(
+        info.address.as_str(),
+        "https://bucket.s3.us-west-2.amazonaws.com/dir/key",
+        "results project back to the caller's own spelling"
+    );
+
+    // Path-style: the bucket is the first path segment and must NOT survive
+    // into the rewritten key.
+    stat_addr(&stack, "https://s3.us-west-2.amazonaws.com/bucket/dir/key")
+        .await
+        .expect("the path-style spelling resolves");
+    assert_eq!(backend.last_received().as_str(), "probe://bucket/dir/key");
+
+    // The canonical form is untouched by the generated rules.
+    let info = stat_addr(&stack, "probe://bucket/dir/key").await.unwrap();
+    assert_eq!(info.address.as_str(), "probe://bucket/dir/key");
+}
+
+/// Generated aliases are Hidden: addressable (proven above), but a root
+/// browser keeps showing the canonical form only — the synthesized alias
+/// roots are retained with the unlisted marker, never advertised as visible.
+#[tokio::test]
+async fn derived_aliases_are_addressable_but_not_advertised() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://bucket.s3.us-west-2.amazonaws.com/"],
+        Vec::new(),
+    );
+    let stack = empty_alias_stack(backend.clone()).await;
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+
+    let (snapshot, _stream) = stack
+        .root()
+        .list_address_roots(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap();
+    let visible: Vec<&str> = snapshot
+        .roots
+        .iter()
+        .filter(|root| root.visible)
+        .map(|root| root.root.as_str())
+        .collect();
+    assert_eq!(
+        visible,
+        vec!["probe://bucket/"],
+        "listings keep showing the canonical form only"
+    );
+    let alias_root = snapshot
+        .roots
+        .iter()
+        .find(|root| root.root.as_str() == "https://bucket.s3.us-west-2.amazonaws.com/")
+        .expect("the derived alias root is retained (addressable), just unlisted");
+    assert_eq!(alias_root.visibility, AddressVisibility::Hidden);
+    assert!(!alias_root.visible);
+    assert_eq!(alias_root.alias_state, Some(AliasState::Live));
+}
+
+/// The derived rows are honest connections: listed with their provenance
+/// marker (which backend connection re-registering would bring them back),
+/// and withdrawn — not orphaned — when that connection is removed.
+#[tokio::test]
+async fn derived_rows_declare_provenance_and_are_withdrawn_on_removal() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &[
+            "https://bucket.s3.us-west-2.amazonaws.com/",
+            "https://s3.us-west-2.amazonaws.com/bucket/",
+        ],
+        Vec::new(),
+    );
+    let stack = empty_alias_stack(backend.clone()).await;
+    let registered = stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+
+    let listed = stack
+        .root()
+        .list_connections(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap()
+        .0
+        .connections;
+    let derived: Vec<&Connection> = listed
+        .iter()
+        .filter(|row| {
+            row.user_metadata
+                .contains_key(ALIAS_DERIVED_FROM_METADATA_KEY)
+        })
+        .collect();
+    assert_eq!(derived.len(), 2, "one derived row per spelling: {listed:?}");
+    for row in &derived {
+        assert_eq!(
+            row.user_metadata
+                .get(ALIAS_DERIVED_FROM_METADATA_KEY)
+                .map(String::as_str),
+            Some(format!("backend/{}", registered.id.0).as_str())
+        );
+        assert_eq!(row.owning_target.as_deref(), Some("wrapper"));
+        assert_eq!(
+            row.user_metadata.get(ALIAS_TO_KEY).map(String::as_str),
+            Some("probe://bucket/")
+        );
+    }
+
+    stack
+        .root()
+        .remove_connection(connection_key("backend", &registered.id), None)
+        .await
+        .unwrap();
+    let after = stack
+        .root()
+        .list_connections(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap()
+        .0
+        .connections;
+    assert!(
+        after.is_empty(),
+        "the backend row and both derived rows are gone: {after:?}"
+    );
+    let error = stat_addr(&stack, "https://bucket.s3.us-west-2.amazonaws.com/key")
+        .await
+        .expect_err("a withdrawn spelling no longer resolves");
+    assert_eq!(error.code(), ErrorCode::NoRoute);
+}
+
+/// The config-as-Stack path: a backend factory seeds its connection from its
+/// own layer config, so no `add_connection` ever crosses the wrapper — the
+/// build-time adoption scan is what covers it.
+#[tokio::test]
+async fn preexisting_connections_are_adopted_at_build() {
+    let backend = SpellingBackend::with_preexisting(
+        "probe://bucket/",
+        &["https://bucket.s3.us-west-2.amazonaws.com/"],
+        Vec::new(),
+    );
+    let stack = empty_alias_stack(backend.clone()).await;
+
+    stat_addr(&stack, "https://bucket.s3.us-west-2.amazonaws.com/key")
+        .await
+        .expect("a connection that predates the wrapper still gets its aliases");
+    assert_eq!(backend.last_received().as_str(), "probe://bucket/key");
+}
+
+/// Explicit beats derived: an operator rule on the same scope evicts the
+/// generated rule instead of being refused as a duplicate of a rule nobody
+/// wrote, and dispatch follows the operator's `to` from then on.
+#[tokio::test]
+async fn an_explicit_rule_evicts_the_derived_rule_on_its_scope() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://held.example/pub/"],
+        vec![test_root("target:///r/")],
+    );
+    let stack = empty_alias_stack(backend.clone()).await;
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+    stat_addr(&stack, "https://held.example/pub/x")
+        .await
+        .unwrap();
+    assert_eq!(backend.last_received().as_str(), "probe://bucket/x");
+
+    stack
+        .root()
+        .add_connection(
+            alias_request("wrapper", None, "https://held.example/pub/", "target:///r/"),
+            None,
+        )
+        .await
+        .expect("the explicit rule must not be refused as a duplicate of a derived one");
+
+    stat_addr(&stack, "https://held.example/pub/x")
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.last_received().as_str(),
+        "target:///r/x",
+        "the operator's rewrite wins"
+    );
+    let listed = stack
+        .root()
+        .list_connections(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap()
+        .0
+        .connections;
+    assert!(
+        listed.iter().all(|row| !row
+            .user_metadata
+            .contains_key(ALIAS_DERIVED_FROM_METADATA_KEY)),
+        "the derived row was evicted: {listed:?}"
+    );
+}
+
+/// The reverse collision: a spelling whose scope an operator rule already
+/// covers is skipped — the operator's rule keeps routing, and the backend
+/// registration itself must never fail over a generation convenience.
+#[tokio::test]
+async fn a_colliding_spelling_never_fails_the_registration() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://held.example/pub/"],
+        vec![test_root("target:///r/")],
+    );
+    let stack = empty_alias_stack(backend.clone()).await;
+    stack
+        .root()
+        .add_connection(
+            alias_request("wrapper", None, "https://held.example/pub/", "target:///r/"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let registered = stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .expect("a colliding derived spelling must not fail the registration");
+
+    // The operator's rule still owns the scope.
+    stat_addr(&stack, "https://held.example/pub/x")
+        .await
+        .unwrap();
+    assert_eq!(backend.last_received().as_str(), "target:///r/x");
+
+    // Owning it by DISPATCH is not enough: a derived row retained and merely
+    // shadowed would answer here too, and would come back the moment the
+    // explicit rule went away. Nothing on the scope carries the provenance
+    // marker at all.
+    let listed = stack
+        .root()
+        .list_connections(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap()
+        .0
+        .connections;
+    let explicit = listed
+        .iter()
+        .find(|row| {
+            row.current_addresses
+                .iter()
+                .any(|address| address.as_str() == "https://held.example/pub/")
+                && !row
+                    .user_metadata
+                    .contains_key(ALIAS_DERIVED_FROM_METADATA_KEY)
+        })
+        .expect("the operator's rule is listed");
+    assert!(
+        !listed.iter().any(|row| {
+            row.user_metadata
+                .contains_key(ALIAS_DERIVED_FROM_METADATA_KEY)
+                && row
+                    .current_addresses
+                    .iter()
+                    .any(|address| address.as_str() == "https://held.example/pub/")
+        }),
+        "the derived copy is evicted, not shadowed: {listed:?}"
+    );
+
+    // And eviction is permanent for the life of the registration: removing
+    // the explicit rule leaves the spelling unrouted until the backend
+    // connection re-registers, rather than uncovering a surviving derived row.
+    stack
+        .root()
+        .remove_connection(connection_key("wrapper", &explicit.id), None)
+        .await
+        .unwrap();
+    let error = stat_addr(&stack, "https://held.example/pub/x")
+        .await
+        .expect_err("the scope is unrouted once the explicit rule is gone");
+    assert_eq!(error.code(), ErrorCode::NoRoute);
+
+    stack
+        .root()
+        .remove_connection(connection_key("backend", &registered.id), None)
+        .await
+        .unwrap();
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+    stat_addr(&stack, "https://held.example/pub/x")
+        .await
+        .expect("re-registering the backend brings the derived spelling back");
+    assert_eq!(backend.last_received().as_str(), "probe://bucket/x");
+}
+
+/// Derivation spans an await — the registration returns, then the wrapper
+/// lists `inner`'s connections before committing the generated rules — and a
+/// removal of that same connection inside that window withdraws nothing,
+/// because nothing is installed yet. The install behind it must not then
+/// commit rules for a connection that no longer exists: those rows would be
+/// listed as derived from a vanished owner and stay dangling until the same
+/// connection happened to re-register.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_racing_an_in_flight_derivation_leaves_no_orphaned_rules() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://held.example/pub/"],
+        Vec::new(),
+    );
+    let stack = Arc::new(empty_alias_stack(backend.clone()).await);
+    let gate = backend.arm_listing_gate();
+
+    let adding = tokio::spawn({
+        let stack = Arc::clone(&stack);
+        async move {
+            stack
+                .root()
+                .add_connection(backend_connect_request(), None)
+                .await
+                .unwrap()
+        }
+    });
+
+    // The registration is committed below and its derivation is parked in the
+    // inner listing. The id is the backend's first, minted by that add.
+    gate.await_entry().await;
+    let registered = ConnectionId("probe-1".to_string());
+    stack
+        .root()
+        .remove_connection(connection_key("backend", &registered), None)
+        .await
+        .expect("the connection the add just registered is removable");
+
+    gate.release(1);
+    adding
+        .await
+        .expect("the registration itself still succeeds");
+
+    let listed = listed_connections(&stack).await;
+    assert!(
+        listed.is_empty(),
+        "the removed connection leaves no derived rows behind: {listed:?}"
+    );
+    let error = stat_addr(&stack, "https://held.example/pub/x")
+        .await
+        .expect_err("a spelling of a removed connection resolves nowhere");
+    assert_eq!(error.code(), ErrorCode::NoRoute);
+}
+
+/// A probe must preview the add that follows it, and the add on a scope a
+/// derived rule owns evicts that rule. Without the same eviction in the
+/// preview the probe would report the scope taken and refuse an add that
+/// succeeds — which breaks any client that requires a green probe before an
+/// operator override. Side-effect freedom is the other half: previewing the
+/// override must not itself evict the derived row or move dispatch.
+#[tokio::test]
+async fn a_probe_previews_the_override_of_a_derived_scope_without_taking_it() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://held.example/pub/"],
+        vec![test_root("target:///r/")],
+    );
+    let stack = empty_alias_stack(backend.clone()).await;
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+
+    let derived_rows = |listed: &[Connection]| -> usize {
+        listed
+            .iter()
+            .filter(|row| {
+                row.user_metadata
+                    .contains_key(ALIAS_DERIVED_FROM_METADATA_KEY)
+            })
+            .count()
+    };
+    assert_eq!(derived_rows(&listed_connections(&stack).await), 1);
+
+    stack
+        .root()
+        .probe(
+            alias_request("wrapper", None, "https://held.example/pub/", "target:///r/"),
+            None,
+        )
+        .await
+        .expect("the scope a derived rule owns previews as available");
+
+    // Nothing moved: the derived row is still there and still answering.
+    assert_eq!(
+        derived_rows(&listed_connections(&stack).await),
+        1,
+        "a preview never evicts"
+    );
+    stat_addr(&stack, "https://held.example/pub/x")
+        .await
+        .unwrap();
+    assert_eq!(backend.last_received().as_str(), "probe://bucket/x");
+
+    // The add the probe previewed does evict it, and takes dispatch.
+    stack
+        .root()
+        .add_connection(
+            alias_request("wrapper", None, "https://held.example/pub/", "target:///r/"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(derived_rows(&listed_connections(&stack).await), 0);
+    stat_addr(&stack, "https://held.example/pub/x")
+        .await
+        .unwrap();
+    assert_eq!(backend.last_received().as_str(), "target:///r/x");
+}
+
+/// A derived spelling selects exactly the object its canonical address does.
+///
+/// The Stack collapses repeated path separators at the address boundary, for
+/// every scheme, before any layer sees the request — a deliberate repo-wide
+/// rule (`address::collapse_empty_segments`) that the three published plugin
+/// contracts state, and that an emitter's round-trip check enforces by
+/// dropping such a key from listings rather than handing out an address that
+/// names something else. A generated alias adds a SPELLING of an address; it
+/// must not add an object-selection rule of its own. This pins the equivalence
+/// in both directions, so a future change that made the alias path finer or
+/// coarser than the canonical one fails here.
+#[tokio::test]
+async fn a_derived_spelling_selects_the_same_object_as_the_canonical_address() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://bucket.s3.us-west-2.amazonaws.com/"],
+        Vec::new(),
+    );
+    let stack = empty_alias_stack(backend.clone()).await;
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+
+    // The canonical spelling is collapsed by the address boundary; this is
+    // true with no alias rule in play at all.
+    stat_addr(&stack, "probe://bucket/a//b").await.unwrap();
+    let canonical = backend.last_received();
+    assert_eq!(canonical.as_str(), "probe://bucket/a/b");
+
+    // The generated spelling of the same address lands on the same object —
+    // not a different one, and not a refusal the canonical form does not get.
+    stat_addr(&stack, "https://bucket.s3.us-west-2.amazonaws.com/a//b")
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.last_received(),
+        canonical,
+        "a generated spelling must select what its canonical address selects"
+    );
+
+    // And an ordinary single-separator key is untouched by either spelling.
+    stat_addr(&stack, "https://bucket.s3.us-west-2.amazonaws.com/a/b")
+        .await
+        .unwrap();
+    assert_eq!(backend.last_received().as_str(), "probe://bucket/a/b");
+}
+
+/// A derived copy the takeover FOUND and could not evict is fatal to the
+/// explicit add: that copy covers the same scope at equal specificity and
+/// keeps routing past the rule, so reporting `Ok` would report a rewrite that
+/// silently does not apply.
+///
+/// And the rule is never PUBLISHED in that state. The takeover runs before the
+/// commit, so a subscriber cannot see an `Added` for a rule that does not yet
+/// apply and act on it — nor the transient `Added` then `Removed` pair a
+/// commit-first-and-roll-back ordering would expose.
+#[tokio::test]
+async fn an_explicit_add_that_cannot_evict_a_known_shadow_never_publishes_the_rule() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://held.example/pub/"],
+        vec![test_root("target:///r/")],
+    );
+    let stack = empty_alias_stack(backend.clone()).await;
+    backend.hold_unevictable_shadow("https://held.example/pub/");
+
+    // Subscribed before the add, so nothing it emits can be missed.
+    let (_snapshot, stream) = stack
+        .root()
+        .list_connections(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap();
+    let mut stream = stream.expect("the wrapper always supplies a connection stream");
+
+    let error = stack
+        .root()
+        .add_connection(
+            alias_request("wrapper", None, "https://held.example/pub/", "target:///r/"),
+            None,
+        )
+        .await
+        .expect_err("a rule that would stay shadowed is not a successful add");
+    assert_eq!(error.code(), ErrorCode::Internal);
+
+    let listed = listed_connections(&stack).await;
+    assert!(
+        !listed
+            .iter()
+            .any(|row| row.owning_target.as_deref() == Some("wrapper")),
+        "the refused rule leaves nothing installed on this wrapper: {listed:?}"
+    );
+
+    // Nothing was announced at all — not an `Added`, and so not a `Removed`
+    // undoing one either.
+    match futures::poll!(stream.next()) {
+        std::task::Poll::Pending => {}
+        other => panic!("a refused takeover must publish no connection event, got {other:?}"),
+    }
+}
+
+/// A refused add must not have consumed an inner derived copy on the way to
+/// being refused. The takeover runs before the authoritative commit, so
+/// without serialization two adds can both clear their prechecks, both evict,
+/// and only then have one of them rejected at the commit — and a derived copy
+/// regenerates only when its backend connection re-registers, so the rejected
+/// operation would have permanently changed live routing.
+///
+/// Asserted without assuming which add wins: exactly one survives, and the
+/// surviving inner copy is the loser's scope. With both adds evicting, none
+/// would survive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_add_never_consumes_an_inner_derived_copy() {
+    const FIRST: &str = "https://first.example/pub/";
+    const SECOND: &str = "https://second.example/pub/";
+
+    let backend = SpellingBackend::new("probe://bucket/", &[], vec![test_root("target:///r/")]);
+    let stack = Arc::new(empty_alias_stack(backend.clone()).await);
+    backend.hold_evictable_shadows(&[FIRST, SECOND]);
+    // Both takeover scans park, so both adds are in flight together — the
+    // interleaving the serialization has to make impossible.
+    let gate = backend.arm_listing_gate_for(2);
+
+    // The same id on two different scopes: whichever commits second is
+    // rejected, and must not have evicted its scope's copy to get there.
+    let add = |scope: &'static str, started: Arc<tokio::sync::Semaphore>| {
+        let stack = Arc::clone(&stack);
+        tokio::spawn(async move {
+            started.add_permits(1);
+            stack
+                .root()
+                .add_connection(
+                    alias_request("wrapper", Some("race"), scope, "target:///r/"),
+                    None,
+                )
+                .await
+        })
+    };
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let first = add(FIRST, Arc::clone(&started));
+    // One add has reached the gate; entry ORDER is not assumed.
+    gate.await_entry().await;
+    let second = add(SECOND, Arc::clone(&started));
+    // Both tasks are running before anything is released. The second cannot
+    // be waited on at the gate — under the serialization this test exists to
+    // check, it never reaches it — so this is the strongest join available.
+    for _ in 0..2 {
+        started.acquire().await.expect("tasks start").forget();
+    }
+
+    gate.release(2);
+    let outcomes = [
+        (FIRST, first.await.unwrap()),
+        (SECOND, second.await.unwrap()),
+    ];
+    let refused: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, result)| result.is_err())
+        .map(|(scope, _)| *scope)
+        .collect();
+    assert_eq!(
+        refused.len(),
+        1,
+        "exactly one add owns the id: {:?}",
+        outcomes
+            .iter()
+            .map(|(s, r)| (s, r.is_ok()))
+            .collect::<Vec<_>>()
+    );
+    for (_, result) in &outcomes {
+        if let Err(error) = result {
+            assert_eq!(error.code(), ErrorCode::AlreadyExists);
+        }
+    }
+
+    assert_eq!(
+        backend.surviving_shadow_scopes(),
+        refused,
+        "the refused add must leave the inner derived copy on its scope intact"
+    );
+}
+
+/// A scan that could not RUN is a different case, and stays best-effort: it
+/// says nothing about whether a derived copy exists, and most stacks have no
+/// inner alias layer at all — so an unrelated inner failure must not refuse a
+/// purely local address rewrite, nor fail a build. The scope-naming warning is
+/// the operator's trace.
+#[tokio::test]
+async fn an_explicit_add_survives_a_takeover_scan_that_cannot_run() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://held.example/pub/"],
+        vec![test_root("target:///r/")],
+    );
+    let stack = empty_alias_stack(backend.clone()).await;
+    backend.fail_listings_with(ErrorCode::Transient);
+
+    stack
+        .root()
+        .add_connection(
+            alias_request("wrapper", None, "https://held.example/pub/", "target:///r/"),
+            None,
+        )
+        .await
+        .expect("an unrelated inner scan failure must not refuse a local rule");
+
+    backend.stop_failing_listings();
+    stat_addr(&stack, "https://held.example/pub/x")
+        .await
+        .unwrap();
+    assert_eq!(backend.last_received().as_str(), "target:///r/x");
+}
+
+/// Derivation runs after the delegated registration has already committed, so
+/// an inner layer that never answers the scan must cost a bounded wait, not an
+/// unbounded one: the connection exists either way, and a call that never
+/// returns invites the caller to retry an operation that succeeded.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_inner_scan_does_not_hold_a_committed_registration() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://bucket.s3.us-west-2.amazonaws.com/"],
+        Vec::new(),
+    );
+    let stack = empty_alias_stack(backend.clone()).await;
+    backend.hang_listings();
+
+    // Paused time auto-advances once every task is idle, so the scan's budget
+    // expires here without the test waiting it out in real time.
+    let registered = stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .expect("the registration is committed and must be reported as such");
+    assert_eq!(registered.backend_kind, PROBE_KIND);
+
+    // And the expiry is a FAILED scan, so derivation fails closed exactly as
+    // an outright error does: the registration stands, no rule is installed,
+    // and a later re-registration derives once the inner layer answers.
+    let error = stat_addr(&stack, "https://bucket.s3.us-west-2.amazonaws.com/key")
+        .await
+        .expect_err("an unanswered ownership scan derives nothing");
+    assert_eq!(error.code(), ErrorCode::NoRoute);
+    stat_addr(&stack, "probe://bucket/key")
+        .await
+        .expect("the canonical form is unaffected");
+}
+
+/// The motivating case for failing closed, end to end across stacked wrappers.
+///
+/// An operator suppresses a generated spelling at the inner wrapper. The
+/// backend then re-registers while the ownership scan is failing. If the outer
+/// wrapper treated "scan failed" as "nobody owns this scope", it would install
+/// its own rule for that spelling — and its rewrite runs BEFORE the request
+/// ever reaches the inner suppression, so a deliberately unroutable address
+/// would silently become routable.
+#[tokio::test]
+async fn a_failed_ownership_scan_cannot_reopen_an_inner_suppression() {
+    const SPELLING: &str = "https://bucket.s3.us-west-2.amazonaws.com/key";
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://bucket.s3.us-west-2.amazonaws.com/"],
+        Vec::new(),
+    );
+    let stack = nested_alias_stack(backend.clone()).await;
+    let registered = stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+
+    // The operator suppresses the generated spelling where it was derived.
+    stack
+        .root()
+        .add_connection(
+            visibility_request(
+                "inner",
+                "https://bucket.s3.us-west-2.amazonaws.com/",
+                "suppressed",
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    let error = stat_addr(&stack, SPELLING)
+        .await
+        .expect_err("the operator's suppression takes effect");
+    assert_eq!(error.code(), ErrorCode::NoRoute);
+
+    // Re-register with the ownership scan failing.
+    stack
+        .root()
+        .remove_connection(connection_key("backend", &registered.id), None)
+        .await
+        .unwrap();
+    backend.fail_listings_with(ErrorCode::Transient);
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .expect("the registration itself still succeeds");
+    backend.stop_failing_listings();
+
+    let error = stat_addr(&stack, SPELLING)
+        .await
+        .expect_err("a failed scan must not re-open a suppressed spelling");
+    assert_eq!(error.code(), ErrorCode::NoRoute);
+    stat_addr(&stack, "probe://bucket/key")
+        .await
+        .expect("the canonical form is unaffected");
+}
+
+/// A cancelled build is not a degraded build. The adoption scan is best-effort
+/// for every other failure, but returning `Ok` from a build whose token fired
+/// would hand back a partially-configured wrapper under a contract that says
+/// the build fails — and the caller cannot tell the two apart.
+#[tokio::test]
+async fn a_cancelled_adoption_scan_fails_the_build() {
+    let backend = SpellingBackend::with_preexisting(
+        "probe://bucket/",
+        &["https://bucket.s3.us-west-2.amazonaws.com/"],
+        Vec::new(),
+    );
+    backend.fail_listings_with(ErrorCode::Cancelled);
+    let Err(error) = build_stack(
+        ALIAS_KIND,
+        Arc::new(AliasWrapperFactory::default()),
+        backend,
+        LayerConfig::new(),
+    )
+    .await
+    else {
+        panic!("a cancelled adoption scan must fail the build")
+    };
+    assert_eq!(error.code(), ErrorCode::Cancelled);
+}
+
+/// Every OTHER adoption-scan failure still degrades: alias generation is a
+/// convenience and must never cost the wrapper its build.
+#[tokio::test]
+async fn a_failed_adoption_scan_still_builds() {
+    let backend = SpellingBackend::with_preexisting(
+        "probe://bucket/",
+        &["https://bucket.s3.us-west-2.amazonaws.com/"],
+        Vec::new(),
+    );
+    backend.fail_listings_with(ErrorCode::Transient);
+    let Ok(stack) = build_stack(
+        ALIAS_KIND,
+        Arc::new(AliasWrapperFactory::default()),
+        backend.clone(),
+        LayerConfig::new(),
+    )
+    .await
+    else {
+        panic!("a scan failure costs the generated rules, never the build")
+    };
+
+    backend.stop_failing_listings();
+    // No rules were derived, so only the canonical form routes.
+    stat_addr(&stack, "probe://bucket/key").await.unwrap();
+    let refused = stat_addr(&stack, "https://bucket.s3.us-west-2.amazonaws.com/key")
+        .await
+        .expect_err("nothing was derived on the degraded path");
+    assert_eq!(refused.code(), ErrorCode::NoRoute);
+}
+
+/// A presigned / SAS URL authenticates itself with its query. A generated
+/// rule that captured it would rewrite it onto the canonical form, where those
+/// parameters mean nothing and the connection's own credentials authenticate
+/// instead — turning an expired, revoked or deliberately narrow URL into a
+/// full privileged read. The generated rule stands aside and the address falls
+/// through to whatever else routes it.
+#[tokio::test]
+async fn a_generated_rule_declines_a_credential_bearing_url() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://bucket.s3.us-west-2.amazonaws.com/"],
+        Vec::new(),
+    );
+    let stack = empty_alias_stack(backend.clone()).await;
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+
+    // Nothing else routes https here, so declining reads as `NoRoute` — the
+    // same answer an unconfigured namespace gives. In a stack with an HTTP
+    // layer it falls through to that instead, and the signature is honoured.
+    let error = stat_addr(
+        &stack,
+        "https://bucket.s3.us-west-2.amazonaws.com/k?X-Amz-Signature=deadbeef",
+    )
+    .await
+    .expect_err("a signed URL must not be served with connection credentials");
+    assert_eq!(error.code(), ErrorCode::NoRoute);
+
+    // The same object without the signature still resolves, so this is the
+    // query being declined and not the spelling.
+    stat_addr(&stack, "https://bucket.s3.us-west-2.amazonaws.com/k")
+        .await
+        .expect("the plain spelling is unaffected");
+    assert_eq!(backend.last_received().as_str(), "probe://bucket/k");
+
+    // And a version selector is carried, because it names a version of the
+    // same object rather than an authority to reach it.
+    stat_addr(
+        &stack,
+        "https://bucket.s3.us-west-2.amazonaws.com/k?versionId=v1",
+    )
+    .await
+    .expect("a version pin is not a credential");
+    assert_eq!(
+        backend.last_received().as_str(),
+        "probe://bucket/k?versionId=v1",
+        "the selector is carried through to the backend"
+    );
+}
+
+/// The Hub URL shapes the huggingface plugin advertises, driven through the
+/// real rule machinery rather than a bare prefix rewrite: on each public
+/// origin — the canonical host over `https://` and `http://`, and the `www.`
+/// and `hf.co` hosts over either — the derived rule is SELECTED for the
+/// repository root (with and without the trailing slash a browser address bar
+/// drops), for a path beneath it, and for a `?revision=` pin, and every result
+/// projects back onto the spelling the caller used. A download link's
+/// `?download=true` is not a version selector, so the rule stands aside for it.
+#[tokio::test]
+async fn hub_url_spellings_select_the_derived_rule_on_every_public_origin() {
+    let origins = [
+        "https://huggingface.co",
+        "http://huggingface.co",
+        "https://www.huggingface.co",
+        "http://www.huggingface.co",
+        "https://hf.co",
+        "http://hf.co",
+    ];
+    let spellings: Vec<String> = origins
+        .iter()
+        .map(|origin| format!("{origin}/acme/demo/"))
+        .collect();
+    let backend = SpellingBackend::new(
+        "hf://models/acme/demo/",
+        &spellings.iter().map(String::as_str).collect::<Vec<_>>(),
+        Vec::new(),
+    );
+    let stack = empty_alias_stack(backend.clone()).await;
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+
+    for origin in origins {
+        // The bare repository root, as a browser address bar yields it.
+        stat_addr(&stack, &format!("{origin}/acme/demo"))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{origin}: the slash-less repository root selects the rule: {error:?}")
+            });
+        assert_eq!(
+            backend.last_received().as_str().trim_end_matches('/'),
+            "hf://models/acme/demo",
+            "{origin}: the root rewrites onto the canonical root"
+        );
+
+        // A path beneath it, projected back onto the caller's spelling.
+        let pasted = format!("{origin}/acme/demo/weights/model.bin");
+        let info = stat_addr(&stack, &pasted)
+            .await
+            .unwrap_or_else(|error| panic!("{pasted}: {error:?}"));
+        assert_eq!(
+            backend.last_received().as_str(),
+            "hf://models/acme/demo/weights/model.bin"
+        );
+        assert_eq!(
+            info.address.as_str(),
+            pasted,
+            "results project back to the caller's own spelling"
+        );
+
+        // The revision pin is a carried selector: it rides through to the
+        // backend and comes back on the projected address, percent-encoding
+        // intact.
+        let pinned = format!("{origin}/acme/demo/config.json?revision=refs%2Fpr%2F1");
+        let info = stat_addr(&stack, &pinned)
+            .await
+            .unwrap_or_else(|error| panic!("{pinned}: {error:?}"));
+        assert_eq!(
+            backend.last_received().as_str(),
+            "hf://models/acme/demo/config.json?revision=refs%2Fpr%2F1"
+        );
+        assert_eq!(info.address.as_str(), pinned);
+
+        // A download link's query is not a version selector: the generated
+        // rule stands aside and, with nothing else routing the origin, the
+        // address is `NoRoute`.
+        let refused = stat_addr(
+            &stack,
+            &format!("{origin}/acme/demo/resolve/main/config.json?download=true"),
+        )
+        .await
+        .expect_err("a download link's query keeps the generated rule aside");
+        assert_eq!(refused.code(), ErrorCode::NoRoute, "{origin}");
+    }
+
+    // The canonical form is untouched by the generated rules.
+    let info = stat_addr(&stack, "hf://models/acme/demo/weights/model.bin")
+        .await
+        .unwrap();
+    assert_eq!(
+        info.address.as_str(),
+        "hf://models/acme/demo/weights/model.bin"
+    );
+}
+
+/// An AUTHORED rule keeps today's behaviour. Writing one is a deliberate
+/// statement that this prefix means that target; generation is a default
+/// applied on the operator's behalf, and only the default stands aside.
+#[tokio::test]
+async fn an_authored_rule_still_answers_a_credential_bearing_url() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://held.example/pub/"],
+        vec![test_root("target:///r/")],
+    );
+    let stack = empty_alias_stack(backend.clone()).await;
+    stack
+        .root()
+        .add_connection(
+            alias_request("wrapper", None, "https://held.example/pub/", "target:///r/"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    stat_addr(&stack, "https://held.example/pub/k?sig=abc")
+        .await
+        .expect("an authored rule answers whatever it was written for");
+    assert_eq!(backend.last_received().as_str(), "target:///r/k?sig=abc");
+}
+
+/// A generated child spelling must not re-open a subtree the operator
+/// suppressed above it. Longest-prefix visibility selection would otherwise
+/// let the derived rule's intrinsic `Hidden` outrank the broader
+/// `Suppressed`, so an address under the generated scope would resolve while
+/// its ancestor is deliberately denied. Both installation orders, because the
+/// rule set is rebuilt on either mutation.
+#[tokio::test]
+async fn an_ancestor_suppression_covers_a_derived_child_spelling() {
+    for suppress_first in [true, false] {
+        let backend = SpellingBackend::new(
+            "probe://bucket/",
+            &["https://s3.us-west-2.amazonaws.com/bucket/"],
+            Vec::new(),
+        );
+        let stack = empty_alias_stack(backend.clone()).await;
+        let suppress = || {
+            stack.root().add_connection(
+                visibility_request(
+                    "wrapper",
+                    "https://s3.us-west-2.amazonaws.com/",
+                    "suppressed",
+                ),
+                None,
+            )
+        };
+        if suppress_first {
+            suppress().await.unwrap();
+        }
+        stack
+            .root()
+            .add_connection(backend_connect_request(), None)
+            .await
+            .unwrap();
+        if !suppress_first {
+            suppress().await.unwrap();
+        }
+
+        let error = stat_addr(&stack, "https://s3.us-west-2.amazonaws.com/bucket/key")
+            .await
+            .expect_err("the suppressed ancestor covers the generated child");
+        assert_eq!(error.code(), ErrorCode::NoRoute, "{suppress_first}");
+
+        // The denial is scoped to that ancestor, not global: the canonical
+        // form is elsewhere in the address space and keeps working.
+        stat_addr(&stack, "probe://bucket/key")
+            .await
+            .expect("the canonical form is unaffected");
+    }
+}
+
+/// The operator escape hatch for one generated spelling they do not want
+/// answered: an ordinary visibility override — no new mechanism — suppresses
+/// it, indistinguishable from never-configured, while the canonical form and
+/// the connection's other spellings keep working.
+#[tokio::test]
+async fn a_visibility_override_suppresses_a_derived_alias() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &[
+            "https://bucket.s3.us-west-2.amazonaws.com/",
+            "https://s3.us-west-2.amazonaws.com/bucket/",
+        ],
+        Vec::new(),
+    );
+    let stack = empty_alias_stack(backend.clone()).await;
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+    stack
+        .root()
+        .add_connection(
+            visibility_request(
+                "wrapper",
+                "https://s3.us-west-2.amazonaws.com/bucket/",
+                "suppressed",
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let error = stat_addr(&stack, "https://s3.us-west-2.amazonaws.com/bucket/key")
+        .await
+        .expect_err("the suppressed spelling is refused");
+    assert_eq!(error.code(), ErrorCode::NoRoute);
+
+    stat_addr(&stack, "https://bucket.s3.us-west-2.amazonaws.com/key")
+        .await
+        .expect("the other spelling keeps working");
+    stat_addr(&stack, "probe://bucket/key")
+        .await
+        .expect("the canonical form keeps working");
+}
+
+/// Stacked alias wrappers derive each spelling exactly once, at the innermost
+/// wrapper. A registration delegates through every wrapper on the path, so
+/// without the ownership pre-filter each one installed its own copy — dead
+/// weight at dispatch (the inner copy's synthesized root interrupts the outer
+/// chain at equal specificity) that broke eviction, because an explicit rule
+/// evicted only the local copy while the surviving inner one kept answering.
+#[tokio::test]
+async fn stacked_wrappers_derive_each_spelling_once_at_the_innermost_layer() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &[
+            "https://bucket.s3.us-west-2.amazonaws.com/",
+            "https://s3.us-west-2.amazonaws.com/bucket/",
+        ],
+        Vec::new(),
+    );
+    let stack = nested_alias_stack(backend.clone()).await;
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+
+    // The spelling resolves through both wrappers to the physical root.
+    stat_addr(&stack, "https://bucket.s3.us-west-2.amazonaws.com/key")
+        .await
+        .expect("the spelling resolves through the stacked wrappers");
+    assert_eq!(backend.last_received().as_str(), "probe://bucket/key");
+
+    // Exactly one derived row per spelling, owned by the INNER wrapper.
+    let listed = stack
+        .root()
+        .list_connections(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap()
+        .0
+        .connections;
+    let derived: Vec<&Connection> = listed
+        .iter()
+        .filter(|row| {
+            row.user_metadata
+                .contains_key(ALIAS_DERIVED_FROM_METADATA_KEY)
+        })
+        .collect();
+    assert_eq!(
+        derived.len(),
+        2,
+        "one derived row per spelling, not one per wrapper: {listed:?}"
+    );
+    for row in &derived {
+        assert_eq!(row.owning_target.as_deref(), Some("inner"));
+    }
+}
+
+/// Explicit beats derived ACROSS stacked wrappers: the derived copy lives at
+/// the innermost wrapper, so an explicit rule added at the OUTER one must
+/// evict it there — a local-only eviction leaves the inner copy covering the
+/// scope at equal specificity, which interrupts the outer explicit rule's
+/// chain and keeps routing to the canonical backend past the operator's
+/// rewrite.
+#[tokio::test]
+async fn an_explicit_outer_rule_beats_an_inner_derived_rule() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://held.example/pub/"],
+        vec![test_root("target:///r/")],
+    );
+    let stack = nested_alias_stack(backend.clone()).await;
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+    stat_addr(&stack, "https://held.example/pub/x")
+        .await
+        .unwrap();
+    assert_eq!(backend.last_received().as_str(), "probe://bucket/x");
+
+    stack
+        .root()
+        .add_connection(
+            alias_request("outer", None, "https://held.example/pub/", "target:///r/"),
+            None,
+        )
+        .await
+        .expect("the outer explicit rule installs");
+
+    stat_addr(&stack, "https://held.example/pub/x")
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.last_received().as_str(),
+        "target:///r/x",
+        "the operator's rewrite wins over the inner derived copy"
+    );
+    // The inner derived row is gone, not merely shadowed.
+    let listed = stack
+        .root()
+        .list_connections(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap()
+        .0
+        .connections;
+    assert!(
+        listed.iter().all(|row| {
+            !row.user_metadata
+                .contains_key(ALIAS_DERIVED_FROM_METADATA_KEY)
+        }),
+        "the inner derived row was evicted: {listed:?}"
+    );
+}
+
+/// The same contract holds when the explicit rule is added at the wrapper
+/// that owns the derived copy — the local eviction path.
+#[tokio::test]
+async fn an_explicit_inner_rule_beats_the_inner_derived_rule() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://held.example/pub/"],
+        vec![test_root("target:///r/")],
+    );
+    let stack = nested_alias_stack(backend.clone()).await;
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+
+    stack
+        .root()
+        .add_connection(
+            alias_request("inner", None, "https://held.example/pub/", "target:///r/"),
+            None,
+        )
+        .await
+        .expect("the inner explicit rule installs");
+
+    stat_addr(&stack, "https://held.example/pub/x")
+        .await
+        .unwrap();
+    assert_eq!(backend.last_received().as_str(), "target:///r/x");
+}
+
+/// Ordering matters for "explicit beats derived": the operator's rule can
+/// PREDATE the registration. The outer wrapper's install path must recognize
+/// that one of its own explicit rules already owns a candidate scope, derive
+/// nothing anywhere for it, and evict the copy the inner wrapper just
+/// installed (the inner hook runs first, and the inner wrapper has no rule on
+/// the scope to stop it).
+#[tokio::test]
+async fn an_explicit_outer_rule_added_before_the_registration_still_wins() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://held.example/pub/"],
+        vec![test_root("target:///r/")],
+    );
+    let stack = nested_alias_stack(backend.clone()).await;
+    stack
+        .root()
+        .add_connection(
+            alias_request("outer", None, "https://held.example/pub/", "target:///r/"),
+            None,
+        )
+        .await
+        .expect("the explicit rule installs before the backend exists");
+
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+
+    stat_addr(&stack, "https://held.example/pub/x")
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.last_received().as_str(),
+        "target:///r/x",
+        "the pre-existing rewrite wins over the just-derived inner copy"
+    );
+    let listed = stack
+        .root()
+        .list_connections(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap()
+        .0
+        .connections;
+    assert!(
+        listed.iter().all(|row| {
+            !row.user_metadata
+                .contains_key(ALIAS_DERIVED_FROM_METADATA_KEY)
+        }),
+        "no derived copy survives at any wrapper: {listed:?}"
+    );
+}
+
+/// The config-as-Stack ordering of the same contract: the outer wrapper's
+/// rule comes from its own `aliases` TOML, wrappers build bottom-up, so the
+/// inner wrapper has already adopted-and-derived by the time the outer one is
+/// constructed. The outer adoption scan must treat its static rule as taking
+/// the scope over and evict the inner copy — `add_connection` never runs at
+/// all on this path.
+#[tokio::test]
+async fn a_config_authored_outer_rule_beats_the_derived_copy() {
+    let backend = SpellingBackend::with_preexisting(
+        "probe://bucket/",
+        &["https://held.example/pub/"],
+        vec![test_root("target:///r/")],
+    );
+    let mut outer_config = LayerConfig::new();
+    outer_config.insert(
+        "aliases".into(),
+        ConfigValue::Toml(
+            "[[rule]]\nfrom = \"https://held.example/pub/\"\nto = \"target:///r/\"\n".into(),
+        ),
+    );
+    let stack = Stack::builder("outer")
+        .wrapper_factory(Arc::new(AliasWrapperFactory::default()))
+        .backend_factory(Arc::new(SharedBackendFactory {
+            backend: backend.clone(),
+        }))
+        .layer({
+            let mut spec = LayerSpec::wrapper("outer", ALIAS_KIND, "inner");
+            spec.config = outer_config;
+            spec
+        })
+        .layer(LayerSpec::wrapper("inner", ALIAS_KIND, "backend"))
+        .layer(LayerSpec::backend("backend", PROBE_KIND))
+        .build()
+        .await
+        .unwrap();
+
+    stat_addr(&stack, "https://held.example/pub/x")
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.last_received().as_str(),
+        "target:///r/x",
+        "the config-authored rewrite wins over the adoption-derived inner copy"
+    );
+    let listed = stack
+        .root()
+        .list_connections(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap()
+        .0
+        .connections;
+    assert!(
+        listed.iter().all(|row| {
+            !row.user_metadata
+                .contains_key(ALIAS_DERIVED_FROM_METADATA_KEY)
+        }),
+        "no derived copy survives at any wrapper: {listed:?}"
+    );
+}
+
+/// The notification half of cross-wrapper eviction: a subscriber applying
+/// root deltas as keyed upsert/delete (the `notification_drain` shape) must
+/// converge on the same root set a fresh snapshot reports — in particular it
+/// must NOT end up without the cloud URL, which the inner wrapper's eviction
+/// `Removed` would cause if the outer projection forwarded a removal at a
+/// node its own live rule still advertises.
+#[tokio::test]
+async fn root_delta_consumers_keep_the_scope_an_explicit_rule_takes_over() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://held.example/pub/"],
+        vec![test_root("target:///r/")],
+    );
+    let stack = nested_alias_stack(backend.clone()).await;
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+
+    // Subscribe BEFORE the takeover, like a live consumer.
+    let (snapshot, stream) = stack
+        .root()
+        .list_address_roots(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap();
+    let mut stream = stream.expect("update stream");
+    let mut held: std::collections::BTreeSet<String> = snapshot
+        .roots
+        .iter()
+        .map(|root| root.root.to_string())
+        .collect();
+
+    stack
+        .root()
+        .add_connection(
+            alias_request("outer", None, "https://held.example/pub/", "target:///r/"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The oracle: what a fresh subscriber sees after the dust settles.
+    let expected: std::collections::BTreeSet<String> = stack
+        .root()
+        .list_address_roots(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap()
+        .0
+        .roots
+        .iter()
+        .map(|root| root.root.to_string())
+        .collect();
+    assert!(
+        expected.contains("https://held.example/pub/"),
+        "the fresh snapshot advertises the taken-over scope: {expected:?}"
+    );
+
+    // Apply deltas exactly as a keyed upsert/delete consumer does, until the
+    // held set converges on the oracle and stays there for a grace window —
+    // bounded, so a lost root fails with the diff rather than hanging. The
+    // order the local `Added` and the inner eviction's events reach a merged
+    // consumer is not guaranteed, so convergence alone could pass by luck of
+    // scheduling; the load-bearing assertion is that NO `Removed` names the
+    // taken-over scope at all — the projection must suppress it, because a
+    // rule-backed root the wrapper goes on advertising never went away.
+    let scope = "https://held.example/pub/";
+    let mut saw_removed_scope = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let apply = |event: RootInfoChange,
+                 held: &mut std::collections::BTreeSet<String>,
+                 saw_removed_scope: &mut bool| {
+        match event {
+            RootInfoChange::Snapshot(roots) => {
+                *held = roots.iter().map(|root| root.root.to_string()).collect();
+            }
+            RootInfoChange::Added(roots) | RootInfoChange::Updated(roots) => {
+                for root in roots {
+                    held.insert(root.root.to_string());
+                }
+            }
+            RootInfoChange::Removed(roots) => {
+                for root in roots {
+                    if root.root.as_str() == scope {
+                        *saw_removed_scope = true;
+                    }
+                    held.remove(root.root.as_str());
+                }
+            }
+        }
+    };
+    while held != expected {
+        let event = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("delta consumer never converged: held={held:?} expected={expected:?}")
+            })
+            .expect("stream stays open")
+            .expect("stream yields changes");
+        apply(event, &mut held, &mut saw_removed_scope);
+    }
+    // Grace window: a straggling event (the eviction's, in either order) must
+    // not knock the consumer back off the oracle.
+    let quiet = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    while let Ok(Some(event)) = tokio::time::timeout_at(quiet, stream.next()).await {
+        apply(
+            event.expect("stream yields changes"),
+            &mut held,
+            &mut saw_removed_scope,
+        );
+    }
+    assert!(
+        !saw_removed_scope,
+        "no delta may withdraw the scope a live local rule advertises"
+    );
+    assert_eq!(
+        held, expected,
+        "the consumer holds what a fresh snapshot shows"
+    );
+    assert!(held.contains(scope));
+}
+
+/// Several spellings taken over in ONE registration: both explicit outer
+/// rules predate the backend, so the outer wrapper's single install pass
+/// collects both scopes and its one batched downstream eviction must remove
+/// both inner derived copies — the multi-scope shape of the takeover path.
+#[tokio::test]
+async fn a_registration_with_several_taken_over_spellings_evicts_them_all() {
+    let backend = SpellingBackend::new(
+        "probe://bucket/",
+        &["https://held.example/pub/", "https://mirror.example/pub/"],
+        vec![test_root("target:///r/"), test_root("target:///q/")],
+    );
+    let stack = nested_alias_stack(backend.clone()).await;
+    for (from, to) in [
+        ("https://held.example/pub/", "target:///r/"),
+        ("https://mirror.example/pub/", "target:///q/"),
+    ] {
+        stack
+            .root()
+            .add_connection(alias_request("outer", None, from, to), None)
+            .await
+            .expect("the explicit rules install before the backend exists");
+    }
+
+    stack
+        .root()
+        .add_connection(backend_connect_request(), None)
+        .await
+        .unwrap();
+
+    stat_addr(&stack, "https://held.example/pub/x")
+        .await
+        .unwrap();
+    assert_eq!(backend.last_received().as_str(), "target:///r/x");
+    stat_addr(&stack, "https://mirror.example/pub/x")
+        .await
+        .unwrap();
+    assert_eq!(backend.last_received().as_str(), "target:///q/x");
+    let listed = stack
+        .root()
+        .list_connections(&ovstorage::Extensions::new(), None)
+        .await
+        .unwrap()
+        .0
+        .connections;
+    assert!(
+        listed.iter().all(|row| {
+            !row.user_metadata
+                .contains_key(ALIAS_DERIVED_FROM_METADATA_KEY)
+        }),
+        "both inner derived copies were evicted: {listed:?}"
+    );
 }

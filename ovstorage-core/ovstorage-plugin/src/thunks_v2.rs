@@ -778,6 +778,268 @@ unsafe fn delete_directory_request(
 // Result -> FFI stream encoders for the LayerVTable streaming slots
 // =====================================================================
 
+// One queued entry lets the async producer overlap with a blocking FFI pull
+// without allowing an arbitrarily large listing to accumulate at the ABI
+// boundary. The producer may additionally own the entry whose send is parked,
+// so peak residency is two encoded entries.
+/// Rust-only producer bridge bound; not part of the generated plugin ABI.
+/// cbindgen:ignore
+const LIST_ENTRY_CHANNEL_CAPACITY: usize = 1;
+
+#[cfg(test)]
+pub(crate) const fn list_entry_channel_capacity_for_test() -> usize {
+    LIST_ENTRY_CHANNEL_CAPACITY
+}
+
+#[cfg(test)]
+struct ListEntrySendObservation {
+    attempts: std::sync::atomic::AtomicUsize,
+    completions: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ListEntrySendObservation {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            completions: std::sync::atomic::AtomicUsize::new(0),
+            changed: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn record_attempt(&self) {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    fn record_completion(&self) {
+        self.completions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    async fn wait_for(&self, attempts: usize, completions: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let notified = self.changed.notified();
+                if self.attempts.load(std::sync::atomic::Ordering::SeqCst) >= attempts
+                    && self.completions.load(std::sync::atomic::Ordering::SeqCst) >= completions
+                {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("list-entry pump reached the expected send gate");
+    }
+}
+
+enum ListEntryFrame {
+    Item(ffi::ObjectInfo),
+    Error(ffi::Error),
+}
+
+struct ListEntryState {
+    receiver: async_channel::Receiver<ListEntryFrame>,
+    producer: tokio::task::JoinHandle<()>,
+    terminal: bool,
+    /// Retains and observes the token passed when `list_stream` was opened.
+    _cancel_guard: Option<ffi::CancelTokenLocal>,
+}
+
+impl Drop for ListEntryState {
+    fn drop(&mut self) {
+        // Closing first releases a producer parked in `send`; aborting also
+        // tears down a producer parked while polling its source stream. The
+        // receiver then drops every encoded ObjectInfo still queued in it.
+        self.receiver.close();
+        self.producer.abort();
+    }
+}
+
+/// Encode a `ListStream` as the pull-based FFI list-entry stream while
+/// retaining the open-time cancellation guard for the stream's lifetime.
+///
+/// The source is driven by an async task into a capacity-one channel. This is
+/// intentionally a producer pump rather than `next_fn` calling `block_on` on
+/// the source directly: slow foreign consumers exert backpressure at the
+/// channel, while `drop_fn` can abort a producer parked in either source I/O or
+/// a full-channel send.
+fn list_entry_stream_to_ffi_with_cancel(
+    stream: crate::ListStream,
+    cancel_guard: Option<ffi::CancelTokenLocal>,
+) -> ffi::ListEntryStream {
+    #[cfg(test)]
+    {
+        list_entry_stream_to_ffi_with_cancel_inner(stream, cancel_guard, None)
+    }
+    #[cfg(not(test))]
+    {
+        list_entry_stream_to_ffi_with_cancel_inner(stream, cancel_guard)
+    }
+}
+
+#[cfg(test)]
+fn list_entry_stream_to_ffi_with_cancel_observed(
+    stream: crate::ListStream,
+    cancel_guard: Option<ffi::CancelTokenLocal>,
+    send_observation: std::sync::Arc<ListEntrySendObservation>,
+) -> ffi::ListEntryStream {
+    list_entry_stream_to_ffi_with_cancel_inner(stream, cancel_guard, Some(send_observation))
+}
+
+fn list_entry_stream_to_ffi_with_cancel_inner(
+    stream: crate::ListStream,
+    cancel_guard: Option<ffi::CancelTokenLocal>,
+    #[cfg(test)] send_observation: Option<std::sync::Arc<ListEntrySendObservation>>,
+) -> ffi::ListEntryStream {
+    use futures::{FutureExt as _, StreamExt as _};
+
+    let cancel = cancel_guard
+        .as_ref()
+        .map(ffi::CancelTokenLocal::token_clone);
+    let (sender, receiver) = async_channel::bounded(LIST_ENTRY_CHANNEL_CAPACITY);
+    let panic_sender = sender.clone();
+    let producer = crate::ffi_runtime::runtime().spawn(async move {
+        let pump = AssertUnwindSafe(async move {
+            let mut stream = stream;
+            loop {
+                let next = match cancel.as_ref() {
+                    Some(token) => tokio::select! {
+                        biased;
+                        () = token.cancelled() => {
+                            let error = Error::new(ErrorCode::Cancelled, "list_stream cancelled");
+                            let _ = sender
+                                .send(ListEntryFrame::Error(marshal::error::to_ffi(&error)))
+                                .await;
+                            return;
+                        }
+                        item = stream.next() => item,
+                    },
+                    None => stream.next().await,
+                };
+
+                let (frame, terminal) = match next {
+                    Some(Ok(item)) => (
+                        ListEntryFrame::Item(marshal::metadata::object_info_to_ffi(item)),
+                        false,
+                    ),
+                    Some(Err(error)) => {
+                        (ListEntryFrame::Error(marshal::error::to_ffi(&error)), true)
+                    }
+                    None => return,
+                };
+
+                #[cfg(test)]
+                if let Some(observation) = send_observation.as_ref() {
+                    observation.record_attempt();
+                }
+                let sent = match cancel.as_ref() {
+                    Some(token) if !terminal => tokio::select! {
+                        biased;
+                        () = token.cancelled() => {
+                            let error = Error::new(ErrorCode::Cancelled, "list_stream cancelled");
+                            sender
+                                .send(ListEntryFrame::Error(marshal::error::to_ffi(&error)))
+                                .await
+                        }
+                        result = sender.send(frame) => result,
+                    },
+                    _ => sender.send(frame).await,
+                };
+                #[cfg(test)]
+                if let Some(observation) = send_observation.as_ref() {
+                    observation.record_completion();
+                }
+                if sent.is_err() || terminal {
+                    return;
+                }
+            }
+        })
+        .catch_unwind()
+        .await;
+
+        if pump.is_err() {
+            let error = Error::new(
+                ErrorCode::Internal,
+                "plugin panicked iterating or encoding a ListEntryStream",
+            );
+            let _ = panic_sender
+                .send(ListEntryFrame::Error(marshal::error::to_ffi(&error)))
+                .await;
+        }
+    });
+    let outer = Box::new(ListEntryState {
+        receiver,
+        producer,
+        terminal: false,
+        _cancel_guard: cancel_guard,
+    });
+    ffi::ListEntryStream {
+        state: Box::into_raw(outer) as *mut core::ffi::c_void,
+        next_fn: list_entry_next_thunk,
+        drop_fn: list_entry_drop_thunk,
+    }
+}
+
+// `next_fn` slot of the `ffi::ListEntryStream` erased-state vtable; called
+// through the stream pointer to pull the next listing entry, not by symbol.
+/// cbindgen:ignore
+unsafe extern "C" fn list_entry_next_thunk(
+    state: *mut core::ffi::c_void,
+    out_item: *mut ffi::ObjectInfo,
+    out_error: *mut ffi::Error,
+) -> ffi::StreamStep {
+    unsafe {
+        let state = &mut *(state as *mut ListEntryState);
+        if state.terminal {
+            return ffi::StreamStep::Ended;
+        }
+        // `next_fn` is the blocking half of the FFI pull iterator. The async
+        // producer runs independently on the plugin runtime and cannot get
+        // more than one entry ahead of this receive (plus its parked send).
+        let pulled = std::panic::catch_unwind(AssertUnwindSafe(|| state.receiver.recv_blocking()));
+        match pulled {
+            Ok(Ok(ListEntryFrame::Item(item))) => {
+                std::ptr::write(out_item, item);
+                ffi::StreamStep::Yielded
+            }
+            Ok(Ok(ListEntryFrame::Error(error))) => {
+                std::ptr::write(out_error, error);
+                state.terminal = true;
+                ffi::StreamStep::Failed
+            }
+            Ok(Err(_closed)) => {
+                state.terminal = true;
+                ffi::StreamStep::Ended
+            }
+            Err(_) => {
+                std::ptr::write(
+                    out_error,
+                    marshal::error::to_ffi(&Error::new(
+                        ErrorCode::Internal,
+                        "plugin panicked iterating a ListEntryStream",
+                    )),
+                );
+                state.terminal = true;
+                ffi::StreamStep::Failed
+            }
+        }
+    }
+}
+
+// `drop_fn` slot of the `ffi::ListEntryStream` erased-state vtable; called
+// through the stream pointer to free its erased state.
+/// cbindgen:ignore
+unsafe extern "C" fn list_entry_drop_thunk(state: *mut core::ffi::c_void) {
+    crate::ffi_runtime::guard_drop("ListEntryStream", || unsafe {
+        let _ = Box::from_raw(state as *mut ListEntryState);
+    });
+}
+
 /// Wrap a `ChangeStream` (`watch_directory`'s result) as the pull-based
 /// `ffi::BackendChangeStream`, projecting each `ChangeEvent` onto the SPI
 /// change-event via the shared `marshal::change` mirror.
@@ -1229,6 +1491,37 @@ layer_async_op!(
     list,
     list_page_to_ffi
 );
+// `list_stream` is hand-written so the open-time cancel guard moves into the
+// returned pull iterator rather than being dropped when the open completes.
+/// cbindgen:ignore
+unsafe extern "C" fn list_stream_thunk(
+    state: *mut core::ffi::c_void,
+    request: *const ffi::ListRequest,
+    cancel: *const ffi::CancelTokenFFI,
+    on_complete: ffi::OnComplete,
+    user_data: *mut core::ffi::c_void,
+) {
+    let req = match unsafe {
+        decode_async_request(request, "ListRequest", "list_stream", list_request)
+    } {
+        Ok(request) => request,
+        Err(error) => return fire_complete_err(error, on_complete, user_data),
+    };
+    let layer = unsafe { clone_layer_arc(state) };
+    let cancel_local = crate::ffi_runtime::local_cancel(cancel);
+    crate::ffi_runtime::spawn_async_stream_thunk(
+        "list_stream",
+        cancel_local,
+        on_complete,
+        user_data,
+        move |cancel_token| Box::pin(async move { layer.list_stream(req, cancel_token).await }),
+        move |stream, cancel_guard| {
+            Some(abi_alloc::AbiOwned::new(
+                list_entry_stream_to_ffi_with_cancel(stream, cancel_guard),
+            ))
+        },
+    );
+}
 layer_async_op!(
     list_versions_thunk,
     ffi::ListVersionsRequest,
@@ -1793,7 +2086,8 @@ const LAYER_VTABLE_INIT: ffi::LayerVTableV1 = ffi::LayerVTableV1 {
     update_connection_credentials: update_connection_credentials_thunk,
     update_connection_attributes: update_connection_attributes_thunk,
     authenticate_connection: authenticate_connection_thunk,
-    _reserved: [None; 16],
+    list_stream: list_stream_thunk,
+    _reserved: [None; 15],
 };
 
 /// Process-wide Layer vtable installed in every `LayerHandle` produced
@@ -2449,7 +2743,7 @@ pub fn plugin_vtable_template_for_test() -> ffi::PluginVTableV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
     /// The export half of the descriptor chain: every Rust plugin's declaration
     /// leaves through `layer_kind_descriptor_to_ffi`. A constant substituted
@@ -2500,6 +2794,10 @@ mod tests {
         assert_eq!(
             LAYER_VTABLE.abi_version,
             ffi::OVSTORAGE_PLUGIN_ABI_V2_VERSION
+        );
+        assert_eq!(
+            LAYER_VTABLE.list_stream as usize, list_stream_thunk as *const () as usize,
+            "every Rust-produced Layer vtable serves list_stream"
         );
         assert!(LAYER_VTABLE._reserved.iter().all(Option::is_none));
     }
@@ -2695,6 +2993,379 @@ mod tests {
             Err(unsafe { marshal::error::from_ffi(error) })
         };
         sender.send(value).unwrap();
+    }
+
+    extern "C" fn capture_list_stream(
+        status: i32,
+        result: *mut core::ffi::c_void,
+        error: *mut ffi::Error,
+        user_data: *mut core::ffi::c_void,
+    ) {
+        let sender = unsafe {
+            Box::from_raw(user_data as *mut std::sync::mpsc::Sender<Result<ffi::ListEntryStream>>)
+        };
+        let value = if status == ffi::FFI_STATUS_OK {
+            assert!(error.is_null());
+            Ok(unsafe { abi_alloc::abi_unbox(result.cast::<ffi::ListEntryStream>()) })
+        } else {
+            assert!(result.is_null());
+            let error = unsafe { abi_alloc::abi_unbox(error) };
+            Err(unsafe { marshal::error::from_ffi(error) })
+        };
+        sender.send(value).unwrap();
+    }
+
+    fn test_layer_descriptor(kind: &str) -> LayerKindDescriptor {
+        LayerKindDescriptor {
+            kind: kind.into(),
+            layer_type: LayerType::Backend,
+            display_name: format!("{kind} test layer"),
+            description: None,
+            config_schema: Vec::new(),
+            credential_schema: Vec::new(),
+            credential_methods: Vec::new(),
+            icon: None,
+            accepts_connections: false,
+            auth_capable: false,
+            supports_user_metadata: false,
+        }
+    }
+
+    fn list_entry(index: usize) -> crate::ObjectInfo {
+        crate::ObjectInfo {
+            etag_strength: crate::EtagStrength::Strong,
+            address: Url::parse(&format!("test://root/{index:03}.bin")).unwrap(),
+            kind: crate::ObjectKind::File,
+            etag: Some(format!("etag-{index}")),
+            version: None,
+            size: Some(index as u64),
+            mtime: None,
+            checksums: crate::ChecksumSet::new(),
+            effective_permissions: None,
+            system_metadata: None,
+            user_metadata: None,
+            modified_by: None,
+            versioned_address: None,
+        }
+    }
+
+    fn open_list_stream(layer: Arc<dyn Layer>) -> (*mut core::ffi::c_void, ffi::ListEntryStream) {
+        open_list_stream_with_cancel(layer, std::ptr::null())
+    }
+
+    fn open_list_stream_with_cancel(
+        layer: Arc<dyn Layer>,
+        cancel: *const ffi::CancelTokenFFI,
+    ) -> (*mut core::ffi::c_void, ffi::ListEntryStream) {
+        let state = leak_layer(layer);
+        let request = crate::consume_v2::build_list(Request::new(ListRequest {
+            prefix: Url::parse("test://root/").unwrap(),
+            options: crate::ListOptions::default(),
+        }));
+        let (sender, receiver) = std::sync::mpsc::channel::<Result<ffi::ListEntryStream>>();
+
+        unsafe {
+            (LAYER_VTABLE.list_stream)(
+                state,
+                &request,
+                cancel,
+                capture_list_stream,
+                Box::into_raw(Box::new(sender)).cast(),
+            )
+        };
+        std::mem::forget(request);
+        let stream = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        (state, stream)
+    }
+
+    struct BufferedOnlyListLayer;
+
+    #[async_trait::async_trait]
+    impl Layer for BufferedOnlyListLayer {
+        fn name(&self) -> &str {
+            "buffered-only-list"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            test_layer_descriptor(self.name())
+        }
+
+        async fn list(
+            &self,
+            _request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ListPage> {
+            Ok(ListPage {
+                items: vec![list_entry(0), list_entry(1)],
+                next_page_token: None,
+            })
+        }
+    }
+
+    #[test]
+    fn list_stream_thunk_serves_the_buffered_trait_default() {
+        let (state, stream) = open_list_stream(Arc::new(BufferedOnlyListLayer));
+        let mut error = std::mem::MaybeUninit::<ffi::Error>::uninit();
+
+        for expected in ["test://root/000.bin", "test://root/001.bin"] {
+            let mut item = std::mem::MaybeUninit::<ffi::ObjectInfo>::uninit();
+            let step =
+                unsafe { (stream.next_fn)(stream.state, item.as_mut_ptr(), error.as_mut_ptr()) };
+            assert_eq!(step, ffi::StreamStep::Yielded);
+            let decoded = unsafe {
+                marshal::metadata::object_info_from_ffi(item.assume_init())
+                    .expect("thunk-emitted ObjectInfo decodes")
+            };
+            assert_eq!(decoded.address.as_str(), expected);
+        }
+        let mut item = std::mem::MaybeUninit::<ffi::ObjectInfo>::uninit();
+        assert_eq!(
+            unsafe { (stream.next_fn)(stream.state, item.as_mut_ptr(), error.as_mut_ptr()) },
+            ffi::StreamStep::Ended
+        );
+
+        drop(stream);
+        unsafe { layer_drop_thunk(state) };
+    }
+
+    struct ErrorListLayer;
+
+    #[async_trait::async_trait]
+    impl Layer for ErrorListLayer {
+        fn name(&self) -> &str {
+            "error-list"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            test_layer_descriptor(self.name())
+        }
+
+        async fn list_stream(
+            &self,
+            _request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<crate::ListStream> {
+            Ok(Box::pin(futures::stream::iter([Err(Error::new(
+                ErrorCode::Transient,
+                "scripted listing failure",
+            ))])))
+        }
+    }
+
+    #[test]
+    fn list_stream_item_errors_are_terminal_failed_steps() {
+        let (state, stream) = open_list_stream(Arc::new(ErrorListLayer));
+        let mut item = std::mem::MaybeUninit::<ffi::ObjectInfo>::uninit();
+        let mut error = std::mem::MaybeUninit::<ffi::Error>::uninit();
+
+        assert_eq!(
+            unsafe { (stream.next_fn)(stream.state, item.as_mut_ptr(), error.as_mut_ptr()) },
+            ffi::StreamStep::Failed
+        );
+        let error = unsafe { marshal::error::from_ffi(error.assume_init()) };
+        assert_eq!(error.code(), ErrorCode::Transient);
+        assert_eq!(
+            unsafe { (stream.next_fn)(stream.state, item.as_mut_ptr(), std::ptr::null_mut()) },
+            ffi::StreamStep::Ended,
+            "a list entry error is terminal, unlike an update-stream resync frame"
+        );
+
+        drop(stream);
+        unsafe { layer_drop_thunk(state) };
+    }
+
+    struct PumpedListLayer {
+        observation: Arc<ListPumpObservation>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    struct ListPumpObservation {
+        polls: AtomicUsize,
+    }
+
+    impl ListPumpObservation {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                polls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    struct StreamDropFlag(Arc<AtomicBool>);
+
+    impl Drop for StreamDropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Layer for PumpedListLayer {
+        fn name(&self) -> &str {
+            "pumped-list"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            test_layer_descriptor(self.name())
+        }
+
+        async fn list_stream(
+            &self,
+            _request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<crate::ListStream> {
+            let state = (
+                0_usize,
+                self.observation.clone(),
+                StreamDropFlag(self.dropped.clone()),
+            );
+            Ok(Box::pin(futures::stream::unfold(
+                state,
+                |(index, observation, drop_flag)| async move {
+                    observation.polls.fetch_add(1, Ordering::SeqCst);
+                    Some((Ok(list_entry(index)), (index + 1, observation, drop_flag)))
+                },
+            )))
+        }
+    }
+
+    fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !predicate() {
+            assert!(std::time::Instant::now() < deadline, "{message}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_stream_thunk_backpressures_and_drop_aborts_the_producer() {
+        let observation = ListPumpObservation::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let source = PumpedListLayer {
+            observation: observation.clone(),
+            dropped: dropped.clone(),
+        }
+        .list_stream(
+            Request::new(ListRequest {
+                prefix: Url::parse("test://root/").unwrap(),
+                options: crate::ListOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let sends = ListEntrySendObservation::new();
+        let stream = list_entry_stream_to_ffi_with_cancel_observed(source, None, sends.clone());
+
+        sends.wait_for(2, 1).await;
+        assert_eq!(
+            observation.polls.load(Ordering::SeqCst),
+            2,
+            "capacity-one bridge may own only one queued and one sending entry"
+        );
+        assert_eq!(sends.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            sends.completions.load(Ordering::SeqCst),
+            1,
+            "the second send remains parked until the consumer pulls"
+        );
+
+        // Pulling the queued entry releases the parked second send and permits
+        // exactly one more source poll and send attempt. The attempted/completed
+        // send gates prove this from bridge state rather than elapsed time.
+        let mut item = std::mem::MaybeUninit::<ffi::ObjectInfo>::uninit();
+        let mut error = std::mem::MaybeUninit::<ffi::Error>::uninit();
+        assert_eq!(
+            unsafe { (stream.next_fn)(stream.state, item.as_mut_ptr(), error.as_mut_ptr()) },
+            ffi::StreamStep::Yielded
+        );
+        let item = unsafe {
+            marshal::metadata::object_info_from_ffi(item.assume_init())
+                .expect("thunk-emitted ObjectInfo decodes")
+        };
+        assert_eq!(item, list_entry(0));
+
+        sends.wait_for(3, 2).await;
+        assert_eq!(
+            observation.polls.load(Ordering::SeqCst),
+            3,
+            "one consumer pull releases one parked send and one source poll"
+        );
+        assert_eq!(sends.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            sends.completions.load(Ordering::SeqCst),
+            2,
+            "the third send is parked behind the second queued entry"
+        );
+
+        // Dropping must discard the queued frame and abort the producer whose
+        // third send is now backpressured.
+        drop(stream);
+        wait_until(
+            || dropped.load(Ordering::SeqCst),
+            "dropping the FFI stream did not reclaim its async producer",
+        );
+    }
+
+    struct ParkedListLayer {
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Layer for ParkedListLayer {
+        fn name(&self) -> &str {
+            "parked-list"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            test_layer_descriptor(self.name())
+        }
+
+        async fn list_stream(
+            &self,
+            _request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<crate::ListStream> {
+            let drop_flag = StreamDropFlag(self.dropped.clone());
+            Ok(Box::pin(futures::stream::poll_fn(move |_cx| {
+                let _guard = &drop_flag;
+                std::task::Poll::Pending
+            })))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_stream_open_token_cancels_a_parked_producer() {
+        let host_token = CancellationToken::new();
+        let handle = ffi::cancel_token_to_ffi(host_token.clone());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (state, stream) = open_list_stream_with_cancel(
+            Arc::new(ParkedListLayer {
+                dropped: dropped.clone(),
+            }),
+            handle.as_ffi_ptr(),
+        );
+        host_token.cancel();
+
+        let mut item = std::mem::MaybeUninit::<ffi::ObjectInfo>::uninit();
+        let mut error = std::mem::MaybeUninit::<ffi::Error>::uninit();
+        assert_eq!(
+            unsafe { (stream.next_fn)(stream.state, item.as_mut_ptr(), error.as_mut_ptr()) },
+            ffi::StreamStep::Failed
+        );
+        let error = unsafe { marshal::error::from_ffi(error.assume_init()) };
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+
+        drop(stream);
+        wait_until(
+            || dropped.load(Ordering::SeqCst),
+            "cancelled list producer did not release its source stream",
+        );
+        drop(handle);
+        unsafe { layer_drop_thunk(state) };
     }
 
     #[test]

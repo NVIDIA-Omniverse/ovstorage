@@ -83,6 +83,39 @@ template <class T>
 using ranged_read_fn = ovstorage::task<T> (ovstorage::LayerHandle::*)(
     std::string, ovstorage::ReadOptions, const ovstorage::CancelToken*) const;
 
+// `stat` and `list` are overloaded on their C options struct, so `auto`
+// cannot deduce a member pointer to either; both arities are pinned.
+using stat_fn = ovstorage::task<ovstorage::Info> (ovstorage::LayerHandle::*)(
+    std::string, bool, const ovstorage::CancelToken*) const;
+using options_stat_fn =
+    ovstorage::task<ovstorage::Info> (ovstorage::LayerHandle::*)(
+        std::string, OvStorage_StatOptions, const ovstorage::CancelToken*) const;
+using list_fn = ovstorage::task<ovstorage::List> (ovstorage::LayerHandle::*)(
+    std::string,
+    bool,
+    std::uint32_t,
+    std::string,
+    bool,
+    const ovstorage::CancelToken*) const;
+using options_list_fn =
+    ovstorage::task<ovstorage::List> (ovstorage::LayerHandle::*)(
+        std::string, OvStorage_ListOptions, const ovstorage::CancelToken*) const;
+
+template <class T>
+concept has_rvalue_info = requires(T&& value) {
+    std::move(value).info();
+};
+
+template <class T>
+concept publicly_default_constructible = requires { T{}; };
+
+static_assert(!has_rvalue_info<ovstorage::LocalDelegate>);
+static_assert(!publicly_default_constructible<ovstorage::StackConfig>);
+
+// `copy` and `rename` each have a single overload (a defaulted `CopyOptions`,
+// not a second overload on `bool`), so `auto` deduction works here unlike
+// the genuinely overloaded read/write verbs above.
+
 // Anchor the wrapper's RAII / value types so their member templates get
 // instantiated. Default-constructed handles are all-null and destruct
 // cleanly without touching a runtime.
@@ -90,6 +123,7 @@ void instantiate_wrapper_types()
 {
     ovstorage::Error err;
     (void)err.code();
+    (void)err.code_name();
 
     // Result<T> / Result<void>.
     auto ok = ovstorage::Result<void>::success();
@@ -108,6 +142,7 @@ void instantiate_wrapper_types()
     ovstorage::WriteOptions write_options;
     ovstorage::ConnectionAttributePatch attribute_patch;
     ovstorage::LocalDelegate delegate;
+    (void)delegate.info();
     ovstorage::AccessDecision decision;
     ovstorage::List list;
     ovstorage::VersionList versions;
@@ -122,11 +157,19 @@ void instantiate_wrapper_types()
     OvStorage_Info raw_info{};
     raw_info.address = "file:///moved";
     raw_info.kind = OvStorage_ObjectKind_Directory;
+    raw_info.etag_strength = OVSTORAGE_ETAG_STRENGTH_WEAK;
+    raw_info.versioned_address = "file:///moved?v=1";
     ovstorage::Info owned_info(ovstorage_info_clone(&raw_info));
     ovstorage::Info moved_info(std::move(owned_info));
     assert(moved_info.address() == "file:///moved");
+    assert(moved_info.etag_strength() == OVSTORAGE_ETAG_STRENGTH_WEAK);
+    assert(moved_info.has_versioned_address());
+    assert(moved_info.versioned_address() == "file:///moved?v=1");
     assert(owned_info.address().empty());
     assert(owned_info.kind() == OvStorage_ObjectKind_File);
+    assert(owned_info.etag_strength() == OVSTORAGE_ETAG_STRENGTH_UNSPECIFIED);
+    assert(!owned_info.has_versioned_address());
+    assert(!owned_info.versioned_address().has_value());
     assert(!owned_info.has_size());
     assert(owned_info.size() == 0);
     (void)info.get();
@@ -135,6 +178,9 @@ void instantiate_wrapper_types()
     (void)info.has_size();
     (void)info.size();
     (void)info.etag();
+    (void)info.etag_strength();
+    (void)info.has_versioned_address();
+    (void)info.versioned_address();
     (void)info.version();
     (void)info.has_mtime_unix_nanos();
     (void)info.mtime_unix_nanos();
@@ -200,6 +246,9 @@ void instantiate_wrapper_types()
     (void)info.view().modified_by();
     (void)info.view().checksums();
     (void)info.view().effective_permissions();
+    (void)info.view().etag_strength();
+    (void)info.view().has_versioned_address();
+    (void)info.view().versioned_address();
 
     (void)connection.auth_failed_code();
     (void)connection.auth_failed_code_name();
@@ -209,6 +258,7 @@ void instantiate_wrapper_types()
     (void)connection.authenticated_expires_at_unix_nanos();
     (void)connection.awaiting_auth_reason();
     (void)connection.awaiting_auth_unknown_details();
+    (void)connection.owning_target();
 
     (void)root_info.owning_target();
     (void)root_info.range_read_strategy();
@@ -281,7 +331,8 @@ void instantiate_wrapper_types()
 
     // Member-function pointers force each LayerHandle coroutine method to
     // be parsed + type-checked (a stale C signature fails to compile).
-    auto stat_fn = &ovstorage::LayerHandle::stat;
+    stat_fn plain_stat_fn = &ovstorage::LayerHandle::stat;
+    options_stat_fn options_stat = &ovstorage::LayerHandle::stat;
     using read_bytes_result = std::pair<ovstorage::Bytes, ovstorage::Info>;
     read_fn<read_bytes_result> read_bytes_fn =
         &ovstorage::LayerHandle::read_bytes;
@@ -310,7 +361,8 @@ void instantiate_wrapper_types()
         &ovstorage::LayerHandle::get_latest_version;
     auto watch_directory_fn = &ovstorage::LayerHandle::watch_directory;
     auto delete_fn = &ovstorage::LayerHandle::delete_object;
-    auto list_fn = &ovstorage::LayerHandle::list;
+    list_fn plain_list_fn = &ovstorage::LayerHandle::list;
+    options_list_fn options_list = &ovstorage::LayerHandle::list;
     auto list_versions_fn = &ovstorage::LayerHandle::list_versions;
     auto copy_fn = &ovstorage::LayerHandle::copy;
     auto rename_fn = &ovstorage::LayerHandle::rename;
@@ -326,11 +378,13 @@ void instantiate_wrapper_types()
     auto update_attributes_fn =
         &ovstorage::LayerHandle::update_connection_attributes;
     auto authenticate_fn = &ovstorage::LayerHandle::authenticate_connection;
+    auto root_info_fn = &ovstorage::LayerHandle::root_info_for;
     auto list_roots_fn = &ovstorage::LayerHandle::list_address_roots;
     // Cross-language live handoff.
     auto export_handle_fn = &ovstorage::LayerHandle::export_handle;
     auto import_handle_fn = &ovstorage::LayerHandle::import_handle;
-    (void)stat_fn;
+    (void)plain_stat_fn;
+    (void)options_stat;
     (void)read_bytes_fn;
     (void)ranged_read_bytes_fn;
     (void)read_stream_fn;
@@ -347,7 +401,8 @@ void instantiate_wrapper_types()
     (void)get_latest_version_fn;
     (void)watch_directory_fn;
     (void)delete_fn;
-    (void)list_fn;
+    (void)plain_list_fn;
+    (void)options_list;
     (void)list_versions_fn;
     (void)copy_fn;
     (void)rename_fn;
@@ -362,6 +417,7 @@ void instantiate_wrapper_types()
     (void)update_creds_fn;
     (void)update_attributes_fn;
     (void)authenticate_fn;
+    (void)root_info_fn;
     (void)list_roots_fn;
     (void)export_handle_fn;
     (void)import_handle_fn;
@@ -374,6 +430,10 @@ void instantiate_wrapper_types()
     auto set_children_fn = &ovstorage::Stack::set_children;
     auto stack_add_conn_fn = &ovstorage::Stack::add_connection;
     auto build_fn = &ovstorage::Stack::build;
+    auto config_from_str_fn = &ovstorage::StackConfig::from_toml_str;
+    auto config_from_path_fn = &ovstorage::StackConfig::from_toml_path;
+    auto config_from_default_fn = &ovstorage::StackConfig::from_default_path;
+    auto config_build_fn = &ovstorage::StackConfig::build;
     auto reg_add_plugin_fn = &ovstorage::Registry::add_plugin;
     auto plugin_load_fn = &ovstorage::Plugin::load;
     auto plugin_inspect_fn = &ovstorage::Plugin::inspect;
@@ -384,6 +444,10 @@ void instantiate_wrapper_types()
     (void)set_children_fn;
     (void)stack_add_conn_fn;
     (void)build_fn;
+    (void)config_from_str_fn;
+    (void)config_from_path_fn;
+    (void)config_from_default_fn;
+    (void)config_build_fn;
     (void)reg_add_plugin_fn;
     (void)plugin_load_fn;
     (void)plugin_inspect_fn;

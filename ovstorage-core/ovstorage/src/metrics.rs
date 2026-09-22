@@ -20,6 +20,12 @@ pub const SPI_DURATION_SECONDS: &str = "ovstorage_spi_duration_seconds";
 pub const RETRY_CALLS_TOTAL: &str = "ovstorage_retry_calls_total";
 pub const RETRY_EXHAUSTED_TOTAL: &str = "ovstorage_retry_exhausted_total";
 
+// --- hub_cache ---
+
+pub const HUB_CACHE_REQUESTS_TOTAL: &str = "ovstorage_hub_cache_requests_total";
+pub const HUB_CACHE_LOOKUP_DURATION_SECONDS: &str = "ovstorage_hub_cache_lookup_duration_seconds";
+pub const HUB_CACHE_FILLS_TOTAL: &str = "ovstorage_hub_cache_fills_total";
+
 /// Register human-readable descriptions for all ovstorage library
 /// metrics. Safe to call before or after a recorder is installed.
 pub fn describe_metrics() {
@@ -39,6 +45,19 @@ pub fn describe_metrics() {
     describe_counter!(
         RETRY_EXHAUSTED_TOTAL,
         "SPI calls where retry was exhausted without success."
+    );
+    describe_counter!(
+        HUB_CACHE_REQUESTS_TOTAL,
+        "hub_cache layer lookups by op, outcome (hit/miss/bypass), and reason."
+    );
+    describe_histogram!(
+        HUB_CACHE_LOOKUP_DURATION_SECONDS,
+        Unit::Seconds,
+        "Wall-clock latency of a hub_cache lookup from entry to its hit/miss/bypass classification, by op."
+    );
+    describe_counter!(
+        HUB_CACHE_FILLS_TOTAL,
+        "hub_cache fill attempts by op, outcome (committed/aborted/skipped), and reason."
     );
 }
 

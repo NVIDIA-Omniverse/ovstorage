@@ -45,6 +45,15 @@
  */
 typedef enum {
   OvStorage_Status_Ok = 0,
+  /**
+   * An object, route, or required configuration was not found. The C status
+   * surface intentionally folds plugin `NotConfigured` errors into this
+   * coarse bucket. For plugin-originated errors, `ovstorage_error_code_name`
+   * preserves the plugin's finer name. Errors minted by the C host carry
+   * only the coarse name `"NotFound"`; consult the operation context and
+   * `OvStorage_Error::message` for their concrete cause. The name alone does
+   * not establish object absence, particularly for setup failures.
+   */
   OvStorage_Status_NotFound = 1,
   OvStorage_Status_AlreadyExists = 2,
   OvStorage_Status_PermissionDenied = 3,
@@ -104,6 +113,20 @@ typedef enum {
   OvStorage_ObjectKind_DirectoryMarker = 2,
   OvStorage_ObjectKind_DirectoryInferred = 3,
 } OvStorage_ObjectKind;
+
+/**
+ * Backend declaration of how an object's etag may be trusted.
+ *
+ * `UNSPECIFIED` makes no strength promise and must be treated as `WEAK` by
+ * callers making trust decisions. `STRONG` declares that the etag identifies
+ * the exact object bytes; `WEAK` declares only a weaker equivalence chosen by
+ * the backend.
+ */
+typedef enum OvStorage_EtagStrength {
+  OVSTORAGE_ETAG_STRENGTH_UNSPECIFIED = 0,
+  OVSTORAGE_ETAG_STRENGTH_STRONG = 1,
+  OVSTORAGE_ETAG_STRENGTH_WEAK = 2,
+} OvStorage_EtagStrength;
 
 typedef enum {
   OvStorage_ConfigValueKind_String = 0,
@@ -336,6 +359,14 @@ typedef struct OvStorage_SecretValue OvStorage_SecretValue;
  */
 typedef struct OvStorage_Stack OvStorage_Stack;
 
+/**
+ * Immutable parsed `[ovstorage]` Stack configuration. Created by an
+ * `ovstorage_stack_config_from_*` loader and freed with
+ * `ovstorage_stack_config_destroy`. Literal credentials remain resident for
+ * this reusable handle's lifetime; prefer `${NAME}` environment references.
+ */
+typedef struct OvStorage_StackConfig OvStorage_StackConfig;
+
 typedef struct OvStorage_UpdateMetadataOptions OvStorage_UpdateMetadataOptions;
 
 /** Owned list of contiguous borrowed version `Info` items. */
@@ -345,26 +376,79 @@ typedef struct OvStorage_Error {
   OvStorage_Status code;
   char *message;
   /**
-   * Stable machine-readable name of the fine-grained error code behind
-   * `OvStorage_Error.code` (e.g. `"BrokerUnavailable"`), or NULL when the error
-   * carries no code name. Points at a static string owned by the
-   * library: it stays valid for the process lifetime, must not be
+   * Machine-readable name supplied with this error: the finer plugin code
+   * (e.g. `"BrokerUnavailable"`) for plugin-originated errors, or the coarse
+   * status name for errors minted by the C host. NULL when no name is supplied.
+   * Presence does not imply a finer identity. Points at a static string owned
+   * by the library: it stays valid for the process lifetime, must not be
    * freed, and is read through `ovstorage_error_code_name`.
    */
   const char *code_name;
 } OvStorage_Error;
 
+/**
+ * Options for pinning the process-global auth substrate. A non-NULL options
+ * pointer must set `auth_dir` and/or `credential_namespace`; setting both to
+ * NULL is invalid. Repeating the same resolved directory and namespace is a
+ * no-op, while changing either one after pinning returns
+ * `OvStorage_Status_Unsupported`.
+ */
 typedef struct OvStorage_InitAuthSubstrateOptions {
   /**
-   * Borrowed C-string naming the auth directory to pin. Must not be
-   * NULL: pass `options = NULL` to `ovstorage_init_auth_substrate` to
-   * request the default (`$OVSTORAGE_AUTH_DIR` or a per-process temp
-   * dir) instead. Calling `ovstorage_init_auth_substrate` twice with
-   * the same resolved path is a no-op; calling it with a different path
-   * returns `OvStorage_Status_Unsupported`.
+   * Borrowed non-empty C-string naming the absolute auth directory to pin.
+   * NULL selects the default: `$OVSTORAGE_AUTH_DIR`, else the platform
+   * per-user data directory plus `ovstorage/auth`, else a user-scoped
+   * temporary fallback. An empty or relative explicit value, or an empty or
+   * relative `$OVSTORAGE_AUTH_DIR`, is invalid: the store re-opens paths under
+   * this directory for the life of the process, so it must not move with the
+   * working directory. On Windows, drive-relative (`C:dir`) and root-relative
+   * (`\dir`) forms are relative for this purpose.
    */
   const char *auth_dir;
+  /**
+   * Borrowed C-string naming the credential persistence namespace. NULL
+   * selects `default`. A namespace is 1-64 bytes of `[A-Za-z0-9._-]` and
+   * starts with an ASCII alphanumeric character. Its lowercase hexadecimal
+   * byte encoding names the file `<auth_dir>/c-credentials/<stem>.creds`.
+   *
+   * Unrelated applications should pass distinct namespaces so they do not
+   * collide. Sharing a namespace is how cooperating applications share
+   * credentials.
+   */
+  const char *credential_namespace;
 } OvStorage_InitAuthSubstrateOptions;
+
+/** Severity values emitted by plugin `HostCallbacks::log`. */
+typedef enum {
+  OvStorage_PluginLogLevel_Trace = 0,
+  OvStorage_PluginLogLevel_Debug = 1,
+  OvStorage_PluginLogLevel_Info = 2,
+  OvStorage_PluginLogLevel_Warn = 3,
+  OvStorage_PluginLogLevel_Error = 4,
+} OvStorage_PluginLogLevel;
+
+/**
+ * Receives one plugin event that passes the configured threshold. `target` and
+ * `message` are borrowed UTF-8 byte sequences and are valid only for this
+ * call. The host serializes calls to this sink, including calls made by
+ * concurrent plugin callbacks. A sink must not call back into ovstorage.
+ */
+typedef void (*OvStorage_PluginLogSink)(void *sink_state,
+                                        OvStorage_PluginLogLevel level,
+                                        const char *target,
+                                        size_t target_len,
+                                        const char *message,
+                                        size_t message_len);
+
+/**
+ * Process-wide plugin-log routing. The sink and `sink_state` are borrowed and
+ * must remain valid until this configuration is replaced or reset.
+ */
+typedef struct OvStorage_PluginLogOptions {
+  OvStorage_PluginLogLevel level;
+  OvStorage_PluginLogSink sink;
+  void *sink_state;
+} OvStorage_PluginLogOptions;
 
 typedef struct OvStorage_AccessOps {
   bool read;
@@ -376,7 +460,7 @@ typedef struct OvStorage_AccessOps {
 typedef struct OvStorage_AccessDecision {
   bool allowed;
   OvStorage_AccessOps denied_ops;
-  char *reason;
+  char *reason; /* NULL when absent. */
 } OvStorage_AccessDecision;
 
 typedef struct OvStorage_Bytes {
@@ -387,6 +471,13 @@ typedef struct OvStorage_Bytes {
 
 typedef struct OvStorage_StatOptions {
   bool full_metadata;
+  /**
+   * Ask for `OvStorage_Info::versioned_address` even when the lookup costs
+   * extra work. A positional initializer that names only `full_metadata`
+   * leaves this false, and a backend then supplies the pin only when it
+   * already has it.
+   */
+  bool versioned_address;
 } OvStorage_StatOptions;
 
 typedef void (*OvStorage_InfoCallback)(OvStorage_Status status,
@@ -641,12 +732,33 @@ typedef void (*OvStorage_StatusCallback)(OvStorage_Status status,
                                          const OvStorage_Error *error,
                                          void *user_data);
 
+/**
+ * Options for `ovstorage_list`. A NULL `options` or a zeroed struct lists
+ * the first page, non-recursively, with the backend's default page size.
+ */
 typedef struct OvStorage_ListOptions {
   bool recursive;
   bool has_max_results;
   uint32_t max_results;
+  /**
+   * NUL-terminated continuation token from the `next_page_token` of the
+   * previous `OvStorage_List`; NULL for the first page.
+   *
+   * Must be non-empty and valid UTF-8. An empty string is rejected with
+   * `OvStorage_Status_InvalidArgument` rather than treated as "first page",
+   * so a caller that propagates an absent `next_page_token` as `""` gets an
+   * error instead of silently re-listing from the start. See
+   * `OvStorage_WriteOptions::if_match_etag` for the same rule on a write.
+   */
   const char *page_token;
   bool full_metadata;
+  /**
+   * Ask for `OvStorage_Info::versioned_address` on every item even when
+   * the listing costs extra work. A positional initializer that names only
+   * `full_metadata` leaves this false, and a backend then supplies the pin
+   * only when it already has it.
+   */
+  bool versioned_address;
 } OvStorage_ListOptions;
 
 typedef void (*OvStorage_ListCallback)(OvStorage_Status status,
@@ -654,9 +766,19 @@ typedef void (*OvStorage_ListCallback)(OvStorage_Status status,
                                        const OvStorage_Error *error,
                                        void *user_data);
 
+/**
+ * Options for `ovstorage_list_versions`. A NULL `options` or a zeroed struct
+ * lists the first page with the backend's default page size.
+ */
 typedef struct OvStorage_ListVersionsOptions {
   bool has_max_results;
   uint32_t max_results;
+  /**
+   * NUL-terminated continuation token from the `next_page_token` of the
+   * previous `OvStorage_VersionList`; NULL for the first page. Must be
+   * non-empty and valid UTF-8; see `OvStorage_ListOptions::page_token` for
+   * why an empty string is rejected rather than treated as "first page".
+   */
   const char *page_token;
 } OvStorage_ListVersionsOptions;
 
@@ -688,8 +810,8 @@ typedef struct OvStorage_BackendChangeEvent {
   OvStorage_BackendChangeEventKind kind;
   const char *address;
   OvStorage_ChangeKind change_kind;
-  const char *etag;
-  const char *version;
+  const char *etag;    /* NULL when absent. */
+  const char *version; /* NULL when absent. */
   bool has_size;
   uint64_t size;
   bool has_mtime_unix_nanos;
@@ -867,6 +989,19 @@ struct OvStorage_Info {
    */
   bool has_effective_permissions;
   OvStorage_AccessOps effective_permissions;
+  /**
+   * Trust declaration for `etag`. `OVSTORAGE_ETAG_STRENGTH_UNSPECIFIED`
+   * is untrusted and must be treated as `OVSTORAGE_ETAG_STRENGTH_WEAK`.
+   */
+  OvStorage_EtagStrength etag_strength;
+  /**
+   * The address that names this version of the object; NULL when the
+   * backend does not version it or was not asked (`versioned_address` on
+   * the stat and list options). A pin, not an identity: reads through it
+   * serve this version while the backend retains it, and mutations
+   * through it are refused.
+   */
+  const char *versioned_address;
 };
 
 /**
@@ -900,7 +1035,7 @@ struct OvStorage_VersionList {
 struct OvStorage_Connection {
   const char *id;
   const char *backend_kind;
-  const char *display_name; /* NULL when absent. */
+  const char *display_name; /* Always set. */
   OvStorage_Capabilities capabilities;
   const char *const *addresses;
   size_t addresses_len;
@@ -944,6 +1079,19 @@ struct OvStorage_Connection {
    * `awaiting_auth_reason` is `OvStorage_AuthReason_Unknown`.
    */
   const char *awaiting_auth_unknown_details; /* NULL when absent. */
+  /**
+   * Instance name of the Layer that owns this connection — the `target`
+   * argument `ovstorage_authenticate_connection`,
+   * `ovstorage_update_connection_credentials` and
+   * `ovstorage_remove_connection` route by, paired with `id`.
+   *
+   * It is reported on the row so a caller can address the connection
+   * without first resolving an owner from an address: a connection parked
+   * in `AwaitingAuth` or refused into `AuthFailed` may publish no address
+   * at all, and `OvStorage_RootInfo::owning_target` is unreachable for it.
+   * NULL when the Layer reports none.
+   */
+  const char *owning_target; /* NULL when absent. */
 };
 
 /** Connection-list counterpart of `OvStorage_List`, without pagination. */
@@ -977,6 +1125,18 @@ struct OvStorage_AuthEvent {
     } progress;
     struct {
       const OvStorage_Connection *connection;
+      /**
+       * The credentials the connection just authenticated with, if the
+       * plugin reported any -- not every backend does. Unlike `connection`,
+       * this is *not* borrowed: it is owned by this event and freed when
+       * `ovstorage_auth_event_destroy` runs, unless
+       * `ovstorage_auth_event_take_succeeded_credentials` has already taken
+       * it, which is how a caller pushes it on via
+       * `ovstorage_update_connection_credentials` or persists it
+       * elsewhere -- both consume ownership, so it cannot stay a borrow.
+       * NULL if the plugin reported none, or once taken.
+       */
+      OvStorage_SecretBundle *credentials;
     } succeeded;
     struct {
       OvStorage_Status code;
@@ -1032,7 +1192,7 @@ struct OvStorage_RootInfo {
   size_t icon_len;
   /**
    * Instance name of the Layer that owns connections for this root — the
-   * `target` argument `ovstorage_authenticate`,
+   * `target` argument `ovstorage_authenticate_connection`,
    * `ovstorage_update_connection_credentials` and
    * `ovstorage_remove_connection` route by.
    *
@@ -1102,6 +1262,16 @@ typedef void (*OvStorage_RootInfoListCallback)(OvStorage_Status status,
                                                const OvStorage_Error *error,
                                                void *user_data);
 
+/**
+ * Delivers one owned `RootInfo` on success. The caller owns `root` and must
+ * destroy it with `ovstorage_root_info_destroy`. On error, `root` is NULL and
+ * `error` describes the failure.
+ */
+typedef void (*OvStorage_RootInfoCallback)(OvStorage_Status status,
+                                           OvStorage_RootInfo *root,
+                                           const OvStorage_Error *error,
+                                           void *user_data);
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -1134,10 +1304,12 @@ void ovstorage_error_clear(OvStorage_Error *error);
 const char *ovstorage_error_message(const OvStorage_Error *error);
 
 /**
- * Stable machine-readable name of the fine-grained error code carried by
- * `error` (e.g. `"BrokerUnavailable"` for a broker outage surfaced as
- * `OvStorage_Status_Transient`). Returns NULL when `error` is NULL or carries no
- * code name. The returned pointer is a static string owned by the
+ * Machine-readable name carried by `error`. Plugin-originated errors retain
+ * the finer plugin name (e.g. `"BrokerUnavailable"` behind
+ * `OvStorage_Status_Transient`); errors minted by the C host carry the coarse
+ * status name. The name does not identify the error's origin or establish
+ * object absence without operation context. Returns NULL when `error` is NULL
+ * or carries no code name. The returned pointer is a static string owned by the
  * library: it stays valid for the process lifetime, must not be freed,
  * and outlives `ovstorage_error_clear` on `error`.
  *
@@ -1168,31 +1340,67 @@ bool ovstorage_status_is_retryable(OvStorage_Status status);
  * loader comment in `ovstorage::loader::register_host_substrate`), so
  * the `(SecretStore, AuthRefreshLock)` pair is shared across every Stack
  * and plugin load in one process. This function lets callers pin a
- * non-default `auth_dir` before any plugin is loaded.
+ * chosen `auth_dir` and credential namespace before any plugin is loaded.
  *
  * `options = NULL` uses the default `auth_dir` (resolved from
- * `$OVSTORAGE_AUTH_DIR` or a per-process temp dir). Calling this
- * twice with the same resolved path is a no-op; calling it with a
- * different path returns `OvStorage_Status_Unsupported`. `ovstorage_load_plugin`
- * auto-initializes the substrate with the default `auth_dir` if this was
- * not called first.
+ * `$OVSTORAGE_AUTH_DIR`, else the platform per-user data directory plus
+ * `ovstorage/auth`, else a user-scoped temporary fallback) and the `default`
+ * credential namespace. Calling this twice with the same resolved path and
+ * namespace is a no-op; calling it with a different path or namespace returns
+ * `OvStorage_Status_Unsupported`. `ovstorage_load_plugin` auto-initializes the
+ * substrate with the default `auth_dir` and namespace if this was not called
+ * first.
  *
  * Pinning is one-shot and process-global, so a non-NULL `options` must
- * name a directory: `options->auth_dir == NULL` returns
- * `OvStorage_Status_InvalidArgument` rather than quietly pinning the default and
- * making a later explicit call fail with `OvStorage_Status_Unsupported`. Pass
- * `options = NULL` to ask for the default.
+ * set `auth_dir` and/or `credential_namespace`: setting both fields to NULL
+ * returns `OvStorage_Status_InvalidArgument` rather than quietly pinning the
+ * defaults and making a later explicit call fail with
+ * `OvStorage_Status_Unsupported`. Pass `options = NULL` to ask for both
+ * defaults.
  *
  * # Safety
  *
  * `options` must be NULL or point to a valid
- * `OvStorage_InitAuthSubstrateOptions` whose `auth_dir` is a
- * NUL-terminated UTF-8 string that stays valid for the duration of the
- * call (it is copied, not retained). `out_error` must be NULL or a valid
- * `OvStorage_Error*`.
+ * `OvStorage_InitAuthSubstrateOptions` whose non-NULL fields are
+ * NUL-terminated strings that stay valid for the duration of the call (they
+ * are copied, not retained). `auth_dir` must be non-empty valid UTF-8 and
+ * `credential_namespace` must have the form documented on the struct.
+ * `out_error` must be NULL or a valid `OvStorage_Error*`.
  */
 OvStorage_Status ovstorage_init_auth_substrate(const OvStorage_InitAuthSubstrateOptions *options,
                                                OvStorage_Error *out_error);
+
+/**
+ * Configure the process-wide route for logs emitted by loaded plugins.
+ *
+ * The production default is `Warn`: TRACE, DEBUG, and INFO records are
+ * discarded before formatting or writing, while WARN and ERROR records go to
+ * stderr. Passing non-NULL `options` selects a threshold and, optionally, a
+ * host-owned sink. Passing NULL removes an explicit selection and re-enables
+ * the environment fallback: `$OVSTORAGE_LOG`, then `$RUST_LOG`, then `Warn`.
+ * It reads that fallback on the first plugin log and whenever options are
+ * reset, retaining the resulting threshold until the next reset.
+ * The fallback reduces valid comma-separated global and target-level Rust
+ * directives to their most verbose declared level and does not provide
+ * target-specific routing; a bare valid target selects Trace, and `off`
+ * disables plugin records. Numeric Rust levels `0` through `5` are accepted
+ * too. A malformed directive invalidates its whole variable, so an invalid
+ * `OVSTORAGE_LOG` falls through to `RUST_LOG`, then Warn, matching the Rust
+ * host. Embedders that need target-specific control use a sink. An explicit
+ * configuration always takes precedence over the environment.
+ *
+ * `options->level` must be a declared `OvStorage_PluginLogLevel` value.
+ * This setter serializes with plugin callbacks. It is intended for process
+ * initialization; a sink must not call this function or another ovstorage API.
+ *
+ * # Safety
+ *
+ * `options` must be NULL or point to a valid options struct for the duration
+ * of the call. The sink and `sink_state` are borrowed until replaced or reset.
+ * `out_error` must be NULL or valid writable `OvStorage_Error*` storage.
+ */
+OvStorage_Status ovstorage_set_plugin_log_options(const OvStorage_PluginLogOptions *options,
+                                                  OvStorage_Error *out_error);
 
 /**
  * Create a cancel token to hand to the async ops that accept one.
@@ -1359,14 +1567,17 @@ OvStorage_Info *ovstorage_info_clone(const OvStorage_Info *info);
  * `OvStorage_LocalDelegate*` delivered by a read-local-file callback,
  * not yet destroyed; it is freed here. The borrowed pointers returned
  * by `ovstorage_local_delegate_path` and
- * `ovstorage_local_delegate_info` dangle afterwards.
+ * `ovstorage_local_delegate_info` dangle afterwards. If the producing
+ * backend supplied a lease for the local path, destroying the delegate
+ * releases that lease exactly once.
  */
 void ovstorage_local_delegate_destroy(OvStorage_LocalDelegate *delegate);
 
 /**
  * Borrowed local filesystem path of the delegated object; NULL if
- * `delegate` is NULL. Owned by `delegate`: valid until it is
- * destroyed; do not free.
+ * `delegate` is NULL. Owned by `delegate`: valid until it is destroyed;
+ * do not free. When the producer supplied a path lease, the delegate keeps
+ * that lease alive until destruction.
  *
  * # Safety
  *
@@ -1375,9 +1586,10 @@ void ovstorage_local_delegate_destroy(OvStorage_LocalDelegate *delegate);
 const char *ovstorage_local_delegate_path(const OvStorage_LocalDelegate *delegate);
 
 /**
- * Borrowed `OvStorage_Info*` describing the delegated object; NULL if
- * `delegate` is NULL. Owned by `delegate`: valid until it is destroyed
- * and must NOT be passed to `ovstorage_info_destroy`.
+ * Borrowed `OvStorage_Info*` snapshot delivered with the delegated path;
+ * NULL if `delegate` is NULL. Owned by `delegate`: valid until it is
+ * destroyed and must NOT be passed to `ovstorage_info_destroy`. Available
+ * fields are backend-dependent and may differ from a later `stat` result.
  *
  * # Safety
  *
@@ -1899,7 +2111,9 @@ void ovstorage_delete(const OvStorage_LayerHandle *handle,
  *
  * `handle` must be NULL or a valid `*const LayerHandle`. `prefix` must be
  * NULL or a NUL-terminated UTF-8 C-string (copied before spawning).
- * `options` must be NULL or point to valid `ListOptions`. `cancel` must
+ * `options` must be NULL or point to valid `ListOptions`; a non-NULL
+ * `page_token` must be non-empty (an empty one completes with
+ * `OvStorage_Status_InvalidArgument`). `cancel` must
  * be NULL or a valid `*const CancelToken`; it may be destroyed after this
  * call returns (the token is cloned internally). `on_complete` must be a
  * valid callback function or NULL (NULL is a no-op — the request is
@@ -1920,7 +2134,9 @@ void ovstorage_list(const OvStorage_LayerHandle *handle,
  *
  * `handle` must be NULL or a valid `*const LayerHandle`. `address` must be
  * NULL or a NUL-terminated UTF-8 C-string (copied before spawning).
- * `options` must be NULL or point to valid `ListVersionsOptions`.
+ * `options` must be NULL or point to valid `ListVersionsOptions`; a
+ * non-NULL `page_token` must be non-empty (an empty one completes with
+ * `OvStorage_Status_InvalidArgument`).
  * `cancel` must be NULL or a valid `*const CancelToken`; it may be
  * destroyed after this call returns (the token is cloned internally).
  * `on_complete` must be a valid callback function or NULL (NULL is a no-op
@@ -1978,10 +2194,35 @@ void ovstorage_watch_directory(const OvStorage_LayerHandle *handle,
                                void *user_data);
 
 /**
+ * Options common to `ovstorage_copy` and `ovstorage_rename`.
+ *
+ * `no_overwrite` and `if_match_etag` are the two spellings of a destination
+ * precondition and are mutually exclusive, matching `OvStorage_WriteOptions`
+ * exactly: `no_overwrite` means "fail if anything is there", `if_match_etag`
+ * means "fail unless what is there is exactly this". Setting both is
+ * rejected with `OvStorage_Status_InvalidArgument`. Leaving both unset (a
+ * NULL `options`, or a zeroed struct) means "overwrite whatever is there",
+ * which is also this call's behavior when no `options` is given at all --
+ * unchanged from before this struct existed.
+ */
+typedef struct OvStorage_CopyOptions {
+  bool no_overwrite;
+  /**
+   * NUL-terminated etag the destination must currently carry for the copy
+   * or rename to proceed; NULL for no precondition. Must be non-empty and
+   * valid UTF-8. See `OvStorage_WriteOptions::if_match_etag` for why an
+   * empty string is rejected rather than treated as "no precondition".
+   */
+  const char *if_match_etag;
+} OvStorage_CopyOptions;
+
+/**
  * # Safety
  *
  * `handle` must be NULL or a valid `*const LayerHandle`. `src` and `dest`
  * must be NULL or NUL-terminated UTF-8 C-strings (copied before spawning).
+ * `options` may be NULL for the default of "overwrite whatever is at
+ * `dest`", matching this call's behavior before `options` existed.
  * `cancel` must be NULL or a valid `*const CancelToken`; it may be
  * destroyed after this call returns (the token is cloned internally).
  * `on_complete` must be a valid callback function or NULL (NULL is a no-op
@@ -1993,6 +2234,7 @@ void ovstorage_watch_directory(const OvStorage_LayerHandle *handle,
 void ovstorage_copy(const OvStorage_LayerHandle *handle,
                     const char *src,
                     const char *dest,
+                    const OvStorage_CopyOptions *options,
                     const OvStorage_CancelToken *cancel,
                     OvStorage_InfoCallback on_complete,
                     void *user_data);
@@ -2002,6 +2244,8 @@ void ovstorage_copy(const OvStorage_LayerHandle *handle,
  *
  * `handle` must be NULL or a valid `*const LayerHandle`. `src` and `dest`
  * must be NULL or NUL-terminated UTF-8 C-strings (copied before spawning).
+ * `options` may be NULL for the default of "overwrite whatever is at
+ * `dest`", matching this call's behavior before `options` existed.
  * `cancel` must be NULL or a valid `*const CancelToken`; it may be
  * destroyed after this call returns (the token is cloned internally).
  * `on_complete` must be a valid callback function or NULL (NULL is a no-op
@@ -2013,6 +2257,7 @@ void ovstorage_copy(const OvStorage_LayerHandle *handle,
 void ovstorage_rename(const OvStorage_LayerHandle *handle,
                       const char *src,
                       const char *dest,
+                      const OvStorage_CopyOptions *options,
                       const OvStorage_CancelToken *cancel,
                       OvStorage_StatusCallback on_complete,
                       void *user_data);
@@ -2263,6 +2508,129 @@ const char *ovstorage_kind_descriptor_list_item_kind(const OvStorage_KindDescrip
 const char *ovstorage_kind_descriptor_list_item_display_name(const OvStorage_KindDescriptorList *list,
                                                              size_t index,
                                                              size_t *out_len);
+
+/**
+ * Parse an immutable Stack configuration from a TOML document.
+ *
+ * Only the top-level `[ovstorage]` table is consumed. A valid document with
+ * no such table produces an empty configuration. This programmatic loader
+ * does not read `OVSTORAGE__*` environment variables; use
+ * `ovstorage_stack_config_from_toml_path` for the operator-facing overlay.
+ *
+ * # Safety
+ *
+ * `toml` must be a NUL-terminated UTF-8 string valid for the duration of the
+ * call. `out_config` must point at writable storage for one
+ * `OvStorage_StackConfig*`; it is set to NULL before validation and receives
+ * an owned handle only on `Ok`. `out_error` must be NULL or a valid
+ * `OvStorage_Error*`.
+ */
+OvStorage_Status ovstorage_stack_config_from_toml_str(
+    const char *toml,
+    OvStorage_StackConfig **out_config,
+    OvStorage_Error *out_error);
+
+/**
+ * Load an immutable Stack configuration from a UTF-8 TOML file and merge the
+ * process environment's `OVSTORAGE__` overlay. The prefix is removed, ASCII
+ * keys are lowercased, and `__` separates nested keys: for example,
+ * `OVSTORAGE__ROOT` targets `ovstorage.root` and
+ * `OVSTORAGE__LAYERS__FILES__ROOT` targets
+ * `ovstorage.layers.files.root`. Environment values use Figment-style
+ * scalar/array/table inference for the documented forms; otherwise they remain
+ * strings. Prefix matching is ASCII case-insensitive, key paths after the
+ * prefix must be ASCII, and values must be UTF-8. Overlapping table paths are
+ * merged. When multiple environment names canonicalize to one path, the later
+ * process-environment entry replaces the earlier one.
+ *
+ * # Safety
+ *
+ * `path` must be a NUL-terminated UTF-8 path valid for the duration of the
+ * call. `out_config` and `out_error` have the same contract as
+ * `ovstorage_stack_config_from_toml_str`.
+ */
+OvStorage_Status ovstorage_stack_config_from_toml_path(
+    const char *path,
+    OvStorage_StackConfig **out_config,
+    OvStorage_Error *out_error);
+
+/**
+ * Try the first regular file at `./ovstorage.toml`, then
+ * `$XDG_CONFIG_HOME/ovstorage/ovstorage.toml`, or
+ * `$HOME/.config/ovstorage/ovstorage.toml` when `XDG_CONFIG_HOME` is unset.
+ * A discovered file is loaded with the same `OVSTORAGE__` overlay as
+ * `ovstorage_stack_config_from_toml_path`. When neither candidate exists the
+ * call succeeds and leaves `*out_config == NULL`. This core helper does not
+ * inspect the host-level `OVSTORAGE_CONFIG` selection variable.
+ *
+ * # Safety
+ *
+ * `out_config` and `out_error` have the same contract as
+ * `ovstorage_stack_config_from_toml_str`.
+ */
+OvStorage_Status ovstorage_stack_config_from_default_path(
+    OvStorage_StackConfig **out_config,
+    OvStorage_Error *out_error);
+
+/**
+ * Destroy an owned parsed Stack configuration. Parser storage, including any
+ * literal credentials, is cleared before release. Null pointers are safe and
+ * do nothing.
+ *
+ * # Safety
+ *
+ * `config` must be NULL or an owned handle returned by an
+ * `ovstorage_stack_config_from_*` loader and not already destroyed.
+ */
+void ovstorage_stack_config_destroy(OvStorage_StackConfig *config);
+
+/**
+ * Build a parsed configuration through the same Stack builder and registry
+ * factory-resolution path as the imperative C API. Layer kinds are resolved
+ * only from `registry`; this function does not load plugins implicitly.
+ *
+ * The configuration and registry are borrowed and reusable after return.
+ * An empty configuration builds an Unsupported root, matching the Rust
+ * `build_stack` empty-Stack behavior. Connections without any configured
+ * layers are rejected.
+ *
+ * # Safety
+ *
+ * `config` must be a live parsed configuration and `registry` a live
+ * registry. `options` must be NULL or point to a valid
+ * `OvStorage_StackBuildOptions`. `out_handle` must point at writable storage
+ * for one `OvStorage_LayerHandle*`; it is set to NULL before validation and
+ * receives an owned handle only on `Ok`. `out_error` must be NULL or a valid
+ * `OvStorage_Error*`. This is blocking and must not be called from an
+ * ovstorage runtime worker thread.
+ */
+OvStorage_Status ovstorage_stack_build_from_config(
+    const OvStorage_StackConfig *config,
+    const OvStorage_Registry *registry,
+    const OvStorage_StackBuildOptions *options,
+    OvStorage_LayerHandle **out_handle,
+    OvStorage_Error *out_error);
+
+/**
+ * Asynchronously build a parsed configuration. Translation into an
+ * independent Stack builder completes before this function returns, so
+ * `config` and `registry` need only remain valid for the call. A translation
+ * or argument error fires `on_complete` inline. Otherwise completion follows
+ * `ovstorage_stack_build_async`; the internal builder is always reclaimed.
+ *
+ * # Safety
+ *
+ * `config`, `registry`, `options`, `cancel`, `on_complete`, and `user_data`
+ * follow the corresponding contracts of `ovstorage_stack_build_from_config`
+ * and `ovstorage_stack_build_async`. `on_complete == NULL` is a no-op.
+ */
+void ovstorage_stack_build_from_config_async(
+    const OvStorage_StackConfig *config,
+    const OvStorage_Registry *registry,
+    const OvStorage_StackBuildOptions *options,
+    const OvStorage_CancelToken *cancel,
+    OvStorage_StackBuildCallback on_complete,
+    void *user_data);
 
 /**
  * Create an empty Stack builder. Free with `ovstorage_stack_destroy`
@@ -2813,6 +3181,26 @@ void ovstorage_update_connection_attributes(const OvStorage_LayerHandle *handle,
  * freed here and must not be used afterwards.
  */
 void ovstorage_auth_event_destroy(OvStorage_AuthEvent *event);
+
+/**
+ * Take ownership of a `Succeeded` event's credentials, so they outlive the
+ * event -- to push via `ovstorage_update_connection_credentials` or persist
+ * them elsewhere. Returns NULL, and takes nothing, if `event` is NULL,
+ * `event->kind` is not `OvStorage_AuthEventKind_Succeeded`, the plugin
+ * reported no credentials, or this has already been called on this event.
+ * Safe to call at most once per event; the second call answers NULL.
+ *
+ * # Safety
+ *
+ * `event` must be NULL or a valid, not-yet-destroyed `OvStorage_AuthEvent*`.
+ * The returned pointer, when non-NULL, is owned by the caller and freed
+ * exactly once with `ovstorage_secret_bundle_destroy` -- or consumed by
+ * `ovstorage_update_connection_credentials`, which takes the same kind of
+ * ownership.
+ */
+OvStorage_SecretBundle *ovstorage_auth_event_take_succeeded_credentials(
+    OvStorage_AuthEvent *event);
+
 /**
  * Drive the authentication flow for the connection `connection_id` owned
  * by the Layer named `target`. The layer returns a stream of `AuthEvent`s;
@@ -2866,6 +3254,45 @@ void ovstorage_root_info_destroy(OvStorage_RootInfo *info);
  * be individually destroyed.
  */
 void ovstorage_root_info_list_destroy(OvStorage_RootInfoList *list);
+
+/**
+ * Return the authoritative address-root metadata for one resolved address.
+ *
+ * The built Stack delegates this query through its configured Layer graph and
+ * returns the root selected for the address. Plugin-backed Layers parse and
+ * canonicalize absolute URLs at the plugin ABI boundary; native C Layers
+ * define their own accepted address spelling and routing semantics. Clients
+ * must use this operation when a decision depends on the route for a specific
+ * address; matching a `list_address_roots` snapshot as raw string prefixes is
+ * not equivalent.
+ *
+ * Plugin-backed Layers require `address` to be an absolute URL with an
+ * authority. A syntactically invalid address completes with
+ * `OvStorage_Status_InvalidArgument`, and an address with no configured owner
+ * completes with `OvStorage_Status_NoRoute`. Implementations may also report
+ * `OvStorage_Status_Unsupported`; cancellation completes with
+ * `OvStorage_Status_Cancelled`.
+ *
+ * # Safety
+ *
+ * `handle` must be NULL or a valid `*const OvStorage_LayerHandle` from
+ * `ovstorage_stack_build`; NULL completes with `InvalidArgument`. `address`
+ * must be NULL or a NUL-terminated UTF-8 C-string (copied before spawning);
+ * NULL or non-UTF-8 completes with `InvalidArgument`. Further address syntax
+ * is validated by the configured Layer. `cancel` must be NULL or a valid
+ * `*const OvStorage_CancelToken`; it may be destroyed after this call returns
+ * (the token is cloned internally).
+ * `on_complete` must be a valid callback function or NULL (NULL is a no-op).
+ * `user_data` is an opaque context pointer passed to the callback and must
+ * remain valid until `on_complete` fires exactly once. The callback receives
+ * ownership of the returned `OvStorage_RootInfo*` on success and must free it
+ * with `ovstorage_root_info_destroy`, or receives NULL on error.
+ */
+void ovstorage_root_info_for(const OvStorage_LayerHandle *handle,
+                             const char *address,
+                             const OvStorage_CancelToken *cancel,
+                             OvStorage_RootInfoCallback on_complete,
+                             void *user_data);
 
 /**
  * List the address roots the built Stack root currently exposes.

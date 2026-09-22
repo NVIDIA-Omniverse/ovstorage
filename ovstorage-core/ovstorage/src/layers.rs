@@ -22,6 +22,7 @@ pub const METADATA_CACHE_KIND: &str = "metadata_cache";
 pub const BYTE_CACHE_KIND: &str = "byte_cache";
 pub const RETRY_KIND: &str = "retry";
 pub const REDIRECT_FOLLOWER_KIND: &str = "redirect_follower";
+pub const HUB_CACHE_KIND: &str = "hub_cache";
 
 pub const ALIAS_TO_METADATA_KEY: &str = "org.omniverse.ovstorage/alias-to";
 pub const ALIAS_VISIBILITY_METADATA_KEY: &str = "org.omniverse.ovstorage/alias-visibility";
@@ -78,12 +79,12 @@ mod tests {
     /// branch, and this is the only backend in the plugin-free registry, so
     /// nothing else pins it.
     #[test]
-    fn the_file_backend_declares_its_user_metadata_support() {
+    fn the_file_backend_declares_no_user_metadata_support() {
         let descriptor = default_layer_factories()[0].descriptor();
         assert!(
-            descriptor.supports_user_metadata,
-            "the file backend persists user metadata in a sidecar and returns it \
-             on stat, so a host composes its attribution layer over that branch"
+            !descriptor.supports_user_metadata,
+            "the file backend stores no user metadata and refuses a write that \
+             carries any, so a host must compose no attribution layer over that branch"
         );
     }
 }

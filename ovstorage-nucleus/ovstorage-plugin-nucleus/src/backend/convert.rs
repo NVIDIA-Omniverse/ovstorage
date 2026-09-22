@@ -7,11 +7,17 @@ use std::time::SystemTime;
 
 use nucleus_client::types::{PathAtVersion, PathPermission, PathType};
 use ovstorage_plugin::{
-    Error, ErrorCode, ObjectInfo, ObjectKind, Result, SystemMetadata, Url, address,
+    Error, ErrorCode, EtagStrength, ObjectInfo, ObjectKind, Result, SystemMetadata, Url, address,
 };
 
 use crate::address::NucleusTarget;
 use crate::ops::acl_to_effective_permissions;
+
+/// Contract: omni1 exposes etags as opaque precondition tokens but does not
+/// declare that equal tokens prove byte-identical content. Precondition support
+/// does not imply byte-identity strength, so trust-sensitive consumers take the
+/// fail-safe path.
+const OMNI1_ETAG_STRENGTH: EtagStrength = EtagStrength::Unspecified;
 
 pub(super) fn poisoned_state(_: std::sync::PoisonError<impl Sized>) -> Error {
     Error::new(
@@ -87,6 +93,7 @@ pub(super) fn stat2_to_object_info(
         acl_to_effective_permissions(&perms)
     });
     ObjectInfo {
+        etag_strength: OMNI1_ETAG_STRENGTH,
         address,
         kind,
         etag: result.etag,
@@ -104,6 +111,7 @@ pub(super) fn stat2_to_object_info(
         },
         user_metadata: None,
         modified_by: promoted_modified_by,
+        versioned_address: None,
     }
 }
 
@@ -113,6 +121,7 @@ pub(super) fn read_result_to_object_info(
     bytes: &[u8],
 ) -> ObjectInfo {
     ObjectInfo {
+        etag_strength: OMNI1_ETAG_STRENGTH,
         address,
         kind: ObjectKind::File,
         etag: result.etag.clone(),
@@ -124,6 +133,7 @@ pub(super) fn read_result_to_object_info(
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
@@ -132,6 +142,7 @@ pub(super) fn create_asset_to_object_info(
     result: nucleus_client::types::CreateAssetResult,
 ) -> ObjectInfo {
     ObjectInfo {
+        etag_strength: OMNI1_ETAG_STRENGTH,
         address,
         kind: ObjectKind::File,
         etag: result.etag,
@@ -143,6 +154,7 @@ pub(super) fn create_asset_to_object_info(
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
@@ -151,6 +163,7 @@ pub(super) fn update_asset_to_object_info(
     result: nucleus_client::types::UpdateAssetResult,
 ) -> ObjectInfo {
     ObjectInfo {
+        etag_strength: OMNI1_ETAG_STRENGTH,
         address,
         kind: ObjectKind::File,
         etag: result.etag,
@@ -162,6 +175,7 @@ pub(super) fn update_asset_to_object_info(
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
@@ -208,6 +222,7 @@ pub(super) fn list_entry_to_item(
         .clone()
         .or_else(|| entry.created_by.clone());
     let info = ObjectInfo {
+        etag_strength: OMNI1_ETAG_STRENGTH,
         address: absolute_address,
         // Nucleus has native directory inodes — directory entries are
         // `ObjectKind::Directory`, which skips the host-side marker-fold pass.
@@ -227,6 +242,7 @@ pub(super) fn list_entry_to_item(
         system_metadata: None,
         user_metadata: None,
         modified_by,
+        versioned_address: None,
     };
     Ok(Some(info))
 }
@@ -283,5 +299,21 @@ mod tests {
             .unwrap()
             .expect("an ordinary path must be listed");
         assert_eq!(item.address.as_str(), "omniverse://server/root/a/b.usd");
+        assert_eq!(item.etag_strength, EtagStrength::Unspecified);
+    }
+
+    #[test]
+    fn a_server_etag_remains_unspecified_without_a_byte_identity_contract() {
+        let prefix_address = address::parse("omniverse://server/root/").unwrap();
+        let entry = nucleus_client::types::List2ResponsePathEntry {
+            path: Some("/root/a.usd".into()),
+            etag: Some("omni-version-token".into()),
+            ..Default::default()
+        };
+        let item = list_entry_to_item(&prefix_address, "/root/", entry, false)
+            .unwrap()
+            .expect("the server entry must be listed");
+        assert_eq!(item.etag.as_deref(), Some("omni-version-token"));
+        assert_eq!(item.etag_strength, EtagStrength::Unspecified);
     }
 }

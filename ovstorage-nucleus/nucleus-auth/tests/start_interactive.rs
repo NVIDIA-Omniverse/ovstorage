@@ -21,7 +21,7 @@ impl Transport for HangingTransport {
         _interface: &str,
         _method: &str,
         _params: serde_json::Value,
-        _binary: Option<Vec<u8>>,
+        _binary: Option<&[u8]>,
     ) -> anyhow::Result<Subscription> {
         let (tx, rx) = mpsc::channel::<anyhow::Result<RawResponse>>(1);
         let (stop_tx, _stop_rx) = mpsc::channel::<u64>(1);

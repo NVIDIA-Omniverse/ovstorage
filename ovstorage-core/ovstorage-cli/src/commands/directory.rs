@@ -370,6 +370,7 @@ pub(crate) struct ListArgs {
     pub prefix: Option<String>,
     pub recursive: bool,
     pub full_metadata: bool,
+    pub versioned_address: bool,
     pub max_results: Option<u32>,
     pub page_token: Option<String>,
     pub format: OutputFormat,
@@ -398,14 +399,29 @@ pub(crate) async fn list(
                 max_results: args.max_results,
                 page_token: args.page_token,
                 full_metadata: args.full_metadata,
+                versioned_address: args.versioned_address,
             },
             Some(cancel.clone()),
         )
         .await?;
+    // The pin column appears only when the caller asked for it, so scripts
+    // that parse the default output keep seeing exactly the bytes they did
+    // before; a backend that volunteers a pin unasked is not shown either.
+    let show_pin = args.versioned_address;
+    let pin_cell = |item: &ovstorage::ObjectInfo| {
+        item.versioned_address
+            .as_ref()
+            .map(|pin| pin.to_string())
+            .unwrap_or_else(|| "-".into())
+    };
     match args.format {
         OutputFormat::Human => {
             for item in &page.items {
-                println!("{}", item.address);
+                if show_pin {
+                    println!("{}\t{}", item.address, pin_cell(item));
+                } else {
+                    println!("{}", item.address);
+                }
             }
         }
         OutputFormat::Table => {
@@ -422,10 +438,18 @@ pub(crate) async fn list(
                         .size
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "-".into());
-                    vec![kind.into(), size, item.address.to_string()]
+                    let mut row = vec![kind.into(), size, item.address.to_string()];
+                    if show_pin {
+                        row.push(pin_cell(item));
+                    }
+                    row
                 })
                 .collect();
-            print_table(&["KIND", "SIZE", "ADDRESS"], &rows);
+            if show_pin {
+                print_table(&["KIND", "SIZE", "ADDRESS", "VERSIONED_ADDRESS"], &rows);
+            } else {
+                print_table(&["KIND", "SIZE", "ADDRESS"], &rows);
+            }
         }
     }
     if let Some(token) = page.next_page_token {

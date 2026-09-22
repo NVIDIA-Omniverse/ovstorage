@@ -7,11 +7,22 @@
 //! tolerates the `Unsupported` a backend with no interactive flow answers
 //! with. `AuthFailed` is neither: it is the origin's definite refusal, so
 //! reporting `Connected` and exiting 0 over it would tell the operator the
-//! opposite of what happened — and would leave the route prefix taken, since
-//! the CLI has no command that removes a connection.
+//! opposite of what happened — and would leave the route prefix taken, with
+//! nothing on stdout to say which connection `disconnect` has to clear.
 //!
 //! `http` is used because it is the one in-tree backend that decides
 //! `AuthFailed` from a live answer (a `401` to its connect-time probe).
+//!
+//! The last test drives a scripted REPL session, because a route-prefix
+//! collision only exists INSIDE one process: a one-shot `connect` exits and
+//! takes the registration with it. It covers the credential channel that is
+//! reachable without a terminal — userinfo on `root_url` — which is
+//! deliberately NOT rotated: `update_connection_credentials` replaces the
+//! values inside a connection's credential *bundle*, and userinfo is not in
+//! one, so `connect` re-surfaces the refusal rather than re-probing the old
+//! secret and reporting its verdict as the new one's. The rotating path takes
+//! a bundle credential, which `connect` prompts for at the TTY, so it is
+//! covered in-process by the unit tests in `commands::connect`.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -177,5 +188,129 @@ fn connect_succeeds_when_the_origin_accepts_the_credential() {
     assert!(
         !stderr.contains("was not confirmed"),
         "an accepted credential must carry no unconfirmed note.\nstderr: {stderr}"
+    );
+}
+
+/// Accepts exactly one Basic credential and refuses everything else, so the
+/// origin — not the CLI — decides which of two userinfo spellings is correct.
+fn spawn_selective_origin(accepted: String) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 2048];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]).to_string();
+            let offered = request.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim().to_string())
+            });
+            let response = if offered.as_deref() == Some(accepted.as_str()) {
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            } else {
+                "HTTP/1.1 401 Unauthorized\r\n\
+                 WWW-Authenticate: Basic realm=\"test\"\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            };
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    format!("{addr}")
+}
+
+fn basic(user: &str, password: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+    )
+}
+
+/// A corrected userinfo credential on an origin whose first spelling was
+/// refused: the route prefix carries no userinfo, so the two spellings are one
+/// node and the second `connect` collides with the first.
+///
+/// The refusal is what must come back. Userinfo is not in the credential
+/// bundle, so there is nothing for `update_connection_credentials` to replace —
+/// rotating on it would re-probe the OLD secret and report that verdict as the
+/// new credential's, which is worse than the collision the operator can already
+/// read. The incumbent must also survive: exactly one route, still refused.
+#[test]
+fn a_second_connect_on_one_origin_re_surfaces_the_refusal_when_the_secret_is_userinfo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugin_dir = staged_plugin_dir();
+    let config = write_http_config(tmp.path());
+    let authority = spawn_selective_origin(basic("ops", "right"));
+
+    let mut child = Command::new(binary())
+        .env("OVSTORAGE_PLUGIN_DIR", &plugin_dir)
+        .env("OVSTORAGE_AUTH_DIR", tmp.path().join("auth"))
+        .arg("--config")
+        .arg(&config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ovstorage REPL");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin handle");
+        // One process, so the first registration is still live when the second
+        // `connect` runs — which is the only way this collision happens at all.
+        stdin
+            .write_all(
+                format!(
+                    "connect http http://ops:wrong@{authority}/assets/\n\
+                     connect http http://ops:right@{authority}/assets/\n\
+                     list-routes\n\
+                     quit\n"
+                )
+                .as_bytes(),
+            )
+            .expect("script the session");
+        stdin.flush().expect("flush");
+    }
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("wait_with_output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stdout.contains("Registered, but not authenticated"),
+        "the refused first credential must still register.\nstdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("already serves an address prefix"),
+        "the second connect must come back as the route refusal.\nstderr: {stderr}"
+    );
+    // Nothing may claim the credential was replaced: it was not, and saying so
+    // would send the operator away believing the origin now has the good one.
+    assert!(
+        !stdout.contains("Credentials updated") && !stdout.contains("Credentials replaced"),
+        "no rotation happened here, so none may be reported.\nstdout: {stdout}"
+    );
+    // One route, so the refused second connection was not registered alongside
+    // the first — the state the collision exists to prevent. A `list-routes`
+    // row continues with a tab; `connect`'s "Visible roots" list indents the
+    // prefix, while the REPL prompt follows it with `>` instead.
+    let prefix = format!("http://{authority}/assets/");
+    let route_row_prefix = format!("{prefix}\t");
+    let printed = stdout
+        .lines()
+        .filter(|line| line.starts_with(&route_row_prefix))
+        .count();
+    assert_eq!(
+        printed, 1,
+        "exactly one route may hold the prefix; {printed} rows printed it.\n\
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+    // Asserted on stderr, where the diagnostics are: stdout carries whatever
+    // the line editor echoed of the typed command, which is the operator's own
+    // input rather than something this code chose to render.
+    assert!(
+        !stderr.contains("wrong") && !stderr.contains("right"),
+        "no secret may be rendered into a diagnostic.\nstderr: {stderr}"
     );
 }

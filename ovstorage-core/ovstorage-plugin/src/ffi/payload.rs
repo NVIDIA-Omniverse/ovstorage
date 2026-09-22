@@ -384,6 +384,10 @@ pub struct BackendItemInfo {
     pub system_metadata: Optional<SystemMetadata>,
     pub user_metadata: Optional<UserMetadata>,
     pub modified_by: Optional<Str>,
+    pub etag_strength: EtagStrengthV1,
+    /// See `crate::BackendItemInfo::versioned_address`. Tail-appended in ABI
+    /// v19.
+    pub versioned_address: Optional<Str>,
 }
 
 unsafe impl Send for BackendItemInfo {}

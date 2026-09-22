@@ -21,13 +21,17 @@ pub(crate) async fn stat(
     state: &SessionState,
     address: &str,
     full_metadata: bool,
+    versioned_address: bool,
     cancel: &CancellationToken,
 ) -> ovstorage::Result<()> {
     let stack = &state.stack;
     let info = stack
         .stat(
             resolve_address(address, state.pwd.as_ref())?,
-            StatOptions { full_metadata },
+            StatOptions {
+                full_metadata,
+                versioned_address,
+            },
             Some(cancel.clone()),
         )
         .await?;

@@ -346,6 +346,29 @@ async fn drive_list_levels(scenario: &Scenario) -> ScenarioReport {
     passed(scenario)
 }
 
+async fn drive_list_stream_parity_and_cancel(scenario: &Scenario) -> ScenarioReport {
+    let root = TempDir::new().expect("tempdir");
+    let layer = fs_layer(&root).await;
+    for addr in ["opendal://fs/top.txt", "opendal://fs/nested/inner.txt"] {
+        if let Err(err) = write_object(
+            &layer,
+            addr,
+            b"list-stream".to_vec(),
+            WriteOptions::default(),
+        )
+        .await
+        {
+            return failed(scenario, format!("setup write of {addr} failed: {err}"));
+        }
+    }
+    scenario
+        .drive_list_stream_parity_and_cancel(
+            layer.as_ref(),
+            address::parse("opendal://fs/").expect("prefix parses"),
+        )
+        .await
+}
+
 /// Capability self-gates for ops the fs profile genuinely does NOT
 /// advertise. The op is invoked against a live fs connection and must be
 /// refused with a typed `Unsupported` locally — the fs root makes any
@@ -690,6 +713,7 @@ async fn conformance_scenarios_fs_profile() {
             "write-done-inline" => drive_write_done_inline(scenario).await,
             "delete-existing-object" => drive_delete_existing(scenario).await,
             "list-one-level-vs-recursive" => drive_list_levels(scenario).await,
+            "list-stream-parity-and-cancel" => drive_list_stream_parity_and_cancel(scenario).await,
             // Ops the fs profile genuinely does not advertise: the layer
             // must self-gate with a typed Unsupported, locally.
             "capability-gate-write-redirect-unsupported"
@@ -745,7 +769,8 @@ async fn conformance_scenarios_fs_profile() {
             "compat-gates-v1-capability"
             | "write-redirect-commits-on-done"
             | "retry-never-replays-continue-write"
-            | "protocol-slots-pass-through" => runner.skip(
+            | "protocol-slots-pass-through"
+            | "materialize-unsupported-without-cache" => runner.skip(
                 scenario.name,
                 "host/wrapper-side contract; driven in ovstorage's \
                  tests/conformance_protocol_slots.rs",
@@ -775,6 +800,7 @@ async fn conformance_scenarios_fs_profile() {
         "delete-on-directory-type-mismatch",
         "list-on-file-type-mismatch",
         "list-one-level-vs-recursive",
+        "list-stream-parity-and-cancel",
         "read-on-directory-type-mismatch",
         "read-streamed-empty",
         "stat-basic-objectinfo",

@@ -2,9 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use ovstorage_cache::{Cache, CacheConfig};
+use ovstorage_plugin_test::{Route, ScriptedResponse, start_responder_with_redirect};
 
 use super::*;
 use ovstorage::ext::LayerExt as _;
+
+fn strong_response(body: &[u8], etag: &str) -> ScriptedResponse {
+    let mut response = ScriptedResponse::ok(body);
+    response
+        .headers
+        .push(("etag".into(), format!("\"{etag}\"")));
+    response
+}
 
 /// Revoke-mid-flight, structural: with a hot metadata cache
 /// composed BELOW the per-listener auth layer, reloading the policy to deny-all
@@ -59,11 +68,17 @@ async fn broker_authz_precedes_hot_cache_on_revocation() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn broker_cache_hit_survives_broker_unavailability() {
-    let root = unique_temp_dir();
     let client_cache_root = unique_temp_dir();
-    std::fs::create_dir_all(&root).unwrap();
-    let prefix = address_for_path(&root);
-    let broker = Arc::new(Broker::new(file_broker_stack(&root).await));
+    let prefix = Url::parse("test://demo/").unwrap();
+    // The synthetic backend declares its in-memory object validator Strong,
+    // making this a trusted-cache availability test. The file backend's Weak
+    // size+mtime validator deliberately takes the untrusted path.
+    let broker = Arc::new(Broker::new(
+        BrokerStackFixture::new()
+            .test_backend(HashMap::new())
+            .build_stack()
+            .await,
+    ));
     let server =
         spawn_broker_grpc_tcp_listener(broker.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
     let discovery_url = server.endpoint_url();
@@ -104,25 +119,19 @@ async fn broker_cache_hit_survives_broker_unavailability() {
 
     drop(client);
     drop(broker);
-    std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(client_cache_root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn broker_grpc_plugin_read_redirect_populates_cache() {
-    let root = unique_temp_dir();
     let client_cache_root = unique_temp_dir();
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(
-        root.join("plugin-redirect-read.txt"),
-        b"plugin redirect bytes",
-    )
-    .unwrap();
-    let mut test_cfg = HashMap::new();
-    test_cfg.insert(
-        "test_redirect_url".into(),
-        ConfigValue::String(format!("file://{}/", root.display())),
-    );
+    let (responder, redirect_kv) = start_responder_with_redirect(vec![Route::new(
+        "GET",
+        "/plugin-redirect-read.txt",
+        strong_response(b"plugin redirect bytes", "plugin-redirect-v1"),
+    )])
+    .expect("loopback responder binds");
+    let test_cfg = HashMap::from([(redirect_kv.0.to_string(), redirect_kv.1)]);
     let broker = Arc::new(Broker::new(
         BrokerStackFixture::new()
             .test_backend(test_cfg)
@@ -158,7 +167,7 @@ async fn broker_grpc_plugin_read_redirect_populates_cache() {
     assert_eq!(info.size, Some(21));
 
     shutdown_test_server(server).await;
-    std::fs::remove_file(root.join("plugin-redirect-read.txt")).unwrap();
+    responder.set_routes(vec![Route::new("GET", "/", ScriptedResponse::not_found())]);
 
     let (bytes, info) = client
         .read_bytes(object, ReadOptions::default(), None)
@@ -169,22 +178,27 @@ async fn broker_grpc_plugin_read_redirect_populates_cache() {
 
     drop(client);
     drop(broker);
-    std::fs::remove_dir_all(root).unwrap();
+    drop(responder);
     std::fs::remove_dir_all(client_cache_root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn broker_cached_read_survives_expired_redirects() {
-    let root = unique_temp_dir();
     let client_cache_root = unique_temp_dir();
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("cached-before-expiry.txt"), b"cached bytes").unwrap();
-    std::fs::write(root.join("uncached-after-expiry.txt"), b"expired redirect").unwrap();
-    let mut test_cfg = HashMap::new();
-    test_cfg.insert(
-        "test_redirect_url".into(),
-        ConfigValue::String(format!("file://{}/", root.display())),
-    );
+    let (responder, redirect_kv) = start_responder_with_redirect(vec![
+        Route::new(
+            "GET",
+            "/cached-before-expiry.txt",
+            strong_response(b"cached bytes", "cached-before-expiry-v1"),
+        ),
+        Route::new(
+            "GET",
+            "/uncached-after-expiry.txt",
+            strong_response(b"expired redirect", "uncached-after-expiry-v1"),
+        ),
+    ])
+    .expect("loopback responder binds");
+    let test_cfg = HashMap::from([(redirect_kv.0.to_string(), redirect_kv.1)]);
     let broker = Arc::new(Broker::new(
         BrokerStackFixture::new()
             .test_backend(test_cfg)
@@ -254,7 +268,7 @@ async fn broker_cached_read_survives_expired_redirects() {
     shutdown_test_server(server).await;
     drop(client);
     drop(broker);
-    std::fs::remove_dir_all(root).unwrap();
+    drop(responder);
     std::fs::remove_dir_all(client_cache_root).unwrap();
 }
 
@@ -361,18 +375,26 @@ async fn broker_plugin_redirect_continue_write_rejects_wrong_cardinality() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn broker_owned_cache_serves_brokered_read_after_backing_file_disappears() {
-    let root = unique_temp_dir();
+async fn broker_owned_cache_serves_strong_content_after_backing_loss() {
     let broker_cache_root = unique_temp_dir();
-    std::fs::create_dir_all(&root).unwrap();
-    let prefix = address_for_path(&root);
+    let prefix = Url::parse("test://demo/").unwrap();
+    let test_cfg = HashMap::from([
+        (
+            "test_inject_error_on".into(),
+            ConfigValue::String("stat".into()),
+        ),
+        (
+            "test_inject_error_code".into(),
+            ConfigValue::String("NotFound".into()),
+        ),
+    ]);
     // The broker composition shares a host byte cache into the in-stack
-    // `byte_cache` wrapper; the broker builder sets `lost_backing_fallback`
-    // (NotFound validator stats serve the last proven content) and
-    // `warm_delegates` (a cacheable LocalDelegate read warms the CAS).
+    // `byte_cache` wrapper. The Strong synthetic write result warms the cache;
+    // persistent NotFound injection on stat then models lost backing without a
+    // delete through the cache, which would intentionally invalidate the key.
     let broker = Arc::new(Broker::new(
         BrokerStackFixture::new()
-            .file(&root)
+            .test_backend(test_cfg)
             .byte_cache(Arc::new(
                 Cache::open(CacheConfig {
                     state_root: broker_cache_root.join("state"),
@@ -399,7 +421,6 @@ async fn broker_owned_cache_serves_brokered_read_after_backing_file_disappears()
     )
     .await
     .unwrap();
-    remove_file_retry(root.join("cached-broker.txt")).unwrap();
 
     let (bytes, info) = client
         .read_bytes(object, ReadOptions::default(), None)
@@ -407,6 +428,59 @@ async fn broker_owned_cache_serves_brokered_read_after_backing_file_disappears()
         .unwrap();
     assert_eq!(bytes, b"broker cached bytes");
     assert_eq!(info.size, Some(19));
+
+    shutdown_test_server(server).await;
+    drop(client);
+    drop(broker);
+    remove_dir_all_retry(broker_cache_root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn broker_owned_cache_does_not_fallback_for_weak_file_validator() {
+    let root = unique_temp_dir();
+    let broker_cache_root = unique_temp_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let prefix = address_for_path(&root);
+    let broker = Arc::new(Broker::new(
+        BrokerStackFixture::new()
+            .file(&root)
+            .byte_cache(Arc::new(
+                Cache::open(CacheConfig {
+                    state_root: broker_cache_root.join("state"),
+                    cache_root: broker_cache_root.join("cache"),
+                })
+                .unwrap(),
+            ))
+            .build_stack()
+            .await,
+    ));
+    let server =
+        spawn_broker_grpc_tcp_listener(broker.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let discovery_url = server.endpoint_url();
+    let client = broker_client_stack(&discovery_url).await;
+    let object = address::join_relative(&prefix, "weak-file.txt").unwrap();
+
+    ovstorage::ext::LayerExt::write(
+        &*client,
+        object.clone(),
+        Body::Bytes(b"weak file bytes".to_vec()),
+        WriteOptions::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let (_, info) = client
+        .read_bytes(object.clone(), ReadOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(info.etag_strength, ovstorage::EtagStrength::Weak);
+
+    remove_file_retry(root.join("weak-file.txt")).unwrap();
+    let error = client
+        .read_bytes(object, ReadOptions::default(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::NotFound);
 
     shutdown_test_server(server).await;
     drop(client);
@@ -449,26 +523,23 @@ async fn broker_mirrors_upstream_redirect_size_threshold() {
 // cap — the fixture's `follow_cap()` setter supplies the cap, which composes
 // the follower as `follow_reads = true` with that cap. The `test` backend
 // emits the backend redirect (`test_redirect_url` ⇒ `read` returns
-// `Redirect(file://<root>/<key>)`); the broker follows it, fetches the file
-// bytes, and tees them into the byte cache. The client holds NO cache, so every
-// cache effect is broker-side. Removing the redirect target after the first
-// read proves the second read is served from the broker byte cache: the backend
-// still emits a `Redirect`, but following it would now fail, so a successful
-// second read can only have come from the teed bytes.
+// `Redirect(http://<origin>/<key>)`); the broker follows it, fetches the bytes,
+// and tees them into the byte cache. The client holds NO cache, so every cache
+// effect is broker-side. Making the origin answer NotFound after the first read
+// proves the second read is served from the broker byte cache: the backend still
+// emits a `Redirect`, but following it would fail.
 #[tokio::test(flavor = "multi_thread")]
 async fn broker_follows_backend_read_redirect_and_tees_into_byte_cache() {
-    let root = unique_temp_dir();
     let broker_cache_root = unique_temp_dir();
-    std::fs::create_dir_all(&root).unwrap();
-    // The redirect target the followed read fetches from. The `test` backend
-    // roots at `test://demo/`, so reading `test://demo/follow-me.txt` mints a
-    // redirect to `file://<root>/follow-me.txt`.
-    std::fs::write(root.join("follow-me.txt"), b"followed redirect bytes").unwrap();
-    let mut test_cfg = HashMap::new();
-    test_cfg.insert(
-        "test_redirect_url".into(),
-        ConfigValue::String(format!("file://{}/", root.display())),
-    );
+    // The loopback origin returns a quoted strong validator, so the follower's
+    // normalized ObjectInfo is eligible for trusted cache admission.
+    let (responder, redirect_kv) = start_responder_with_redirect(vec![Route::new(
+        "GET",
+        "/follow-me.txt",
+        strong_response(b"followed redirect bytes", "follow-me-v1"),
+    )])
+    .expect("loopback responder binds");
+    let test_cfg = HashMap::from([(redirect_kv.0.to_string(), redirect_kv.1)]);
     let broker = Arc::new(Broker::new(
         BrokerStackFixture::new()
             .test_backend(test_cfg)
@@ -501,10 +572,10 @@ async fn broker_follows_backend_read_redirect_and_tees_into_byte_cache() {
     assert_eq!(bytes, b"followed redirect bytes");
     assert_eq!(info.size, Some(23));
 
-    // Drop the redirect target. The backend keeps emitting a `Redirect`, but
-    // following it would now fail — a successful read must come from the teed
-    // bytes in the broker byte cache.
-    remove_file_retry(root.join("follow-me.txt")).unwrap();
+    // Remove the redirect target logically. The backend keeps emitting a
+    // Redirect, but following it now returns 404; success can only come from
+    // the teed bytes in the broker byte cache.
+    responder.set_routes(vec![Route::new("GET", "/", ScriptedResponse::not_found())]);
 
     let (bytes, info) = client
         .read_bytes(object, ReadOptions::default(), None)
@@ -516,46 +587,63 @@ async fn broker_follows_backend_read_redirect_and_tees_into_byte_cache() {
     shutdown_test_server(server).await;
     drop(client);
     drop(broker);
-    remove_dir_all_retry(root).unwrap();
+    drop(responder);
     remove_dir_all_retry(broker_cache_root).unwrap();
 }
 
-// The fixture's `visibility()` setter threads an address-visibility override
-// into the composed Stack's `alias` wrapper. A `Hidden` root must be filtered
-// from `list_address_roots` (only `Visible` roots advertise), while a sibling
-// `Visible` root still shows — closing the dead-field gap on the setter.
+// The fixture's `visibility()` setter threads address-visibility overrides
+// into the composed Stack's `alias` wrapper. `Hidden` roots remain in the
+// broker advertisement with their true marker, while `Suppressed` roots stay
+// absent and a sibling `Visible` root retains its marker.
 #[tokio::test(flavor = "multi_thread")]
-async fn broker_hidden_root_is_filtered_from_list_address_roots() {
+async fn broker_advertises_hidden_root_but_omits_suppressed_root() {
     let visible_root = unique_temp_dir();
     let hidden_root = unique_temp_dir();
+    let suppressed_root = unique_temp_dir();
     std::fs::create_dir_all(&visible_root).unwrap();
     std::fs::create_dir_all(&hidden_root).unwrap();
+    std::fs::create_dir_all(&suppressed_root).unwrap();
     let visible_addr = address_for_path(&visible_root);
     let hidden_addr = address_for_path(&hidden_root);
+    let suppressed_addr = address_for_path(&suppressed_root);
     let broker = Broker::new(
         BrokerStackFixture::new()
             .file(&visible_root)
             .file(&hidden_root)
+            .file(&suppressed_root)
             .visibility(hidden_addr.clone(), ovstorage::AddressVisibility::Hidden)
+            .visibility(
+                suppressed_addr.clone(),
+                ovstorage::AddressVisibility::Suppressed,
+            )
             .build_stack()
             .await,
     );
 
     let roots = broker.list_address_roots(&default_context()).await.unwrap();
-    assert!(
+    assert_eq!(
         roots
             .iter()
-            .any(|root| root.address.as_str().starts_with(visible_addr.as_str())),
-        "the Visible root must advertise: {roots:?}"
+            .find(|root| root.address == visible_addr)
+            .map(|root| root.visibility),
+        Some(ovstorage::AddressVisibility::Visible),
+        "the Visible root must advertise with its marker: {roots:?}"
+    );
+    assert_eq!(
+        roots
+            .iter()
+            .find(|root| root.address == hidden_addr)
+            .map(|root| root.visibility),
+        Some(ovstorage::AddressVisibility::Hidden),
+        "the Hidden root must advertise with its marker: {roots:?}"
     );
     assert!(
-        !roots
-            .iter()
-            .any(|root| root.address.as_str().starts_with(hidden_addr.as_str())),
-        "the Hidden root must be filtered from list_address_roots: {roots:?}"
+        roots.iter().all(|root| root.address != suppressed_addr),
+        "the Suppressed root must be absent from list_address_roots: {roots:?}"
     );
 
     drop(broker);
     remove_dir_all_retry(visible_root).unwrap();
     remove_dir_all_retry(hidden_root).unwrap();
+    remove_dir_all_retry(suppressed_root).unwrap();
 }

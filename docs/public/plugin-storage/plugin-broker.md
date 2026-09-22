@@ -40,7 +40,15 @@ directory.
   accurate `supports_recursive_list`, `supports_version_listing`,
   `supports_watch_directory`, `version_list_order`,
   `watch_directory_kinds`, `redirect_size_threshold`, etc. for each
-  brokered route).
+  brokered route; the one exception is an ingested scheme fallback root,
+  which is lowered to its read side whatever the wire asserted — see
+  [Capability bits](#capability-bits)). When a route supports `list`, the
+  client also advertises
+  `supports_list_stream` and walks the unary `List` cursor with a bounded
+  page size. This bounds plugin-client residency, not daemon work: each page
+  enters the daemon's buffered `Layer::list`, so an upstream layer whose cursor
+  paginates a whole-prefix materialization may re-enumerate and refold that
+  prefix once per client page.
 - **Config keys** (see the `BackendFactory::descriptor()` block in
   `src/lib.rs`):
   - `address` (**required**, `Text`): broker discovery / gRPC address.
@@ -179,19 +187,25 @@ the broker daemon dispatches into the same in-process `s3` plugin,
 and any backend-specific refusal surfaces back through the wire with
 the original message preserved.
 
+Object metadata is transparent too: the broker preserves the upstream etag
+strength declaration and `versioned_address` rather than reclassifying
+them, and forwards both `versioned_address` cost flags untouched; the
+downstream plugin decides what they cost.
+
 ## Layer-to-RPC mapping
 
 | Layer method | Broker RPC |
 |---|---|
 | `list_address_roots` (snapshot) | `ListAddressRoots` — unary; populates `RootInfo.capabilities` |
 | `list_address_roots` (updates) | `WatchAddressRoots` — server-streaming `Snapshot` / `Added` / `Removed` (broker emits one initial `Snapshot` from its current route table; ongoing delta emission requires a runtime-mutable broker route table, which the daemon does not implement today) |
-| `stat` | `Stat` — unary |
+| `stat` | `Stat` — unary; `StatOptions::versioned_address` forwarded |
 | `read` (inline / stream) | `Read` — server-streaming. Wire shapes: `info, body, body, ...` (byte branch) or standalone `redirect` (`ReadResult::Redirect` for the host to follow). The `info, redirect` bridging shape is allowed by proto for forward compat; `broker-client` tolerates it but the broker does not emit it |
 | `write` / `write_stream` | `Write` — bidirectional-streaming. First frame `WriteOpen` (dest, `size_hint?`, user metadata, `if_dest`); subsequent `chunk` frames. The proto can carry a `WriteRedirectBatch` on this stream, but the daemon does not emit one: `Broker::write` drives the redirect loop through its own in-stack follower and returns a terminal `WriteResult` on every success path. Client-driven redirects arrive on the `WriteRedirect` RPC below instead |
 | `write_redirect` (body-less) | `WriteRedirect` — unary entry point that returns the first `WriteRedirectBatch` without opening a bidi stream. Plugin forwards `size_hint = None` faithfully — `Broker::write_redirect` applies no size policy of its own and passes the request down its stack, leaving the accept-or-refuse decision to the upstream plugin; contrasts with `nucleus` which refuses `None` because LFT multipart needs total length |
 | `continue_write` | `ContinueWrite` — unary; carries each subsequent `WriteRedirectBatch` / `RedirectResultBatch` exchange for multipart uploads (S3 Initiate / Parts / Complete) |
 | `delete` | `Delete` — unary |
-| `list` | `List` — unary; `recursive` and `page_token` forwarded faithfully (no plugin-side refusal) |
+| `list` | `List` — unary; `recursive`, `page_token` and `versioned_address` forwarded faithfully (no plugin-side refusal) |
+| `list_stream` | Repeated unary `List` calls with bounded client-side pages; follows opaque continuation tokens, checks cancellation between pages, and rejects recent token cycles. Every page enters the daemon's buffered `Layer::list`, so an upstream offset cursor over whole-prefix materialization may repeat enumeration and folding per client page |
 | `list_versions` | `ListVersions` — unary; `page_token` forwarded |
 | `get_latest_version` | `GetLatestVersion` — unary |
 | `create_directory` | `CreateDirectory` — unary |
@@ -201,6 +215,25 @@ the original message preserved.
 | `update_metadata` | `UpdateMetadata` — unary |
 | `check_access` | `CheckAccess` — unary; broker intersects backend permission with broker authz decisions for requested ops |
 | `watch_directory` | `WatchDirectory` — server-streaming `ChangeEvent { Object \| Lapsed }` |
+
+For a root that does not advertise `watch_directory_resumable`, the plugin
+coalesces logical watches through one SDK `WatchCoalescer` owned by the broker
+connection. The key is the connection's current credential-identity generation
+plus the canonical resolved prefix (connection identity is implicit in the
+per-instance coalescer). An identity-changing credential update cancels and
+replaces that registry before the new principal can subscribe, so it must open
+a freshly authorized broker request. Subscribers with the same key share one
+recursive, metadata-inclusive upstream gRPC stream;
+the dispatcher filters this superset by each subscriber's prefix, recursion,
+and metadata options. Object and upstream `Lapsed` events fan out unchanged. A
+non-resumable request carrying `since` joins the live stream and receives one
+initial synthetic `Lapsed`, because the transport cannot replay that cursor.
+
+When the longest matching published root advertises
+`watch_directory_resumable = true`, the plugin bypasses the coalescer and opens
+a dedicated gRPC stream. It forwards `recursive`, metadata selection, `since`,
+and poll cadence verbatim so resumable replay is never truncated by attachment
+to an existing live stream.
 
 `Auth` (server-streaming) and `RegisterCredential` (unary) handle the
 broker's per-user upstream-OAuth flow. The daemon drives device flow and
@@ -287,12 +320,36 @@ Per-route fields the broker forwards intact:
 `supports_atomic_rename`,
 `has_real_directories`, `supports_list`, `supports_recursive_list`,
 `wants_list_backed_stat`, `populates_subdirectory_metadata`,
-`address_roots_are_dynamic`, `supports_version_listing`,
+`supports_version_listing`,
 `version_list_order`, `populates_effective_permissions_on_stat`,
 `supports_access_check`, `supports_watch_directory`,
 `watch_directory_kinds`, `watch_directory_resumable`,
 `watch_directory_max_lag`, `redirect_size_threshold`,
 `supports_native_metadata_patch`, `supports_metadata_rewrite_emulation`.
+
+One root is not mirrored field-by-field. A scheme fallback root the
+broker advertises (`s3:///`, `gs:///`, `azure:///`, marked
+`org.omniverse.ovstorage/scheme-fallback = "anonymous"` in its
+`user_metadata`) is ingested only when this layer's own table grants the
+scheme — `anonymous_fallback = ["s3"]` under `[ovstorage.layers.broker]`;
+see "Anonymous fallback" in [`../configuration.md`](../configuration.md)
+— and it leaves ingestion read-only whatever capability bits the wire
+asserted: write, write_stream, write_redirect, delete, create_directory,
+delete_directory, copy, rename, native metadata patch and every
+watch_directory bit are false; list, list_stream (still forced equal to
+list), recursive list, version listing, access check and the shape facts
+are kept. Every mutating slot and `watch_directory` on an address that
+root answers is refused locally, before any request reaches the broker,
+with `Unsupported`, `this address is reached through the anonymous
+s3:// fallback, which is read-only`, and the next action `add a
+connection for s3://bucket/ with credentials to modify it`. The root
+named is the address's origin rather than a bucket or container node
+root, because this layer routes for every scheme the broker serves and
+knows none of their node shapes; the caller's path, query and userinfo
+never reach the message. `copy` and `rename` are refused when either the
+source or the destination is fallback-routed. Lowering at projection is
+what lets a host that gates on capabilities never reach the slot, the
+same as against the cloud layer's own root.
 
 ## Enforcement
 

@@ -174,6 +174,13 @@ credentials = { access_key_id = "${AWS_ACCESS_KEY_ID}", secret_access_key = "${A
 A credential string that does not match the strict POSIX form
 `${[A-Za-z_][A-Za-z0-9_]*}` passes through literally.
 
+Do not put literal secrets in the TOML. A reusable parsed configuration keeps
+literal credential bytes for its lifetime. The native C/C++ loader clears its
+file, overlay, and parser storage when that storage is released, but the bytes
+still remain resident until `StackConfig` is destroyed. `${NAME}` keeps only
+the placeholder in the parsed document and resolves the secret when a
+connection is built.
+
 ## The empty stack
 
 **No `[ovstorage.layers]` means an empty stack.** There is no code-side
@@ -195,7 +202,11 @@ enumerate the backend layers the stack was built with, so a kind is absent
 until this config declares a layer for it. That holds for the built-in `file`
 backend as much as for a plugin-provided one. `ovstorage connect` reads the
 same listing, which is why it fails with `NotConfigured: "no backend kinds are
-registered"` against an empty stack.
+registered"` against an empty stack. `ovstorage init` writes the canonical
+minimal `file` layer graph and loads it into the live session, which makes the
+built-in backend kind available to `connect`. It returns `AlreadyExists` when
+the session already has a configured stack, even with `--force`, or when the
+destination file exists and `--force` is absent.
 
 ## Canonical default (the `file` backend)
 
@@ -217,14 +228,29 @@ The connection attaches to the `file` layer (its `target` defaults to
 `backend_kind = "file"`). Load plugins before building the stack when its graph
 uses any other kind.
 
+`ovstorage init` emits the layer half of this graph: `[ovstorage]` with
+`root = "file"` and `[ovstorage.layers.file]`, but no
+`[[ovstorage.connections]]` entry. In the live session, `connect file <dir>`
+supplies the connection and `write-config ovstorage.toml --force` writes the
+complete configuration back to the initialized file.
+
 > **Watch coalescing.** Watch coalescing lives in the backends, not in a host
 > layer. A competing-consumer backend (S3, GCS) self-coalesces overlapping
 > subscriptions onto one physical consumer via the SDK `WatchCoalescer`, proven
 > by the `watch-concurrent-cross-prefix-no-split` conformance scenario. There is
 > no `watch_coalescing` stack layer to configure. Non-competing-consumer
-> backends (Azure change-feed, services-client, nucleus, file, broker-relay)
-> open one physical watch per overlapping subscription; correctness is
-> unaffected because those transports broadcast every event to every reader.
+> backends (Azure change-feed, services-client, nucleus, file) can open one
+> physical watch per overlapping subscription because those transports
+> broadcast every event to every reader. The broker-client is a transport
+> adapter exception: within one connection credential-identity generation it
+> coalesces non-resumable watches sharing a resolved prefix onto one gRPC
+> stream. An identity-changing credential update replaces the registry. A
+> route advertising
+> `watch_directory_resumable = true` bypasses coalescing so its cursor and
+> options reach a dedicated stream unchanged. Separately, the broker daemon
+> injects its broker-native `watch_limit` Layer at the root of its shared inner
+> Stack, centrally bounding admitted watches per principal (default 256) and
+> process-wide (default 4096); this is admission control, not coalescing.
 
 ## Standard layer kinds
 
@@ -244,11 +270,36 @@ configuration guidance.
 | `redirect_follower` | HTTP plugin | Follows backend redirect pointers | `inner` |
 | `byte_cache` | Cache plugin | Caches object bytes (config: `max_object_bytes`, …) | `inner` |
 | `metadata_cache` | Cache plugin | Caches stat/list metadata | `inner` |
+| `hub_cache` | Hub Cache plugin | **Experimental.** Caches object bytes in a local Omniverse Hub (usd-workstation-cache); configuration keys and behavior may change between releases (config: `endpoint`, `key_scheme`, `max_object_bytes`, …) | `inner` |
 
 Every wrapper in that table is behavior you place in the graph yourself: a
 stack that does not declare `retry` or `redirect_follower` has neither
-behavior. Per-prefix routing is the `router` layer's `children` plus the
-address roots each connection serves.
+behavior.
+
+The `metadata_cache` keeps one row per address and records the cost flags —
+`full_metadata`, `versioned_address` — that row was fetched under. A `stat`
+whose set flags the row covers is served from it, so a default `stat` may
+come back with the richer fields an earlier flagged call paid for; a request
+the row does not cover goes upstream once with the union of the stored and
+requested flags and replaces the row. A `full_metadata = true` result is
+cached like any other. Rows a `list` fills vouch only for the
+`versioned_address` flag the listing was asked to carry, so a `full_metadata`
+stat always reaches the backend.
+
+`hub_cache` places the local hub daemon inside the stack's trust domain:
+the hub accepts writes from any local process with no authentication, so a
+served entry is only as trustworthy as the workstation's local processes.
+Entries under `omni-client-compat` digest keys are proven against their
+bytes before they are served (repeat serves of a file state reuse the
+proof, with the state pinned by identifiers a non-root local process
+cannot restore; where no such identifier exists, every serve re-proves);
+entries under the default `ovstorage` scheme carry no provable content
+identity, so a local process that derives the key can plant bytes the
+layer will serve. Enable the layer only where every local process is
+already trusted with the objects being cached.
+
+Per-prefix routing is the `router` layer's `children` plus the address
+roots each connection serves.
 
 The `redirect_follower` declares four config keys of its own — `follow_reads`
 (default `true`), `follow_reads_max_bytes` (default unset — unbounded),
@@ -310,7 +361,10 @@ disagree is a state an operator cannot debug from the outside. A bespoke
 library host composing its own `StackConfig` sets the layer key directly, and
 does so legitimately, as do the CLI and MCP hosts, which declare a
 `redirect_follower` and do no stamping — for them the layer key is the
-setting.
+setting. The anonymous fallback grant follows the same rule — a top-level
+key on those two hosts, stamped onto the backend layer that reads it, and a
+hand-set layer key refused; see [Anonymous fallback for `s3`, `gs` and
+`azure`](#anonymous-fallback-for-s3-gs-and-azure).
 
 This layer is where the check can be applied *gracefully*, by holding the
 connection and fetching the bytes itself, which makes it security-relevant
@@ -464,8 +518,9 @@ depends on the error's shape:
 
 | `stat` outcome | Effect on the read |
 |---|---|
-| Succeeds with an `etag` | Keys the cache on that validator; the index is not consulted |
-| Succeeds without an `etag` | Bypass — unversioned content is never served from cache |
+| Succeeds with a nonempty `Strong` `etag` | Keys the cache on that validator; the index is not consulted |
+| Succeeds without an `etag` | Bypasses the lookup; a later Strong read result may still fill content and publish the availability row |
+| Succeeds with an empty, `Weak`, or `Unspecified` `etag` | Bypasses the lookup, clears any live fallback, and suppresses availability publication for this read |
 | `Transient`, `DeadlineExceeded`, `ResourceExhausted`, `Internal`, `BrokerUnavailable`, `NetworkFilesystemRefused`, `StateRootUnavailable`, `RedirectExpired` | **Outage** — the index answers, and the last content proved for the address is served |
 | `NotFound` | Bypass by default; **outage** when `lost_backing_fallback = true` |
 | `Unsupported` | Bypass — a backend that cannot `stat` gets no validation, so it is never served from the index |
@@ -475,6 +530,16 @@ depends on the error's shape:
 "Bypass" means the read proceeds to the inner layer as if nothing were cached;
 it does not mean the read succeeds. A principal the backend refuses is never
 served partition-shared content from the index.
+
+The successful-stat distinction also governs fills. A present untrusted
+validator suppresses the read-start availability fence, so even if the read's
+own result declares a nonempty validator `Strong`, that result can populate
+only the strict validator-keyed content row. It does not publish the
+last-known-validator row used during an outage. This keeps a backend whose
+ordinary stats are weak or unspecified from staging and fsyncing a tombstone
+on every read. An absent stat validator is different: it makes no strength
+claim, so the cache takes the fence and can publish a Strong validator learned
+from a redirected or otherwise enriched read result.
 
 `lost_backing_fallback = true` (default `false`) is therefore a single move in
 that table: it reclassifies `NotFound` from an answer to an outage, so an
@@ -545,8 +610,12 @@ inner = "router"
 from = "ov:///public/"
 to   = "file:///srv/data/"
 
-# Override how a prefix is advertised: "visible" (default), "hidden", or
-# "suppressed" (alias-only; rejected as a caller-supplied address).
+# Override root visibility locally and across broker/REST boundaries:
+# "visible" (default) is listed, addressable, and carried as visible;
+# "hidden" is unlisted but addressable and carried marked as hidden;
+# "suppressed" is omitted from advertisements and rejected as a caller address.
+# A rule can only narrow an incoming root's visibility, never widen it: a
+# "visible" rule does not re-list a root the broker already marked hidden.
 [[ovstorage.layers.alias.visibility]]
 address    = "file:///srv/data/"
 visibility = "suppressed"
@@ -558,8 +627,394 @@ node, matching reads scheme, authority and path alone, and a fragment never
 reaches a backend — so either component in a rule is a load error naming it.
 A caller's *request* address may still carry a query.
 
-A `suppressed` prefix is never advertised by `list_address_roots` and cannot be
-addressed directly; it is reachable only as an alias target.
+Locally, `visible` roots appear in route listings and remain directly
+addressable. `hidden` roots are omitted from listings but remain directly
+addressable. Broker and REST root advertisements carry both kinds with their
+true visibility, so a broker client installs a hidden root for routing without
+showing it in ordinary route listings. A `suppressed` prefix is omitted from
+every root advertisement and a caller addressing it receives `NoRoute`; it is
+reachable only as an alias target.
+
+### Generated aliases for `s3`, `azure` and `huggingface` connections
+
+When an `s3`, `azure` or `huggingface` connection registers below an
+`alias` layer, the layer generates **hidden** alias rules for the ordinary
+URLs of the same data automatically — a user pasting a URL they already
+hold does not translate it first. An S3 connection on the AWS profile accepts
+its six public URL shapes in the commercial partition (virtual-hosted and
+path-style, each in the regional, global, and legacy `s3-<region>`
+spelling) — four outside it, since the region-less global shapes name the
+commercial partition only and bucket names are unique just within a
+partition; China also swaps in the `.amazonaws.com.cn` suffix — three shapes, path-style only,
+for a bucket whose name contains a dot, since its virtual-hosted HTTPS
+host never fetches; a connection with an explicit endpoint (MinIO, B2,
+R2, custom) accepts exactly the one shape its endpoint configuration
+describes. An Azure connection accepts its blob-endpoint URL
+(`https://<account>.blob.<suffix>/<container>/`, or the configured
+`blob_endpoint`, including path-style Azurite), plus the `dfs` twin when
+`hierarchical_namespace` is set. A `huggingface` connection accepts the
+Hub's own repository URL on `https://huggingface.co`,
+`http://huggingface.co`, their `www.` twins, and the short domain `hf.co`
+over either scheme — prefixed `datasets/` or `spaces/` for those
+repository types — so `https://huggingface.co/acme/demo/`
+rewrites onto `hf://models/acme/demo/`; a loopback `endpoint` accepts
+exactly its own shape. The exact shapes are listed in each plugin's
+document.
+
+Generated rules are `hidden` — addressable, never advertised, so listings
+keep showing the canonical `s3://` / `azure://` / `hf://` form only. They
+are never persisted: they regenerate from whatever registers the connection
+(config replay at startup, a runtime add) and are withdrawn when it is
+removed. In `list_connections` output they carry the
+`org.omniverse.ovstorage/alias-derived-from` metadata key naming the
+connection they came from. An explicit alias rule you author on the same
+prefix wins — it evicts the generated rule rather than being refused as a
+duplicate. The eviction lasts until the backend connection re-registers
+(config replay at startup, or removing and re-adding it): removing your
+explicit rule later does *not* bring the generated one back by itself. To
+turn a single generated spelling off reversibly instead, use an ordinary
+`suppressed` visibility override on its prefix — removing the override
+restores the spelling. A stack without an `alias` layer above the backend
+simply gets no generated rules.
+
+Generation fails closed. If the layer cannot determine what an inner
+`alias` layer already owns — its connection scan errors or times out — the
+registration still succeeds but **no** rules are generated for it, rather
+than generating them as though nothing were owned. An absent answer is not
+evidence that a scope is free, and treating it as one would let a
+transient fault re-derive a spelling an inner layer owns, including one
+suppressed there. Re-register the connection once the inner layer answers
+to generate them.
+
+A generated spelling names exactly the address its canonical form names.
+The address boundary normalizes every request the same way whatever
+spelling it arrived under — including collapsing repeated `/` in the
+path, which is why a key containing `//` is not addressable through
+ovstorage under any spelling (see the plugin storage contract). Adding a
+generated alias adds a way to *write* an address, never a different rule
+for which object it selects.
+
+**A generated rule stands aside for a credential-bearing URL.** An S3
+presigned URL or an Azure SAS URL authenticates itself with its query and
+grants exactly what it was signed for. Rewritten onto the canonical
+`s3://` / `azure://` form those parameters stop meaning anything, and the
+connection's own configured credentials would authenticate instead — so an
+expired, revoked, or deliberately narrow URL would be served as a full
+privileged read. A generated rule therefore declines any query it does not
+recognize, and the address falls through to whatever else routes it (an
+HTTP layer that honours the signature, or no route at all). The version
+selectors the backends read — `versionId`, `versionid`, `generation`,
+`revision` — are carried through, because they name a version of the same
+object; a backend that does not read one of them ignores or refuses it on
+its own terms. An alias rule you author yourself is unaffected: writing one
+states that this prefix means that target, and only the default applied on
+your behalf stands aside.
+
+**An endpoint path prefix is never published as a generated spelling.**
+Generated spellings appear in `list_connections` and `list_address_roots`
+output, which a principal holding only the addressless introspection
+operation can read — a weaker grant than reading the data. An endpoint
+path can be a capability token, and connection configuration is otherwise
+never returned, so a connection whose endpoint carries a path generates
+no spelling for it: `s3` keeps only `host[:port]` from an endpoint, and
+`azure` withholds a path-bearing endpoint entirely unless it is loopback
+(which is what keeps path-style Azurite working); `huggingface` admits no
+endpoint but the default and a loopback one, so the same carve-out covers
+every endpoint it can be given. Author the alias rule
+by hand if you want that prefix accepted — publishing it is then your
+decision rather than a default.
+
+Adding an explicit alias rule on a scope an inner `alias` layer holds a
+generated rule for fails if that generated rule is found and cannot be
+removed. The takeover runs before the rule is published, so the rule is
+never announced on the connection or root update streams in a state where
+a generated copy still shadows it, and a failed takeover publishes nothing
+at all. The rule is withdrawn again rather than left installed, because
+a surviving generated copy covers the same scope and would keep routing
+past it: the add either takes effect with `explicit beats derived`
+holding, or does not take effect. Retry once the inner layer accepts the
+removal. If the *scan* for such copies cannot run at all — an inner layer
+that is unreachable, in a stack that may well have no inner `alias` layer
+to begin with — the add still succeeds and logs a warning naming the
+scope, so an unrelated inner fault does not refuse a purely local address
+rewrite.
+
+A `suppressed` override on a *broader* prefix covers the generated
+spellings under it too: a generated rule never re-opens a subtree you
+denied above it. An override you place on the generated prefix itself
+still decides that prefix, so `suppressed` at
+`https://s3.us-west-2.amazonaws.com/` with `visible` at
+`https://s3.us-west-2.amazonaws.com/bucket/` is a working combination.
+
+**One case leaves a generated row behind.** Withdrawing a connection's
+generated rules is refused when the remaining rule set would be invalid,
+which is reachable only when a generated rule currently shields an
+otherwise-cyclic set of rules you authored. The removal of the backend
+connection still succeeds; its generated rows stay listed, marked
+`alias-derived-from` a connection that is gone, and advertise as
+`dangling`. Read that as a report that the authored rules the row shields
+contain a cycle. The rows are ordinary alias connections, so
+`remove_connection` on the row's own id deletes one directly once the
+cycle is corrected.
+
+**Authorization is deliberately untouched.** Authorization evaluates the
+caller-supplied address *before* alias resolution, and policy is deny-all
+when absent — so a grant on `azure://account/container` does **not** cover
+`https://account.blob.core.windows.net/container`, a grant on
+`hf://models/acme/demo/` does not cover `https://huggingface.co/acme/demo/`,
+and no matching grant is ever generated (that would silently widen a
+deny-by-default policy). In a brokered or gateway deployment the generated
+aliases therefore do nothing until you grant their URL space, exactly as for
+an alias you author by hand; a direct library host has no authz layer and
+gets the benefit immediately.
+
+### Anonymous fallback for `s3`, `gs` and `azure`
+
+An `s3://`, `gs://` or `azure://` address that no configured connection
+serves answers `NoRoute`, and nothing is attempted. A backend layer of the
+`s3`, `gcs` or `azure` kind can instead be **granted** a fallback for its
+scheme: an unrouted address on that scheme routes to the layer, which
+attempts it **anonymously** and **read-only**. The grant is the layer key
+`anonymous_fallback`, a TOML array of the schemes the layer serves. Absent
+or empty is off, which is the default everywhere; a value that is not an
+array of scheme strings, a scheme outside the closed set, or a scheme the
+layer's kind does not serve (`["gs"]` on an `s3` layer) is refused at
+startup with `InvalidArgument`. The keys beside it tune the fallback and are
+read whether or not the grant is present, so a misspelt or mistyped one
+fails at startup instead of sitting inert until the grant is added:
+
+```toml
+[ovstorage.layers.s3]
+anonymous_fallback = ["s3"]
+# Default us-east-1: where the region probe is sent, and the region a bucket
+# is assumed in when the answer names none.
+anonymous_fallback_region = "us-east-1"
+# Optional. Skips the region probe (one endpoint serves every bucket) and
+# defaults the profile to "custom". MinIO, emulators, sovereign endpoints.
+# anonymous_fallback_endpoint = "http://minio:9000"
+# Optional: aws | minio | r2 | b2 | custom.
+# anonymous_fallback_compatibility_profile = "minio"
+# Default false. A bucket whose name contains "." is path-style regardless.
+anonymous_fallback_force_path_style = false
+anonymous_fallback_max_backends = 64        # default; 1 to 100000
+anonymous_fallback_mints_per_minute = 120   # default; 1 to 1000000
+
+[ovstorage.layers.gcs]
+anonymous_fallback = ["gs"]
+# Optional; the default is the public endpoint. Emulators set theirs.
+# anonymous_fallback_endpoint = "https://storage.googleapis.com"
+anonymous_fallback_max_backends = 64        # default; 1 to 1000000
+anonymous_fallback_mints_per_minute = 120   # default; 1 to 1000000
+
+[ovstorage.layers.azure]
+anonymous_fallback = ["azure"]
+# Default core.windows.net; a sovereign cloud sets its own suffix.
+anonymous_fallback_endpoint_suffix = "core.windows.net"
+anonymous_fallback_max_backends = 64        # default; at least 1
+anonymous_fallback_mints_per_minute = 120   # default; at least 1
+```
+
+A connection request — a runtime `add_connection` or a probe — that carries
+any `anonymous_fallback*` key is refused with `InvalidArgument` naming the
+key as a layer key: set on a connection it would otherwise be ignored while
+the operator believed it took effect.
+
+With the grant in place the host behaves as though a scheme-level anonymous
+connection existed, without one existing. `list_address_roots` publishes one
+extra root per granted scheme — `s3:///`, `gs:///`, `azure:///` — with
+`hidden` visibility, no connection id, and the metadata key
+`org.omniverse.ovstorage/scheme-fallback` valued `anonymous`; `ovstorage
+doctor` lists it among the roots with that marker. The router consults the
+root only after every configured prefix misses, so a connection for a bucket
+always outranks the fallback for that bucket, and adding one evicts the
+anonymous client the fallback built for it. `root_info_for` on an address
+reached this way answers the scheme root itself, never a synthesized
+per-bucket root; `list_connections` is unchanged; `ovstorage connect` on
+such a bucket sees no incumbent; and nothing is persisted — the root is
+config, regenerated at every start from the grant and gone when the grant
+is.
+
+The fallback is anonymous **by construction**. Its client is built with no
+credential source of any kind — not the environment (`AWS_*`,
+`GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_*`), not a credentials file, not an
+instance-metadata service — so the process's ambient identity is never
+spent on an address the operator did not configure, and every request that
+leaves the process is unsigned. A bucket that refuses anonymous access
+answers `PermissionDenied`, as it does through a configured anonymous
+connection; a bucket that does not exist answers `NotFound`.
+
+It is read-only **by construction** too. Every mutation — `write`,
+`write_stream`, `write_redirect`, `continue_write`, `delete`, `copy`,
+`rename`, `create_directory`, `delete_directory`, `update_metadata` — and
+`watch_directory` answer `Unsupported` before any request is sent (`this
+address is reached through the anonymous s3:// fallback, which is
+read-only`), with a next action naming the bucket root a connection would
+be added for and never the caller's path. A `copy` or `rename` is refused
+when either end is reached through the fallback. The scheme root advertises
+read-side capability bits only, so a host that gates on capabilities never
+reaches the slot in the first place; its ranged-read strategy is the
+`Native` one the kind's connection roots advertise, so `root_info_for`
+answers the same strategy for a fallback-served address as for a configured
+one on the same store. The bare scheme root itself, and any address with an
+empty authority (`s3:///key`), is `InvalidArgument`: it names no bucket, or
+on `azure` no storage account.
+
+**A presigned S3 URL or an Azure SAS URL falls through to `NoRoute`.** Any
+query other than the `versionId` / `versionid` / `generation` / `revision`
+version selectors keeps an address out of the fallback, for the reason a
+generated alias rule stands aside: the query is the authority the caller
+presented, and an anonymous attempt against the canonical address would
+silently discard it.
+
+S3 learns a bucket's region once, from one unsigned `HeadBucket` per bucket
+sent to `anonymous_fallback_region`. The `x-amz-bucket-region` header on the
+answer names the region whatever the status; a `2xx` or `4xx` naming none
+means the configured region; and a `404` is `NotFound` and is not
+remembered. The region is then cached per bucket for the life of the
+process. A probe the store did not judge — a `3xx` naming no region, a
+`429` or `5xx`, a transport failure — teaches no region and is remembered
+for one minute, during which the bucket answers `ResourceExhausted` naming
+the wait (`the region probe for this bucket failed recently; it is not sent
+again for another N s`) before any client is built or charged. A built
+client whose own request answers `301` naming a valid region other than the
+one it was built for takes that region and is rebuilt on the next touch of
+that bucket, once and without a probe; any other `301` — one naming the
+built region, or none — leaves the client in place, evicts and charges
+nothing, and reaches the caller as `InvalidArgument`. A configured
+`anonymous_fallback_endpoint` skips the probe and the heal alike: no region
+changes the client it pins, so a `301` met there surfaces as
+`InvalidArgument` and nothing is rebuilt. The S3 endpoint must be a bare
+`http` or `https` origin — scheme, host and port; one that embeds
+credentials or carries a path, query or fragment is refused at startup with
+`InvalidArgument` naming the key and the layer, never the value. GCS
+needs none: the bucket is the address's authority and one public endpoint
+serves every bucket; a GCS `anonymous_fallback_endpoint` is kept as scheme,
+host, port and path only, and one that embeds credentials, carries a query
+or a fragment, uses a scheme other than `http` or `https`, or names no host
+is refused at startup with `InvalidArgument` naming the key and the layer,
+never the value. Azure takes the account and container from the address
+(`azure://account/container/` is the node a client is built for), assumes a
+flat namespace, and derives the blob host from
+`anonymous_fallback_endpoint_suffix`.
+
+The fallback is bounded. At most `anonymous_fallback_max_backends`
+anonymous clients stay resident (default 64; the least recently used is
+evicted), and at most `anonymous_fallback_mints_per_minute` new ones are
+built per sliding minute (default 120). A first touch beyond the budget
+answers `ResourceExhausted` (`anonymous fallback mint budget exhausted;
+retry later`), which is retryable, while an address whose client is resident
+is still served; every build attempt counts, including one that fails, a
+refusal answered from S3's region negative cache builds nothing and is not
+charged, and concurrent first touches of one bucket build once. Every kind
+refuses `0` for either bound at startup. Each build logs one `INFO` line at
+the `ovstorage.fallback` target naming the scheme and the bucket's origin,
+never the key.
+
+**Cloud instance-metadata endpoints are refused before any connection is
+opened, whatever the grant says and whatever an authorization rule allows.**
+Any host in `169.254.0.0/16` or `fe80::/10`, `100.100.100.200`,
+`168.63.129.16`, `fd00:ec2::254`, an IPv6 address embedding a refused IPv4
+address, and the exact names `metadata.google.internal`, `metadata.goog`
+and `metadata` — matched exactly, never by suffix — answer `PermissionDenied`
+naming the origin only (`refusing to contact <origin>: it is a cloud
+instance-metadata endpoint, and ovstorage never fetches from one on a
+caller's behalf`). The refusal applies to the host the fallback derives from
+an address, to a configured `anonymous_fallback_endpoint` at startup
+(granted or not), and to every redirect destination the http plugin and the
+redirect follower are handed, under every `redirect_policy`. A process that
+can be pointed at such an endpoint on a caller's behalf hands the caller the
+instance's role credentials — the server-side request forgery this surface
+exists not to become. A DNS name that resolves to a link-local address is not
+caught: the predicate judges the host as written. An endpoint an operator
+configures on an ordinary connection (`endpoint`, `blob_endpoint`,
+`root_url`) that matches is honoured with one `WARN`, not refused.
+
+**On the broker and the REST gateway an operator does not set the layer
+key.** Those hosts carry the grant as two top-level keys beside
+`redirect_credential_disclosure` — `anonymous_fallback_schemes = []`, a list
+of `"s3"`, `"gs"` and `"azure"`, and `anonymous_http_fallback = "refuse"` —
+and stamp `anonymous_fallback` onto the one layer of each granted scheme's
+kind. The carrier is resolved against the routed graph — the layers `root`
+reaches through `inner` and `children`, which is exactly the set the Stack
+builder instantiates — so a backend reached only through a wrapper chain,
+or one that is itself the root, carries the grant as well as a router child
+does. A graph that sets the layer key by hand on an `s3`, `gcs`, `azure` or
+`http` layer is **refused at startup** with `InvalidArgument` naming the
+layer and both top-level keys, even when nothing is granted — refusing
+beats silently overriding, for the reason the disclosure key gives. The
+grant is also refused when the graph declares no layer of a granted
+scheme's kind (declare `[ovstorage.layers.gcs]` and add it to the router's
+`children` first; a grant that sits inert is the failure an operator never
+notices); when its only layers of that kind are declared but not reachable
+from `root`, refused by name (`` `anonymous_fallback_schemes` grants `gs`,
+but layer `gcs` of kind `gcs` is declared and not reachable from the
+graph's root, so the grant would sit inert: add it to the router's
+`children` (or make it the root, or a wrapper's `inner`) ``); and when
+`root` reaches more than one. Only routed layers are counted, so a
+declared-but-unrouted duplicate does not trip the two-layer refusal.
+`anonymous_http_fallback = "allow"` parses and is refused at startup: no
+http tier exists to honour it, and a grant that did nothing would be worse
+than one that fails loud, so an unrouted `http://` or `https://` address
+answers `NoRoute`. The grant lives at the top level because it is a
+property of the deployment rather than of any connection: a brokered fetch
+runs from the broker's network position and reaches whatever that position
+reaches, and only the operator of that position can say whether its
+clients may point it at buckets it was not configured for. A bespoke
+library host composing its own `StackConfig` sets the layer key directly,
+as do the CLI and MCP hosts — for them the layer key is the setting.
+
+A brokered client honours a scheme fallback root the broker advertises only
+when its own `broker` layer table grants the scheme:
+
+```toml
+[ovstorage.layers.broker]
+anonymous_fallback = ["s3"]
+```
+
+Without the local grant the advertised root is dropped at ingestion and the
+address is `NoRoute` on the client, whatever the broker granted; with it,
+the client forwards the address verbatim and the broker's own router and
+backend do the rest. The ingested root is read-only on the client whatever
+capability bits the wire asserted — every write, delete, copy, rename,
+directory-mutation, metadata-patch and watch bit is false; list,
+list_stream, recursive list, version listing and access check are kept —
+and every mutation and `watch_directory` on an address it answers is
+refused on the client, before any request reaches the broker, with the
+same `Unsupported` message; the next action names the address's origin
+(`add a connection for s3://public-bucket/ with credentials to modify it`),
+because the client knows no scheme's node shape. A `copy` or `rename` is
+refused when either end is fallback-routed. The client publishes no
+fallback root of its own: the key is an admission filter, not a licence to
+attempt anything from the client's position.
+
+One layer per kind carries the grant. Two layers of one kind both
+publishing `s3:///` publish one node twice: the router keeps the root it
+aggregated earliest, logs the collision as an overlapping address root, and
+the second grant is inert. The stamped hosts refuse such a graph outright;
+a library host that composes one gets the log line and earliest-wins.
+
+The fallback does not re-open what an `alias` layer closed. A `suppressed`
+visibility override on a prefix still refuses a caller addressing it with
+`NoRoute` before routing runs, granted or not, and the scheme root passes
+through `alias` as `hidden` rather than being dropped. The fallback also
+covers the canonical `s3://` / `gs://` / `azure://` spellings only: no
+generated alias exists for a bucket without a connection, so its ordinary
+cloud URL — `https://public-bucket.s3.amazonaws.com/key`, say — is
+`NoRoute`.
+
+**Authorization is deliberately untouched.** Policy sees the caller's
+address before routing and is deny-all when absent, so a caller no rule
+covers is denied before the fallback is consulted and can never cause an
+outbound request. A grant on `s3://public-bucket/` covers that bucket and
+nothing beside it — not a sibling bucket, not `s3:///` — and no grant is
+ever generated for the fallback, exactly as none is for a generated alias.
+The hidden scheme root is listed only to a principal whose rule covers the
+bare scheme (`prefix = "s3://"`), and that rule grants nothing on any
+bucket; a brokered client needs it to see the root at all. `root_info_for`
+on an address the policy does not cover answers `NoRoute`, indistinguishable
+from an address nothing routes — deliberately, so the error code never
+reports what a grant could switch on. **A fallback grants routability, never
+authority.**
 
 ## Server auth kinds
 
@@ -606,22 +1061,36 @@ selects which host honors it. Nested keys use `__` as the separator:
 
 | Host | Prefix | Example |
 |---|---|---|
-| CLI / MCP server | `OVSTORAGE__` | `OVSTORAGE__ROOT` → `ovstorage.root` |
+| CLI / MCP server / file-backed Python `Stack.from_config` / native C/C++ path loader | `OVSTORAGE__` | `OVSTORAGE__ROOT` → `ovstorage.root` |
 | broker | `OVSTORAGE_BROKER__` | `OVSTORAGE_BROKER__OVSTORAGE__ROOT` → `ovstorage.root` |
 | REST gateway | `OVSTORAGE_REST__` | `OVSTORAGE_REST__OVSTORAGE__ROOT` → `ovstorage.root` |
 
-The CLI/MCP `OVSTORAGE__` prefix maps directly into the `[ovstorage]`
-table, so `OVSTORAGE__LAYERS__BYTE_CACHE__MAX_OBJECT_BYTES` sets
-`ovstorage.layers.byte_cache.max_object_bytes`. The broker and REST
-gateway load their own top-level config (`[listener]` / `[server]`, auth,
-attribution) and read the stack as a nested `ovstorage` field, so their
-prefixes carry the extra `OVSTORAGE__` (i.e. `..._BROKER__OVSTORAGE__…`)
-to reach a stack key. A bare `OVSTORAGE__…` variable is honored only by
-the CLI/MCP path — the servers ignore it.
+For the CLI, MCP server, file-backed Python `Stack.from_config`, and native
+C/C++ `StackConfig::from_toml_path`, the `OVSTORAGE__` prefix maps directly
+into the `[ovstorage]` table, so
+`OVSTORAGE__LAYERS__BYTE_CACHE__MAX_OBJECT_BYTES` sets
+`ovstorage.layers.byte_cache.max_object_bytes`. The broker and REST gateway
+load their own top-level config (`[listener]` / `[server]`, auth, attribution)
+and read the stack as a nested `ovstorage` field, so their prefixes carry the
+extra `OVSTORAGE__` (i.e. `..._BROKER__OVSTORAGE__…`) to reach a stack key. A
+bare `OVSTORAGE__…` variable is honored by the CLI, MCP, Python, and native
+C/C++ path loaders. The servers ignore it.
 
-Environment values override the file. (For the CLI/MCP path this overlay
-applies when a config file is loaded from a path; it is intentionally
-skipped when a config is parsed from an in-memory string in tests.)
+Environment values override the file. This overlay applies when the CLI, MCP,
+Python `Stack.from_config`, or native C/C++ path loader loads configuration from
+a file. Python's `toml=` and native C/C++ `StackConfig::from_toml_str` parse an
+in-memory document and intentionally skip the overlay.
+
+For the shared `OVSTORAGE__` stack loader used by the CLI, MCP, Python, and
+native C/C++ surfaces, prefix and key matching is ASCII case-insensitive and
+key paths after the prefix must contain only ASCII characters. Values must be
+valid Unicode (`UTF-8` at the C boundary). Variables that target different
+fields under the same table coalesce, so a table-valued override and a nested
+override can be used together. Do not define multiple spellings that
+canonicalize to the same key; the later process-environment entry wins, and
+that enumeration order is not a portable configuration mechanism. On the
+native C/C++ loader, inferred integers are limited to the TOML signed 64-bit
+range; larger decimal values remain strings.
 
 ## Config file locations
 
@@ -641,6 +1110,14 @@ that applies:
 The MCP server uses the same resolution without the CLI flags:
 `$OVSTORAGE_CONFIG`, then the `./ovstorage.toml` → XDG search path, then
 the empty stack. (Set `OVSTORAGE_MCP_NO_CONFIG` to force the empty stack.)
+Python's `Stack.from_config(path=None)` uses the same MCP-style resolution:
+`$OVSTORAGE_CONFIG`, then the default search path, then an empty stack.
+
+Native C/C++ `StackConfig::from_default_path` mirrors the core library helper:
+it tries `./ovstorage.toml`, then the XDG user config path, and returns no
+config when neither exists. It does not inspect `$OVSTORAGE_CONFIG`; a native
+host that supports that selection variable resolves it before calling the
+explicit path loader.
 
 ## Portability: `ovstorage write-config`
 

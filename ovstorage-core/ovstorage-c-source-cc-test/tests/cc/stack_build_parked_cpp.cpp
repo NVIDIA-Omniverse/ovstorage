@@ -60,6 +60,55 @@ ExportParkedFn g_export_parked = nullptr;
 ParkVoidFn g_park_wait_arrived = nullptr;
 ParkVoidFn g_release_park_gate = nullptr;
 
+// Prove declarative composition resolves a non-built-in kind through the
+// caller's Registry. The fixture's ordinary plugin manifest advertises the
+// `test` backend factory; the parked root below is a separate export.
+bool config_builds_registered_plugin_kind(const char* fixture_path)
+{
+    auto loaded = ovstorage::Plugin::load(fixture_path, true);
+    if (!loaded) {
+        std::fprintf(stderr, "could not load the config-build plugin: %s\n",
+                     loaded.error().message().c_str());
+        return false;
+    }
+    ovstorage::Plugin plugin = std::move(loaded).value();
+    ovstorage::Registry registry;
+    auto registered = registry.add_plugin(plugin);
+    if (!registered) {
+        std::fprintf(stderr,
+                     "could not register the config-build plugin: %s\n",
+                     registered.error().message().c_str());
+        return false;
+    }
+    auto parsed = ovstorage::StackConfig::from_toml_str(
+        "[ovstorage]\n"
+        "root = \"custom\"\n"
+        "[ovstorage.layers.custom]\n"
+        "kind = \"test\"\n");
+    if (!parsed) {
+        std::fprintf(stderr,
+                     "could not parse the plugin-backed Stack config: %s\n",
+                     parsed.error().message().c_str());
+        return false;
+    }
+    ovstorage::StackConfig config = std::move(parsed).value();
+    ovstorage::Registry unregistered;
+    auto missing = ovstorage::sync_wait(config.build(unregistered));
+    if (missing || missing.error().code() != OvStorage_Status_InvalidArgument) {
+        std::fputs("unregistered `test` kind did not fail with InvalidArgument\n",
+                   stderr);
+        return false;
+    }
+    auto built = ovstorage::sync_wait(config.build(registry));
+    if (!built) {
+        std::fprintf(stderr,
+                     "could not build the registered `test` kind: %s\n",
+                     built.error().message().c_str());
+        return false;
+    }
+    return true;
+}
+
 // Import a fresh parked root from the fixture (each export resets the gate).
 // The handoff runs through the wrapper's own `import_handle`, so the returned
 // root is an ordinary `LayerHandle` with an ordinary destructor.
@@ -204,6 +253,9 @@ extern "C" int ovstorage_c_source_stack_build_parked_cpp(const char* fixture_pat
 {
     if (fixture_path == nullptr) {
         std::fputs("fixture path is null\n", stderr);
+        return 1;
+    }
+    if (!config_builds_registered_plugin_kind(fixture_path)) {
         return 1;
     }
     // RTLD_LOCAL so the fixture's own bundled plugin-SDK symbols never

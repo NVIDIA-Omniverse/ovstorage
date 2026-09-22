@@ -17,6 +17,7 @@ License-expression values in the Cargo dependency table are taken verbatim from 
 
 | Component | Location | License | Attribution | Notes |
 |---|---|---|---|---|
+| tomlc17 | `ovstorage-c-source/src/vendor/tomlc17/` | MIT | Copyright 2024-2026 CK Tan | Amalgamated parser source from [`cktan/tomlc17`](https://github.com/cktan/tomlc17) at commit `64a063b8636a4b48d142f978270f5e53e605e240`. The upstream license is preserved beside the source. Local changes preserve the C99 compiler floor, match the effective Figment TOML 1.0 grammar, retain and fully consume long fractional timestamps, parse floating point in the C locale, clear parser pools before release, and make provider-overlay arrays replace rather than append; public symbols are prefixed at inclusion. |
 | gRPC health checking protocol | `ovstorage-remote/ovstorage-broker-protocol/proto/grpc/health/v1/health.proto` | Apache-2.0 | Copyright 2015 The gRPC Authors | Vendored verbatim from [`grpc/grpc-proto`](https://github.com/grpc/grpc-proto/blob/master/grpc/health/v1/health.proto); the upstream Apache 2.0 notice is preserved inline. |
 | Contributor Covenant Code of Conduct (v1.4) | [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | CC-BY-4.0 | Copyright © Coraline Ada Ehmke and Contributor Covenant contributors | Adapted from [`contributor-covenant.org/version/1/4`](https://www.contributor-covenant.org/version/1/4/code-of-conduct.html). Attribution and license link preserved in the file body. NVIDIA modifications are project-specific wording (project name and enforcement contact) and remain under CC-BY-4.0. |
 
@@ -56,75 +57,84 @@ Each `skills/<slug>/SKILL.md` carries `license: CC-BY-4.0` in its YAML frontmatt
 | Crate | Version | License expression | Repository |
 |---|---:|---|---|
 | `adler2` | 2.0.1 | `0BSD OR MIT OR Apache-2.0` | [https://github.com/oyvindln/adler2](https://github.com/oyvindln/adler2) |
-| `aho-corasick` | 1.1.4 | `Unlicense OR MIT` | [https://github.com/BurntSushi/aho-corasick](https://github.com/BurntSushi/aho-corasick) |
+| `aho-corasick` | 1.1.5 | `Unlicense OR MIT` | [https://github.com/BurntSushi/aho-corasick](https://github.com/BurntSushi/aho-corasick) |
+| `alloca` | 0.4.0 | `MIT` | [https://github.com/playXE/alloca-rs](https://github.com/playXE/alloca-rs) |
 | `allocator-api2` | 0.2.21 | `MIT OR Apache-2.0` | [https://github.com/zakarumych/allocator-api2](https://github.com/zakarumych/allocator-api2) |
-| `android_system_properties` | 0.1.5 | `MIT/Apache-2.0` | [https://github.com/nical/android_system_properties](https://github.com/nical/android_system_properties) |
+| `android_system_properties` | 0.1.6 | `MIT OR Apache-2.0` | [https://github.com/nical/android_system_properties](https://github.com/nical/android_system_properties) |
+| `anes` | 0.1.6 | `MIT OR Apache-2.0` | [https://github.com/zrzka/anes-rs](https://github.com/zrzka/anes-rs) |
 | `anstream` | 1.0.0 | `MIT OR Apache-2.0` | [https://github.com/rust-cli/anstyle.git](https://github.com/rust-cli/anstyle.git) |
 | `anstyle` | 1.0.14 | `MIT OR Apache-2.0` | [https://github.com/rust-cli/anstyle.git](https://github.com/rust-cli/anstyle.git) |
 | `anstyle-parse` | 1.0.0 | `MIT OR Apache-2.0` | [https://github.com/rust-cli/anstyle.git](https://github.com/rust-cli/anstyle.git) |
 | `anstyle-query` | 1.1.5 | `MIT OR Apache-2.0` | [https://github.com/rust-cli/anstyle.git](https://github.com/rust-cli/anstyle.git) |
 | `anstyle-wincon` | 3.0.11 | `MIT OR Apache-2.0` | [https://github.com/rust-cli/anstyle.git](https://github.com/rust-cli/anstyle.git) |
-| `anyhow` | 1.0.103 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/anyhow](https://github.com/dtolnay/anyhow) |
-| `arc-swap` | 1.9.1 | `MIT OR Apache-2.0` | [https://github.com/vorner/arc-swap](https://github.com/vorner/arc-swap) |
+| `anyhow` | 1.0.104 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/anyhow](https://github.com/dtolnay/anyhow) |
+| `arc-swap` | 1.9.2 | `MIT OR Apache-2.0` | [https://github.com/vorner/arc-swap](https://github.com/vorner/arc-swap) |
 | `assert-json-diff` | 2.0.2 | `MIT` | [https://github.com/davidpdrsn/assert-json-diff.git](https://github.com/davidpdrsn/assert-json-diff.git) |
 | `async-channel` | 2.5.0 | `Apache-2.0 OR MIT` | [https://github.com/smol-rs/async-channel](https://github.com/smol-rs/async-channel) |
 | `async-stream` | 0.3.6 | `MIT` | [https://github.com/tokio-rs/async-stream](https://github.com/tokio-rs/async-stream) |
 | `async-stream-impl` | 0.3.6 | `MIT` | [https://github.com/tokio-rs/async-stream](https://github.com/tokio-rs/async-stream) |
-| `async-trait` | 0.1.89 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/async-trait](https://github.com/dtolnay/async-trait) |
+| `async-trait` | 0.1.92 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/async-trait](https://github.com/dtolnay/async-trait) |
 | `atomic` | 0.6.1 | `Apache-2.0/MIT` | [https://github.com/Amanieu/atomic-rs](https://github.com/Amanieu/atomic-rs) |
 | `atomic-waker` | 1.1.2 | `Apache-2.0 OR MIT` | [https://github.com/smol-rs/atomic-waker](https://github.com/smol-rs/atomic-waker) |
 | `autocfg` | 1.5.1 | `Apache-2.0 OR MIT` | [https://github.com/cuviper/autocfg](https://github.com/cuviper/autocfg) |
-| `aws-credential-types` | 1.2.14 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
-| `aws-runtime` | 1.7.5 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
-| `aws-sdk-s3` | 1.137.0 | `Apache-2.0` | [https://github.com/awslabs/aws-sdk-rust](https://github.com/awslabs/aws-sdk-rust) |
-| `aws-sdk-sqs` | 1.102.0 | `Apache-2.0` | [https://github.com/awslabs/aws-sdk-rust](https://github.com/awslabs/aws-sdk-rust) |
-| `aws-sigv4` | 1.4.5 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
-| `aws-smithy-async` | 1.2.14 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
-| `aws-smithy-checksums` | 0.64.8 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
-| `aws-smithy-eventstream` | 0.60.21 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
-| `aws-smithy-http` | 0.63.6 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
-| `aws-smithy-http-client` | 1.1.13 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
-| `aws-smithy-json` | 0.62.7 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
-| `aws-smithy-observability` | 0.2.6 | `Apache-2.0` | [https://github.com/awslabs/smithy-rs](https://github.com/awslabs/smithy-rs) |
-| `aws-smithy-runtime` | 1.11.3 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
-| `aws-smithy-runtime-api` | 1.12.3 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
-| `aws-smithy-runtime-api-macros` | 1.0.0 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
-| `aws-smithy-schema` | 0.1.0 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
-| `aws-smithy-types` | 1.5.0 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
-| `aws-smithy-xml` | 0.60.15 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
-| `aws-types` | 1.3.16 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-credential-types` | 1.3.0 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-runtime` | 1.9.2 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-sdk-s3` | 1.146.1 | `Apache-2.0` | [https://github.com/awslabs/aws-sdk-rust](https://github.com/awslabs/aws-sdk-rust) |
+| `aws-sdk-sqs` | 1.109.0 | `Apache-2.0` | [https://github.com/awslabs/aws-sdk-rust](https://github.com/awslabs/aws-sdk-rust) |
+| `aws-sigv4` | 1.5.1 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-smithy-async` | 1.3.0 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-smithy-checksums` | 0.65.0 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-smithy-eventstream` | 0.61.4 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-smithy-http` | 0.64.0 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-smithy-http-client` | 1.4.2 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-smithy-json` | 0.63.1 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-smithy-observability` | 0.3.0 | `Apache-2.0` | [https://github.com/awslabs/smithy-rs](https://github.com/awslabs/smithy-rs) |
+| `aws-smithy-runtime` | 1.14.2 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-smithy-runtime-api` | 1.16.2 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-smithy-runtime-api-macros` | 1.1.0 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-smithy-schema` | 0.2.1 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-smithy-types` | 1.6.4 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-smithy-xml` | 0.62.1 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
+| `aws-types` | 1.6.0 | `Apache-2.0` | [https://github.com/smithy-lang/smithy-rs](https://github.com/smithy-lang/smithy-rs) |
 | `axum` | 0.7.9 | `MIT` | [https://github.com/tokio-rs/axum](https://github.com/tokio-rs/axum) |
 | `axum` | 0.8.9 | `MIT` | [https://github.com/tokio-rs/axum](https://github.com/tokio-rs/axum) |
 | `axum-core` | 0.4.5 | `MIT` | [https://github.com/tokio-rs/axum](https://github.com/tokio-rs/axum) |
 | `axum-core` | 0.5.6 | `MIT` | [https://github.com/tokio-rs/axum](https://github.com/tokio-rs/axum) |
 | `backon` | 1.6.0 | `Apache-2.0` | [https://github.com/Xuanwo/backon](https://github.com/Xuanwo/backon) |
+| `base16ct` | 0.2.0 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/formats/tree/master/base16ct](https://github.com/RustCrypto/formats/tree/master/base16ct) |
 | `base64` | 0.22.1 | `MIT OR Apache-2.0` | [https://github.com/marshallpierce/rust-base64](https://github.com/marshallpierce/rust-base64) |
 | `base64` | 0.23.1 | `MIT OR Apache-2.0` | [https://github.com/marshallpierce/rust-base64](https://github.com/marshallpierce/rust-base64) |
 | `base64-simd` | 0.8.0 | `MIT` | [https://github.com/Nugine/simd](https://github.com/Nugine/simd) |
+| `base64ct` | 1.8.3 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/formats](https://github.com/RustCrypto/formats) |
 | `bitflags` | 1.3.2 | `MIT/Apache-2.0` | [https://github.com/bitflags/bitflags](https://github.com/bitflags/bitflags) |
-| `bitflags` | 2.12.1 | `MIT OR Apache-2.0` | [https://github.com/bitflags/bitflags](https://github.com/bitflags/bitflags) |
+| `bitflags` | 2.13.2 | `MIT OR Apache-2.0` | [https://github.com/bitflags/bitflags](https://github.com/bitflags/bitflags) |
 | `block-buffer` | 0.10.4 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
 | `block-buffer` | 0.12.1 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
 | `bumpalo` | 3.20.3 | `MIT OR Apache-2.0` | [https://github.com/fitzgen/bumpalo](https://github.com/fitzgen/bumpalo) |
-| `bytemuck` | 1.25.0 | `Zlib OR Apache-2.0 OR MIT` | [https://github.com/Lokathor/bytemuck](https://github.com/Lokathor/bytemuck) |
+| `bytemuck` | 1.25.2 | `Zlib OR Apache-2.0 OR MIT` | [https://github.com/Lokathor/bytemuck](https://github.com/Lokathor/bytemuck) |
 | `byteorder` | 1.5.0 | `Unlicense OR MIT` | [https://github.com/BurntSushi/byteorder](https://github.com/BurntSushi/byteorder) |
-| `bytes` | 1.11.1 | `MIT` | [https://github.com/tokio-rs/bytes](https://github.com/tokio-rs/bytes) |
+| `bytes` | 1.12.1 | `MIT` | [https://github.com/tokio-rs/bytes](https://github.com/tokio-rs/bytes) |
 | `bytes-utils` | 0.1.4 | `Apache-2.0/MIT` | [https://github.com/vorner/bytes-utils](https://github.com/vorner/bytes-utils) |
+| `cast` | 0.3.0 | `MIT OR Apache-2.0` | [https://github.com/japaric/cast.rs](https://github.com/japaric/cast.rs) |
 | `castaway` | 0.2.4 | `MIT` | [https://github.com/sagebind/castaway](https://github.com/sagebind/castaway) |
-| `cbindgen` | 0.29.3 | `MPL-2.0` | [https://github.com/mozilla/cbindgen](https://github.com/mozilla/cbindgen) |
-| `cc` | 1.2.63 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/cc-rs](https://github.com/rust-lang/cc-rs) |
+| `cbindgen` | 0.29.4 | `MPL-2.0` | [https://github.com/mozilla/cbindgen](https://github.com/mozilla/cbindgen) |
+| `cc` | 1.4.6 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/cc-rs](https://github.com/rust-lang/cc-rs) |
 | `cfg-if` | 1.0.4 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/cfg-if](https://github.com/rust-lang/cfg-if) |
 | `cfg_aliases` | 0.1.1 | `MIT` | [https://github.com/katharostech/cfg_aliases](https://github.com/katharostech/cfg_aliases) |
-| `cfg_aliases` | 0.2.1 | `MIT` | [https://github.com/katharostech/cfg_aliases](https://github.com/katharostech/cfg_aliases) |
-| `chrono` | 0.4.44 | `MIT OR Apache-2.0` | [https://github.com/chronotope/chrono](https://github.com/chronotope/chrono) |
-| `clap` | 4.6.1 | `MIT OR Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
-| `clap_builder` | 4.6.0 | `MIT OR Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
-| `clap_derive` | 4.6.1 | `MIT OR Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
-| `clap_lex` | 1.1.0 | `MIT OR Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
+| `cfg_aliases` | 0.2.2 | `MIT` | [https://github.com/katharostech/cfg_aliases](https://github.com/katharostech/cfg_aliases) |
+| `chacha20` | 0.10.2 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/stream-ciphers](https://github.com/RustCrypto/stream-ciphers) |
+| `chrono` | 0.4.45 | `MIT OR Apache-2.0` | [https://github.com/chronotope/chrono](https://github.com/chronotope/chrono) |
+| `ciborium` | 0.2.2 | `Apache-2.0` | [https://github.com/enarx/ciborium](https://github.com/enarx/ciborium) |
+| `ciborium-io` | 0.2.2 | `Apache-2.0` | [https://github.com/enarx/ciborium](https://github.com/enarx/ciborium) |
+| `ciborium-ll` | 0.2.2 | `Apache-2.0` | [https://github.com/enarx/ciborium](https://github.com/enarx/ciborium) |
+| `clap` | 4.6.7 | `MIT OR Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
+| `clap_builder` | 4.6.7 | `MIT OR Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
+| `clap_derive` | 4.6.7 | `MIT OR Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
+| `clap_lex` | 1.1.1 | `MIT OR Apache-2.0` | [https://github.com/clap-rs/clap](https://github.com/clap-rs/clap) |
 | `clipboard-win` | 5.4.1 | `BSL-1.0` | [https://github.com/DoumanAsh/clipboard-win](https://github.com/DoumanAsh/clipboard-win) |
 | `cmov` | 0.5.4 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
 | `colorchoice` | 1.0.5 | `MIT OR Apache-2.0` | [https://github.com/rust-cli/anstyle.git](https://github.com/rust-cli/anstyle.git) |
-| `combine` | 4.6.7 | `MIT` | [https://github.com/Marwes/combine](https://github.com/Marwes/combine) |
+| `combine` | 4.6.8 | `MIT` | [https://github.com/Marwes/combine](https://github.com/Marwes/combine) |
 | `compact_str` | 0.9.1 | `MIT` | [https://github.com/ParkMyCar/compact_str](https://github.com/ParkMyCar/compact_str) |
 | `concurrent-queue` | 2.5.0 | `Apache-2.0 OR MIT` | [https://github.com/smol-rs/concurrent-queue](https://github.com/smol-rs/concurrent-queue) |
 | `const-oid` | 0.10.2 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/formats](https://github.com/RustCrypto/formats) |
@@ -135,153 +145,172 @@ Each `skills/<slug>/SKILL.md` carries `license: CC-BY-4.0` in its YAML frontmatt
 | `core-foundation-sys` | 0.8.7 | `MIT OR Apache-2.0` | [https://github.com/servo/core-foundation-rs](https://github.com/servo/core-foundation-rs) |
 | `cow-utils` | 0.1.3 | `MIT` | [https://github.com/RReverser/cow-utils-rs](https://github.com/RReverser/cow-utils-rs) |
 | `cpufeatures` | 0.2.17 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
-| `cpufeatures` | 0.3.0 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
+| `cpufeatures` | 0.3.1 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
 | `crc-fast` | 1.10.0 | `MIT OR Apache-2.0` | [https://github.com/awesomized/crc-fast-rust](https://github.com/awesomized/crc-fast-rust) |
 | `crc32c` | 0.6.8 | `Apache-2.0/MIT` | [https://github.com/zowens/crc32c](https://github.com/zowens/crc32c) |
-| `crc32fast` | 1.5.0 | `MIT OR Apache-2.0` | [https://github.com/srijs/rust-crc32fast](https://github.com/srijs/rust-crc32fast) |
-| `crossbeam-epoch` | 0.9.20 | `MIT OR Apache-2.0` | [https://github.com/crossbeam-rs/crossbeam](https://github.com/crossbeam-rs/crossbeam) |
-| `crossbeam-utils` | 0.8.21 | `MIT OR Apache-2.0` | [https://github.com/crossbeam-rs/crossbeam](https://github.com/crossbeam-rs/crossbeam) |
+| `crc32fast` | 1.5.2 | `MIT OR Apache-2.0` | [https://github.com/srijs/rust-crc32fast](https://github.com/srijs/rust-crc32fast) |
+| `criterion` | 0.8.2 | `Apache-2.0 OR MIT` | [https://github.com/criterion-rs/criterion.rs](https://github.com/criterion-rs/criterion.rs) |
+| `criterion-plot` | 0.8.2 | `Apache-2.0 OR MIT` | [https://github.com/criterion-rs/criterion.rs](https://github.com/criterion-rs/criterion.rs) |
+| `crossbeam-epoch` | 0.9.21 | `MIT OR Apache-2.0` | [https://github.com/crossbeam-rs/crossbeam](https://github.com/crossbeam-rs/crossbeam) |
+| `crossbeam-utils` | 0.8.23 | `MIT OR Apache-2.0` | [https://github.com/crossbeam-rs/crossbeam](https://github.com/crossbeam-rs/crossbeam) |
 | `crossterm` | 0.25.0 | `MIT` | [https://github.com/crossterm-rs/crossterm](https://github.com/crossterm-rs/crossterm) |
 | `crossterm_winapi` | 0.9.1 | `MIT` | [https://github.com/crossterm-rs/crossterm-winapi](https://github.com/crossterm-rs/crossterm-winapi) |
 | `crunchy` | 0.2.4 | `MIT` | [https://github.com/eira-fransham/crunchy](https://github.com/eira-fransham/crunchy) |
+| `crypto-bigint` | 0.5.5 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/crypto-bigint](https://github.com/RustCrypto/crypto-bigint) |
 | `crypto-common` | 0.1.7 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/traits](https://github.com/RustCrypto/traits) |
 | `crypto-common` | 0.2.2 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/traits](https://github.com/RustCrypto/traits) |
 | `ctor` | 0.4.3 | `Apache-2.0 OR MIT` | [https://github.com/mmastrac/rust-ctor](https://github.com/mmastrac/rust-ctor) |
 | `ctor-proc-macro` | 0.0.6 | `Apache-2.0 OR MIT` | [https://github.com/mmastrac/rust-ctor](https://github.com/mmastrac/rust-ctor) |
 | `ctutils` | 0.4.2 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
-| `darling` | 0.24.0 | `MIT` | [https://github.com/TedDriggs/darling](https://github.com/TedDriggs/darling) |
-| `darling_core` | 0.24.0 | `MIT` | [https://github.com/TedDriggs/darling](https://github.com/TedDriggs/darling) |
-| `darling_macro` | 0.24.0 | `MIT` | [https://github.com/TedDriggs/darling](https://github.com/TedDriggs/darling) |
-| `data-encoding` | 2.11.0 | `MIT` | [https://github.com/ia0/data-encoding](https://github.com/ia0/data-encoding) |
+| `curve25519-dalek` | 4.1.3 | `BSD-3-Clause` | [https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek) |
+| `curve25519-dalek-derive` | 0.1.1 | `MIT/Apache-2.0` | [https://github.com/dalek-cryptography/curve25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek) |
+| `darling` | 0.24.1 | `MIT` | [https://github.com/TedDriggs/darling](https://github.com/TedDriggs/darling) |
+| `darling_core` | 0.24.1 | `MIT` | [https://github.com/TedDriggs/darling](https://github.com/TedDriggs/darling) |
+| `darling_macro` | 0.24.1 | `MIT` | [https://github.com/TedDriggs/darling](https://github.com/TedDriggs/darling) |
+| `data-encoding` | 2.11.1 | `MIT` | [https://github.com/ia0/data-encoding](https://github.com/ia0/data-encoding) |
 | `deadpool` | 0.12.3 | `MIT OR Apache-2.0` | [https://github.com/bikeshedder/deadpool](https://github.com/bikeshedder/deadpool) |
 | `deadpool-runtime` | 0.1.4 | `MIT OR Apache-2.0` | [https://github.com/bikeshedder/deadpool](https://github.com/bikeshedder/deadpool) |
+| `der` | 0.7.10 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/formats/tree/master/der](https://github.com/RustCrypto/formats/tree/master/der) |
 | `deranged` | 0.5.8 | `MIT OR Apache-2.0` | [https://github.com/jhpratt/deranged](https://github.com/jhpratt/deranged) |
 | `digest` | 0.10.7 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/traits](https://github.com/RustCrypto/traits) |
 | `digest` | 0.11.3 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/traits](https://github.com/RustCrypto/traits) |
 | `dispatch2` | 0.3.1 | `Zlib OR Apache-2.0 OR MIT` | [https://github.com/madsmtm/objc2](https://github.com/madsmtm/objc2) |
-| `displaydoc` | 0.2.6 | `MIT OR Apache-2.0` | [https://github.com/yaahc/displaydoc](https://github.com/yaahc/displaydoc) |
+| `displaydoc` | 0.2.7 | `MIT OR Apache-2.0` | [https://github.com/yaahc/displaydoc](https://github.com/yaahc/displaydoc) |
 | `dlv-list` | 0.5.2 | `MIT OR Apache-2.0` | [https://github.com/sgodwincs/dlv-list-rs](https://github.com/sgodwincs/dlv-list-rs) |
 | `dragonbox_ecma` | 0.1.12 | `Apache-2.0 WITH LLVM-exception OR BSL-1.0` | [https://github.com/magic-akari/dragonbox](https://github.com/magic-akari/dragonbox) |
 | `dtor` | 0.0.6 | `Apache-2.0 OR MIT` | [https://github.com/mmastrac/rust-ctor](https://github.com/mmastrac/rust-ctor) |
 | `dtor-proc-macro` | 0.0.5 | `Apache-2.0 OR MIT` | [https://github.com/mmastrac/rust-ctor](https://github.com/mmastrac/rust-ctor) |
 | `dyn-clone` | 1.0.20 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/dyn-clone](https://github.com/dtolnay/dyn-clone) |
-| `either` | 1.16.0 | `MIT OR Apache-2.0` | [https://github.com/rayon-rs/either](https://github.com/rayon-rs/either) |
+| `ecdsa` | 0.16.9 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/signatures/tree/master/ecdsa](https://github.com/RustCrypto/signatures/tree/master/ecdsa) |
+| `ed25519` | 2.2.3 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/signatures/tree/master/ed25519](https://github.com/RustCrypto/signatures/tree/master/ed25519) |
+| `ed25519-dalek` | 2.2.0 | `BSD-3-Clause` | [https://github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek) |
+| `either` | 1.18.0 | `MIT OR Apache-2.0` | [https://github.com/rayon-rs/either](https://github.com/rayon-rs/either) |
+| `elliptic-curve` | 0.13.8 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/traits/tree/master/elliptic-curve](https://github.com/RustCrypto/traits/tree/master/elliptic-curve) |
 | `endian-type` | 0.1.2 | `MIT` | [https://github.com/Lolirofle/endian-type.git](https://github.com/Lolirofle/endian-type.git) |
 | `equivalent` | 1.0.2 | `Apache-2.0 OR MIT` | [https://github.com/indexmap-rs/equivalent](https://github.com/indexmap-rs/equivalent) |
 | `errno` | 0.3.14 | `MIT OR Apache-2.0` | [https://github.com/lambda-fairy/rust-errno](https://github.com/lambda-fairy/rust-errno) |
-| `error-code` | 3.3.2 | `BSL-1.0` | [https://github.com/DoumanAsh/error-code](https://github.com/DoumanAsh/error-code) |
-| `event-listener` | 5.4.1 | `Apache-2.0 OR MIT` | [https://github.com/smol-rs/event-listener](https://github.com/smol-rs/event-listener) |
+| `error-code` | 3.4.0 | `BSL-1.0` | [https://github.com/DoumanAsh/error-code](https://github.com/DoumanAsh/error-code) |
+| `event-listener` | 5.4.2 | `Apache-2.0 OR MIT` | [https://github.com/smol-rs/event-listener](https://github.com/smol-rs/event-listener) |
 | `event-listener-strategy` | 0.5.4 | `Apache-2.0 OR MIT` | [https://github.com/smol-rs/event-listener-strategy](https://github.com/smol-rs/event-listener-strategy) |
 | `fallible-iterator` | 0.3.0 | `MIT/Apache-2.0` | [https://github.com/sfackler/rust-fallible-iterator](https://github.com/sfackler/rust-fallible-iterator) |
 | `fallible-streaming-iterator` | 0.1.9 | `MIT/Apache-2.0` | [https://github.com/sfackler/fallible-streaming-iterator](https://github.com/sfackler/fallible-streaming-iterator) |
-| `fastrand` | 2.4.1 | `Apache-2.0 OR MIT` | [https://github.com/smol-rs/fastrand](https://github.com/smol-rs/fastrand) |
+| `fastrand` | 2.5.0 | `Apache-2.0 OR MIT` | [https://github.com/smol-rs/fastrand](https://github.com/smol-rs/fastrand) |
 | `fd-lock` | 4.0.4 | `MIT OR Apache-2.0` | [https://github.com/yoshuawuyts/fd-lock](https://github.com/yoshuawuyts/fd-lock) |
+| `ff` | 0.13.1 | `MIT/Apache-2.0` | [https://github.com/zkcrypto/ff](https://github.com/zkcrypto/ff) |
+| `fiat-crypto` | 0.2.9 | `MIT OR Apache-2.0 OR BSD-1-Clause` | [https://github.com/mit-plv/fiat-crypto](https://github.com/mit-plv/fiat-crypto) |
 | `figment` | 0.10.19 | `MIT OR Apache-2.0` | [https://github.com/SergioBenitez/Figment](https://github.com/SergioBenitez/Figment) |
-| `find-msvc-tools` | 0.1.9 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/cc-rs](https://github.com/rust-lang/cc-rs) |
+| `find-msvc-tools` | 0.1.12 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/cc-rs](https://github.com/rust-lang/cc-rs) |
 | `fixedbitset` | 0.5.7 | `MIT OR Apache-2.0` | [https://github.com/petgraph/fixedbitset](https://github.com/petgraph/fixedbitset) |
 | `flagset` | 0.4.7 | `Apache-2.0` | [https://github.com/enarx/flagset](https://github.com/enarx/flagset) |
-| `flate2` | 1.1.9 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/flate2-rs](https://github.com/rust-lang/flate2-rs) |
+| `flate2` | 1.1.10 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/flate2-rs](https://github.com/rust-lang/flate2-rs) |
 | `fnv` | 1.0.7 | `Apache-2.0 / MIT` | [https://github.com/servo/rust-fnv](https://github.com/servo/rust-fnv) |
 | `foldhash` | 0.1.5 | `Zlib` | [https://github.com/orlp/foldhash](https://github.com/orlp/foldhash) |
 | `foldhash` | 0.2.0 | `Zlib` | [https://github.com/orlp/foldhash](https://github.com/orlp/foldhash) |
 | `form_urlencoded` | 1.2.2 | `MIT OR Apache-2.0` | [https://github.com/servo/rust-url](https://github.com/servo/rust-url) |
 | `fs2` | 0.4.3 | `MIT/Apache-2.0` | [https://github.com/danburkert/fs2-rs](https://github.com/danburkert/fs2-rs) |
-| `futures` | 0.3.32 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
-| `futures-channel` | 0.3.32 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
-| `futures-core` | 0.3.32 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
-| `futures-executor` | 0.3.32 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
-| `futures-io` | 0.3.32 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
-| `futures-macro` | 0.3.32 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
-| `futures-sink` | 0.3.32 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
-| `futures-task` | 0.3.32 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
-| `futures-util` | 0.3.32 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
+| `futures` | 0.3.34 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
+| `futures-channel` | 0.3.34 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
+| `futures-core` | 0.3.34 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
+| `futures-executor` | 0.3.34 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
+| `futures-io` | 0.3.34 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
+| `futures-macro` | 0.3.34 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
+| `futures-sink` | 0.3.34 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
+| `futures-task` | 0.3.34 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
+| `futures-util` | 0.3.34 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/futures-rs](https://github.com/rust-lang/futures-rs) |
 | `fuzzy-matcher` | 0.3.7 | `MIT` | [https://github.com/lotabout/fuzzy-matcher](https://github.com/lotabout/fuzzy-matcher) |
 | `fxhash` | 0.2.1 | `Apache-2.0/MIT` | [https://github.com/cbreeden/fxhash](https://github.com/cbreeden/fxhash) |
 | `generic-array` | 0.14.7 | `MIT` | [https://github.com/fizyk20/generic-array.git](https://github.com/fizyk20/generic-array.git) |
 | `getrandom` | 0.2.17 | `MIT OR Apache-2.0` | [https://github.com/rust-random/getrandom](https://github.com/rust-random/getrandom) |
 | `getrandom` | 0.3.4 | `MIT OR Apache-2.0` | [https://github.com/rust-random/getrandom](https://github.com/rust-random/getrandom) |
-| `getrandom` | 0.4.2 | `MIT OR Apache-2.0` | [https://github.com/rust-random/getrandom](https://github.com/rust-random/getrandom) |
+| `getrandom` | 0.4.3 | `MIT OR Apache-2.0` | [https://github.com/rust-random/getrandom](https://github.com/rust-random/getrandom) |
 | `gloo-timers` | 0.3.0 | `MIT OR Apache-2.0` | [https://github.com/rustwasm/gloo/tree/master/crates/timers](https://github.com/rustwasm/gloo/tree/master/crates/timers) |
-| `h2` | 0.4.16 | `MIT` | [https://github.com/hyperium/h2](https://github.com/hyperium/h2) |
+| `group` | 0.13.0 | `MIT/Apache-2.0` | [https://github.com/zkcrypto/group](https://github.com/zkcrypto/group) |
+| `h2` | 0.4.19 | `MIT` | [https://github.com/hyperium/h2](https://github.com/hyperium/h2) |
+| `half` | 2.7.1 | `MIT OR Apache-2.0` | [https://github.com/VoidStarKat/half-rs](https://github.com/VoidStarKat/half-rs) |
 | `hashbrown` | 0.12.3 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/hashbrown](https://github.com/rust-lang/hashbrown) |
 | `hashbrown` | 0.14.5 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/hashbrown](https://github.com/rust-lang/hashbrown) |
 | `hashbrown` | 0.15.5 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/hashbrown](https://github.com/rust-lang/hashbrown) |
 | `hashbrown` | 0.16.1 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/hashbrown](https://github.com/rust-lang/hashbrown) |
 | `hashbrown` | 0.17.1 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/hashbrown](https://github.com/rust-lang/hashbrown) |
-| `hashlink` | 0.11.0 | `MIT OR Apache-2.0` | [https://github.com/kyren/hashlink](https://github.com/kyren/hashlink) |
+| `hashlink` | 0.11.1 | `MIT OR Apache-2.0` | [https://github.com/djc/hashlink](https://github.com/djc/hashlink) |
 | `heck` | 0.4.1 | `MIT OR Apache-2.0` | [https://github.com/withoutboats/heck](https://github.com/withoutboats/heck) |
 | `heck` | 0.5.0 | `MIT OR Apache-2.0` | [https://github.com/withoutboats/heck](https://github.com/withoutboats/heck) |
-| `hermit-abi` | 0.5.2 | `MIT OR Apache-2.0` | [https://github.com/hermit-os/hermit-rs](https://github.com/hermit-os/hermit-rs) |
+| `hermit-abi` | 0.5.3 | `MIT OR Apache-2.0` | [https://github.com/hermit-os/hermit-rs](https://github.com/hermit-os/hermit-rs) |
 | `hex` | 0.4.3 | `MIT OR Apache-2.0` | [https://github.com/KokaKiwi/rust-hex](https://github.com/KokaKiwi/rust-hex) |
+| `hkdf` | 0.12.4 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/KDFs/](https://github.com/RustCrypto/KDFs/) |
 | `hmac` | 0.12.1 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/MACs](https://github.com/RustCrypto/MACs) |
 | `hmac` | 0.13.0 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/MACs](https://github.com/RustCrypto/MACs) |
 | `home` | 0.5.12 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/cargo](https://github.com/rust-lang/cargo) |
 | `http` | 0.2.12 | `MIT OR Apache-2.0` | [https://github.com/hyperium/http](https://github.com/hyperium/http) |
-| `http` | 1.4.1 | `MIT OR Apache-2.0` | [https://github.com/hyperium/http](https://github.com/hyperium/http) |
+| `http` | 1.5.0 | `MIT OR Apache-2.0` | [https://github.com/hyperium/http](https://github.com/hyperium/http) |
 | `http-body` | 0.4.6 | `MIT` | [https://github.com/hyperium/http-body](https://github.com/hyperium/http-body) |
-| `http-body` | 1.0.1 | `MIT` | [https://github.com/hyperium/http-body](https://github.com/hyperium/http-body) |
-| `http-body-util` | 0.1.3 | `MIT` | [https://github.com/hyperium/http-body](https://github.com/hyperium/http-body) |
+| `http-body` | 1.1.0 | `MIT` | [https://github.com/hyperium/http-body](https://github.com/hyperium/http-body) |
+| `http-body-util` | 0.1.5 | `MIT` | [https://github.com/hyperium/http-body](https://github.com/hyperium/http-body) |
 | `httparse` | 1.10.1 | `MIT OR Apache-2.0` | [https://github.com/seanmonstar/httparse](https://github.com/seanmonstar/httparse) |
 | `httpdate` | 1.0.3 | `MIT OR Apache-2.0` | [https://github.com/pyfisch/httpdate](https://github.com/pyfisch/httpdate) |
-| `hybrid-array` | 0.4.12 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/hybrid-array](https://github.com/RustCrypto/hybrid-array) |
-| `hyper` | 1.10.1 | `MIT` | [https://github.com/hyperium/hyper](https://github.com/hyperium/hyper) |
+| `hybrid-array` | 0.4.15 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/hybrid-array](https://github.com/RustCrypto/hybrid-array) |
+| `hyper` | 1.11.1 | `MIT` | [https://github.com/hyperium/hyper](https://github.com/hyperium/hyper) |
 | `hyper-rustls` | 0.27.9 | `Apache-2.0 OR ISC OR MIT` | [https://github.com/rustls/hyper-rustls](https://github.com/rustls/hyper-rustls) |
 | `hyper-timeout` | 0.5.2 | `MIT OR Apache-2.0` | [https://github.com/hjr3/hyper-timeout](https://github.com/hjr3/hyper-timeout) |
 | `hyper-util` | 0.1.20 | `MIT` | [https://github.com/hyperium/hyper-util](https://github.com/hyperium/hyper-util) |
 | `iana-time-zone` | 0.1.65 | `MIT OR Apache-2.0` | [https://github.com/strawlab/iana-time-zone](https://github.com/strawlab/iana-time-zone) |
 | `iana-time-zone-haiku` | 0.1.2 | `MIT OR Apache-2.0` | [https://github.com/strawlab/iana-time-zone](https://github.com/strawlab/iana-time-zone) |
-| `icu_collections` | 2.2.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `icu_locale_core` | 2.2.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `icu_normalizer` | 2.2.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `icu_normalizer_data` | 2.2.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `icu_properties` | 2.2.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `icu_properties_data` | 2.2.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `icu_provider` | 2.2.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `id-arena` | 2.3.0 | `MIT/Apache-2.0` | [https://github.com/fitzgen/id-arena](https://github.com/fitzgen/id-arena) |
+| `icu_collections` | 2.3.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `icu_locale_core` | 2.3.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `icu_locale_fallback` | 2.3.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `icu_locale_fallback_data` | 2.3.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `icu_normalizer` | 2.3.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `icu_normalizer_data` | 2.3.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `icu_properties` | 2.3.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `icu_properties_data` | 2.3.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `icu_provider` | 2.3.1 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `icu_segmenter` | 2.3.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `icu_segmenter_data` | 2.3.0 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
 | `ident_case` | 1.0.1 | `MIT/Apache-2.0` | [https://github.com/TedDriggs/ident_case](https://github.com/TedDriggs/ident_case) |
 | `idna` | 1.1.0 | `MIT OR Apache-2.0` | [https://github.com/servo/rust-url/](https://github.com/servo/rust-url/) |
 | `idna_adapter` | 1.2.2 | `Apache-2.0 OR MIT` | [https://github.com/hsivonen/idna_adapter](https://github.com/hsivonen/idna_adapter) |
 | `indexmap` | 1.9.3 | `Apache-2.0 OR MIT` | [https://github.com/bluss/indexmap](https://github.com/bluss/indexmap) |
-| `indexmap` | 2.14.0 | `Apache-2.0 OR MIT` | [https://github.com/indexmap-rs/indexmap](https://github.com/indexmap-rs/indexmap) |
+| `indexmap` | 2.14.2 | `Apache-2.0 OR MIT` | [https://github.com/indexmap-rs/indexmap](https://github.com/indexmap-rs/indexmap) |
 | `indoc` | 2.0.7 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/indoc](https://github.com/dtolnay/indoc) |
 | `inlinable_string` | 0.1.15 | `Apache-2.0/MIT` | [https://github.com/fitzgen/inlinable_string](https://github.com/fitzgen/inlinable_string) |
 | `inquire` | 0.7.5 | `MIT` | [https://github.com/mikaelmello/inquire](https://github.com/mikaelmello/inquire) |
 | `inventory` | 0.3.24 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/inventory](https://github.com/dtolnay/inventory) |
-| `ipnet` | 2.12.0 | `MIT OR Apache-2.0` | [https://github.com/krisprice/ipnet](https://github.com/krisprice/ipnet) |
+| `ipnet` | 2.12.2 | `MIT OR Apache-2.0` | [https://github.com/krisprice/ipnet](https://github.com/krisprice/ipnet) |
 | `is_terminal_polyfill` | 1.70.2 | `MIT OR Apache-2.0` | [https://github.com/polyfill-rs/is_terminal_polyfill](https://github.com/polyfill-rs/is_terminal_polyfill) |
+| `itertools` | 0.13.0 | `MIT OR Apache-2.0` | [https://github.com/rust-itertools/itertools](https://github.com/rust-itertools/itertools) |
 | `itertools` | 0.14.0 | `MIT OR Apache-2.0` | [https://github.com/rust-itertools/itertools](https://github.com/rust-itertools/itertools) |
 | `itoa` | 1.0.18 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/itoa](https://github.com/dtolnay/itoa) |
 | `jni` | 0.22.4 | `MIT OR Apache-2.0` | [https://github.com/jni-rs/jni-rs](https://github.com/jni-rs/jni-rs) |
 | `jni-macros` | 0.22.4 | `MIT OR Apache-2.0` | [https://github.com/jni-rs/jni-rs](https://github.com/jni-rs/jni-rs) |
 | `jni-sys` | 0.4.1 | `MIT OR Apache-2.0` | [https://github.com/jni-rs/jni-sys](https://github.com/jni-rs/jni-sys) |
 | `jni-sys-macros` | 0.4.1 | `MIT OR Apache-2.0` | [https://github.com/jni-rs/jni-sys](https://github.com/jni-rs/jni-sys) |
-| `js-sys` | 0.3.99 | `MIT OR Apache-2.0` | [https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys) |
-| `jsonwebtoken` | 9.3.1 | `MIT` | [https://github.com/Keats/jsonwebtoken](https://github.com/Keats/jsonwebtoken) |
+| `js-sys` | 0.3.105 | `MIT OR Apache-2.0` | [https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys) |
+| `jsonwebtoken` | 11.1.0 | `MIT` | [https://github.com/Keats/jsonwebtoken](https://github.com/Keats/jsonwebtoken) |
 | `lazy_static` | 1.5.0 | `MIT OR Apache-2.0` | [https://github.com/rust-lang-nursery/lazy-static.rs](https://github.com/rust-lang-nursery/lazy-static.rs) |
-| `leb128fmt` | 0.1.0 | `MIT OR Apache-2.0` | [https://github.com/bluk/leb128fmt](https://github.com/bluk/leb128fmt) |
-| `libc` | 0.2.186 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/libc](https://github.com/rust-lang/libc) |
+| `libc` | 0.2.189 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/libc](https://github.com/rust-lang/libc) |
 | `libloading` | 0.8.9 | `ISC` | [https://github.com/nagisa/rust_libloading/](https://github.com/nagisa/rust_libloading/) |
+| `libm` | 0.2.16 | `MIT` | [https://github.com/rust-lang/compiler-builtins](https://github.com/rust-lang/compiler-builtins) |
 | `libsqlite3-sys` | 0.37.0 | `MIT` | [https://github.com/rusqlite/rusqlite](https://github.com/rusqlite/rusqlite) |
 | `linux-raw-sys` | 0.12.1 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/sunfishcode/linux-raw-sys](https://github.com/sunfishcode/linux-raw-sys) |
-| `litemap` | 0.8.2 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `litemap` | 0.8.3 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
 | `lock_api` | 0.4.14 | `MIT OR Apache-2.0` | [https://github.com/Amanieu/parking_lot](https://github.com/Amanieu/parking_lot) |
-| `log` | 0.4.31 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/log](https://github.com/rust-lang/log) |
-| `lru` | 0.16.4 | `MIT` | [https://github.com/jeromefroe/lru-rs.git](https://github.com/jeromefroe/lru-rs.git) |
-| `lru-slab` | 0.1.2 | `MIT OR Apache-2.0 OR Zlib` | [https://github.com/Ralith/lru-slab](https://github.com/Ralith/lru-slab) |
+| `log` | 0.4.34 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/log](https://github.com/rust-lang/log) |
+| `lru` | 0.18.4 | `MIT` | [https://github.com/jeromefroe/lru-rs.git](https://github.com/jeromefroe/lru-rs.git) |
+| `lru-slab` | 0.1.3 | `MIT OR Apache-2.0 OR Zlib` | [https://github.com/Ralith/lru-slab](https://github.com/Ralith/lru-slab) |
 | `matchers` | 0.2.0 | `MIT` | [https://github.com/hawkw/matchers](https://github.com/hawkw/matchers) |
 | `matchit` | 0.7.3 | `MIT AND BSD-3-Clause` | [https://github.com/ibraheemdev/matchit](https://github.com/ibraheemdev/matchit) |
 | `matchit` | 0.8.4 | `MIT AND BSD-3-Clause` | [https://github.com/ibraheemdev/matchit](https://github.com/ibraheemdev/matchit) |
 | `md-5` | 0.10.6 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
 | `md-5` | 0.11.0 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
-| `memchr` | 2.8.1 | `Unlicense OR MIT` | [https://github.com/BurntSushi/memchr](https://github.com/BurntSushi/memchr) |
+| `memchr` | 2.8.3 | `Unlicense OR MIT` | [https://github.com/BurntSushi/memchr](https://github.com/BurntSushi/memchr) |
 | `memoffset` | 0.9.1 | `MIT` | [https://github.com/Gilnaa/memoffset](https://github.com/Gilnaa/memoffset) |
 | `metrics` | 0.24.6 | `MIT` | [https://github.com/metrics-rs/metrics](https://github.com/metrics-rs/metrics) |
 | `metrics-exporter-prometheus` | 0.16.2 | `MIT` | [https://github.com/metrics-rs/metrics](https://github.com/metrics-rs/metrics) |
 | `metrics-util` | 0.19.1 | `MIT` | [https://github.com/metrics-rs/metrics](https://github.com/metrics-rs/metrics) |
 | `mime` | 0.3.17 | `MIT OR Apache-2.0` | [https://github.com/hyperium/mime](https://github.com/hyperium/mime) |
-| `miniz_oxide` | 0.8.9 | `MIT OR Zlib OR Apache-2.0` | [https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide) |
+| `miniz_oxide` | 0.9.1 | `MIT OR Zlib OR Apache-2.0` | [https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide) |
 | `mio` | 0.8.11 | `MIT` | [https://github.com/tokio-rs/mio](https://github.com/tokio-rs/mio) |
-| `mio` | 1.2.1 | `MIT` | [https://github.com/tokio-rs/mio](https://github.com/tokio-rs/mio) |
+| `mio` | 1.2.3 | `MIT` | [https://github.com/tokio-rs/mio](https://github.com/tokio-rs/mio) |
 | `multimap` | 0.10.1 | `MIT OR Apache-2.0` | [https://github.com/havarnov/multimap](https://github.com/havarnov/multimap) |
 | `ndk-context` | 0.1.1 | `MIT OR Apache-2.0` | [https://github.com/rust-windowing/android-ndk-rs](https://github.com/rust-windowing/android-ndk-rs) |
 | `newline-converter` | 0.3.0 | `MIT` | [https://github.com/spitfire05/rnc/tree/master/crates/newline-converter](https://github.com/spitfire05/rnc/tree/master/crates/newline-converter) |
@@ -290,9 +319,11 @@ Each `skills/<slug>/SKILL.md` carries `license: CC-BY-4.0` in its YAML frontmatt
 | `nix` | 0.31.3 | `MIT` | [https://github.com/nix-rust/nix](https://github.com/nix-rust/nix) |
 | `nonmax` | 0.5.5 | `MIT OR Apache-2.0` | [https://github.com/LPGhatguy/nonmax](https://github.com/LPGhatguy/nonmax) |
 | `nu-ansi-term` | 0.50.3 | `MIT` | [https://github.com/nushell/nu-ansi-term](https://github.com/nushell/nu-ansi-term) |
-| `num-bigint` | 0.4.6 | `MIT OR Apache-2.0` | [https://github.com/rust-num/num-bigint](https://github.com/rust-num/num-bigint) |
+| `num-bigint` | 0.4.8 | `MIT OR Apache-2.0` | [https://github.com/rust-num/num-bigint](https://github.com/rust-num/num-bigint) |
+| `num-bigint-dig` | 0.8.6 | `MIT/Apache-2.0` | [https://github.com/dignifiedquire/num-bigint](https://github.com/dignifiedquire/num-bigint) |
 | `num-conv` | 0.2.2 | `MIT OR Apache-2.0` | [https://github.com/jhpratt/num-conv](https://github.com/jhpratt/num-conv) |
-| `num-integer` | 0.1.46 | `MIT OR Apache-2.0` | [https://github.com/rust-num/num-integer](https://github.com/rust-num/num-integer) |
+| `num-integer` | 0.1.47 | `MIT OR Apache-2.0` | [https://github.com/rust-num/num-integer](https://github.com/rust-num/num-integer) |
+| `num-iter` | 0.1.46 | `MIT OR Apache-2.0` | [https://github.com/rust-num/num-iter](https://github.com/rust-num/num-iter) |
 | `num-traits` | 0.2.19 | `MIT OR Apache-2.0` | [https://github.com/rust-num/num-traits](https://github.com/rust-num/num-traits) |
 | `num_cpus` | 1.17.0 | `MIT OR Apache-2.0` | [https://github.com/seanmonstar/num_cpus](https://github.com/seanmonstar/num_cpus) |
 | `objc2` | 0.6.4 | `MIT` | [https://github.com/madsmtm/objc2](https://github.com/madsmtm/objc2) |
@@ -302,16 +333,17 @@ Each `skills/<slug>/SKILL.md` carries `license: CC-BY-4.0` in its YAML frontmatt
 | `objc2-foundation` | 0.3.2 | `MIT` | [https://github.com/madsmtm/objc2](https://github.com/madsmtm/objc2) |
 | `once_cell` | 1.21.4 | `MIT OR Apache-2.0` | [https://github.com/matklad/once_cell](https://github.com/matklad/once_cell) |
 | `once_cell_polyfill` | 1.70.2 | `MIT OR Apache-2.0` | [https://github.com/polyfill-rs/once_cell_polyfill](https://github.com/polyfill-rs/once_cell_polyfill) |
+| `oorandom` | 11.1.5 | `MIT` | [https://hg.sr.ht/~icefox/oorandom](https://hg.sr.ht/~icefox/oorandom) |
 | `opendal` | 0.50.2 | `Apache-2.0` | [https://github.com/apache/opendal](https://github.com/apache/opendal) |
 | `openssl-probe` | 0.2.1 | `MIT OR Apache-2.0` | [https://github.com/rustls/openssl-probe](https://github.com/rustls/openssl-probe) |
-| `opentelemetry` | 0.31.0 | `Apache-2.0` | [https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry](https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry) |
-| `opentelemetry-http` | 0.31.0 | `Apache-2.0` | [https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-http](https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-http) |
-| `opentelemetry-otlp` | 0.31.1 | `Apache-2.0` | [https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-otlp](https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-otlp) |
-| `opentelemetry-proto` | 0.31.0 | `Apache-2.0` | [https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto](https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto) |
-| `opentelemetry_sdk` | 0.31.0 | `Apache-2.0` | [https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-sdk](https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-sdk) |
+| `opentelemetry` | 0.32.0 | `Apache-2.0` | [https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry](https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry) |
+| `opentelemetry-http` | 0.32.0 | `Apache-2.0` | [https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-http](https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-http) |
+| `opentelemetry-otlp` | 0.32.0 | `Apache-2.0` | [https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-otlp](https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-otlp) |
+| `opentelemetry-proto` | 0.32.0 | `Apache-2.0` | [https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto](https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto) |
+| `opentelemetry_sdk` | 0.32.1 | `Apache-2.0` | [https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-sdk](https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-sdk) |
 | `ordered-multimap` | 0.7.3 | `MIT` | [https://github.com/sgodwincs/ordered-multimap-rs](https://github.com/sgodwincs/ordered-multimap-rs) |
 | `outref` | 0.5.2 | `MIT` | [https://github.com/Nugine/outref](https://github.com/Nugine/outref) |
-| `owo-colors` | 4.3.0 | `MIT` | [https://github.com/owo-colors/owo-colors](https://github.com/owo-colors/owo-colors) |
+| `owo-colors` | 4.4.0 | `MIT` | [https://github.com/owo-colors/owo-colors](https://github.com/owo-colors/owo-colors) |
 | `oxc-miette` | 2.7.1 | `Apache-2.0` | [https://github.com/oxc-project/oxc-miette](https://github.com/oxc-project/oxc-miette) |
 | `oxc-miette-derive` | 2.7.1 | `Apache-2.0` | [https://github.com/oxc-project/oxc-miette](https://github.com/oxc-project/oxc-miette) |
 | `oxc_allocator` | 0.114.0 | `MIT` | [https://github.com/oxc-project/oxc](https://github.com/oxc-project/oxc) |
@@ -327,6 +359,9 @@ Each `skills/<slug>/SKILL.md` carries `license: CC-BY-4.0` in its YAML frontmatt
 | `oxc_span` | 0.114.0 | `MIT` | [https://github.com/oxc-project/oxc](https://github.com/oxc-project/oxc) |
 | `oxc_str` | 0.114.0 | `MIT` | [https://github.com/oxc-project/oxc](https://github.com/oxc-project/oxc) |
 | `oxc_syntax` | 0.114.0 | `MIT` | [https://github.com/oxc-project/oxc](https://github.com/oxc-project/oxc) |
+| `p256` | 0.13.2 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/elliptic-curves/tree/master/p256](https://github.com/RustCrypto/elliptic-curves/tree/master/p256) |
+| `p384` | 0.13.1 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/elliptic-curves/tree/master/p384](https://github.com/RustCrypto/elliptic-curves/tree/master/p384) |
+| `page_size` | 0.6.0 | `MIT/Apache-2.0` | [https://github.com/Elzair/page_size_rs](https://github.com/Elzair/page_size_rs) |
 | `parking` | 2.2.1 | `Apache-2.0 OR MIT` | [https://github.com/smol-rs/parking](https://github.com/smol-rs/parking) |
 | `parking_lot` | 0.12.5 | `MIT OR Apache-2.0` | [https://github.com/Amanieu/parking_lot](https://github.com/Amanieu/parking_lot) |
 | `parking_lot_core` | 0.9.12 | `MIT OR Apache-2.0` | [https://github.com/Amanieu/parking_lot](https://github.com/Amanieu/parking_lot) |
@@ -335,6 +370,7 @@ Each `skills/<slug>/SKILL.md` carries `license: CC-BY-4.0` in its YAML frontmatt
 | `pear` | 0.2.9 | `MIT OR Apache-2.0` | [https://github.com/SergioBenitez/Pear](https://github.com/SergioBenitez/Pear) |
 | `pear_codegen` | 0.2.9 | `MIT OR Apache-2.0` | [https://github.com/SergioBenitez/Pear](https://github.com/SergioBenitez/Pear) |
 | `pem` | 3.0.6 | `MIT` | [https://github.com/jcreekmore/pem-rs.git](https://github.com/jcreekmore/pem-rs.git) |
+| `pem-rfc7468` | 0.7.0 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/formats/tree/master/pem-rfc7468](https://github.com/RustCrypto/formats/tree/master/pem-rfc7468) |
 | `percent-encoding` | 2.3.2 | `MIT OR Apache-2.0` | [https://github.com/servo/rust-url/](https://github.com/servo/rust-url/) |
 | `petgraph` | 0.7.1 | `MIT OR Apache-2.0` | [https://github.com/petgraph/petgraph](https://github.com/petgraph/petgraph) |
 | `petgraph` | 0.8.3 | `MIT OR Apache-2.0` | [https://github.com/petgraph/petgraph](https://github.com/petgraph/petgraph) |
@@ -346,23 +382,26 @@ Each `skills/<slug>/SKILL.md` carries `license: CC-BY-4.0` in its YAML frontmatt
 | `pin-project-internal` | 1.1.13 | `Apache-2.0 OR MIT` | [https://github.com/taiki-e/pin-project](https://github.com/taiki-e/pin-project) |
 | `pin-project-lite` | 0.2.17 | `Apache-2.0 OR MIT` | [https://github.com/taiki-e/pin-project-lite](https://github.com/taiki-e/pin-project-lite) |
 | `pin-utils` | 0.1.0 | `MIT OR Apache-2.0` | [https://github.com/rust-lang-nursery/pin-utils](https://github.com/rust-lang-nursery/pin-utils) |
-| `pkg-config` | 0.3.33 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/pkg-config-rs](https://github.com/rust-lang/pkg-config-rs) |
-| `portable-atomic` | 1.13.1 | `Apache-2.0 OR MIT` | [https://github.com/taiki-e/portable-atomic](https://github.com/taiki-e/portable-atomic) |
-| `potential_utf` | 0.1.5 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `pkcs1` | 0.7.5 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/formats/tree/master/pkcs1](https://github.com/RustCrypto/formats/tree/master/pkcs1) |
+| `pkcs8` | 0.10.2 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/formats/tree/master/pkcs8](https://github.com/RustCrypto/formats/tree/master/pkcs8) |
+| `pkg-config` | 0.3.34 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/pkg-config-rs](https://github.com/rust-lang/pkg-config-rs) |
+| `portable-atomic` | 1.15.0 | `Apache-2.0 OR MIT` | [https://github.com/taiki-e/portable-atomic](https://github.com/taiki-e/portable-atomic) |
+| `potential_utf` | 0.1.6 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
 | `powerfmt` | 0.2.0 | `MIT OR Apache-2.0` | [https://github.com/jhpratt/powerfmt](https://github.com/jhpratt/powerfmt) |
 | `ppv-lite86` | 0.2.21 | `MIT OR Apache-2.0` | [https://github.com/cryptocorrosion/cryptocorrosion](https://github.com/cryptocorrosion/cryptocorrosion) |
 | `prettyplease` | 0.2.37 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/prettyplease](https://github.com/dtolnay/prettyplease) |
-| `proc-macro2` | 1.0.106 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/proc-macro2](https://github.com/dtolnay/proc-macro2) |
+| `primeorder` | 0.13.6 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/elliptic-curves/tree/master/primeorder](https://github.com/RustCrypto/elliptic-curves/tree/master/primeorder) |
+| `proc-macro2` | 1.0.107 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/proc-macro2](https://github.com/dtolnay/proc-macro2) |
 | `proc-macro2-diagnostics` | 0.10.1 | `MIT/Apache-2.0` | [https://github.com/SergioBenitez/proc-macro2-diagnostics](https://github.com/SergioBenitez/proc-macro2-diagnostics) |
-| `process-wrap` | 9.1.0 | `Apache-2.0 OR MIT` | [https://github.com/watchexec/process-wrap](https://github.com/watchexec/process-wrap) |
+| `process-wrap` | 10.0.0 | `Apache-2.0 OR MIT` | [https://github.com/watchexec/process-wrap](https://github.com/watchexec/process-wrap) |
 | `prost` | 0.13.5 | `Apache-2.0` | [https://github.com/tokio-rs/prost](https://github.com/tokio-rs/prost) |
-| `prost` | 0.14.3 | `Apache-2.0` | [https://github.com/tokio-rs/prost](https://github.com/tokio-rs/prost) |
+| `prost` | 0.14.4 | `Apache-2.0` | [https://github.com/tokio-rs/prost](https://github.com/tokio-rs/prost) |
 | `prost-build` | 0.13.5 | `Apache-2.0` | [https://github.com/tokio-rs/prost](https://github.com/tokio-rs/prost) |
-| `prost-build` | 0.14.3 | `Apache-2.0` | [https://github.com/tokio-rs/prost](https://github.com/tokio-rs/prost) |
+| `prost-build` | 0.14.4 | `Apache-2.0` | [https://github.com/tokio-rs/prost](https://github.com/tokio-rs/prost) |
 | `prost-derive` | 0.13.5 | `Apache-2.0` | [https://github.com/tokio-rs/prost](https://github.com/tokio-rs/prost) |
-| `prost-derive` | 0.14.3 | `Apache-2.0` | [https://github.com/tokio-rs/prost](https://github.com/tokio-rs/prost) |
+| `prost-derive` | 0.14.4 | `Apache-2.0` | [https://github.com/tokio-rs/prost](https://github.com/tokio-rs/prost) |
 | `prost-types` | 0.13.5 | `Apache-2.0` | [https://github.com/tokio-rs/prost](https://github.com/tokio-rs/prost) |
-| `prost-types` | 0.14.3 | `Apache-2.0` | [https://github.com/tokio-rs/prost](https://github.com/tokio-rs/prost) |
+| `prost-types` | 0.14.4 | `Apache-2.0` | [https://github.com/tokio-rs/prost](https://github.com/tokio-rs/prost) |
 | `protoc-bin-vendored` | 3.2.0 | `MIT` | [https://github.com/stepancheg/rust-protoc-bin-vendored/](https://github.com/stepancheg/rust-protoc-bin-vendored/) |
 | `protoc-bin-vendored-linux-aarch_64` | 3.2.0 | `MIT` | [https://github.com/stepancheg/rust-protoc-bin-vendored/](https://github.com/stepancheg/rust-protoc-bin-vendored/) |
 | `protoc-bin-vendored-linux-ppcle_64` | 3.2.0 | `MIT` | [https://github.com/stepancheg/rust-protoc-bin-vendored/](https://github.com/stepancheg/rust-protoc-bin-vendored/) |
@@ -373,7 +412,7 @@ Each `skills/<slug>/SKILL.md` carries `license: CC-BY-4.0` in its YAML frontmatt
 | `protoc-bin-vendored-macos-x86_64` | 3.2.0 | `MIT` | [https://github.com/stepancheg/rust-protoc-bin-vendored/](https://github.com/stepancheg/rust-protoc-bin-vendored/) |
 | `protoc-bin-vendored-win32` | 3.2.0 | `MIT` | [https://github.com/stepancheg/rust-protoc-bin-vendored/](https://github.com/stepancheg/rust-protoc-bin-vendored/) |
 | `pulldown-cmark` | 0.13.4 | `MIT` | [https://github.com/raphlinus/pulldown-cmark](https://github.com/raphlinus/pulldown-cmark) |
-| `pulldown-cmark-to-cmark` | 22.0.0 | `Apache-2.0` | [https://github.com/Byron/pulldown-cmark-to-cmark](https://github.com/Byron/pulldown-cmark-to-cmark) |
+| `pulldown-cmark-to-cmark` | 22.0.1 | `Apache-2.0` | [https://github.com/Byron/pulldown-cmark-to-cmark](https://github.com/Byron/pulldown-cmark-to-cmark) |
 | `pyo3` | 0.21.2 | `MIT OR Apache-2.0` | [https://github.com/pyo3/pyo3](https://github.com/pyo3/pyo3) |
 | `pyo3-async-runtimes` | 0.21.0 | `Apache-2.0` | [https://github.com/PyO3/pyo3-async-runtimes](https://github.com/PyO3/pyo3-async-runtimes) |
 | `pyo3-build-config` | 0.21.2 | `MIT OR Apache-2.0` | [https://github.com/pyo3/pyo3](https://github.com/pyo3/pyo3) |
@@ -384,68 +423,77 @@ Each `skills/<slug>/SKILL.md` carries `license: CC-BY-4.0` in its YAML frontmatt
 | `quanta` | 0.12.6 | `MIT` | [https://github.com/metrics-rs/quanta](https://github.com/metrics-rs/quanta) |
 | `quick-xml` | 0.36.2 | `MIT` | [https://github.com/tafia/quick-xml](https://github.com/tafia/quick-xml) |
 | `quick-xml` | 0.37.5 | `MIT` | [https://github.com/tafia/quick-xml](https://github.com/tafia/quick-xml) |
-| `quinn` | 0.11.9 | `MIT OR Apache-2.0` | [https://github.com/quinn-rs/quinn](https://github.com/quinn-rs/quinn) |
-| `quinn-proto` | 0.11.14 | `MIT OR Apache-2.0` | [https://github.com/quinn-rs/quinn](https://github.com/quinn-rs/quinn) |
-| `quinn-udp` | 0.5.14 | `MIT OR Apache-2.0` | [https://github.com/quinn-rs/quinn](https://github.com/quinn-rs/quinn) |
-| `quote` | 1.0.45 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/quote](https://github.com/dtolnay/quote) |
+| `quinn` | 0.11.12 | `MIT OR Apache-2.0` | [https://github.com/quinn-rs/quinn](https://github.com/quinn-rs/quinn) |
+| `quinn-proto` | 0.11.18 | `MIT OR Apache-2.0` | [https://github.com/quinn-rs/quinn](https://github.com/quinn-rs/quinn) |
+| `quinn-udp` | 0.5.15 | `MIT OR Apache-2.0` | [https://github.com/quinn-rs/quinn](https://github.com/quinn-rs/quinn) |
+| `quote` | 1.0.47 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/quote](https://github.com/dtolnay/quote) |
 | `r-efi` | 5.3.0 | `MIT OR Apache-2.0 OR LGPL-2.1-or-later` | [https://github.com/r-efi/r-efi](https://github.com/r-efi/r-efi) |
 | `r-efi` | 6.0.0 | `MIT OR Apache-2.0 OR LGPL-2.1-or-later` | [https://github.com/r-efi/r-efi](https://github.com/r-efi/r-efi) |
 | `radix_trie` | 0.2.1 | `MIT` | [https://github.com/michaelsproul/rust_radix_trie](https://github.com/michaelsproul/rust_radix_trie) |
-| `rand` | 0.8.6 | `MIT OR Apache-2.0` | [https://github.com/rust-random/rand](https://github.com/rust-random/rand) |
-| `rand` | 0.9.4 | `MIT OR Apache-2.0` | [https://github.com/rust-random/rand](https://github.com/rust-random/rand) |
+| `rand` | 0.10.2 | `MIT OR Apache-2.0` | [https://github.com/rust-random/rand](https://github.com/rust-random/rand) |
+| `rand` | 0.8.8 | `MIT OR Apache-2.0` | [https://github.com/rust-random/rand](https://github.com/rust-random/rand) |
+| `rand` | 0.9.5 | `MIT OR Apache-2.0` | [https://github.com/rust-random/rand](https://github.com/rust-random/rand) |
 | `rand_chacha` | 0.3.1 | `MIT OR Apache-2.0` | [https://github.com/rust-random/rand](https://github.com/rust-random/rand) |
 | `rand_chacha` | 0.9.0 | `MIT OR Apache-2.0` | [https://github.com/rust-random/rand](https://github.com/rust-random/rand) |
+| `rand_core` | 0.10.1 | `MIT OR Apache-2.0` | [https://github.com/rust-random/rand_core](https://github.com/rust-random/rand_core) |
 | `rand_core` | 0.6.4 | `MIT OR Apache-2.0` | [https://github.com/rust-random/rand](https://github.com/rust-random/rand) |
 | `rand_core` | 0.9.5 | `MIT OR Apache-2.0` | [https://github.com/rust-random/rand](https://github.com/rust-random/rand) |
+| `rand_pcg` | 0.10.2 | `MIT OR Apache-2.0` | [https://github.com/rust-random/rngs](https://github.com/rust-random/rngs) |
 | `rand_xoshiro` | 0.7.0 | `MIT OR Apache-2.0` | [https://github.com/rust-random/rngs](https://github.com/rust-random/rngs) |
-| `rapidhash` | 4.4.1 | `MIT OR Apache-2.0` | [https://github.com/hoxxep/rapidhash](https://github.com/hoxxep/rapidhash) |
+| `rapidhash` | 4.5.1 | `MIT OR Apache-2.0` | [https://github.com/hoxxep/rapidhash](https://github.com/hoxxep/rapidhash) |
 | `raw-cpuid` | 11.6.0 | `MIT` | [https://github.com/gz/rust-cpuid](https://github.com/gz/rust-cpuid) |
 | `redox_syscall` | 0.5.18 | `MIT` | [https://gitlab.redox-os.org/redox-os/syscall](https://gitlab.redox-os.org/redox-os/syscall) |
-| `ref-cast` | 1.0.25 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/ref-cast](https://github.com/dtolnay/ref-cast) |
-| `ref-cast-impl` | 1.0.25 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/ref-cast](https://github.com/dtolnay/ref-cast) |
-| `regex` | 1.12.3 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/regex](https://github.com/rust-lang/regex) |
-| `regex-automata` | 0.4.14 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/regex](https://github.com/rust-lang/regex) |
+| `ref-cast` | 1.0.27 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/ref-cast](https://github.com/dtolnay/ref-cast) |
+| `ref-cast-impl` | 1.0.27 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/ref-cast](https://github.com/dtolnay/ref-cast) |
+| `regex` | 1.13.1 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/regex](https://github.com/rust-lang/regex) |
+| `regex-automata` | 0.4.18 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/regex](https://github.com/rust-lang/regex) |
 | `regex-lite` | 0.1.9 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/regex](https://github.com/rust-lang/regex) |
-| `regex-syntax` | 0.8.10 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/regex](https://github.com/rust-lang/regex) |
+| `regex-syntax` | 0.8.11 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/regex](https://github.com/rust-lang/regex) |
 | `reqsign` | 0.16.5 | `Apache-2.0` | [https://github.com/Xuanwo/reqsign](https://github.com/Xuanwo/reqsign) |
 | `reqwest` | 0.12.28 | `MIT OR Apache-2.0` | [https://github.com/seanmonstar/reqwest](https://github.com/seanmonstar/reqwest) |
+| `reqwest` | 0.13.5 | `MIT OR Apache-2.0` | [https://github.com/seanmonstar/reqwest](https://github.com/seanmonstar/reqwest) |
+| `rfc6979` | 0.4.0 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/signatures/tree/master/rfc6979](https://github.com/RustCrypto/signatures/tree/master/rfc6979) |
 | `ring` | 0.17.14 | `Apache-2.0 AND ISC` | [https://github.com/briansmith/ring](https://github.com/briansmith/ring) |
-| `rmcp` | 3.1.2 | `Apache-2.0` | [https://github.com/modelcontextprotocol/rust-sdk/](https://github.com/modelcontextprotocol/rust-sdk/) |
-| `rmcp-macros` | 3.1.2 | `Apache-2.0` | [https://github.com/modelcontextprotocol/rust-sdk/](https://github.com/modelcontextprotocol/rust-sdk/) |
+| `rmcp` | 3.4.0 | `Apache-2.0` | [https://github.com/modelcontextprotocol/rust-sdk/](https://github.com/modelcontextprotocol/rust-sdk/) |
+| `rmcp-macros` | 3.4.0 | `Apache-2.0` | [https://github.com/modelcontextprotocol/rust-sdk/](https://github.com/modelcontextprotocol/rust-sdk/) |
+| `rsa` | 0.9.10 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/RSA](https://github.com/RustCrypto/RSA) |
 | `rsqlite-vfs` | 0.1.1 | `MIT` | — |
 | `rusqlite` | 0.39.0 | `MIT` | [https://github.com/rusqlite/rusqlite](https://github.com/rusqlite/rusqlite) |
 | `rust-ini` | 0.21.3 | `MIT` | [https://github.com/zonyitoo/rust-ini](https://github.com/zonyitoo/rust-ini) |
-| `rustc-hash` | 2.1.2 | `Apache-2.0 OR MIT` | [https://github.com/rust-lang/rustc-hash](https://github.com/rust-lang/rustc-hash) |
+| `rustc-hash` | 2.1.3 | `Apache-2.0 OR MIT` | [https://github.com/rust-lang/rustc-hash](https://github.com/rust-lang/rustc-hash) |
 | `rustc_version` | 0.4.1 | `MIT OR Apache-2.0` | [https://github.com/djc/rustc-version-rs](https://github.com/djc/rustc-version-rs) |
 | `rustix` | 1.1.4 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/bytecodealliance/rustix](https://github.com/bytecodealliance/rustix) |
-| `rustls` | 0.23.40 | `Apache-2.0 OR ISC OR MIT` | [https://github.com/rustls/rustls](https://github.com/rustls/rustls) |
+| `rustls` | 0.23.45 | `Apache-2.0 OR ISC OR MIT` | [https://github.com/rustls/rustls](https://github.com/rustls/rustls) |
 | `rustls-native-certs` | 0.8.4 | `Apache-2.0 OR ISC OR MIT` | [https://github.com/rustls/rustls-native-certs](https://github.com/rustls/rustls-native-certs) |
 | `rustls-pemfile` | 2.2.0 | `Apache-2.0 OR ISC OR MIT` | [https://github.com/rustls/pemfile](https://github.com/rustls/pemfile) |
-| `rustls-pki-types` | 1.14.1 | `MIT OR Apache-2.0` | [https://github.com/rustls/pki-types](https://github.com/rustls/pki-types) |
-| `rustls-webpki` | 0.103.13 | `ISC` | [https://github.com/rustls/webpki](https://github.com/rustls/webpki) |
-| `rustversion` | 1.0.22 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/rustversion](https://github.com/dtolnay/rustversion) |
+| `rustls-pki-types` | 1.15.1 | `MIT OR Apache-2.0` | [https://github.com/rustls/pki-types](https://github.com/rustls/pki-types) |
+| `rustls-platform-verifier` | 0.7.0 | `MIT OR Apache-2.0` | [https://github.com/rustls/rustls-platform-verifier](https://github.com/rustls/rustls-platform-verifier) |
+| `rustls-platform-verifier-android` | 0.1.1 | `MIT OR Apache-2.0` | [https://github.com/rustls/rustls-platform-verifier](https://github.com/rustls/rustls-platform-verifier) |
+| `rustls-webpki` | 0.103.15 | `ISC` | [https://github.com/rustls/webpki](https://github.com/rustls/webpki) |
+| `rustversion` | 1.0.23 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/rustversion](https://github.com/dtolnay/rustversion) |
 | `rustyline` | 14.0.0 | `MIT` | [https://github.com/kkawakam/rustyline](https://github.com/kkawakam/rustyline) |
 | `ryu` | 1.0.23 | `Apache-2.0 OR BSL-1.0` | [https://github.com/dtolnay/ryu](https://github.com/dtolnay/ryu) |
 | `same-file` | 1.0.6 | `Unlicense/MIT` | [https://github.com/BurntSushi/same-file](https://github.com/BurntSushi/same-file) |
 | `schannel` | 0.1.29 | `MIT` | [https://github.com/steffengy/schannel-rs](https://github.com/steffengy/schannel-rs) |
-| `schemars` | 1.2.1 | `MIT` | [https://github.com/GREsau/schemars](https://github.com/GREsau/schemars) |
-| `schemars_derive` | 1.2.1 | `MIT` | [https://github.com/GREsau/schemars](https://github.com/GREsau/schemars) |
+| `schemars` | 1.2.2 | `MIT` | [https://github.com/GREsau/schemars](https://github.com/GREsau/schemars) |
+| `schemars_derive` | 1.2.2 | `MIT` | [https://github.com/GREsau/schemars](https://github.com/GREsau/schemars) |
 | `scopeguard` | 1.2.0 | `MIT OR Apache-2.0` | [https://github.com/bluss/scopeguard](https://github.com/bluss/scopeguard) |
+| `sec1` | 0.7.3 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/formats/tree/master/sec1](https://github.com/RustCrypto/formats/tree/master/sec1) |
 | `security-framework` | 3.7.0 | `MIT OR Apache-2.0` | [https://github.com/kornelski/rust-security-framework](https://github.com/kornelski/rust-security-framework) |
 | `security-framework-sys` | 2.17.0 | `MIT OR Apache-2.0` | [https://github.com/kornelski/rust-security-framework](https://github.com/kornelski/rust-security-framework) |
 | `semver` | 1.0.28 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/semver](https://github.com/dtolnay/semver) |
 | `seq-macro` | 0.3.6 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/seq-macro](https://github.com/dtolnay/seq-macro) |
-| `serde` | 1.0.228 | `MIT OR Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
-| `serde_core` | 1.0.228 | `MIT OR Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
-| `serde_derive` | 1.0.228 | `MIT OR Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
-| `serde_derive_internals` | 0.29.1 | `MIT OR Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
-| `serde_json` | 1.0.150 | `MIT OR Apache-2.0` | [https://github.com/serde-rs/json](https://github.com/serde-rs/json) |
+| `serde` | 1.0.229 | `MIT OR Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
+| `serde_core` | 1.0.229 | `MIT OR Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
+| `serde_derive` | 1.0.229 | `MIT OR Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
+| `serde_derive_internals` | 0.30.0 | `MIT OR Apache-2.0` | [https://github.com/serde-rs/serde](https://github.com/serde-rs/serde) |
+| `serde_json` | 1.0.151 | `MIT OR Apache-2.0` | [https://github.com/serde-rs/json](https://github.com/serde-rs/json) |
 | `serde_path_to_error` | 0.1.20 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/path-to-error](https://github.com/dtolnay/path-to-error) |
 | `serde_spanned` | 0.6.9 | `MIT OR Apache-2.0` | [https://github.com/toml-rs/toml](https://github.com/toml-rs/toml) |
 | `serde_spanned` | 1.1.1 | `MIT OR Apache-2.0` | [https://github.com/toml-rs/toml](https://github.com/toml-rs/toml) |
 | `serde_urlencoded` | 0.7.1 | `MIT/Apache-2.0` | [https://github.com/nox/serde_urlencoded](https://github.com/nox/serde_urlencoded) |
 | `serde_yaml` | 0.9.34+deprecated | `MIT OR Apache-2.0` | [https://github.com/dtolnay/serde-yaml](https://github.com/dtolnay/serde-yaml) |
-| `sha1` | 0.10.6 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
+| `sha1` | 0.10.7 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
 | `sha1` | 0.11.0 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
 | `sha2` | 0.10.9 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
 | `sha2` | 0.11.0 | `MIT OR Apache-2.0` | [https://github.com/RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
@@ -455,56 +503,59 @@ Each `skills/<slug>/SKILL.md` carries `license: CC-BY-4.0` in its YAML frontmatt
 | `signal-hook` | 0.3.18 | `Apache-2.0/MIT` | [https://github.com/vorner/signal-hook](https://github.com/vorner/signal-hook) |
 | `signal-hook-mio` | 0.2.5 | `MIT OR Apache-2.0` | [https://github.com/vorner/signal-hook](https://github.com/vorner/signal-hook) |
 | `signal-hook-registry` | 1.4.8 | `MIT OR Apache-2.0` | [https://github.com/vorner/signal-hook](https://github.com/vorner/signal-hook) |
-| `simd-adler32` | 0.3.9 | `MIT` | [https://github.com/mcountryman/simd-adler32](https://github.com/mcountryman/simd-adler32) |
-| `simd_cesu8` | 1.1.1 | `Apache-2.0 OR MIT` | [https://github.com/seancroach/simd_cesu8](https://github.com/seancroach/simd_cesu8) |
+| `signature` | 2.2.0 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/traits/tree/master/signature](https://github.com/RustCrypto/traits/tree/master/signature) |
+| `simd-adler32` | 0.3.10 | `MIT` | [https://github.com/mcountryman/simd-adler32](https://github.com/mcountryman/simd-adler32) |
+| `simd_cesu8` | 1.2.0 | `Apache-2.0 OR MIT` | [https://github.com/seancroach/simd_cesu8](https://github.com/seancroach/simd_cesu8) |
 | `simdutf8` | 0.1.5 | `MIT OR Apache-2.0` | [https://github.com/rusticstuff/simdutf8](https://github.com/rusticstuff/simdutf8) |
 | `simple_asn1` | 0.6.4 | `ISC` | [https://github.com/acw/simple_asn1](https://github.com/acw/simple_asn1) |
 | `siphasher` | 1.0.3 | `MIT/Apache-2.0` | [https://github.com/jedisct1/rust-siphash](https://github.com/jedisct1/rust-siphash) |
 | `sketches-ddsketch` | 0.3.1 | `Apache-2.0` | [https://github.com/mheffner/rust-sketches-ddsketch](https://github.com/mheffner/rust-sketches-ddsketch) |
 | `slab` | 0.4.12 | `MIT` | [https://github.com/tokio-rs/slab](https://github.com/tokio-rs/slab) |
-| `smallvec` | 1.15.1 | `MIT OR Apache-2.0` | [https://github.com/servo/rust-smallvec](https://github.com/servo/rust-smallvec) |
-| `smawk` | 0.3.2 | `MIT` | [https://github.com/mgeisler/smawk](https://github.com/mgeisler/smawk) |
+| `smallvec` | 1.16.1 | `MIT OR Apache-2.0` | [https://github.com/servo/rust-smallvec](https://github.com/servo/rust-smallvec) |
+| `smawk` | 0.3.3 | `MIT` | [https://github.com/mgeisler/smawk](https://github.com/mgeisler/smawk) |
 | `socket2` | 0.5.10 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/socket2](https://github.com/rust-lang/socket2) |
-| `socket2` | 0.6.4 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/socket2](https://github.com/rust-lang/socket2) |
+| `socket2` | 0.6.5 | `MIT OR Apache-2.0` | [https://github.com/rust-lang/socket2](https://github.com/rust-lang/socket2) |
 | `spin` | 0.10.1 | `MIT` | [https://github.com/mvdnes/spin-rs.git](https://github.com/mvdnes/spin-rs.git) |
+| `spin` | 0.9.9 | `MIT` | [https://github.com/mvdnes/spin-rs.git](https://github.com/mvdnes/spin-rs.git) |
+| `spki` | 0.7.3 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/formats/tree/master/spki](https://github.com/RustCrypto/formats/tree/master/spki) |
 | `sqlite-wasm-rs` | 0.5.5 | `MIT` | [https://github.com/Spxg/sqlite-wasm-rs](https://github.com/Spxg/sqlite-wasm-rs) |
 | `stable_deref_trait` | 1.2.1 | `MIT OR Apache-2.0` | [https://github.com/storyyeller/stable_deref_trait](https://github.com/storyyeller/stable_deref_trait) |
 | `static_assertions` | 1.1.0 | `MIT OR Apache-2.0` | [https://github.com/nvzqz/static-assertions-rs](https://github.com/nvzqz/static-assertions-rs) |
 | `strsim` | 0.11.1 | `MIT` | [https://github.com/rapidfuzz/strsim-rs](https://github.com/rapidfuzz/strsim-rs) |
 | `subtle` | 2.6.1 | `BSD-3-Clause` | [https://github.com/dalek-cryptography/subtle](https://github.com/dalek-cryptography/subtle) |
-| `syn` | 2.0.117 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/syn](https://github.com/dtolnay/syn) |
-| `syn` | 3.0.3 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/syn](https://github.com/dtolnay/syn) |
+| `syn` | 2.0.119 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/syn](https://github.com/dtolnay/syn) |
+| `syn` | 3.0.5 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/syn](https://github.com/dtolnay/syn) |
 | `sync_wrapper` | 1.0.2 | `Apache-2.0` | [https://github.com/Actyx/sync_wrapper](https://github.com/Actyx/sync_wrapper) |
-| `synstructure` | 0.13.2 | `MIT` | [https://github.com/mystor/synstructure](https://github.com/mystor/synstructure) |
+| `synstructure` | 0.14.0 | `MIT` | [https://github.com/mystor/synstructure](https://github.com/mystor/synstructure) |
 | `target-lexicon` | 0.12.16 | `Apache-2.0 WITH LLVM-exception` | [https://github.com/bytecodealliance/target-lexicon](https://github.com/bytecodealliance/target-lexicon) |
 | `tempfile` | 3.27.0 | `MIT OR Apache-2.0` | [https://github.com/Stebalien/tempfile](https://github.com/Stebalien/tempfile) |
-| `textwrap` | 0.16.2 | `MIT` | [https://github.com/mgeisler/textwrap](https://github.com/mgeisler/textwrap) |
+| `textwrap` | 0.16.4 | `MIT` | [https://github.com/mgeisler/textwrap](https://github.com/mgeisler/textwrap) |
 | `thiserror` | 1.0.69 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
-| `thiserror` | 2.0.18 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
+| `thiserror` | 2.0.20 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
 | `thiserror-impl` | 1.0.69 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
-| `thiserror-impl` | 2.0.18 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
-| `thread_local` | 1.1.9 | `MIT OR Apache-2.0` | [https://github.com/Amanieu/thread_local-rs](https://github.com/Amanieu/thread_local-rs) |
-| `time` | 0.3.47 | `MIT OR Apache-2.0` | [https://github.com/time-rs/time](https://github.com/time-rs/time) |
-| `time-core` | 0.1.8 | `MIT OR Apache-2.0` | [https://github.com/time-rs/time](https://github.com/time-rs/time) |
-| `time-macros` | 0.2.27 | `MIT OR Apache-2.0` | [https://github.com/time-rs/time](https://github.com/time-rs/time) |
+| `thiserror-impl` | 2.0.20 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/thiserror](https://github.com/dtolnay/thiserror) |
+| `thread_local` | 1.1.10 | `MIT OR Apache-2.0` | [https://github.com/Amanieu/thread_local-rs](https://github.com/Amanieu/thread_local-rs) |
+| `time` | 0.3.55 | `MIT OR Apache-2.0` | [https://github.com/time-rs/time](https://github.com/time-rs/time) |
+| `time-core` | 0.1.9 | `MIT OR Apache-2.0` | [https://github.com/time-rs/time](https://github.com/time-rs/time) |
+| `time-macros` | 0.2.32 | `MIT OR Apache-2.0` | [https://github.com/time-rs/time](https://github.com/time-rs/time) |
 | `tiny-keccak` | 2.0.2 | `CC0-1.0` | — |
-| `tinystr` | 0.8.3 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `tinyvec` | 1.11.0 | `Zlib OR Apache-2.0 OR MIT` | [https://github.com/Lokathor/tinyvec](https://github.com/Lokathor/tinyvec) |
-| `tinyvec_macros` | 0.1.1 | `MIT OR Apache-2.0 OR Zlib` | [https://github.com/Soveu/tinyvec_macros](https://github.com/Soveu/tinyvec_macros) |
-| `tokio` | 1.52.3 | `MIT` | [https://github.com/tokio-rs/tokio](https://github.com/tokio-rs/tokio) |
-| `tokio-macros` | 2.7.0 | `MIT` | [https://github.com/tokio-rs/tokio](https://github.com/tokio-rs/tokio) |
-| `tokio-rustls` | 0.26.4 | `MIT OR Apache-2.0` | [https://github.com/rustls/tokio-rustls](https://github.com/rustls/tokio-rustls) |
-| `tokio-stream` | 0.1.18 | `MIT` | [https://github.com/tokio-rs/tokio](https://github.com/tokio-rs/tokio) |
+| `tinystr` | 0.8.4 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `tinytemplate` | 1.2.1 | `Apache-2.0 OR MIT` | [https://github.com/bheisler/TinyTemplate](https://github.com/bheisler/TinyTemplate) |
+| `tinyvec` | 1.13.3 | `Zlib OR Apache-2.0 OR MIT` | [https://github.com/Lokathor/tinyvec](https://github.com/Lokathor/tinyvec) |
+| `tokio` | 1.53.1 | `MIT` | [https://github.com/tokio-rs/tokio](https://github.com/tokio-rs/tokio) |
+| `tokio-macros` | 2.7.2 | `MIT` | [https://github.com/tokio-rs/tokio](https://github.com/tokio-rs/tokio) |
+| `tokio-rustls` | 0.26.5 | `MIT OR Apache-2.0` | [https://github.com/rustls/tokio-rustls](https://github.com/rustls/tokio-rustls) |
+| `tokio-stream` | 0.1.19 | `MIT` | [https://github.com/tokio-rs/tokio](https://github.com/tokio-rs/tokio) |
 | `tokio-tungstenite` | 0.24.0 | `MIT` | [https://github.com/snapview/tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) |
-| `tokio-util` | 0.7.18 | `MIT` | [https://github.com/tokio-rs/tokio](https://github.com/tokio-rs/tokio) |
+| `tokio-util` | 0.7.19 | `MIT` | [https://github.com/tokio-rs/tokio](https://github.com/tokio-rs/tokio) |
 | `toml` | 0.8.23 | `MIT OR Apache-2.0` | [https://github.com/toml-rs/toml](https://github.com/toml-rs/toml) |
 | `toml` | 0.9.12+spec-1.1.0 | `MIT OR Apache-2.0` | [https://github.com/toml-rs/toml](https://github.com/toml-rs/toml) |
 | `toml_datetime` | 0.6.11 | `MIT OR Apache-2.0` | [https://github.com/toml-rs/toml](https://github.com/toml-rs/toml) |
 | `toml_datetime` | 0.7.5+spec-1.1.0 | `MIT OR Apache-2.0` | [https://github.com/toml-rs/toml](https://github.com/toml-rs/toml) |
 | `toml_edit` | 0.22.27 | `MIT OR Apache-2.0` | [https://github.com/toml-rs/toml](https://github.com/toml-rs/toml) |
-| `toml_parser` | 1.1.2+spec-1.1.0 | `MIT OR Apache-2.0` | [https://github.com/toml-rs/toml](https://github.com/toml-rs/toml) |
+| `toml_parser` | 1.1.3+spec-1.1.0 | `MIT OR Apache-2.0` | [https://github.com/toml-rs/toml](https://github.com/toml-rs/toml) |
 | `toml_write` | 0.1.2 | `MIT OR Apache-2.0` | [https://github.com/toml-rs/toml](https://github.com/toml-rs/toml) |
-| `toml_writer` | 1.1.1+spec-1.1.0 | `MIT OR Apache-2.0` | [https://github.com/toml-rs/toml](https://github.com/toml-rs/toml) |
+| `toml_writer` | 1.1.2+spec-1.1.0 | `MIT OR Apache-2.0` | [https://github.com/toml-rs/toml](https://github.com/toml-rs/toml) |
 | `tonic` | 0.12.3 | `MIT` | [https://github.com/hyperium/tonic](https://github.com/hyperium/tonic) |
 | `tonic` | 0.14.6 | `MIT` | [https://github.com/hyperium/tonic](https://github.com/hyperium/tonic) |
 | `tonic-build` | 0.12.3 | `MIT` | [https://github.com/hyperium/tonic](https://github.com/hyperium/tonic) |
@@ -520,7 +571,7 @@ Each `skills/<slug>/SKILL.md` carries `license: CC-BY-4.0` in its YAML frontmatt
 | `tracing-attributes` | 0.1.31 | `MIT` | [https://github.com/tokio-rs/tracing](https://github.com/tokio-rs/tracing) |
 | `tracing-core` | 0.1.36 | `MIT` | [https://github.com/tokio-rs/tracing](https://github.com/tokio-rs/tracing) |
 | `tracing-log` | 0.2.0 | `MIT` | [https://github.com/tokio-rs/tracing](https://github.com/tokio-rs/tracing) |
-| `tracing-opentelemetry` | 0.32.1 | `MIT` | [https://github.com/tokio-rs/tracing-opentelemetry](https://github.com/tokio-rs/tracing-opentelemetry) |
+| `tracing-opentelemetry` | 0.33.0 | `MIT` | [https://github.com/tokio-rs/tracing-opentelemetry](https://github.com/tokio-rs/tracing-opentelemetry) |
 | `tracing-serde` | 0.2.0 | `MIT` | [https://github.com/tokio-rs/tracing](https://github.com/tokio-rs/tracing) |
 | `tracing-subscriber` | 0.3.23 | `MIT` | [https://github.com/tokio-rs/tracing](https://github.com/tokio-rs/tracing) |
 | `try-lock` | 0.2.5 | `MIT` | [https://github.com/seanmonstar/try-lock](https://github.com/seanmonstar/try-lock) |
@@ -530,11 +581,9 @@ Each `skills/<slug>/SKILL.md` carries `license: CC-BY-4.0` in its YAML frontmatt
 | `unicase` | 2.9.0 | `MIT OR Apache-2.0` | [https://github.com/seanmonstar/unicase](https://github.com/seanmonstar/unicase) |
 | `unicode-id-start` | 1.4.0 | `(MIT OR Apache-2.0) AND Unicode-3.0` | [https://github.com/Boshen/unicode-id-start](https://github.com/Boshen/unicode-id-start) |
 | `unicode-ident` | 1.0.24 | `(MIT OR Apache-2.0) AND Unicode-3.0` | [https://github.com/dtolnay/unicode-ident](https://github.com/dtolnay/unicode-ident) |
-| `unicode-linebreak` | 0.1.5 | `Apache-2.0` | [https://github.com/axelf4/unicode-linebreak](https://github.com/axelf4/unicode-linebreak) |
 | `unicode-segmentation` | 1.13.3 | `MIT OR Apache-2.0` | [https://github.com/unicode-rs/unicode-segmentation](https://github.com/unicode-rs/unicode-segmentation) |
 | `unicode-width` | 0.1.14 | `MIT OR Apache-2.0` | [https://github.com/unicode-rs/unicode-width](https://github.com/unicode-rs/unicode-width) |
 | `unicode-width` | 0.2.2 | `MIT OR Apache-2.0` | [https://github.com/unicode-rs/unicode-width](https://github.com/unicode-rs/unicode-width) |
-| `unicode-xid` | 0.2.6 | `MIT OR Apache-2.0` | [https://github.com/unicode-rs/unicode-xid](https://github.com/unicode-rs/unicode-xid) |
 | `unindent` | 0.2.4 | `MIT OR Apache-2.0` | [https://github.com/dtolnay/indoc](https://github.com/dtolnay/indoc) |
 | `unsafe-libyaml` | 0.2.11 | `MIT` | [https://github.com/dtolnay/unsafe-libyaml](https://github.com/dtolnay/unsafe-libyaml) |
 | `untrusted` | 0.9.0 | `ISC` | [https://github.com/briansmith/untrusted](https://github.com/briansmith/untrusted) |
@@ -546,7 +595,7 @@ Each `skills/<slug>/SKILL.md` carries `license: CC-BY-4.0` in its YAML frontmatt
 | `utoipa` | 5.5.0 | `MIT OR Apache-2.0` | [https://github.com/juhaku/utoipa](https://github.com/juhaku/utoipa) |
 | `utoipa-axum` | 0.2.0 | `MIT OR Apache-2.0` | [https://github.com/juhaku/utoipa](https://github.com/juhaku/utoipa) |
 | `utoipa-gen` | 5.5.0 | `MIT OR Apache-2.0` | [https://github.com/juhaku/utoipa](https://github.com/juhaku/utoipa) |
-| `uuid` | 1.23.2 | `Apache-2.0 OR MIT` | [https://github.com/uuid-rs/uuid](https://github.com/uuid-rs/uuid) |
+| `uuid` | 1.26.1 | `Apache-2.0 OR MIT` | [https://github.com/uuid-rs/uuid](https://github.com/uuid-rs/uuid) |
 | `valuable` | 0.1.1 | `MIT` | [https://github.com/tokio-rs/valuable](https://github.com/tokio-rs/valuable) |
 | `vcpkg` | 0.2.15 | `MIT/Apache-2.0` | [https://github.com/mcgoo/vcpkg-rs](https://github.com/mcgoo/vcpkg-rs) |
 | `version_check` | 0.9.5 | `MIT/Apache-2.0` | [https://github.com/SergioBenitez/version_check](https://github.com/SergioBenitez/version_check) |
@@ -554,21 +603,18 @@ Each `skills/<slug>/SKILL.md` carries `license: CC-BY-4.0` in its YAML frontmatt
 | `walkdir` | 2.5.0 | `Unlicense/MIT` | [https://github.com/BurntSushi/walkdir](https://github.com/BurntSushi/walkdir) |
 | `want` | 0.3.1 | `MIT` | [https://github.com/seanmonstar/want](https://github.com/seanmonstar/want) |
 | `wasi` | 0.11.1+wasi-snapshot-preview1 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/bytecodealliance/wasi](https://github.com/bytecodealliance/wasi) |
-| `wasip2` | 1.0.3+wasi-0.2.9 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/bytecodealliance/wasi-rs](https://github.com/bytecodealliance/wasi-rs) |
-| `wasip3` | 0.4.0+wasi-0.3.0-rc-2026-01-06 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/bytecodealliance/wasi-rs](https://github.com/bytecodealliance/wasi-rs) |
-| `wasm-bindgen` | 0.2.122 | `MIT OR Apache-2.0` | [https://github.com/wasm-bindgen/wasm-bindgen](https://github.com/wasm-bindgen/wasm-bindgen) |
-| `wasm-bindgen-futures` | 0.4.72 | `MIT OR Apache-2.0` | [https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures) |
-| `wasm-bindgen-macro` | 0.2.122 | `MIT OR Apache-2.0` | [https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro) |
-| `wasm-bindgen-macro-support` | 0.2.122 | `MIT OR Apache-2.0` | [https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro-support](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro-support) |
-| `wasm-bindgen-shared` | 0.2.122 | `MIT OR Apache-2.0` | [https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared) |
-| `wasm-encoder` | 0.244.0 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasm-encoder](https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasm-encoder) |
-| `wasm-metadata` | 0.244.0 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasm-metadata](https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasm-metadata) |
+| `wasip2` | 1.0.4+wasi-0.2.12 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/bytecodealliance/wasi-rs](https://github.com/bytecodealliance/wasi-rs) |
+| `wasm-bindgen` | 0.2.128 | `MIT OR Apache-2.0` | [https://github.com/wasm-bindgen/wasm-bindgen](https://github.com/wasm-bindgen/wasm-bindgen) |
+| `wasm-bindgen-futures` | 0.4.78 | `MIT OR Apache-2.0` | [https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures) |
+| `wasm-bindgen-macro` | 0.2.128 | `MIT OR Apache-2.0` | [https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro) |
+| `wasm-bindgen-macro-support` | 0.2.128 | `MIT OR Apache-2.0` | [https://github.com/wasm-bindgen/wasm-bindgen/tree/main/crates/macro-support](https://github.com/wasm-bindgen/wasm-bindgen/tree/main/crates/macro-support) |
+| `wasm-bindgen-shared` | 0.2.128 | `MIT OR Apache-2.0` | [https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared) |
 | `wasm-streams` | 0.4.2 | `MIT OR Apache-2.0` | [https://github.com/MattiasBuelens/wasm-streams/](https://github.com/MattiasBuelens/wasm-streams/) |
-| `wasmparser` | 0.244.0 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasmparser](https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasmparser) |
-| `web-sys` | 0.3.99 | `MIT OR Apache-2.0` | [https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/web-sys](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/web-sys) |
+| `web-sys` | 0.3.105 | `MIT OR Apache-2.0` | [https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/web-sys](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/web-sys) |
 | `web-time` | 1.1.0 | `MIT OR Apache-2.0` | [https://github.com/daxpedda/web-time](https://github.com/daxpedda/web-time) |
 | `webbrowser` | 1.2.4 | `MIT OR Apache-2.0` | [https://github.com/amodm/webbrowser-rs](https://github.com/amodm/webbrowser-rs) |
-| `webpki-roots` | 1.0.7 | `CDLA-Permissive-2.0` | [https://github.com/rustls/webpki-roots](https://github.com/rustls/webpki-roots) |
+| `webpki-root-certs` | 1.0.9 | `CDLA-Permissive-2.0` | [https://github.com/rustls/webpki-roots](https://github.com/rustls/webpki-roots) |
+| `webpki-roots` | 1.0.9 | `CDLA-Permissive-2.0` | [https://github.com/rustls/webpki-roots](https://github.com/rustls/webpki-roots) |
 | `winapi` | 0.3.9 | `MIT/Apache-2.0` | [https://github.com/retep998/winapi-rs](https://github.com/retep998/winapi-rs) |
 | `winapi-i686-pc-windows-gnu` | 0.4.0 | `MIT/Apache-2.0` | [https://github.com/retep998/winapi-rs](https://github.com/retep998/winapi-rs) |
 | `winapi-util` | 0.1.11 | `Unlicense OR MIT` | [https://github.com/BurntSushi/winapi-util](https://github.com/BurntSushi/winapi-util) |
@@ -586,56 +632,42 @@ Each `skills/<slug>/SKILL.md` carries `license: CC-BY-4.0` in its YAML frontmatt
 | `windows-sys` | 0.48.0 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows-sys` | 0.52.0 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows-sys` | 0.59.0 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
-| `windows-sys` | 0.60.2 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows-sys` | 0.61.2 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows-targets` | 0.48.5 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows-targets` | 0.52.6 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
-| `windows-targets` | 0.53.5 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows-threading` | 0.2.1 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows_aarch64_gnullvm` | 0.48.5 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows_aarch64_gnullvm` | 0.52.6 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
-| `windows_aarch64_gnullvm` | 0.53.1 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows_aarch64_msvc` | 0.48.5 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows_aarch64_msvc` | 0.52.6 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
-| `windows_aarch64_msvc` | 0.53.1 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows_i686_gnu` | 0.48.5 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows_i686_gnu` | 0.52.6 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
-| `windows_i686_gnu` | 0.53.1 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows_i686_gnullvm` | 0.52.6 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
-| `windows_i686_gnullvm` | 0.53.1 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows_i686_msvc` | 0.48.5 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows_i686_msvc` | 0.52.6 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
-| `windows_i686_msvc` | 0.53.1 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows_x86_64_gnu` | 0.48.5 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows_x86_64_gnu` | 0.52.6 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
-| `windows_x86_64_gnu` | 0.53.1 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows_x86_64_gnullvm` | 0.48.5 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows_x86_64_gnullvm` | 0.52.6 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
-| `windows_x86_64_gnullvm` | 0.53.1 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows_x86_64_msvc` | 0.48.5 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `windows_x86_64_msvc` | 0.52.6 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
-| `windows_x86_64_msvc` | 0.53.1 | `MIT OR Apache-2.0` | [https://github.com/microsoft/windows-rs](https://github.com/microsoft/windows-rs) |
 | `winnow` | 0.7.15 | `MIT` | [https://github.com/winnow-rs/winnow](https://github.com/winnow-rs/winnow) |
-| `winnow` | 1.0.3 | `MIT` | [https://github.com/winnow-rs/winnow](https://github.com/winnow-rs/winnow) |
+| `winnow` | 1.0.4 | `MIT` | [https://github.com/winnow-rs/winnow](https://github.com/winnow-rs/winnow) |
 | `wiremock` | 0.6.5 | `MIT/Apache-2.0` | [https://github.com/LukeMathWalker/wiremock-rs](https://github.com/LukeMathWalker/wiremock-rs) |
-| `wit-bindgen` | 0.51.0 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/bytecodealliance/wit-bindgen](https://github.com/bytecodealliance/wit-bindgen) |
 | `wit-bindgen` | 0.57.1 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/bytecodealliance/wit-bindgen](https://github.com/bytecodealliance/wit-bindgen) |
-| `wit-bindgen-core` | 0.51.0 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/bytecodealliance/wit-bindgen](https://github.com/bytecodealliance/wit-bindgen) |
-| `wit-bindgen-rust` | 0.51.0 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/bytecodealliance/wit-bindgen](https://github.com/bytecodealliance/wit-bindgen) |
-| `wit-bindgen-rust-macro` | 0.51.0 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/bytecodealliance/wit-bindgen](https://github.com/bytecodealliance/wit-bindgen) |
-| `wit-component` | 0.244.0 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wit-component](https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wit-component) |
-| `wit-parser` | 0.244.0 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | [https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wit-parser](https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wit-parser) |
-| `writeable` | 0.6.3 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `writeable` | 0.6.4 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
 | `xmlparser` | 0.13.6 | `MIT/Apache-2.0` | [https://github.com/RazrFalcon/xmlparser](https://github.com/RazrFalcon/xmlparser) |
 | `yansi` | 1.0.1 | `MIT OR Apache-2.0` | [https://github.com/SergioBenitez/yansi](https://github.com/SergioBenitez/yansi) |
-| `yoke` | 0.8.2 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `yoke-derive` | 0.8.2 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `zerocopy` | 0.8.50 | `BSD-2-Clause OR Apache-2.0 OR MIT` | [https://github.com/google/zerocopy](https://github.com/google/zerocopy) |
-| `zerocopy-derive` | 0.8.50 | `BSD-2-Clause OR Apache-2.0 OR MIT` | [https://github.com/google/zerocopy](https://github.com/google/zerocopy) |
+| `yoke` | 0.8.3 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `yoke-derive` | 0.8.3 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `zerocopy` | 0.8.57 | `BSD-2-Clause OR Apache-2.0 OR MIT` | [https://github.com/google/zerocopy](https://github.com/google/zerocopy) |
+| `zerocopy-derive` | 0.8.57 | `BSD-2-Clause OR Apache-2.0 OR MIT` | [https://github.com/google/zerocopy](https://github.com/google/zerocopy) |
 | `zerofrom` | 0.1.8 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `zerofrom-derive` | 0.1.7 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `zeroize` | 1.8.2 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
-| `zerotrie` | 0.2.4 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `zerovec` | 0.11.6 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `zerovec-derive` | 0.11.3 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
-| `zmij` | 1.0.21 | `MIT` | [https://github.com/dtolnay/zmij](https://github.com/dtolnay/zmij) |
+| `zerofrom-derive` | 0.1.8 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `zeroize` | 1.9.0 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
+| `zeroize_derive` | 1.5.0 | `Apache-2.0 OR MIT` | [https://github.com/RustCrypto/utils](https://github.com/RustCrypto/utils) |
+| `zerotrie` | 0.2.5 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `zerovec` | 0.11.8 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `zerovec-derive` | 0.11.6 | `Unicode-3.0` | [https://github.com/unicode-org/icu4x](https://github.com/unicode-org/icu4x) |
+| `zlib-rs` | 0.6.8 | `Zlib` | [https://github.com/trifectatechfoundation/zlib-rs](https://github.com/trifectatechfoundation/zlib-rs) |
+| `zmij` | 1.0.23 | `MIT` | [https://github.com/dtolnay/zmij](https://github.com/dtolnay/zmij) |

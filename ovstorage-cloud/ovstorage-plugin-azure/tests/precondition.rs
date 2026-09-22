@@ -620,6 +620,401 @@ async fn list_versions_paginates() {
     );
 }
 
+// === versioned_address ===
+//
+// Azurite 3.36.0 implements no blob versioning, so these are wire-shape
+// assertions against scripted fixtures: which query the flag adds, which extra
+// calls it buys, where the pin comes from, and where it is never produced.
+mod versioned_address_wire {
+    use super::*;
+    use ovstorage_plugin::{ListOptions, ObjectInfo, ObjectKind, StatOptions};
+
+    /// One `include=versions` page: a superseded and a current version of the
+    /// same blob.
+    const VERSIONED_LIST_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ServiceEndpoint="http://127.0.0.1/" ContainerName="bkt">
+  <Prefix>dir/</Prefix>
+  <Blobs>
+    <Blob>
+      <Name>dir/a.bin</Name>
+      <Properties><Etag>0xA1</Etag><Content-Length>1</Content-Length></Properties>
+      <VersionId>v-a1</VersionId>
+      <IsCurrentVersion>false</IsCurrentVersion>
+    </Blob>
+    <Blob>
+      <Name>dir/a.bin</Name>
+      <Properties><Etag>0xA2</Etag><Content-Length>2</Content-Length></Properties>
+      <VersionId>v-a2</VersionId>
+      <IsCurrentVersion>true</IsCurrentVersion>
+    </Blob>
+  </Blobs>
+  <NextMarker />
+</EnumerationResults>"#;
+
+    /// One delimiter page: a marker, two files and a BlobPrefix, no version
+    /// ids (the service never includes them alongside a delimiter).
+    const DELIMITED_LIST_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ServiceEndpoint="http://127.0.0.1/" ContainerName="bkt">
+  <Prefix>dir/</Prefix>
+  <Delimiter>/</Delimiter>
+  <Blobs>
+    <Blob>
+      <Name>dir/</Name>
+      <Properties><Etag>0xM</Etag><Content-Length>0</Content-Length></Properties>
+    </Blob>
+    <Blob>
+      <Name>dir/a.bin</Name>
+      <Properties><Etag>0xA</Etag><Content-Length>1</Content-Length></Properties>
+    </Blob>
+    <Blob>
+      <Name>dir/b.bin</Name>
+      <Properties><Etag>0xB</Etag><Content-Length>2</Content-Length></Properties>
+    </Blob>
+    <BlobPrefix><Name>dir/sub/</Name></BlobPrefix>
+  </Blobs>
+  <NextMarker />
+</EnumerationResults>"#;
+
+    /// One DFS `List Paths` page.
+    const DFS_LIST_BODY: &str = r#"{"paths": [
+  { "name": "dir/a.bin", "contentLength": "1", "etag": "0xA" },
+  { "name": "dir/sub", "isDirectory": "true" }
+]}"#;
+
+    fn versioned(info: &ObjectInfo) -> Option<&str> {
+        info.versioned_address
+            .as_ref()
+            .map(ovstorage_plugin::Url::as_str)
+    }
+
+    fn list_page(body: &str) -> CannedHttpResponse {
+        CannedHttpResponse::xml("200 OK", body).with_header("x-ms-request-id", AZURE_REQUEST_ID)
+    }
+
+    /// A `Get Blob Properties` answer from a versioned container.
+    fn blob_properties(version_id: &str) -> CannedHttpResponse {
+        CannedHttpResponse::new("200 OK", "")
+            .with_header("x-ms-request-id", AZURE_REQUEST_ID)
+            .with_header("ETag", "\"0xHEAD\"")
+            .with_header("Last-Modified", "Mon, 01 Jan 2024 00:00:00 GMT")
+            .with_header("x-ms-version-id", version_id)
+    }
+
+    fn request_lines(server: &ScriptedHttpServer) -> Vec<String> {
+        server
+            .requests()
+            .iter()
+            .map(|raw| raw.lines().next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn recursive_list_with_the_flag_requests_include_versions_and_keeps_the_current() {
+        let server = ScriptedHttpServer::spawn(list_page(VERSIONED_LIST_BODY));
+        let backend = build_backend_with_endpoint("acct", "bkt", server.endpoint());
+        let items = backend
+            .list(
+                target("acct", "bkt", "dir/"),
+                ListOptions {
+                    recursive: true,
+                    versioned_address: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("flagged recursive list");
+        let lines = request_lines(&server);
+        assert_eq!(
+            lines.len(),
+            1,
+            "one page request, no per-blob lookups: {lines:?}"
+        );
+        assert!(lines[0].starts_with("GET "), "{}", lines[0]);
+        assert!(lines[0].contains("include=versions"), "{}", lines[0]);
+        assert!(!lines[0].contains("delimiter="), "{}", lines[0]);
+        assert_eq!(items.len(), 1, "only the current version is listed");
+        assert_eq!(items[0].address.as_str(), "azure://acct/bkt/dir/a.bin");
+        assert_eq!(items[0].etag.as_deref(), Some("0xA2"));
+        assert_eq!(items[0].version.as_deref(), Some("v-a2"));
+        assert_eq!(
+            versioned(&items[0]),
+            Some("azure://acct/bkt/dir/a.bin?versionid=v-a2")
+        );
+    }
+
+    #[tokio::test]
+    async fn non_recursive_list_with_the_flag_heads_each_file_and_pins_from_the_header() {
+        let server = ScriptedHttpServer::spawn_sequence(vec![
+            Some(list_page(DELIMITED_LIST_BODY)),
+            Some(blob_properties("v-a")),
+            Some(blob_properties("v-b")),
+        ]);
+        let backend = build_backend_with_endpoint("acct", "bkt", server.endpoint());
+        let items = backend
+            .list(
+                target("acct", "bkt", "dir/"),
+                ListOptions {
+                    recursive: false,
+                    versioned_address: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("flagged non-recursive list");
+        let lines = request_lines(&server);
+        assert_eq!(
+            lines.len(),
+            3,
+            "one page request plus one HEAD per file entry: {lines:?}"
+        );
+        assert!(lines[0].starts_with("GET "), "{}", lines[0]);
+        assert!(lines[0].contains("delimiter="), "{}", lines[0]);
+        assert!(!lines[0].contains("include="), "{}", lines[0]);
+        assert!(
+            lines[1].starts_with("HEAD ") && lines[1].contains("/bkt/dir/a.bin"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].starts_with("HEAD ") && lines[2].contains("/bkt/dir/b.bin"),
+            "{}",
+            lines[2]
+        );
+
+        let at = |address: &str| {
+            items
+                .iter()
+                .find(|item| item.address.as_str() == address)
+                .unwrap_or_else(|| panic!("no item at {address}"))
+        };
+        let a = at("azure://acct/bkt/dir/a.bin");
+        assert_eq!(
+            versioned(a),
+            Some("azure://acct/bkt/dir/a.bin?versionid=v-a")
+        );
+        assert_eq!(a.version.as_deref(), Some("v-a"));
+        assert_eq!(
+            a.etag.as_deref(),
+            Some("0xHEAD"),
+            "the HEAD's facts replace the listing's, so they describe the version the pin names"
+        );
+        let b = at("azure://acct/bkt/dir/b.bin");
+        assert_eq!(
+            versioned(b),
+            Some("azure://acct/bkt/dir/b.bin?versionid=v-b")
+        );
+        assert_eq!(b.version.as_deref(), Some("v-b"));
+        let marker = at("azure://acct/bkt/dir/");
+        assert_eq!(marker.kind, ObjectKind::DirectoryMarker);
+        assert_eq!(marker.versioned_address, None);
+        let prefix = at("azure://acct/bkt/dir/sub/");
+        assert_eq!(prefix.kind, ObjectKind::DirectoryInferred);
+        assert_eq!(prefix.versioned_address, None);
+    }
+
+    #[tokio::test]
+    async fn non_recursive_list_with_the_flag_fails_the_page_when_a_lookup_fails() {
+        let server = ScriptedHttpServer::spawn_sequence(vec![
+            Some(list_page(DELIMITED_LIST_BODY)),
+            Some(blob_properties("v-a")),
+            Some(
+                CannedHttpResponse::new("403 Forbidden", "")
+                    .with_header("x-ms-request-id", AZURE_REQUEST_ID),
+            ),
+        ]);
+        let backend = build_backend_with_endpoint("acct", "bkt", server.endpoint());
+        let err = backend
+            .list(
+                target("acct", "bkt", "dir/"),
+                ListOptions {
+                    recursive: false,
+                    versioned_address: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("a refused lookup must fail the page");
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn list_without_the_flag_sends_no_include_and_buys_no_lookups() {
+        for recursive in [false, true] {
+            let server = ScriptedHttpServer::spawn(list_page(DELIMITED_LIST_BODY));
+            let backend = build_backend_with_endpoint("acct", "bkt", server.endpoint());
+            let items = backend
+                .list(
+                    target("acct", "bkt", "dir/"),
+                    ListOptions {
+                        recursive,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .expect("unflagged list");
+            let lines = request_lines(&server);
+            assert_eq!(lines.len(), 1, "recursive={recursive}: {lines:?}");
+            assert!(!lines[0].contains("include="), "{}", lines[0]);
+            assert_eq!(items.len(), 4, "recursive={recursive}");
+            assert!(
+                items.iter().all(|item| item.versioned_address.is_none()),
+                "recursive={recursive}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stat_pins_from_the_version_id_header_whatever_the_flag_says() {
+        for flag in [false, true] {
+            let server = ScriptedHttpServer::spawn(blob_properties("v-9"));
+            let backend = build_backend_with_endpoint("acct", "bkt", server.endpoint());
+            let info = backend
+                .stat(
+                    target("acct", "bkt", "blob.bin"),
+                    StatOptions {
+                        versioned_address: flag,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .expect("stat");
+            assert_eq!(info.kind, ObjectKind::File);
+            assert_eq!(info.version.as_deref(), Some("v-9"));
+            assert_eq!(
+                versioned(&info),
+                Some("azure://acct/bkt/blob.bin?versionid=v-9"),
+                "flag={flag}"
+            );
+            assert_eq!(server.hits(), 1, "the pin costs no extra RPC (flag={flag})");
+        }
+    }
+
+    #[tokio::test]
+    async fn stat_echoes_a_caller_pin_as_its_canonical_spelling() {
+        let server = ScriptedHttpServer::spawn(blob_properties("v-3"));
+        let backend = build_backend_with_endpoint("acct", "bkt", server.endpoint());
+        let info = backend
+            .stat(
+                target("acct", "bkt", "blob.bin?versionid=v-3"),
+                StatOptions::default(),
+                None,
+            )
+            .await
+            .expect("pinned stat");
+        assert_eq!(
+            info.address.as_str(),
+            "azure://acct/bkt/blob.bin?versionid=v-3"
+        );
+        assert_eq!(
+            versioned(&info),
+            Some("azure://acct/bkt/blob.bin?versionid=v-3")
+        );
+        let lines = request_lines(&server);
+        assert!(
+            lines[0].contains("versionid=v-3"),
+            "the pin must reach the wire: {}",
+            lines[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn stat_without_a_version_id_header_reports_no_pin() {
+        let server = ScriptedHttpServer::spawn(
+            CannedHttpResponse::new("200 OK", "")
+                .with_header("x-ms-request-id", AZURE_REQUEST_ID)
+                .with_header("ETag", "\"0x1\""),
+        );
+        let backend = build_backend_with_endpoint("acct", "bkt", server.endpoint());
+        let info = backend
+            .stat(
+                target("acct", "bkt", "blob.bin"),
+                StatOptions::default(),
+                None,
+            )
+            .await
+            .expect("stat");
+        assert_eq!(info.version, None);
+        assert_eq!(info.versioned_address, None);
+    }
+
+    #[tokio::test]
+    async fn stat_trailing_slash_marker_reports_no_pin() {
+        let server = ScriptedHttpServer::spawn(blob_properties("v-m"));
+        let backend = build_backend_with_endpoint("acct", "bkt", server.endpoint());
+        let info = backend
+            .stat(target("acct", "bkt", "dir/"), StatOptions::default(), None)
+            .await
+            .expect("marker stat");
+        assert_eq!(info.kind, ObjectKind::DirectoryMarker);
+        assert_eq!(info.version.as_deref(), Some("v-m"));
+        assert_eq!(info.versioned_address, None);
+    }
+
+    #[tokio::test]
+    async fn get_latest_version_carries_its_own_address() {
+        let server = ScriptedHttpServer::spawn(blob_properties("v-7"));
+        let backend = build_backend_with_endpoint("acct", "bkt", server.endpoint());
+        let info = backend
+            .get_latest_version(target("acct", "bkt", "blob.bin"), None)
+            .await
+            .expect("get_latest_version");
+        assert_eq!(
+            info.address.as_str(),
+            "azure://acct/bkt/blob.bin?versionid=v-7"
+        );
+        assert_eq!(info.versioned_address.as_ref(), Some(&info.address));
+    }
+
+    /// The DFS tier reports no version id: a flagged HNS listing issues its one
+    /// `List Paths` request and no lookups, and an HNS `stat` never pins even
+    /// when a fixture volunteers the header.
+    #[tokio::test]
+    async fn hns_list_and_stat_report_no_pin() {
+        let server = ScriptedHttpServer::spawn(
+            CannedHttpResponse::json("200 OK", DFS_LIST_BODY)
+                .with_header("x-ms-request-id", AZURE_REQUEST_ID),
+        );
+        let backend = build_hns_backend_with_endpoint("acct", "bkt", server.endpoint());
+        let items = backend
+            .list(
+                target("acct", "bkt", "dir/"),
+                ListOptions {
+                    recursive: false,
+                    versioned_address: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("flagged HNS list");
+        let lines = request_lines(&server);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(!lines[0].contains("include="), "{}", lines[0]);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| item.versioned_address.is_none()));
+
+        let server = ScriptedHttpServer::spawn(blob_properties("v-hns"));
+        let backend = build_hns_backend_with_endpoint("acct", "bkt", server.endpoint());
+        let info = backend
+            .stat(
+                target("acct", "bkt", "dir/a.bin"),
+                StatOptions {
+                    versioned_address: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("HNS stat");
+        assert_eq!(info.versioned_address, None);
+    }
+}
+
 // === write_stream supports unknown-size uploads ===
 //
 // Historically Azure had no `write_stream` impl; the SPI default

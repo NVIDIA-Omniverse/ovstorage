@@ -5,11 +5,11 @@
 //! here so the broker can implement it without rlib-linking the plugin crate.
 
 use ovstorage_plugin::{
-    AccessDecision, AccessOps, AddressRoot, Body, ChangeEvent, CopyOptions, CreateDirectoryOptions,
-    DeleteDirectoryOptions, DeleteOptions, InteractiveAuthCapability, ListOptions, ListPage,
-    ListVersionsOptions, ObjectInfo, ReadOptions, ReadResult, RedirectResultBatch, RenameOptions,
-    Result, StatOptions, UpdateMetadataOptions, Url, WatchDirectoryOptions, WriteOptions,
-    WriteRedirectBatch, WriteResult, WriteStep,
+    AccessDecision, AccessOps, AddressRoot, Body, CancellationToken, ChangeEvent, CopyOptions,
+    CreateDirectoryOptions, DeleteDirectoryOptions, DeleteOptions, InteractiveAuthCapability,
+    ListOptions, ListPage, ListVersionsOptions, ObjectInfo, ReadOptions, ReadResult,
+    RedirectResultBatch, RenameOptions, Result, StatOptions, UpdateMetadataOptions, Url,
+    WatchDirectoryOptions, WriteOptions, WriteRedirectBatch, WriteResult, WriteStep,
 };
 
 /// Iterator returned by `watch_directory`; each item is a parsed `ChangeEvent`.
@@ -76,6 +76,17 @@ pub trait BrokerClientTransport: Send + Sync {
         &self,
         prefix: Url,
         opts: WatchDirectoryOptions,
+    ) -> Result<BrokerClientWatchDirectoryStream> {
+        self.watch_directory_with_cancel(prefix, opts, None).await
+    }
+    /// Cancellation-aware watch open. Blocking transports must thread the
+    /// supplied token into the physical watch so dropping a coalesced upstream
+    /// can interrupt `Iterator::next` even when the prefix is quiet.
+    async fn watch_directory_with_cancel(
+        &self,
+        prefix: Url,
+        opts: WatchDirectoryOptions,
+        cancel: Option<CancellationToken>,
     ) -> Result<BrokerClientWatchDirectoryStream>;
     async fn create_directory(
         &self,

@@ -116,7 +116,7 @@ pub trait Transport: Send + Sync {
         interface: &str,
         method: &str,
         params: serde_json::Value,
-        binary: Option<Vec<u8>>,
+        binary: Option<&[u8]>,
     ) -> impl std::future::Future<Output = Result<Subscription>> + Send;
 }
 
@@ -268,7 +268,7 @@ mod tests {
                 _interface: &str,
                 _method: &str,
                 _params: serde_json::Value,
-                _binary: Option<Vec<u8>>,
+                _binary: Option<&[u8]>,
             ) -> Result<Subscription> {
                 unimplemented!()
             }

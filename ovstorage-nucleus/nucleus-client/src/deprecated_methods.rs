@@ -22,7 +22,7 @@ use crate::types::{DeletedPath, StatusType, UploadResult};
 pub async fn create(
     client: &impl Transport,
     uri: &str,
-    content: Option<Vec<u8>>,
+    content: Option<&[u8]>,
     path_type: Option<u32>,
 ) -> Result<UploadResult> {
     tracing::debug!(uri = %uri, path_type = ?path_type, "deprecated create");
@@ -46,9 +46,9 @@ pub async fn read(client: &impl Transport, uri: &str) -> Result<Subscription> {
 pub async fn update(
     client: &impl Transport,
     uri: &str,
-    content: Option<Vec<u8>>,
+    content: Option<&[u8]>,
 ) -> Result<UploadResult> {
-    tracing::debug!(uri = %uri, content_len = content.as_ref().map(|c| c.len()), "deprecated update");
+    tracing::debug!(uri = %uri, content_len = content.map(<[u8]>::len), "deprecated update");
     let params = serde_json::json!({ "uri": uri });
     let mut sub = client.send("Connection", "update", params, content).await?;
     let (result, _) = sub.recv::<UploadResult>().await?;
@@ -107,7 +107,7 @@ mod tests {
             _interface: &str,
             _method: &str,
             _params: serde_json::Value,
-            _binary: Option<Vec<u8>>,
+            _binary: Option<&[u8]>,
         ) -> Result<Subscription> {
             let responses = self
                 .responses

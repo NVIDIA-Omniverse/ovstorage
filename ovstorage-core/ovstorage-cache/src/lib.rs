@@ -25,9 +25,8 @@ pub use coordination::CacheCoordination;
 pub use fs_probe::{FsKind, fs_kind};
 pub use lease::{CacheProcess, Lease};
 pub use metadata::{
-    DisabledDispatcher, Invalidation, MetadataCache, MetadataCacheConfig, MetadataCacheKey,
-    MetadataCachePayload, MetadataKind, NotificationDispatcher, hash_list_options,
-    hash_list_versions_options, hash_stat_options,
+    CostFlags, DisabledDispatcher, Invalidation, MetadataCache, MetadataCacheConfig,
+    MetadataCacheKey, MetadataCachePayload, MetadataKind, MetadataLookup, NotificationDispatcher,
 };
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use observer::{

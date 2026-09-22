@@ -213,6 +213,12 @@ impl OpenDalLayer {
             },
             last_probed: None,
             user_metadata: UserMetadata::new(),
+            // This layer owns the connection, and its instance name is the
+            // `ConnectionKey::target` that reaches it -- the same name
+            // `owned_targets` reports and `remove_connection` gates on. Stamped
+            // at construction so the row carries it wherever it goes, including
+            // out of `ConnectionSet`'s change stream.
+            owning_target: Some(self.name.clone()),
         };
         // `ConnectionSet` validates (via the driver) and records auth state; a
         // soft obtain/verify failure parks the connection (`AwaitingAuth`)
@@ -531,6 +537,54 @@ impl Layer for OpenDalLayer {
         paginate_list_items(items, max_results, page_token)
     }
 
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        let prefix = request.input.prefix;
+        let options = request.input.options;
+        if options.max_results.is_some() || options.page_token.is_some() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+
+        let recursive = options.recursive;
+        let backend_options = ListOptions {
+            max_results: None,
+            page_token: None,
+            ..options
+        };
+        let stream_cancel = cancel.clone();
+        // Preserve the native Lister's provider emission order. Recursive flat
+        // walks require byte-sorted input for bounded ancestor synthesis, so
+        // IncrementalListFold rejects an ordering regression rather than
+        // emitting incorrect inferred directories.
+        let (stream, has_real_directories) = self
+            .recover(&prefix, move |instance, target| {
+                let options = backend_options.clone();
+                let cancel = cancel.clone();
+                async move {
+                    let stream = instance
+                        .backend
+                        .list_stream(target, options, cancel)
+                        .await?;
+                    Ok((stream, instance.has_real_directories))
+                }
+            })
+            .await?;
+
+        let stream = Box::pin(IncrementalListFold::new(
+            stream,
+            &prefix,
+            has_real_directories,
+            recursive,
+        ));
+        Ok(cancel_list_stream(stream, stream_cancel))
+    }
+
     // `list_versions`, `get_latest_version`, `watch_directory`, and
     // `update_metadata` keep the `Layer` trait defaults (`Unsupported`) —
     // OpenDAL exposes none of them and relies on the optional operation defaults.
@@ -722,6 +776,12 @@ impl Layer for OpenDalLayer {
             },
             last_probed: None,
             user_metadata: UserMetadata::new(),
+            // This layer owns the connection, and its instance name is the
+            // `ConnectionKey::target` that reaches it -- the same name
+            // `owned_targets` reports and `remove_connection` gates on. Stamped
+            // at construction so the row carries it wherever it goes, including
+            // out of `ConnectionSet`'s change stream.
+            owning_target: Some(self.name.clone()),
         };
         let outcome = self
             .connection_set
@@ -903,5 +963,60 @@ impl Layer for OpenDalLayer {
             patch.display_name,
             patch.user_metadata.into_iter().collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::TryStreamExt as _;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn fs_list_stream_matches_buffered_list() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join("a/b")).unwrap();
+        std::fs::write(root.path().join("a/one.txt"), b"one").unwrap();
+        std::fs::write(root.path().join("a/b/two.txt"), b"two").unwrap();
+
+        let mut config = LayerConfig::new();
+        config.insert("service".into(), ConfigValue::String("fs".into()));
+        config.insert(
+            "root".into(),
+            ConfigValue::String(root.path().display().to_string()),
+        );
+        let layer = OpenDalLayerFactory::default()
+            .create_backend("opendal", &config, None)
+            .await
+            .unwrap();
+        let prefix = address::parse("opendal://fs/").unwrap();
+
+        let root_info = layer
+            .root_info_for(&prefix, &Extensions::new(), None)
+            .await
+            .unwrap();
+        assert!(root_info.capabilities.supports_list_stream);
+
+        for recursive in [false, true] {
+            let request = || {
+                Request::new(ListRequest {
+                    prefix: prefix.clone(),
+                    options: ListOptions {
+                        recursive,
+                        ..ListOptions::default()
+                    },
+                })
+            };
+            let buffered = layer.list(request(), None).await.unwrap().items;
+            let streamed = layer
+                .list_stream(request(), None)
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(streamed, buffered, "recursive={recursive}");
+        }
     }
 }

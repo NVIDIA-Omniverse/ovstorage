@@ -21,11 +21,17 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use ovstorage_plugin::connection::{ConnectionSet, ProbeOutcome};
+use ovstorage_plugin::fallback::{
+    ANONYMOUS_FALLBACK_KEY, decode_anonymous_fallback, is_anonymous_fallback_key, schemes_for_kind,
+    split_anonymous_fallback_keys,
+};
+use ovstorage_plugin::instance_metadata::is_instance_metadata_url;
 use ovstorage_plugin::*;
 use parking_lot::RwLock;
 
 use crate::auth::Authenticator;
 use crate::driver::GcsDriver;
+use crate::fallback::{FallbackPolicy, GcsSchemeFallback, SCHEME};
 use crate::promotion::{OperationEvidence, with_operation_evidence};
 use crate::{
     GcsBackend, GcsConnectionConfig, build_http_client, gcs_capabilities, kind_descriptor,
@@ -58,23 +64,56 @@ impl BackendFactory for GcsLayerFactory {
         config: &LayerConfig,
         cancel: Option<CancellationToken>,
     ) -> Result<LayerHandle> {
+        // The fallback policy is split off FIRST: the static-connection seed
+        // below treats any non-empty table as a connection, and a layer whose
+        // only key is `anonymous_fallback = ["gs"]` describes no connection.
+        let (policy, connection) = split_anonymous_fallback_keys(config);
+        let grant = decode_anonymous_fallback(&policy)?;
+        let served = schemes_for_kind(&self.descriptor.kind);
+        if let Some(scheme) = grant
+            .iter()
+            .find(|scheme| !served.contains(&scheme.as_str()))
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "`{ANONYMOUS_FALLBACK_KEY}` on layer `{name}` (kind {}) names scheme \
+                     `{scheme}`, which this kind does not serve; it serves {}",
+                    self.descriptor.kind,
+                    served.join(", ")
+                ),
+            ));
+        }
+        // Tunables are validated whether or not the grant is present, so a bad
+        // value fails at startup rather than on the day the grant is added.
+        let fallback_policy = FallbackPolicy::parse(&policy, name)?;
+        let fallback = if grant.contains(SCHEME) {
+            Some(Arc::new(GcsSchemeFallback::new(
+                fallback_policy,
+                &self.descriptor.kind,
+                self.descriptor.icon.clone(),
+            )?))
+        } else {
+            None
+        };
         let layer = Arc::new(GcsLayer {
             name: name.to_string(),
             descriptor: self.descriptor.clone(),
             connection_set: Arc::new(ConnectionSet::with_defaults()),
             state: RwLock::new(GcsLayerState {
                 instances: Vec::new(),
-                routes: RouteTable::empty(),
+                routes: build_routes(&[], fallback.as_ref()),
             }),
+            fallback,
             next_instance_counter: AtomicU64::new(0),
         });
-        // A non-empty layer config seeds one static connection (the
+        // A non-empty connection table seeds one static connection (the
         // config-as-Stack path); runtime connections arrive via
         // `add_connection`.
-        if !config.is_empty() {
+        if !connection.is_empty() {
             let request = ConnectionRequest {
                 backend_kind: self.descriptor.kind.clone(),
-                config: config.clone(),
+                config: connection,
                 credentials: SecretBundle::default(),
                 persist: false,
                 display_name: None,
@@ -108,6 +147,10 @@ pub(crate) struct GcsLayer {
     /// under a single lock so a mutation and its route-table rebuild are
     /// published atomically.
     state: RwLock<GcsLayerState>,
+    /// The anonymous `gs://` fallback, present only when the layer's
+    /// `anonymous_fallback` grant names `gs`. Fixed for the life of the layer:
+    /// the grant is layer config, not a connection anyone can add or remove.
+    fallback: Option<Arc<GcsSchemeFallback>>,
     /// Disambiguates trace/routing-only `BackendId`s for byte-identical configs;
     /// connection identity is the `ConnectionId`.
     next_instance_counter: AtomicU64,
@@ -115,7 +158,16 @@ pub(crate) struct GcsLayer {
 
 struct GcsLayerState {
     instances: Vec<Arc<GcsInstance>>,
-    routes: RouteTable<Arc<GcsInstance>>,
+    routes: RouteTable<GcsRoute>,
+}
+
+/// What a route-table hit binds to: a configured connection's instance, or the
+/// scheme fallback when the address matched nothing and the table's second
+/// tier answered.
+#[derive(Clone)]
+enum GcsRoute {
+    Connection(Arc<GcsInstance>),
+    Fallback(Arc<GcsSchemeFallback>),
 }
 
 /// One backend instance serving one connection. Routing/dispatch state only —
@@ -230,19 +282,31 @@ impl AcceptanceWitness {
     }
 }
 
-/// Longest-prefix route table over the current instance set.
-fn build_routes(instances: &[Arc<GcsInstance>]) -> RouteTable<Arc<GcsInstance>> {
-    let items: Vec<(RootInfo, Arc<GcsInstance>)> = instances
+/// Longest-prefix route table over the current instance set, plus the marked
+/// scheme root when a fallback is granted. The table ranks the scheme root
+/// last on its own (it is the shortest prefix there is) and consults it only
+/// through its second tier, so appending it here is bookkeeping, not ranking.
+fn build_routes(
+    instances: &[Arc<GcsInstance>],
+    fallback: Option<&Arc<GcsSchemeFallback>>,
+) -> RouteTable<GcsRoute> {
+    let mut items: Vec<(RootInfo, GcsRoute)> = instances
         .iter()
         .flat_map(|instance| {
             instance
                 .roots
                 .iter()
                 .cloned()
-                .map(|root| (root, instance.clone()))
+                .map(|root| (root, GcsRoute::Connection(instance.clone())))
                 .collect::<Vec<_>>()
         })
         .collect();
+    if let Some(fallback) = fallback {
+        items.push((
+            fallback.root().clone(),
+            GcsRoute::Fallback(fallback.clone()),
+        ));
+    }
     RouteTable::build(items)
 }
 
@@ -271,7 +335,9 @@ impl GcsLayer {
                 ),
             ));
         }
+        self.refuse_fallback_keys_on_connection(&request.config)?;
         let config = GcsConnectionConfig::from_request(&request)?;
+        self.warn_if_endpoint_is_instance_metadata(&config);
         let counter = self.next_instance_counter.fetch_add(1, Ordering::Relaxed);
         let backend_id = BackendId(format!("gcs:{}:{counter}", config.address_root));
 
@@ -306,6 +372,12 @@ impl GcsLayer {
             },
             last_probed: None,
             user_metadata: UserMetadata::new(),
+            // This layer owns the connection, and its instance name is the
+            // `ConnectionKey::target` that reaches it -- the same name
+            // `owned_targets` reports and `remove_connection` gates on. Stamped
+            // at construction so the row carries it wherever it goes, including
+            // out of `ConnectionSet`'s change stream.
+            owning_target: Some(self.name.clone()),
         };
         // `ConnectionSet` validates (via the driver) and records auth state; a
         // soft obtain/verify failure parks the connection (`AwaitingAuth`)
@@ -365,26 +437,82 @@ impl GcsLayer {
         }
     }
 
-    /// Install `instance` and republish the route table atomically.
-    fn install(&self, instance: Arc<GcsInstance>) {
-        let mut state = self.state.write();
-        state.instances.push(instance);
-        state.routes = build_routes(&state.instances);
+    /// Refuse a connection request that carries a fallback key. Those keys
+    /// belong to the layer table; on a connection they would parse as nothing,
+    /// and the operator would believe the grant took effect.
+    fn refuse_fallback_keys_on_connection(&self, config: &LayerConfig) -> Result<()> {
+        if let Some(key) = config.keys().find(|key| is_anonymous_fallback_key(key)) {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "`{key}` is a layer key, not connection config; set it on \
+                     [ovstorage.layers.{}]",
+                    self.name
+                ),
+            ));
+        }
+        Ok(())
     }
 
-    fn target(&self, url: &Url) -> Result<(Arc<GcsInstance>, ResolvedTarget)> {
-        let instance = self
+    /// Advisory only: an operator who points a configured connection at a cloud
+    /// instance-metadata host chose to, so the connection is built — but the
+    /// choice is worth a line in the log, because the fallback refuses the same
+    /// host outright and the asymmetry should be visible.
+    fn warn_if_endpoint_is_instance_metadata(&self, config: &GcsConnectionConfig) {
+        if let Some(endpoint) = config.endpoint.as_deref()
+            && let Ok(endpoint) = Url::parse(endpoint)
+            && is_instance_metadata_url(&endpoint)
+        {
+            tracing::warn!(
+                layer = %self.name,
+                endpoint = %origin_only(&endpoint),
+                "configured GCS endpoint is a cloud instance-metadata host"
+            );
+        }
+    }
+
+    /// Install `instance` and republish the route table atomically. A
+    /// fallback backend cached for a bucket the new connection serves is
+    /// evicted: the first tier answers that bucket for as long as the
+    /// connection is installed.
+    fn install(&self, instance: Arc<GcsInstance>) {
+        let mut state = self.state.write();
+        if let Some(fallback) = &self.fallback {
+            for root in &instance.roots {
+                fallback.evict_node(&root.root);
+            }
+        }
+        state.instances.push(instance);
+        state.routes = build_routes(&state.instances, self.fallback.as_ref());
+    }
+
+    fn target(&self, url: &Url) -> Result<(GcsRoute, ResolvedTarget)> {
+        let route = self
             .state
             .read()
             .routes
             .lookup(url)
-            .map(|(_, instance)| instance.clone())
+            .map(|(_, route)| route.clone())
             .ok_or_else(|| Error::new(ErrorCode::NoRoute, "no route matches address"))?;
-        let target = ResolvedTarget {
-            backend_id: instance.backend_id.clone(),
-            resolved_address: url.clone(),
+        let target = match &route {
+            GcsRoute::Connection(instance) => ResolvedTarget {
+                backend_id: instance.backend_id.clone(),
+                resolved_address: url.clone(),
+            },
+            GcsRoute::Fallback(fallback) => fallback.resolved_target(url),
         };
-        Ok((instance, target))
+        Ok((route, target))
+    }
+
+    /// Route `url` to a configured connection, refusing a fallback-served
+    /// address before anything else runs. Every mutating slot and
+    /// `watch_directory` resolve through here, so the refusal lands before a
+    /// witness is taken, a body is touched, or a request is built.
+    fn connection_target(&self, url: &Url) -> Result<(Arc<GcsInstance>, ResolvedTarget)> {
+        match self.target(url)? {
+            (GcsRoute::Connection(instance), target) => Ok((instance, target)),
+            (GcsRoute::Fallback(fallback), _) => Err(fallback.mutation_refused(url)),
+        }
     }
 
     /// Route `url` to its instance and run `op` under the connection's
@@ -405,19 +533,60 @@ impl GcsLayer {
     /// parked until some other operation runs. Refusals heard by a CONCURRENT
     /// operation are seen, because those belong to the connection rather than to
     /// an operation.
-    async fn recover<T, F, Fut>(&self, url: &Url, op: F) -> Result<T>
+    ///
+    /// A fallback-served address has no connection to park or promote: the
+    /// anonymous backend is resolved (minted on first touch) and `op` runs once,
+    /// directly. `cancel` bounds that resolution; the operation's own
+    /// cancellation is the closure's business, as before.
+    async fn recover<T, F, Fut>(
+        &self,
+        url: &Url,
+        cancel: Option<CancellationToken>,
+        op: F,
+    ) -> Result<T>
     where
-        F: Fn(Arc<GcsInstance>, ResolvedTarget) -> Fut,
+        F: Fn(Arc<GcsBackend>, ResolvedTarget) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let (instance, target) = self.target(url)?;
+        match self.target(url)? {
+            (GcsRoute::Connection(instance), target) => self.recover_on(instance, target, op).await,
+            (GcsRoute::Fallback(fallback), _) => {
+                let (backend, target) = fallback.backend_for(url, cancel).await?;
+                op(backend, target).await
+            }
+        }
+    }
+
+    /// [`Self::recover`] for a mutating slot: a fallback-served address is
+    /// refused before the recovery loop is entered.
+    async fn recover_mutation<T, F, Fut>(&self, url: &Url, op: F) -> Result<T>
+    where
+        F: Fn(Arc<GcsBackend>, ResolvedTarget) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let (instance, target) = self.connection_target(url)?;
+        self.recover_on(instance, target, op).await
+    }
+
+    /// The connection half of [`Self::recover`]: run `op` under the
+    /// connection's recovery loop with a promotion witness around it.
+    async fn recover_on<T, F, Fut>(
+        &self,
+        instance: Arc<GcsInstance>,
+        target: ResolvedTarget,
+        op: F,
+    ) -> Result<T>
+    where
+        F: Fn(Arc<GcsBackend>, ResolvedTarget) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         let id = instance.connection_id.clone();
         let witness = AcceptanceWitness::take(&instance);
         self.connection_set
             .with_recovery_promoting_if(
                 &id,
                 || witness.proved(self),
-                || witness.scope(op(instance.clone(), target.clone())),
+                || witness.scope(op(instance.backend.clone(), target.clone())),
             )
             .await
     }
@@ -506,11 +675,15 @@ impl Layer for GcsLayer {
         cancel: Option<CancellationToken>,
     ) -> Result<ObjectInfo> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
-            let options = options.clone();
-            let cancel = cancel.clone();
-            async move { instance.backend.stat(target, options, cancel).await }
-        })
+        self.recover(
+            &request.input.address,
+            cancel.clone(),
+            move |backend, target| {
+                let options = options.clone();
+                let cancel = cancel.clone();
+                async move { backend.stat(target, options, cancel).await }
+            },
+        )
         .await
     }
 
@@ -520,11 +693,15 @@ impl Layer for GcsLayer {
         cancel: Option<CancellationToken>,
     ) -> Result<ReadResult> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
-            let options = options.clone();
-            let cancel = cancel.clone();
-            async move { instance.backend.read(target, options, cancel).await }
-        })
+        self.recover(
+            &request.input.address,
+            cancel.clone(),
+            move |backend, target| {
+                let options = options.clone();
+                let cancel = cancel.clone();
+                async move { backend.read(target, options, cancel).await }
+            },
+        )
         .await
     }
 
@@ -538,7 +715,10 @@ impl Layer for GcsLayer {
         // to the caller. The acceptance an inline write earns still counts,
         // though — a connection whose upload the service answered has proved its
         // credentials as surely as any other operation.
-        let (instance, target) = self.target(&request.input.address)?;
+        //
+        // A fallback-served address is refused here, before the body is
+        // touched and before any witness exists.
+        let (instance, target) = self.connection_target(&request.input.address)?;
         let id = instance.connection_id.clone();
         let witness = AcceptanceWitness::take(&instance);
         let options = request.input.options;
@@ -590,7 +770,7 @@ impl Layer for GcsLayer {
         // request of our own before handing back the upload URL. The bytes then
         // travel on the host's follower, which reports back a status this
         // connection does not count — only the initiate is evidence.
-        let (instance, target) = self.target(&request.input.address)?;
+        let (instance, target) = self.connection_target(&request.input.address)?;
         let id = instance.connection_id.clone();
         let witness = AcceptanceWitness::take(&instance);
         let options = request.input.options;
@@ -625,7 +805,7 @@ impl Layer for GcsLayer {
         // status it never received and flip an operator's shared connection to
         // `Authenticated` with no request leaving the process. A redirect-only
         // writer stays parked until some other operation reaches the service.
-        let (instance, target) = self.target(&request.input.address)?;
+        let (instance, target) = self.connection_target(&request.input.address)?;
         instance
             .backend
             .continue_write(
@@ -643,10 +823,10 @@ impl Layer for GcsLayer {
         cancel: Option<CancellationToken>,
     ) -> Result<()> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
+        self.recover_mutation(&request.input.address, move |backend, target| {
             let options = options.clone();
             let cancel = cancel.clone();
-            async move { instance.backend.delete(target, options, cancel).await }
+            async move { backend.delete(target, options, cancel).await }
         })
         .await
     }
@@ -671,15 +851,56 @@ impl Layer for GcsLayer {
             ..options
         };
         let items = self
-            .recover(&request.input.prefix, move |instance, target| {
-                let options = backend_options.clone();
-                let cancel = cancel.clone();
-                async move { instance.backend.list(target, options, cancel).await }
-            })
+            .recover(
+                &request.input.prefix,
+                cancel.clone(),
+                move |backend, target| {
+                    let options = backend_options.clone();
+                    let cancel = cancel.clone();
+                    async move { backend.list(target, options, cancel).await }
+                },
+            )
             .await?;
         // GCS is a flat namespace: never real directories.
         let items = fold_markers_and_infer_subdir_kinds(&prefix, items, false, recursive);
         paginate_list_items(items, max_results, page_token)
+    }
+
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        let prefix = request.input.prefix;
+        let options = request.input.options;
+        if options.max_results.is_some() || options.page_token.is_some() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+
+        let recursive = options.recursive;
+        let backend_options = ListOptions {
+            max_results: None,
+            page_token: None,
+            ..options
+        };
+        let stream_cancel = cancel.clone();
+        let stream = self
+            .recover(&prefix, cancel.clone(), move |backend, target| {
+                let options = backend_options.clone();
+                let cancel = cancel.clone();
+                async move { backend.list_stream(target, options, cancel).await }
+            })
+            .await?;
+        // GCS is flat. Recursive requests are byte-sorted object items; the
+        // non-recursive items-then-prefixes order is preserved without a sort
+        // check by the mode-conditional incremental fold.
+        Ok(cancel_list_stream(
+            Box::pin(IncrementalListFold::new(stream, &prefix, false, recursive)),
+            stream_cancel,
+        ))
     }
 
     async fn list_versions(
@@ -689,16 +910,15 @@ impl Layer for GcsLayer {
     ) -> Result<VersionPage> {
         let options = request.input.options;
         let items = self
-            .recover(&request.input.address, move |instance, target| {
-                let options = options.clone();
-                let cancel = cancel.clone();
-                async move {
-                    instance
-                        .backend
-                        .list_versions(target, options, cancel)
-                        .await
-                }
-            })
+            .recover(
+                &request.input.address,
+                cancel.clone(),
+                move |backend, target| {
+                    let options = options.clone();
+                    let cancel = cancel.clone();
+                    async move { backend.list_versions(target, options, cancel).await }
+                },
+            )
             .await?;
         // Current behavior: the backend paginates natively and internally;
         // the host never chained pages.
@@ -713,10 +933,14 @@ impl Layer for GcsLayer {
         request: Request<ReadRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<ObjectInfo> {
-        self.recover(&request.input.address, move |instance, target| {
-            let cancel = cancel.clone();
-            async move { instance.backend.get_latest_version(target, cancel).await }
-        })
+        self.recover(
+            &request.input.address,
+            cancel.clone(),
+            move |backend, target| {
+                let cancel = cancel.clone();
+                async move { backend.get_latest_version(target, cancel).await }
+            },
+        )
         .await
     }
 
@@ -725,20 +949,17 @@ impl Layer for GcsLayer {
         request: Request<WatchDirectoryRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<ChangeStream> {
-        // Establish the change-feed subscription under `recover`
+        // Establish the change-feed subscription under the recovery loop
         // (establishment is replayable); mid-stream errors surface via the
-        // mapped stream.
+        // mapped stream. A fallback-served prefix is refused first: a watch is
+        // a standing server-side registration, and the anonymous fallback has
+        // no identity to hold one.
         let options = request.input.options;
         let stream = self
-            .recover(&request.input.prefix, move |instance, target| {
+            .recover_mutation(&request.input.prefix, move |backend, target| {
                 let options = options.clone();
                 let cancel = cancel.clone();
-                async move {
-                    instance
-                        .backend
-                        .watch_directory(target, options, cancel)
-                        .await
-                }
+                async move { backend.watch_directory(target, options, cancel).await }
             })
             .await?;
         Ok(Box::new(
@@ -752,15 +973,10 @@ impl Layer for GcsLayer {
         cancel: Option<CancellationToken>,
     ) -> Result<BackendItemInfo> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
+        self.recover_mutation(&request.input.address, move |backend, target| {
             let options = options.clone();
             let cancel = cancel.clone();
-            async move {
-                instance
-                    .backend
-                    .create_directory(target, options, cancel)
-                    .await
-            }
+            async move { backend.create_directory(target, options, cancel).await }
         })
         .await
     }
@@ -771,15 +987,10 @@ impl Layer for GcsLayer {
         cancel: Option<CancellationToken>,
     ) -> Result<()> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
+        self.recover_mutation(&request.input.address, move |backend, target| {
             let options = options.clone();
             let cancel = cancel.clone();
-            async move {
-                instance
-                    .backend
-                    .delete_directory(target, options, cancel)
-                    .await
-            }
+            async move { backend.delete_directory(target, options, cancel).await }
         })
         .await
     }
@@ -789,8 +1000,10 @@ impl Layer for GcsLayer {
         request: Request<CopyRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<WriteStep> {
-        let (source_instance, source) = self.target(&request.input.source)?;
-        let (dest_instance, destination) = self.target(&request.input.destination)?;
+        // Both ends resolve before anything runs: a fallback-served source OR
+        // destination is refused here, before any read of the source.
+        let (source_instance, source) = self.connection_target(&request.input.source)?;
+        let (dest_instance, destination) = self.connection_target(&request.input.destination)?;
         if !Arc::ptr_eq(&source_instance, &dest_instance) {
             return Err(Error::new(
                 ErrorCode::Unsupported,
@@ -830,8 +1043,10 @@ impl Layer for GcsLayer {
         request: Request<RenameRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<()> {
-        let (source_instance, source) = self.target(&request.input.source)?;
-        let (dest_instance, destination) = self.target(&request.input.destination)?;
+        // Both ends resolve before anything runs: a fallback-served source OR
+        // destination is refused here, before any read of the source.
+        let (source_instance, source) = self.connection_target(&request.input.source)?;
+        let (dest_instance, destination) = self.connection_target(&request.input.destination)?;
         if !Arc::ptr_eq(&source_instance, &dest_instance) {
             return Err(Error::new(
                 ErrorCode::Unsupported,
@@ -872,15 +1087,10 @@ impl Layer for GcsLayer {
         cancel: Option<CancellationToken>,
     ) -> Result<BackendItemInfo> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
+        self.recover_mutation(&request.input.address, move |backend, target| {
             let options = options.clone();
             let cancel = cancel.clone();
-            async move {
-                instance
-                    .backend
-                    .update_metadata(target, options, cancel)
-                    .await
-            }
+            async move { backend.update_metadata(target, options, cancel).await }
         })
         .await
     }
@@ -900,16 +1110,15 @@ impl Layer for GcsLayer {
         // nothing, and its successes are ordinary signed requests the service
         // answered.
         let operations = request.input.operations;
-        self.recover(&request.input.address, move |instance, target| {
-            let operations = operations.clone();
-            let cancel = cancel.clone();
-            async move {
-                instance
-                    .backend
-                    .check_access(target, operations, cancel)
-                    .await
-            }
-        })
+        self.recover(
+            &request.input.address,
+            cancel.clone(),
+            move |backend, target| {
+                let operations = operations.clone();
+                let cancel = cancel.clone();
+                async move { backend.check_access(target, operations, cancel).await }
+            },
+        )
         .await
     }
 
@@ -934,7 +1143,9 @@ impl Layer for GcsLayer {
                 ),
             ));
         }
+        self.refuse_fallback_keys_on_connection(&req.config)?;
         let config = GcsConnectionConfig::from_request(&req)?;
+        self.warn_if_endpoint_is_instance_metadata(&config);
         let is_anonymous =
             Authenticator::new(&req.credentials, build_http_client()?)?.is_anonymous();
         let capabilities = gcs_capabilities(&config);
@@ -956,6 +1167,12 @@ impl Layer for GcsLayer {
             },
             last_probed: None,
             user_metadata: UserMetadata::new(),
+            // This layer owns the connection, and its instance name is the
+            // `ConnectionKey::target` that reaches it -- the same name
+            // `owned_targets` reports and `remove_connection` gates on. Stamped
+            // at construction so the row carries it wherever it goes, including
+            // out of `ConnectionSet`'s change stream.
+            owning_target: Some(self.name.clone()),
         };
         let outcome = self
             .connection_set
@@ -1034,7 +1251,7 @@ impl Layer for GcsLayer {
             state
                 .instances
                 .retain(|instance| instance.connection_id != id);
-            state.routes = build_routes(&state.instances);
+            state.routes = build_routes(&state.instances, self.fallback.as_ref());
             Error::new(
                 ErrorCode::Internal,
                 "add_connection did not create a connection",
@@ -1070,7 +1287,7 @@ impl Layer for GcsLayer {
         state
             .instances
             .retain(|instance| instance.connection_id != id);
-        state.routes = build_routes(&state.instances);
+        state.routes = build_routes(&state.instances, self.fallback.as_ref());
         Ok(())
     }
 

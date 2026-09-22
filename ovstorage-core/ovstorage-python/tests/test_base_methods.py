@@ -94,12 +94,14 @@ async def test_write_stream_copy_rename_and_update_metadata_native_path(
     with pytest.raises(ovstorage.NotFoundError):
         await stack.stat(copied)
 
-    updated = await stack.update_metadata(
-        renamed,
-        user_metadata_set={"owner": "smoke"},
-    )
-    assert updated.address == renamed
-    assert updated.user_metadata["owner"] == "smoke"
+    # The file backend stores no user metadata: a metadata update is refused
+    # and stat reports an empty map.
+    with pytest.raises(ovstorage.UnsupportedError):
+        await stack.update_metadata(
+            renamed,
+            user_metadata_set={"owner": "smoke"},
+        )
+    assert (await stack.stat(renamed)).user_metadata == {}
 
 
 async def test_create_and_delete_directory_native_path(

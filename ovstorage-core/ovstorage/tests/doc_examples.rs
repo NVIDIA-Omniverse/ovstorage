@@ -27,6 +27,7 @@ const BUILDABLE_KINDS: &[&str] = &[
     "redirect_follower",
     "byte_cache",
     "metadata_cache",
+    "hub_cache",
 ];
 
 fn public_layer_factories() -> Vec<LoadedLayerFactory> {
@@ -51,6 +52,7 @@ fn public_layer_factories() -> Vec<LoadedLayerFactory> {
         LoadedLayerFactory::Wrapper(Arc::new(
             ovstorage_plugin_cache::MetadataCacheWrapperFactory::default(),
         )),
+        LoadedLayerFactory::Wrapper(Arc::new(ovstorage_plugin_hub_cache::HubCacheWrapperFactory)),
     ]
 }
 

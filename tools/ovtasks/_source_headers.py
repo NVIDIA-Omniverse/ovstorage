@@ -5,16 +5,20 @@
 board requires NVIDIA-authored source files to carry a copyright notice and
 SPDX short-form license identifier before distribution.
 
-Two validation modes:
+Three validation modes:
 
 - **NVIDIA-authored (default).** The SPDX two-line header
   (``SPDX-FileCopyrightText`` + ``SPDX-License-Identifier: Apache-2.0``) must
   appear within the first ``NVIDIA_HEADER_WINDOW_LINES`` lines. The window is
   intentionally small: the header must sit at the top of the file.
-- **Vendored third-party** (the gRPC ``health.proto``). OSRB does not allow
+- **Vendored Apache third-party** (the gRPC ``health.proto``). OSRB does not allow
   the SPDX shortcut for non-NVIDIA-authored code -- the full upstream Apache
   2.0 boilerplate must be preserved verbatim within the first
-  ``VENDORED_HEADER_WINDOW_LINES`` lines."""
+  ``VENDORED_HEADER_WINDOW_LINES`` lines.
+- **Vendored MIT third-party** (tomlc17). Its upstream copyright and license
+  pointer must remain in each source header; the complete MIT text is preserved
+  in the adjacent ``LICENSE`` file and the component is recorded in
+  ``THIRD_PARTY_NOTICES.md``."""
 
 from __future__ import annotations
 
@@ -40,6 +44,12 @@ GRPC_HEALTH_PROTO = (
 )
 GRPC_HEALTH_COPYRIGHT = "Copyright 2015 The gRPC Authors"
 APACHE_LICENSE_FULL_PHRASE = "Licensed under the Apache License, Version 2.0"
+TOMLC17_SOURCES = {
+    "ovstorage-c-source/src/vendor/tomlc17/tomlc17.c",
+    "ovstorage-c-source/src/vendor/tomlc17/tomlc17.h",
+}
+TOMLC17_COPYRIGHT = "Copyright (c) 2024-2026, CK Tan"
+TOMLC17_LICENSE_POINTER = "github.com/cktan/tomlc17/blob/main/LICENSE"
 
 GENERATED_WITH_EXTERNAL_DRIFT_CHECKS = (
     "ovstorage-remote/ovstorage-rest/spec/openapi.yaml",
@@ -89,6 +99,11 @@ def _validate_file(rel: str, text: str) -> str | None:
         head = _leading_lines(text, VENDORED_HEADER_WINDOW_LINES)
         return _require(head, GRPC_HEALTH_COPYRIGHT, VENDORED_HEADER_WINDOW_LINES) or _require(
             head, APACHE_LICENSE_FULL_PHRASE, VENDORED_HEADER_WINDOW_LINES
+        )
+    if rel in TOMLC17_SOURCES:
+        head = _leading_lines(text, VENDORED_HEADER_WINDOW_LINES)
+        return _require(head, TOMLC17_COPYRIGHT, VENDORED_HEADER_WINDOW_LINES) or _require(
+            head, TOMLC17_LICENSE_POINTER, VENDORED_HEADER_WINDOW_LINES
         )
     head = _leading_lines(text, NVIDIA_HEADER_WINDOW_LINES)
     return _require(head, NVIDIA_COPYRIGHT, NVIDIA_HEADER_WINDOW_LINES) or _require(

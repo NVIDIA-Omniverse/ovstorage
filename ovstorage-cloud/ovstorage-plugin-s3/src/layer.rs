@@ -11,6 +11,12 @@
 //! only the routing state. S3 roots are config-derived and fixed at connect
 //! time (the SQS watch never changes roots), so `list_address_roots` is
 //! snapshot-only — no dynamic-root stream.
+//!
+//! A layer granted `anonymous_fallback = ["s3"]` also publishes one hidden
+//! scheme root, `s3:///`, bound to an [`S3SchemeFallback`]: an `s3://` address
+//! no connection serves is attempted anonymously against a per-bucket backend
+//! built on first touch, read-only, with no connection registered. See
+//! [`crate::fallback`] for what the fallback may and may not do.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,15 +24,22 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use ovstorage_plugin::connection::{ConnectionSet, ProbeOutcome};
+use ovstorage_plugin::fallback::{
+    decode_anonymous_fallback, is_anonymous_fallback_key, schemes_for_kind,
+    split_anonymous_fallback_keys,
+};
+use ovstorage_plugin::instance_metadata::is_instance_metadata_url;
 use ovstorage_plugin::*;
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
+use tracing::warn;
 
 use crate::backend::{S3Backend, anonymous_capabilities, s3_capabilities_for_config};
 use crate::client::{OperationEvidence, with_operation_evidence, without_promotion_evidence};
 use crate::config::{self, S3Config};
 use crate::credentials::{self, AwsCredentials};
 use crate::driver::S3Driver;
+use crate::fallback::S3SchemeFallback;
 
 /// The static backend descriptor; converted to the v2 `LayerKindDescriptor`
 /// via [`descriptor_to_layer_kind`] at the factory/layer surface.
@@ -74,23 +87,61 @@ impl BackendFactory for S3LayerFactory {
         config: &LayerConfig,
         cancel: Option<CancellationToken>,
     ) -> Result<LayerHandle> {
+        // The fallback keys are split off FIRST: the static-connection seed
+        // below treats any non-empty table as a connection, and a layer
+        // holding only `anonymous_fallback = ["s3"]` describes no connection.
+        let (policy, connection) = split_anonymous_fallback_keys(config);
+        let grant = decode_anonymous_fallback(&policy)?;
+        let served = schemes_for_kind(&self.descriptor.kind);
+        if let Some(scheme) = grant
+            .iter()
+            .find(|scheme| !served.contains(&scheme.as_str()))
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "`anonymous_fallback` on layer `{name}` (kind {}) names scheme `{scheme}`, \
+                     which this kind does not serve; it serves {}",
+                    self.descriptor.kind,
+                    served.join(", ")
+                ),
+            ));
+        }
+        // The tunables are validated whether or not the grant is on, so a
+        // typo, an endpoint that is not a bare origin, or an instance-metadata
+        // endpoint is reported where the operator wrote it rather than when a
+        // grant later turns it live.
+        let tunables = config::parse_fallback_policy(&policy, name)?;
+        crate::fallback::refuse_instance_metadata_endpoint(&tunables)?;
+        let fallback = grant
+            .contains(crate::fallback::SCHEME)
+            .then(|| {
+                S3SchemeFallback::new(
+                    tunables,
+                    &self.descriptor.kind,
+                    self.descriptor.icon.clone(),
+                )
+            })
+            .transpose()?
+            .map(Arc::new);
         let layer = Arc::new(S3Layer {
             name: name.to_string(),
             descriptor: self.descriptor.clone(),
             connection_set: Arc::new(ConnectionSet::with_defaults()),
             state: RwLock::new(S3LayerState {
                 instances: Vec::new(),
-                routes: RouteTable::empty(),
+                routes: build_routes(&[], fallback.as_ref()),
+                fallback,
             }),
             next_instance_counter: AtomicU64::new(0),
         });
-        // A non-empty layer config seeds one static connection (the
+        // A non-empty connection config seeds one static connection (the
         // config-as-Stack path); runtime connections arrive via
         // `add_connection`.
-        if !config.is_empty() {
+        if !connection.is_empty() {
             let request = ConnectionRequest {
                 backend_kind: self.descriptor.kind.clone(),
-                config: config.clone(),
+                config: connection,
                 credentials: SecretBundle::default(),
                 persist: false,
                 display_name: None,
@@ -133,7 +184,18 @@ pub(crate) struct S3Layer {
 
 struct S3LayerState {
     instances: Vec<Arc<S3Instance>>,
-    routes: RouteTable<Arc<S3Instance>>,
+    /// The anonymous `s3://` fallback, when the layer is granted one. Fixed for
+    /// the life of the layer: the grant is layer config, not a connection.
+    fallback: Option<Arc<S3SchemeFallback>>,
+    routes: RouteTable<S3Route>,
+}
+
+/// What an address routes to: a configured connection's instance, or the
+/// scheme fallback when no connection root is an ancestor of the address.
+#[derive(Clone)]
+enum S3Route {
+    Connection(Arc<S3Instance>),
+    Fallback(Arc<S3SchemeFallback>),
 }
 
 /// One backend instance serving one connection. Routing/dispatch state only —
@@ -229,20 +291,35 @@ impl AcceptanceWitness {
     }
 }
 
-/// Longest-prefix route table over the current instance set.
-fn build_routes(instances: &[Arc<S3Instance>]) -> RouteTable<Arc<S3Instance>> {
-    let items: Vec<(RootInfo, Arc<S3Instance>)> = instances
+/// Route table over the current instance set plus, when granted, the scheme
+/// fallback root. The fallback is appended last; the table ranks it last
+/// anyway (depth zero) and consults it only after every prefix misses.
+fn build_routes(
+    instances: &[Arc<S3Instance>],
+    fallback: Option<&Arc<S3SchemeFallback>>,
+) -> RouteTable<S3Route> {
+    let mut items: Vec<(RootInfo, S3Route)> = instances
         .iter()
         .flat_map(|instance| {
             instance
                 .roots
                 .iter()
                 .cloned()
-                .map(|root| (root, instance.clone()))
+                .map(|root| (root, S3Route::Connection(instance.clone())))
                 .collect::<Vec<_>>()
         })
         .collect();
+    if let Some(fallback) = fallback {
+        items.push((fallback.root().clone(), S3Route::Fallback(fallback.clone())));
+    }
     RouteTable::build(items)
+}
+
+impl S3LayerState {
+    /// Republish the route table after the instance set changed.
+    fn rebuild_routes(&mut self) {
+        self.routes = build_routes(&self.instances, self.fallback.as_ref());
+    }
 }
 
 impl S3Layer {
@@ -271,7 +348,9 @@ impl S3Layer {
                 ),
             ));
         }
+        self.refuse_fallback_keys(&request.config)?;
         let config = config::parse_config(&request.config)?;
+        warn_if_instance_metadata_endpoint(&config);
         let counter = self.next_instance_counter.fetch_add(1, Ordering::Relaxed);
         let backend_id = BackendId(format!(
             "s3:{}:{counter}",
@@ -304,6 +383,7 @@ impl S3Layer {
             .display_name
             .clone()
             .unwrap_or_else(|| format!("S3 {}", config.bucket));
+        let user_metadata = Self::spellings_metadata(&config);
         let connection = Connection {
             id: connection_id.clone(),
             backend_kind: self.descriptor.kind.clone(),
@@ -316,7 +396,13 @@ impl S3Layer {
                 last_attempt: None,
             },
             last_probed: None,
-            user_metadata: UserMetadata::new(),
+            user_metadata,
+            // This layer owns the connection, and its instance name is the
+            // `ConnectionKey::target` that reaches it -- the same name
+            // `owned_targets` reports and `remove_connection` gates on. Stamped
+            // at construction so the row carries it wherever it goes, including
+            // out of `ConnectionSet`'s change stream.
+            owning_target: Some(self.name.clone()),
         };
         // `ConnectionSet` validates (via the driver) and records auth state; a
         // soft obtain/verify failure parks the connection (`AwaitingAuth`)
@@ -349,8 +435,9 @@ impl S3Layer {
         address: Url,
         connection_id: &ConnectionId,
         source: &ConnectionSource,
-        capabilities: Capabilities,
+        mut capabilities: Capabilities,
     ) -> RootInfo {
+        capabilities.supports_list_stream = true;
         // Provenance follows the connection source: static config stays
         // `Static` even though it carries a connection id.
         let route_source = match source {
@@ -376,35 +463,88 @@ impl S3Layer {
         }
     }
 
-    /// Install `instance` and republish the route table atomically.
-    fn install(&self, instance: Arc<S3Instance>) {
-        let mut state = self.state.write();
-        state.instances.push(instance);
-        state.routes = build_routes(&state.instances);
+    /// The `user_metadata` every connection row derived from `config` carries:
+    /// the bucket's ordinary cloud-URL spellings under
+    /// [`ACCEPTED_URL_SPELLINGS_METADATA_KEY`], so an alias wrapper above can
+    /// auto-generate hidden alias rules for them. Shared by
+    /// `instantiate_connection` and `probe` — like `owning_target`, the contract
+    /// is stamped on BOTH row-construction sites, so the preview row a probe
+    /// returns matches the row the subsequent add produces.
+    fn spellings_metadata(config: &S3Config) -> UserMetadata {
+        let mut user_metadata = UserMetadata::new();
+        let url_spellings = config::alternate_url_prefixes(config);
+        if !url_spellings.is_empty() {
+            user_metadata.insert(
+                ACCEPTED_URL_SPELLINGS_METADATA_KEY.to_string(),
+                encode_url_spellings(&url_spellings),
+            );
+        }
+        user_metadata
     }
 
-    fn target(&self, url: &Url) -> Result<(Arc<S3Instance>, ResolvedTarget)> {
-        let instance = self
+    /// Install `instance` and republish the route table atomically. The
+    /// fallback's cached backend for each root the connection publishes is
+    /// evicted in the same step: once the connection is installed the first tier
+    /// answers those nodes, so the anonymous client is only an occupied slot.
+    fn install(&self, instance: Arc<S3Instance>) {
+        let mut state = self.state.write();
+        if let Some(fallback) = &state.fallback {
+            for root in &instance.roots {
+                fallback.evict_node(&root.root);
+            }
+        }
+        state.instances.push(instance);
+        state.rebuild_routes();
+    }
+
+    /// Route `url`: a connection instance when one of its roots is an ancestor
+    /// of the address, else the scheme fallback when the layer is granted one
+    /// and the address carries no credential in its query.
+    ///
+    /// The `ResolvedTarget` for a fallback hit is provisional — its backend id
+    /// names the bucket alone, because the region is not known until
+    /// [`S3SchemeFallback::backend_for`] has run, and that call returns the
+    /// target the operation takes.
+    fn target(&self, url: &Url) -> Result<(S3Route, ResolvedTarget)> {
+        let route = self
             .state
             .read()
             .routes
             .lookup(url)
-            .map(|(_, instance)| instance.clone())
+            .map(|(_, route)| route.clone())
             .ok_or_else(|| Error::new(ErrorCode::NoRoute, "no route matches address"))?;
+        let backend_id = match &route {
+            S3Route::Connection(instance) => instance.backend_id.clone(),
+            S3Route::Fallback(_) => {
+                S3SchemeFallback::backend_id(url.host_str().unwrap_or_default(), None)
+            }
+        };
         let target = ResolvedTarget {
-            backend_id: instance.backend_id.clone(),
+            backend_id,
             resolved_address: url.clone(),
         };
-        Ok((instance, target))
+        Ok((route, target))
     }
 
-    /// Route `url` to its instance and run `op` under the connection's
-    /// data-path recovery loop, promoting a parked connection if the store
-    /// demonstrably accepted one of this operation's own requests. With
-    /// `S3Driver::refresh` unsupported (static keys) the recovery half degrades
-    /// to classify-and-surface, which is correct — and positions s3 for a
-    /// future STS driver without touching call sites. `op` must be replayable
-    /// (no consumed streaming body).
+    /// Route `url` for a slot the fallback does not serve: every mutation, and
+    /// `watch_directory`. A fallback hit is refused here, before any witness is
+    /// taken, any body buffered, any continuation decoded or any request sent;
+    /// a connection hit is returned for the slot to run as it always has.
+    fn configured_target(&self, url: &Url) -> Result<(Arc<S3Instance>, ResolvedTarget)> {
+        match self.target(url)? {
+            (S3Route::Connection(instance), target) => Ok((instance, target)),
+            (S3Route::Fallback(fallback), _) => Err(fallback.refuse_mutation(url)),
+        }
+    }
+
+    /// Route `url` and run `op` against the backend serving it.
+    ///
+    /// On a connection this is the data-path recovery loop, promoting a parked
+    /// connection if the store demonstrably accepted one of this operation's
+    /// own requests. With `S3Driver::refresh` unsupported (static keys) the
+    /// recovery half degrades to classify-and-surface, which is correct — and
+    /// positions s3 for a future STS driver without touching call sites. `op`
+    /// must be replayable (no consumed streaming body).
     ///
     /// The evidence is per-operation, so an operation that reaches no request
     /// earns nothing for anyone: a `read` mints a presigned URL and sends
@@ -416,19 +556,68 @@ impl S3Layer {
     /// nothing in either direction. Refusals heard by a CONCURRENT operation are
     /// seen, because those belong to the connection rather than to an
     /// operation.
-    async fn recover<T, F, Fut>(&self, url: &Url, op: F) -> Result<T>
+    ///
+    /// On the fallback there is no connection to park or promote and no
+    /// credential for the store to refuse, so `op` runs directly against the
+    /// per-bucket anonymous backend, built here on first touch.
+    async fn recover<T, F, Fut>(
+        &self,
+        url: &Url,
+        cancel: Option<CancellationToken>,
+        op: F,
+    ) -> Result<T>
     where
-        F: Fn(Arc<S3Instance>, ResolvedTarget) -> Fut,
+        F: Fn(Arc<S3Backend>, ResolvedTarget, Option<CancellationToken>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let (instance, target) = self.target(url)?;
+        match self.target(url)? {
+            (S3Route::Connection(instance), target) => {
+                self.recover_on(instance, target, cancel, op).await
+            }
+            (S3Route::Fallback(fallback), _) => {
+                let (backend, target) = fallback.backend_for(url, cancel.clone()).await?;
+                op(backend, target, cancel).await
+            }
+        }
+    }
+
+    /// [`Self::recover`] for a slot the fallback does not serve: the fallback
+    /// is refused by [`Self::configured_target`] and a connection runs under
+    /// the same recovery loop.
+    async fn recover_configured<T, F, Fut>(
+        &self,
+        url: &Url,
+        cancel: Option<CancellationToken>,
+        op: F,
+    ) -> Result<T>
+    where
+        F: Fn(Arc<S3Backend>, ResolvedTarget, Option<CancellationToken>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let (instance, target) = self.configured_target(url)?;
+        self.recover_on(instance, target, cancel, op).await
+    }
+
+    /// The connection half of [`Self::recover`]: the acceptance witness and the
+    /// promoting recovery loop around `op` on `instance`.
+    async fn recover_on<T, F, Fut>(
+        &self,
+        instance: Arc<S3Instance>,
+        target: ResolvedTarget,
+        cancel: Option<CancellationToken>,
+        op: F,
+    ) -> Result<T>
+    where
+        F: Fn(Arc<S3Backend>, ResolvedTarget, Option<CancellationToken>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         let id = instance.connection_id.clone();
         let witness = AcceptanceWitness::take(&instance);
         self.connection_set
             .with_recovery_promoting_if(
                 &id,
                 || witness.proved(self),
-                || witness.scope(op(instance.clone(), target.clone())),
+                || witness.scope(op(instance.backend.clone(), target.clone(), cancel.clone())),
             )
             .await
     }
@@ -442,6 +631,48 @@ impl S3Layer {
             .instances
             .iter()
             .any(|installed| Arc::ptr_eq(installed, instance))
+    }
+
+    /// Route both ends of a `copy` or `rename`. Either end reached through the
+    /// fallback refuses the whole operation, naming that end's bucket root,
+    /// before any request is sent for the other.
+    #[allow(clippy::type_complexity)]
+    fn configured_pair(
+        &self,
+        source: &Url,
+        destination: &Url,
+    ) -> Result<(
+        Arc<S3Instance>,
+        ResolvedTarget,
+        Arc<S3Instance>,
+        ResolvedTarget,
+    )> {
+        let (source_route, source_target) = self.target(source)?;
+        let (dest_route, dest_target) = self.target(destination)?;
+        match (source_route, dest_route) {
+            (S3Route::Connection(source_instance), S3Route::Connection(dest_instance)) => {
+                Ok((source_instance, source_target, dest_instance, dest_target))
+            }
+            (S3Route::Fallback(fallback), _) => Err(fallback.refuse_mutation(source)),
+            (_, S3Route::Fallback(fallback)) => Err(fallback.refuse_mutation(destination)),
+        }
+    }
+
+    /// Refuse a connection request that carries a fallback layer key. Such a
+    /// key on a connection would be ignored silently otherwise, and the
+    /// operator would believe it took effect.
+    fn refuse_fallback_keys(&self, config: &LayerConfig) -> Result<()> {
+        if let Some(key) = config.keys().find(|key| is_anonymous_fallback_key(key)) {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "`{key}` is a layer key, not connection config; set it on \
+                     [ovstorage.layers.{}]",
+                    self.name
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Resolve a `ConnectionKey` to its id, enforcing the target-plus-id
@@ -458,6 +689,23 @@ impl S3Layer {
         let mut roots: Vec<RootInfo> = self.state.read().routes.roots().cloned().collect();
         roots.sort_by(|left, right| left.root.as_str().cmp(right.root.as_str()));
         roots
+    }
+}
+
+/// Advisory only: an operator who points a connection at a cloud
+/// instance-metadata host chose to, and the request carries that operator's
+/// own credential, so it is warned about rather than refused. The fallback,
+/// whose hosts come from callers, refuses the same host outright.
+fn warn_if_instance_metadata_endpoint(config: &S3Config) {
+    if let Some(endpoint) = &config.endpoint
+        && let Ok(url) = Url::parse(endpoint)
+        && is_instance_metadata_url(&url)
+    {
+        warn!(
+            endpoint = %origin_only(&url),
+            bucket = %config.bucket,
+            "the configured S3 endpoint is a cloud instance-metadata host"
+        );
     }
 }
 
@@ -565,11 +813,14 @@ impl Layer for S3Layer {
         cancel: Option<CancellationToken>,
     ) -> Result<ObjectInfo> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
-            let options = options.clone();
-            let cancel = cancel.clone();
-            async move { instance.backend.stat(target, options, cancel).await }
-        })
+        self.recover(
+            &request.input.address,
+            cancel,
+            move |backend, target, cancel| {
+                let options = options.clone();
+                async move { backend.stat(target, options, cancel).await }
+            },
+        )
         .await
     }
 
@@ -579,11 +830,14 @@ impl Layer for S3Layer {
         cancel: Option<CancellationToken>,
     ) -> Result<ReadResult> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
-            let options = options.clone();
-            let cancel = cancel.clone();
-            async move { instance.backend.read(target, options, cancel).await }
-        })
+        self.recover(
+            &request.input.address,
+            cancel,
+            move |backend, target, cancel| {
+                let options = options.clone();
+                async move { backend.read(target, options, cancel).await }
+            },
+        )
         .await
     }
 
@@ -597,7 +851,10 @@ impl Layer for S3Layer {
         // to the caller. The acceptance an inline write earns still counts,
         // though — a connection whose `PutObject` the store answered has proved
         // its credentials as surely as any other operation.
-        let (instance, target) = self.target(&request.input.address)?;
+        //
+        // The fallback is refused first, before the witness is taken and
+        // before the body is touched.
+        let (instance, target) = self.configured_target(&request.input.address)?;
         let id = instance.connection_id.clone();
         let witness = AcceptanceWitness::take(&instance);
         let options = request.input.options;
@@ -649,7 +906,7 @@ impl Layer for S3Layer {
         // URLs. A single-part batch presigns only, sends nothing, and earns
         // nothing — the per-operation evidence tells the two apart without this
         // slot having to classify itself.
-        let (instance, target) = self.target(&request.input.address)?;
+        let (instance, target) = self.configured_target(&request.input.address)?;
         let id = instance.connection_id.clone();
         let witness = AcceptanceWitness::take(&instance);
         let options = request.input.options;
@@ -682,7 +939,9 @@ impl Layer for S3Layer {
         // never performed and flip an operator's shared connection to
         // `Authenticated` with no request leaving the process. A redirect-only
         // writer stays parked until some other operation reaches the store.
-        let (instance, target) = self.target(&request.input.address)?;
+        //
+        // The fallback is refused before the continuation is decoded.
+        let (instance, target) = self.configured_target(&request.input.address)?;
         let id = instance.connection_id.clone();
         let witness = AcceptanceWitness::take(&instance);
         let (redirects, results) = (request.input.redirects, request.input.results);
@@ -706,11 +965,14 @@ impl Layer for S3Layer {
         cancel: Option<CancellationToken>,
     ) -> Result<()> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
-            let options = options.clone();
-            let cancel = cancel.clone();
-            async move { instance.backend.delete(target, options, cancel).await }
-        })
+        self.recover_configured(
+            &request.input.address,
+            cancel,
+            move |backend, target, cancel| {
+                let options = options.clone();
+                async move { backend.delete(target, options, cancel).await }
+            },
+        )
         .await
     }
 
@@ -719,14 +981,11 @@ impl Layer for S3Layer {
         request: Request<ListRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<ListPage> {
-        // Pull the full set — the backend walks S3's own
-        // `NextContinuationToken` to the end of the prefix — then fold flat
-        // directory markers / infer subdirectory kinds, and paginate the folded
-        // result so synthesized entries land on stable page boundaries.
-        // Surfacing S3's native continuation token to the CALLER instead, so a
-        // host page maps onto an S3 page, remains a behavior change deferred
-        // past gen1; what is not deferred is completeness, because a folded set
-        // built from a truncated listing reports absent objects as missing.
+        // The streaming surface follows S3's native page walk incrementally.
+        // Buffered listing deliberately still pulls the full set, folds flat
+        // directory markers / inferred subdirectories as a whole, and applies
+        // host-side offset pagination so its item order, tokens, and budget
+        // refusals remain stable.
         let prefix = request.input.prefix.clone();
         let options = request.input.options;
         let max_results = options.max_results;
@@ -738,15 +997,52 @@ impl Layer for S3Layer {
             ..options
         };
         let items = self
-            .recover(&request.input.prefix, move |instance, target| {
-                let options = backend_options.clone();
-                let cancel = cancel.clone();
-                async move { instance.backend.list(target, options, cancel).await }
-            })
+            .recover(
+                &request.input.prefix,
+                cancel,
+                move |backend, target, cancel| {
+                    let options = backend_options.clone();
+                    async move { backend.list(target, options, cancel).await }
+                },
+            )
             .await?;
         // S3 is a flat namespace: never real directories.
         let items = fold_markers_and_infer_subdir_kinds(&prefix, items, false, recursive);
         paginate_list_items(items, max_results, page_token)
+    }
+
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        let prefix = request.input.prefix;
+        let options = request.input.options;
+        if options.max_results.is_some() || options.page_token.is_some() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+
+        let recursive = options.recursive;
+        let backend_options = ListOptions {
+            max_results: None,
+            page_token: None,
+            ..options
+        };
+        let stream_cancel = cancel.clone();
+        let stream = self
+            .recover(&prefix, cancel, move |backend, target, cancel| {
+                let options = backend_options.clone();
+                async move { backend.list_stream(target, options, cancel).await }
+            })
+            .await?;
+        // S3 is a flat namespace: never real directories.
+        Ok(cancel_list_stream(
+            Box::pin(IncrementalListFold::new(stream, &prefix, false, recursive)),
+            stream_cancel,
+        ))
     }
 
     async fn list_versions(
@@ -756,16 +1052,14 @@ impl Layer for S3Layer {
     ) -> Result<VersionPage> {
         let options = request.input.options;
         let items = self
-            .recover(&request.input.address, move |instance, target| {
-                let options = options.clone();
-                let cancel = cancel.clone();
-                async move {
-                    instance
-                        .backend
-                        .list_versions(target, options, cancel)
-                        .await
-                }
-            })
+            .recover(
+                &request.input.address,
+                cancel,
+                move |backend, target, cancel| {
+                    let options = options.clone();
+                    async move { backend.list_versions(target, options, cancel).await }
+                },
+            )
             .await?;
         // Current behavior: the backend honors `page_token` natively but the
         // host never chained pages; keep the same shape.
@@ -780,10 +1074,13 @@ impl Layer for S3Layer {
         request: Request<ReadRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<ObjectInfo> {
-        self.recover(&request.input.address, move |instance, target| {
-            let cancel = cancel.clone();
-            async move { instance.backend.get_latest_version(target, cancel).await }
-        })
+        self.recover(
+            &request.input.address,
+            cancel,
+            move |backend, target, cancel| async move {
+                backend.get_latest_version(target, cancel).await
+            },
+        )
         .await
     }
 
@@ -793,24 +1090,27 @@ impl Layer for S3Layer {
         cancel: Option<CancellationToken>,
     ) -> Result<ChangeStream> {
         // Establish the SQS subscription under `recover` (establishment is
-        // replayable); mid-stream errors surface via the mapped stream.
+        // replayable); mid-stream errors surface via the mapped stream. The
+        // fallback has no identity to hold a subscription with and is refused.
         let options = request.input.options;
         let stream = self
-            .recover(&request.input.prefix, move |instance, target| {
-                let options = options.clone();
-                let cancel = cancel.clone();
-                async move {
-                    // S3 ignores `opts.poll_interval`: the SQS long-poll
-                    // duration is config-only, so the coalescer negotiates over
-                    // this connection-normalized cadence.
-                    let effective_cadence =
-                        Duration::from_secs(instance.backend.config().sqs_wait_seconds.into());
-                    instance
-                        .backend
-                        .watch_directory(target, options, effective_cadence, cancel)
-                        .await
-                }
-            })
+            .recover_configured(
+                &request.input.prefix,
+                cancel,
+                move |backend, target, cancel| {
+                    let options = options.clone();
+                    async move {
+                        // S3 ignores `opts.poll_interval`: the SQS long-poll
+                        // duration is config-only, so the coalescer negotiates
+                        // over this connection-normalized cadence.
+                        let effective_cadence =
+                            Duration::from_secs(backend.config().sqs_wait_seconds.into());
+                        backend
+                            .watch_directory(target, options, effective_cadence, cancel)
+                            .await
+                    }
+                },
+            )
             .await?;
         Ok(Box::new(
             stream.map(|event| event.and_then(backend_change_to_change)),
@@ -823,16 +1123,14 @@ impl Layer for S3Layer {
         cancel: Option<CancellationToken>,
     ) -> Result<BackendItemInfo> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
-            let options = options.clone();
-            let cancel = cancel.clone();
-            async move {
-                instance
-                    .backend
-                    .create_directory(target, options, cancel)
-                    .await
-            }
-        })
+        self.recover_configured(
+            &request.input.address,
+            cancel,
+            move |backend, target, cancel| {
+                let options = options.clone();
+                async move { backend.create_directory(target, options, cancel).await }
+            },
+        )
         .await
     }
 
@@ -842,16 +1140,14 @@ impl Layer for S3Layer {
         cancel: Option<CancellationToken>,
     ) -> Result<()> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
-            let options = options.clone();
-            let cancel = cancel.clone();
-            async move {
-                instance
-                    .backend
-                    .delete_directory(target, options, cancel)
-                    .await
-            }
-        })
+        self.recover_configured(
+            &request.input.address,
+            cancel,
+            move |backend, target, cancel| {
+                let options = options.clone();
+                async move { backend.delete_directory(target, options, cancel).await }
+            },
+        )
         .await
     }
 
@@ -860,8 +1156,11 @@ impl Layer for S3Layer {
         request: Request<CopyRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<WriteStep> {
-        let (source_instance, source) = self.target(&request.input.source)?;
-        let (dest_instance, destination) = self.target(&request.input.destination)?;
+        // Both ends are resolved before anything else: an address the fallback
+        // serves is refused whichever end it sits on, and before any read of
+        // the source.
+        let (source_instance, source, dest_instance, destination) =
+            self.configured_pair(&request.input.source, &request.input.destination)?;
         if !Arc::ptr_eq(&source_instance, &dest_instance) {
             return Err(Error::new(
                 ErrorCode::Unsupported,
@@ -901,8 +1200,8 @@ impl Layer for S3Layer {
         request: Request<RenameRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<()> {
-        let (source_instance, source) = self.target(&request.input.source)?;
-        let (dest_instance, destination) = self.target(&request.input.destination)?;
+        let (source_instance, source, dest_instance, destination) =
+            self.configured_pair(&request.input.source, &request.input.destination)?;
         if !Arc::ptr_eq(&source_instance, &dest_instance) {
             return Err(Error::new(
                 ErrorCode::Unsupported,
@@ -943,16 +1242,14 @@ impl Layer for S3Layer {
         cancel: Option<CancellationToken>,
     ) -> Result<BackendItemInfo> {
         let options = request.input.options;
-        self.recover(&request.input.address, move |instance, target| {
-            let options = options.clone();
-            let cancel = cancel.clone();
-            async move {
-                instance
-                    .backend
-                    .update_metadata(target, options, cancel)
-                    .await
-            }
-        })
+        self.recover_configured(
+            &request.input.address,
+            cancel,
+            move |backend, target, cancel| {
+                let options = options.clone();
+                async move { backend.update_metadata(target, options, cancel).await }
+            },
+        )
         .await
     }
 
@@ -972,16 +1269,16 @@ impl Layer for S3Layer {
         // credential. The cost of that choice is real and is recorded at
         // `vetoes_promotion`.
         let operations = request.input.operations;
-        self.recover(&request.input.address, move |instance, target| {
-            let operations = operations.clone();
-            let cancel = cancel.clone();
-            without_promotion_evidence(async move {
-                instance
-                    .backend
-                    .check_access(target, operations, cancel)
-                    .await
-            })
-        })
+        self.recover(
+            &request.input.address,
+            cancel,
+            move |backend, target, cancel| {
+                let operations = operations.clone();
+                without_promotion_evidence(async move {
+                    backend.check_access(target, operations, cancel).await
+                })
+            },
+        )
         .await
     }
 
@@ -1006,7 +1303,9 @@ impl Layer for S3Layer {
                 ),
             ));
         }
+        self.refuse_fallback_keys(&req.config)?;
         let config = config::parse_config(&req.config)?;
+        warn_if_instance_metadata_endpoint(&config);
         let is_anonymous = credentials::resolve_bundle(&req.credentials)?.is_none();
         let capabilities = if is_anonymous {
             anonymous_capabilities()
@@ -1030,7 +1329,16 @@ impl Layer for S3Layer {
                 last_attempt: None,
             },
             last_probed: None,
-            user_metadata: UserMetadata::new(),
+            // The preview row carries the same spellings contract the
+            // registered row will, so a host can show "these URLs will also
+            // resolve" before the caller commits.
+            user_metadata: Self::spellings_metadata(&config),
+            // This layer owns the connection, and its instance name is the
+            // `ConnectionKey::target` that reaches it -- the same name
+            // `owned_targets` reports and `remove_connection` gates on. Stamped
+            // at construction so the row carries it wherever it goes, including
+            // out of `ConnectionSet`'s change stream.
+            owning_target: Some(self.name.clone()),
         };
         let outcome = self
             .connection_set
@@ -1107,7 +1415,7 @@ impl Layer for S3Layer {
             state
                 .instances
                 .retain(|instance| instance.connection_id != id);
-            state.routes = build_routes(&state.instances);
+            state.rebuild_routes();
             Error::new(
                 ErrorCode::Internal,
                 "add_connection did not create a connection",
@@ -1142,7 +1450,7 @@ impl Layer for S3Layer {
         state
             .instances
             .retain(|instance| instance.connection_id != id);
-        state.routes = build_routes(&state.instances);
+        state.rebuild_routes();
         Ok(())
     }
 

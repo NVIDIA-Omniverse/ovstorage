@@ -731,6 +731,7 @@ void ovc_info_clear(OvStorage_Info *info)
     free((void *)info->etag);
     free((void *)info->version);
     free((void *)info->modified_by);
+    free((void *)info->versioned_address);
     ovc_metadata_destroy(info->user_metadata, info->user_metadata_len);
     ovc_metadata_destroy(info->system_metadata, info->system_metadata_len);
     ovc_checksums_destroy(info->checksums, info->checksums_len);
@@ -769,6 +770,7 @@ OvStorage_Info *ovstorage_info_clone(const OvStorage_Info *info)
     copy->system_metadata_len = info->system_metadata_len;
     copy->has_effective_permissions = info->has_effective_permissions;
     copy->effective_permissions = info->effective_permissions;
+    copy->etag_strength = info->etag_strength;
     copy->address =
         info->address == NULL ? NULL : ovc_string_duplicate(info->address);
     copy->etag = info->etag == NULL ? NULL : ovc_string_duplicate(info->etag);
@@ -777,10 +779,16 @@ OvStorage_Info *ovstorage_info_clone(const OvStorage_Info *info)
     copy->modified_by = info->modified_by == NULL
                             ? NULL
                             : ovc_string_duplicate(info->modified_by);
+    copy->versioned_address =
+        info->versioned_address == NULL
+            ? NULL
+            : ovc_string_duplicate(info->versioned_address);
     if ((info->address != NULL && copy->address == NULL) ||
         (info->etag != NULL && copy->etag == NULL) ||
         (info->version != NULL && copy->version == NULL) ||
-        (info->modified_by != NULL && copy->modified_by == NULL)) {
+        (info->modified_by != NULL && copy->modified_by == NULL) ||
+        (info->versioned_address != NULL &&
+         copy->versioned_address == NULL)) {
         ovstorage_info_destroy(copy);
         return NULL;
     }

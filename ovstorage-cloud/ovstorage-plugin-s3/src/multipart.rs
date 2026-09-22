@@ -15,13 +15,14 @@ const CONTINUATION_TAG: &str = "ovstorage-plugin-s3:multipart:1";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MultipartContinuation {
     pub tag: String,
-    /// The object key. Written to the encoded form but never read back from
-    /// it: on the broker's client-driven route the blob is echoed back by the
-    /// remote caller, so `continue_write` derives the key from the authorized
-    /// request address. `skip_deserializing` is what makes a caller-supplied
-    /// key unreachable rather than merely unused; it is still serialized so a
-    /// continuation minted here stays decodable by a peer replica running an
-    /// earlier build while an upload is in flight.
+    /// The object key. Written to the encoded form but never read back from it.
+    /// The broker's client-driven RPC authenticates the blob and its address
+    /// binding, but direct SPI callers, follower routes, and unsealed hosts have
+    /// no equivalent Layer guarantee, so `continue_write` derives the key from
+    /// the authorized request address. `skip_deserializing` makes an unsealed
+    /// caller's key unreachable rather than merely unused; it is still
+    /// serialized so a continuation minted here stays decodable by a peer
+    /// replica running an earlier build while an upload is in flight.
     #[serde(skip_deserializing)]
     pub key: String,
     pub upload_id: String,

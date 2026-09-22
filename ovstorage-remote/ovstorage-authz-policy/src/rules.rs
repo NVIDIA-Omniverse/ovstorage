@@ -2176,6 +2176,61 @@ mod component_matcher_tests {
         assert!(!scope_covers(&scope, &url("s3://b/docsx/y"), Effect::Deny));
     }
 
+    /// A bare scheme (`s3://`) loads as a scope with an empty authority, so it
+    /// covers the scheme root and nothing hosted: host equality is exact, and
+    /// an absent host equals no bucket. The reverse holds too — a bucket-scoped
+    /// rule never reaches the scheme root. A backend that routes unconfigured
+    /// buckets through a hidden `s3:///` root therefore cannot widen a bucket
+    /// grant, and only a rule written on the bare scheme makes that root
+    /// visible — a rule that grants nothing on any bucket.
+    #[test]
+    fn a_bare_scheme_prefix_loads_and_covers_only_the_scheme_root() {
+        let scope = parse_prefix("bare-s3", "s3://")
+            .expect("a bare scheme prefix loads")
+            .expect("a bare scheme prefix is a scoped rule, not the `*` wildcard");
+        assert_eq!(scope.as_str(), "s3:///");
+        assert!(
+            scope.host_str().is_none_or(str::is_empty),
+            "the scheme root has no authority, got {:?}",
+            scope.host_str()
+        );
+        assert_eq!(scope.path(), "/");
+
+        for effect in [Effect::Allow, Effect::Deny] {
+            assert!(scope_covers(&scope, &url("s3:///"), effect));
+            assert!(!scope_covers(&scope, &url("s3://bucket/"), effect));
+            assert!(!scope_covers(&scope, &url("s3://bucket/key"), effect));
+            assert!(!scope_covers(&url("s3://bucket/"), &url("s3:///"), effect));
+        }
+
+        // The same two facts through the loader and the matcher an operator
+        // reaches: the bare rule covers the scheme root alone, and the bucket
+        // rule covers the bucket alone.
+        let policy = policy(
+            r#"
+            [[policy]]
+            id = "bare-s3"
+            effect = "allow"
+            principal = "alice"
+            operations = ["read", "list"]
+            prefix = "s3://"
+
+            [[policy]]
+            id = "public-bucket"
+            effect = "allow"
+            principal = "bob"
+            operations = ["read", "list"]
+            prefix = "s3://public/"
+            "#,
+        )
+        .unwrap();
+        assert!(policy.is_allowed("alice", Operation::Read, Some(&url("s3:///"))));
+        assert!(!policy.is_allowed("alice", Operation::Read, Some(&url("s3://public/k"))));
+        assert!(!policy.is_allowed("alice", Operation::List, Some(&url("s3://public/"))));
+        assert!(policy.is_allowed("bob", Operation::Read, Some(&url("s3://public/k"))));
+        assert!(!policy.is_allowed("bob", Operation::Read, Some(&url("s3:///"))));
+    }
+
     /// A rule on a path covers every version pin of it. Authorization is
     /// strictly coarser than node identity, which is the safe direction.
     #[test]

@@ -25,10 +25,11 @@ use std::path::Path;
 
 use clap::ValueEnum;
 use ovstorage::{
-    ConfigValue, ConnectionConfig, EMPTY_LAYER_KIND, Error, ErrorCode, LayerTable, StackConfig,
-    StackSpec, config_value_to_toml, contains_env_ref,
+    ConfigValue, ConnectionConfig, Error, ErrorCode, LayerTable, StackConfig, StackSpec,
+    config_value_to_toml, contains_env_ref,
 };
 
+use crate::commands::util::stack_is_unconfigured;
 use crate::session::{SessionConnection, SessionState};
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -54,18 +55,13 @@ pub fn run(
     // `empty` (e.g. `[ovstorage.layers.empty] kind = "file"`), and that must
     // remain write-config'able. Fail before touching the output path.
     let spec = state.stack.spec();
-    let root_is_empty = spec
-        .layers
-        .iter()
-        .find(|l| l.name == spec.root)
-        .is_some_and(|l| l.kind == EMPTY_LAYER_KIND);
-    if root_is_empty {
+    if stack_is_unconfigured(spec) {
         return Err(Error::new(
             ErrorCode::NotConfigured,
-            "cannot write-config an unconfigured (empty) stack; \
-             supply a config that declares `[ovstorage.layers]` \
-             (e.g. --config <file>, or copy the shipped ovstorage.toml; \
-             see docs/public/configuration.md) and re-run",
+            "run `ovstorage init` to create and load the minimal built-in `file` stack; \
+             cannot write-config an unconfigured (empty) stack. Alternatively, supply a config \
+             that declares `[ovstorage.layers]` (e.g. --config <file>, or copy the shipped \
+             ovstorage.toml; see docs/public/configuration.md) and re-run",
         ));
     }
 
@@ -202,7 +198,7 @@ fn layer_config_value_to_toml(key: &str, value: &ConfigValue) -> toml::Value {
 /// `0o600` and atomically replace the target rather than truncating it
 /// in place, which would otherwise follow symlinks and preserve permissive
 /// bits from the prior file.
-fn write_config_atomic(
+pub(crate) fn write_config_atomic(
     path: &Path,
     contents: &str,
     force: bool,
@@ -737,6 +733,11 @@ root = "{root}"
         let out_path = tmp.path().join("out.toml");
         let err = run(&state, &out_path, false, None).unwrap_err();
         assert_eq!(err.code(), ErrorCode::NotConfigured);
+        assert!(
+            err.message().contains("ovstorage init"),
+            "empty-stack recovery must point users to init: {}",
+            err.message()
+        );
         assert!(
             !out_path.exists(),
             "no output file must be written for an empty stack"

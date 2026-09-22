@@ -89,6 +89,16 @@ fn create_asset_ok() -> CannedResponse {
     }
 }
 
+/// The ancestor call every `PathAtBranch`-typed create issues first on a
+/// fresh connection: a write creates its path.
+fn create_directory_ok() -> CannedResponse {
+    CannedResponse {
+        interface: "Connection".into(),
+        method: "create_directory".into(),
+        frames: vec![RawFrame::from_json(&json!({"status": "OK", "ts": {}}))],
+    }
+}
+
 fn passed(scenario: &Scenario) -> ScenarioReport {
     ScenarioReport::passed(scenario, Vec::new())
 }
@@ -245,10 +255,12 @@ async fn drive_read_empty(scenario: &Scenario) -> ScenarioReport {
     }
 }
 
-/// Inline write completes in exactly one `create_asset` with
-/// `overwrite=true` (the `IfDestExists::Overwrite` default).
+/// Inline write is one `create_directory` for the parent folder followed by
+/// exactly one `create_asset` with `overwrite=true` (the
+/// `IfDestExists::Overwrite` default).
 async fn drive_write_done_inline(scenario: &Scenario) -> ScenarioReport {
     let (backend, mock) = mock_backend().await;
+    mock.enqueue(create_directory_ok());
     mock.enqueue(create_asset_ok());
     match backend
         .write(
@@ -267,31 +279,45 @@ async fn drive_write_done_inline(scenario: &Scenario) -> ScenarioReport {
                 );
             }
             let recorded = mock.requests();
-            if recorded.len() != 1 || recorded[0].method != "create_asset" {
+            if recorded.len() != 2
+                || recorded[0].method != "create_directory"
+                || recorded[1].method != "create_asset"
+            {
                 return failed(
                     scenario,
-                    format!("write must be exactly one create_asset, got {recorded:?}"),
+                    format!(
+                        "write must be one create_directory then one create_asset, got {recorded:?}"
+                    ),
                 );
             }
-            if recorded[0].params["overwrite"] != json!(true)
-                || recorded[0].params["path"] != json!({"path": "/Users/alice/new.usd"})
+            if recorded[0].params["path"] != json!({"path": "/Users/alice/"}) {
+                return failed(
+                    scenario,
+                    format!(
+                        "write must ensure the parent folder first: {:?}",
+                        recorded[0].params
+                    ),
+                );
+            }
+            if recorded[1].params["overwrite"] != json!(true)
+                || recorded[1].params["path"] != json!({"path": "/Users/alice/new.usd"})
             {
                 return failed(
                     scenario,
                     format!(
                         "default write must send overwrite=true at the target path: {:?}",
-                        recorded[0].params
+                        recorded[1].params
                     ),
                 );
             }
             // The canned success frame is independent of the request, so
             // the payload bytes must be pinned on the wire explicitly.
-            if recorded[0].blob.as_deref() != Some(b"payload".as_slice()) {
+            if recorded[1].blob.as_deref() != Some(b"payload".as_slice()) {
                 return failed(
                     scenario,
                     format!(
                         "write must carry the object bytes as the binary frame, got {:?}",
-                        recorded[0].blob
+                        recorded[1].blob
                     ),
                 );
             }
@@ -301,10 +327,95 @@ async fn drive_write_done_inline(scenario: &Scenario) -> ScenarioReport {
     }
 }
 
+/// A write creates its path. Omni1 `create_asset` requires the parent
+/// folder, so the plugin climbs deepest-first while the server answers
+/// `NOT_EXIST`, creates each missing level once, and only then sends the
+/// body; a second write into the same tree issues no ancestor call.
+async fn drive_write_creates_missing_ancestors(scenario: &Scenario) -> ScenarioReport {
+    let (backend, mock) = mock_backend().await;
+    let create_directory = |status: &str, path: &str| {
+        mock.enqueue_for_path(
+            CannedResponse {
+                interface: "Connection".into(),
+                method: "create_directory".into(),
+                frames: vec![RawFrame::from_json(&json!({"status": status, "ts": {}}))],
+            },
+            path,
+        );
+    };
+    create_directory("NOT_EXIST", "/Users/alice/fresh/nested/");
+    create_directory("NOT_EXIST", "/Users/alice/fresh/");
+    create_directory("OK", "/Users/alice/");
+    create_directory("OK", "/Users/alice/fresh/");
+    create_directory("OK", "/Users/alice/fresh/nested/");
+    mock.enqueue(create_asset_ok());
+    if let Err(err) = backend
+        .write(
+            obj("/Users/alice/fresh/nested/leaf.usd"),
+            b"payload".to_vec(),
+            WriteOptions::default(),
+            None,
+        )
+        .await
+    {
+        return failed(
+            scenario,
+            format!("nested write into a fresh path failed: {err}"),
+        );
+    }
+    let recorded = mock.requests();
+    let dirs: Vec<&str> = recorded
+        .iter()
+        .filter(|r| r.method == "create_directory")
+        .map(|r| r.params["path"]["path"].as_str().unwrap_or_default())
+        .collect();
+    let expected_dirs = [
+        "/Users/alice/fresh/nested/",
+        "/Users/alice/fresh/",
+        "/Users/alice/",
+        "/Users/alice/fresh/",
+        "/Users/alice/fresh/nested/",
+    ];
+    if dirs != expected_dirs || recorded.last().map(|r| r.method.as_str()) != Some("create_asset") {
+        return failed(
+            scenario,
+            format!("ancestors must be created deepest-first before the body: {recorded:?}"),
+        );
+    }
+    let first_pass = recorded.len();
+    mock.enqueue(create_asset_ok());
+    if let Err(err) = backend
+        .write(
+            obj("/Users/alice/fresh/nested/sibling.usd"),
+            b"payload".to_vec(),
+            WriteOptions::default(),
+            None,
+        )
+        .await
+    {
+        return failed(
+            scenario,
+            format!("second write into the created tree failed: {err}"),
+        );
+    }
+    let recorded = mock.requests();
+    if recorded.len() != first_pass + 1 || recorded[first_pass].method != "create_asset" {
+        return failed(
+            scenario,
+            format!(
+                "a directory this connection created must not be created again: {:?}",
+                &recorded[first_pass..]
+            ),
+        );
+    }
+    passed(scenario)
+}
+
 /// write then delete: the delete routes through `delete2` with the
 /// object's path and both ops succeed.
 async fn drive_delete_existing(scenario: &Scenario) -> ScenarioReport {
     let (backend, mock) = mock_backend().await;
+    mock.enqueue(create_directory_ok());
     mock.enqueue(create_asset_ok());
     mock.enqueue(CannedResponse {
         interface: "Connection".into(),
@@ -336,18 +447,21 @@ async fn drive_delete_existing(scenario: &Scenario) -> ScenarioReport {
         return failed(scenario, format!("delete failed: {err}"));
     }
     let recorded = mock.requests();
-    if recorded.len() != 2 || recorded[1].method != "delete2" {
+    if recorded.len() != 3 || recorded[2].method != "delete2" {
         return failed(
             scenario,
-            format!("write + delete must be create_asset then delete2, got {recorded:?}"),
+            format!(
+                "write + delete must be create_directory, create_asset, then delete2, got \
+                 {recorded:?}"
+            ),
         );
     }
-    if recorded[1].params["paths_to_delete"] != json!([{"path": "/Users/alice/doomed.usd"}]) {
+    if recorded[2].params["paths_to_delete"] != json!([{"path": "/Users/alice/doomed.usd"}]) {
         return failed(
             scenario,
             format!(
                 "delete2 must carry the object path: {:?}",
-                recorded[1].params
+                recorded[2].params
             ),
         );
     }
@@ -436,6 +550,7 @@ async fn drive_write_no_overwrite(scenario: &Scenario) -> ScenarioReport {
         }
     };
     let (backend, mock) = mock_backend().await;
+    mock.enqueue(create_directory_ok());
     mock.enqueue(CannedResponse {
         interface: "Connection".into(),
         method: "create_asset".into(),
@@ -455,12 +570,12 @@ async fn drive_write_no_overwrite(scenario: &Scenario) -> ScenarioReport {
     {
         Err(err) if err.code() == code => {
             let recorded = mock.requests();
-            if recorded.len() != 1 || recorded[0].params["overwrite"] != json!(false) {
+            if recorded.len() != 2 || recorded[1].params["overwrite"] != json!(false) {
                 return failed(
                     scenario,
                     format!(
-                        "no-overwrite write must be one create_asset with overwrite=false: \
-                         {recorded:?}"
+                        "no-overwrite write must be the ancestor call then one create_asset \
+                         with overwrite=false: {recorded:?}"
                     ),
                 );
             }
@@ -711,6 +826,9 @@ async fn conformance_scenarios_bare_backend() {
             "stat-basic-objectinfo" => drive_stat_basic(scenario).await,
             "stat-not-found" => drive_stat_not_found(scenario).await,
             "read-streamed-empty" => drive_read_empty(scenario).await,
+            "write-creates-missing-ancestors" => {
+                drive_write_creates_missing_ancestors(scenario).await
+            }
             "write-done-inline" => drive_write_done_inline(scenario).await,
             "delete-existing-object" => drive_delete_existing(scenario).await,
             "list-one-level-vs-recursive" => drive_list_levels(scenario).await,
@@ -747,7 +865,8 @@ async fn conformance_scenarios_bare_backend() {
             "compat-gates-v1-capability"
             | "write-redirect-commits-on-done"
             | "retry-never-replays-continue-write"
-            | "protocol-slots-pass-through" => runner.skip(
+            | "protocol-slots-pass-through"
+            | "materialize-unsupported-without-cache" => runner.skip(
                 scenario.name,
                 "host/wrapper-side contract; driven in ovstorage's \
                  tests/conformance_protocol_slots.rs",
@@ -773,6 +892,7 @@ async fn conformance_scenarios_bare_backend() {
         "stat-basic-objectinfo",
         "stat-not-found",
         "watch-directory-option-superset",
+        "write-creates-missing-ancestors",
         "write-done-inline",
         "write-no-overwrite-existing",
     ];

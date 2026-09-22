@@ -4,6 +4,11 @@
  * Built-in pure-C file Layer.
  */
 
+#if defined(__APPLE__)
+/* flock is a BSD interface that _POSIX_C_SOURCE alone hides on Darwin. */
+#define _DARWIN_C_SOURCE 1
+#endif
+
 #include "internal.h"
 
 #include "ovstorage_defaults.h"
@@ -21,9 +26,14 @@
 #include <direct.h>
 #include <io.h>
 #include <process.h>
+#if defined(OVC_FILE_BACKEND_TEST_MAIN) &&                              \
+    !defined(SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)
+#define SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE 0x2
+#endif
 #else
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -33,11 +43,13 @@
 #define OVC_FILE_DESCRIPTION "Read and write local file:// URLs"
 #define OVC_FILE_DEFAULT_CONNECTION_NAME "File"
 #define OVC_FILE_TEMP_ATTEMPTS 16U
+/* Access modes for ovc_file_native_open_probe, tried in this order. */
+#define OVC_FILE_PROBE_READ_WRITE 0
+#define OVC_FILE_PROBE_READ 1
+#define OVC_FILE_PROBE_WRITE 2
 #define OVC_FILE_IO_CHUNK_SIZE (1024U * 1024U)
 #define OVC_FILE_MIN_WATCH_POLL_MS UINT64_C(10)
 #define OVC_FILE_WATCH_WAIT_CHUNK_NS UINT64_C(86400000000000)
-#define OVC_FILE_METADATA_DIRECTORY ".ovstorage-meta"
-#define OVC_FILE_METADATA_SUFFIX ".meta"
 
 #if defined(_WIN32)
 static const char *ovc_file_strerror(int error)
@@ -141,7 +153,9 @@ typedef struct ovc_file_task {
             size_t len;
             OvStoragePlugin_IfDestExistsTag if_dest;
             char *match_etag;
-            OvStoragePlugin_KeyValueList user_metadata;
+            /* The request carried a non-empty user_metadata map, which this
+             * backend refuses once the address has resolved. */
+            bool refuse_user_metadata;
         } write;
         struct {
             bool recursive;
@@ -198,8 +212,6 @@ typedef struct ovc_file_item_vector {
 typedef struct ovc_file_watch_entry {
     char *address;
     ovc_file_stat info;
-    bool has_metadata_mtime;
-    int64_t metadata_mtime_unix_nanos;
 } ovc_file_watch_entry;
 
 typedef struct ovc_file_watch_snapshot {
@@ -227,7 +239,6 @@ typedef struct ovc_file_watcher {
     char *path;
     char *address;
     bool recursive;
-    bool include_metadata_changes;
     uint64_t poll_interval_ms;
     bool emit_lapsed;
     ovc_file_watch_snapshot snapshot;
@@ -373,24 +384,9 @@ static OvStoragePlugin_Str ovc_file_owned_string(const char *value)
     return out;
 }
 
-static OvStoragePlugin_Str ovc_file_owned_slice(const char *value,
-                                                size_t length)
-{
-    OvStoragePlugin_Str out;
-
-    out.ptr = (char *)ovc_file_abi_allocate(length == 0 ? 1 : length);
-    out.len = length;
-    if (length != 0) {
-        memcpy(out.ptr, value, length);
-    } else {
-        out.ptr[0] = '\0';
-    }
-    return out;
-}
-
-/* Checked twin of ovc_file_owned_slice for request-proportional copies:
- * host-supplied input must surface ResourceExhausted instead of aborting
- * the process when memory runs out. */
+/* Checked slice copy for request-proportional copies: host-supplied input
+ * must surface ResourceExhausted instead of aborting the process when
+ * memory runs out. */
 static bool ovc_file_try_owned_slice(const char *value,
                                      size_t length,
                                      OvStoragePlugin_Str *out)
@@ -535,6 +531,32 @@ static OvStoragePlugin_ErrorCode ovc_file_errno_code(int native_error)
 #endif
     default:
         return OvStoragePlugin_ErrorCode_Transient;
+    }
+}
+
+/* Whether a failed stat's errno means "there is nothing (examinable) here"
+ * rather than a real failure -- shared by the directory-listing skip-vs-fail
+ * decision and the dangling-symlink no-follow fallback below. A directory
+ * listing entry answering one of these should be skipped rather than
+ * failing the whole listing: the entry itself is gone (ENOENT, a dangling
+ * target or a delete-race with the directory read), was never examinable as
+ * a path (ENOTDIR, a race with the parent being replaced), or cycles back on
+ * itself (ELOOP). A followed stat answering one of these is the case the
+ * no-follow fallback exists for: the link is there but its target is not.
+ * Every other errno -- EACCES, EIO, ... -- denotes a real failure the
+ * caller needs to see, not an absent target, so it is never skipped or
+ * masked by a successful fallback. */
+static bool ovc_file_stat_error_means_absent(int native_error)
+{
+    switch (native_error) {
+    case ENOENT:
+    case ENOTDIR:
+#ifdef ELOOP
+    case ELOOP:
+#endif
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -773,6 +795,9 @@ static void ovc_file_object_info_clear(OvStoragePlugin_ObjectInfo *info)
     if (info->modified_by.present) {
         ovc_file_str_clear(&info->modified_by.value);
     }
+    if (info->versioned_address.present) {
+        ovc_file_str_clear(&info->versioned_address.value);
+    }
     memset(info, 0, sizeof(*info));
 }
 
@@ -810,6 +835,9 @@ static void ovc_file_connection_ffi_clear(
             &connection->auth_state.auth_failed.error_message);
     }
     ovc_file_key_value_list_clear(&connection->user_metadata);
+    if (connection->owning_target.present) {
+        ovc_file_str_clear(&connection->owning_target.value);
+    }
     memset(connection, 0, sizeof(*connection));
 }
 #endif
@@ -824,7 +852,10 @@ static OvStoragePlugin_Capabilities ovc_file_capabilities(void)
     memset(&capabilities, 0, sizeof(capabilities));
     capabilities.supports_if_match_write = true;
     capabilities.supports_no_overwrite_write = true;
-    capabilities.supports_native_metadata_patch = true;
+    /* This backend stores no user metadata: a write carrying a non-empty map
+     * is refused with Unsupported and update_metadata is Unsupported, so no
+     * native patch exists to advertise. */
+    capabilities.supports_native_metadata_patch = false;
     capabilities.writes_are_atomic = true;
     capabilities.supports_copy = true;
     capabilities.supports_rename = true;
@@ -851,7 +882,9 @@ static OvStoragePlugin_Capabilities ovc_file_capabilities(void)
     capabilities.watch_directory_kinds.created = true;
     capabilities.watch_directory_kinds.modified = true;
     capabilities.watch_directory_kinds.deleted = true;
-    capabilities.watch_directory_kinds.metadata_changed = true;
+    /* No user metadata is stored, so nothing can change out from under a
+     * watcher except the object bytes themselves. */
+    capabilities.watch_directory_kinds.metadata_changed = false;
     return capabilities;
 }
 
@@ -865,9 +898,10 @@ static void ovc_file_descriptor_fill(
     out->layer_type = OvStoragePlugin_LayerType_Backend;
     out->accepts_connections = true;
     out->auth_capable = false;
-    /* A write's user_metadata is kept in this backend's sidecar and returned
-       by stat, so a host may compose an attribution layer over this branch. */
-    out->supports_user_metadata = true;
+    /* This backend stores no user metadata: a write carrying a non-empty
+       map is refused and stat reports an empty map, so a host composes no
+       attribution layer over this branch. */
+    out->supports_user_metadata = false;
     out->kind = ovc_file_owned_string(OVC_FILE_KIND);
     out->display_name = ovc_file_owned_string(OVC_FILE_DISPLAY_NAME);
     out->description.present = true;
@@ -1008,6 +1042,7 @@ static bool ovc_file_connection_clone_native(
 
 static void ovc_file_connection_to_ffi(
     const ovc_file_connection *source,
+    const char *owning_name,
     OvStoragePlugin_Connection *out)
 {
     memset(out, 0, sizeof(*out));
@@ -1027,6 +1062,12 @@ static void ovc_file_connection_to_ffi(
     out->user_metadata.ptr = (OvStoragePlugin_KeyValuePair *)
         ovc_file_abi_allocate(sizeof(*out->user_metadata.ptr));
     out->user_metadata.len = 0;
+    /* The layer INSTANCE name a connection op routes by — the same name
+     * `ovc_file_layer_owned_targets` reports and the root encoder above
+     * stamps — so a caller holding this row can build the `ConnectionKey`
+     * that reaches it without deriving the owner from an address. */
+    out->owning_target.present = true;
+    out->owning_target.value = ovc_file_owned_string(owning_name);
 }
 
 static void ovc_file_root_info_fill(
@@ -1189,7 +1230,12 @@ static void ovc_file_win32_info_to_stat(
     out->mtime_unix_ms = out->mtime_unix_nanos / INT64_C(1000000);
 }
 
-static int ovc_file_native_stat_path(const char *path, ovc_file_stat *out)
+/* `out_win32_error` is set to the raw `GetLastError()` value on failure and
+ * left untouched on success; callers that only need the translated `errno`
+ * (i.e. everyone but the dangling-link fallback below) pass NULL. */
+static int ovc_file_native_stat_path_ex(const char *path,
+                                        ovc_file_stat *out,
+                                        DWORD *out_win32_error)
 {
     wchar_t *wide;
     WIN32_FILE_ATTRIBUTE_DATA data;
@@ -1203,6 +1249,9 @@ static int ovc_file_native_stat_path(const char *path, ovc_file_stat *out)
 
         error = GetLastError();
         free(wide);
+        if (out_win32_error != NULL) {
+            *out_win32_error = error;
+        }
         ovc_win32_set_errno(error);
         return -1;
     }
@@ -1213,6 +1262,11 @@ static int ovc_file_native_stat_path(const char *path, ovc_file_stat *out)
                                 data.ftLastWriteTime,
                                 out);
     return 0;
+}
+
+static int ovc_file_native_stat_path(const char *path, ovc_file_stat *out)
+{
+    return ovc_file_native_stat_path_ex(path, out, NULL);
 }
 
 static int ovc_file_native_path_is_link(const char *path, bool *out_is_link)
@@ -1235,6 +1289,89 @@ static int ovc_file_native_path_is_link(const char *path, bool *out_is_link)
     }
     free(wide);
     *out_is_link = (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    return 0;
+}
+
+/* Windows counterpart of the POSIX `ovc_file_native_stat_path_or_link`
+ * below: fall back to the reparse point's own attributes, read with an
+ * exact no-follow open (`FILE_FLAG_OPEN_REPARSE_POINT`), when the normal
+ * path lookup above fails for a reason that means the target is missing,
+ * so a dangling link is reported rather than answered as absent.
+ *
+ * `CreateFileW` performs an exact lookup and never treats `*` or `?` in
+ * `path` as wildcards, unlike `FindFirstFileW`; the caller-derived path
+ * must never be handed to a directory-enumeration API, since a wildcard
+ * match could silently report a different, unrelated filesystem entry.
+ *
+ * The fallback runs for `ovc_file_stat_error_means_absent` first failures,
+ * and also for a raw `ERROR_INVALID_NAME` from the initial lookup: `*` or
+ * `?` in `path` makes `GetFileAttributesExW` reject it outright (it never
+ * treats those as wildcards), and the errno translation for that Win32 code
+ * is shared with the unrelated over-long-name case (see
+ * `ovc_win32_set_errno`), so it is checked here as the untranslated Win32
+ * code rather than by widening the shared errno classifier. A path whose
+ * first lookup failed for any other reason (an access error, a filesystem
+ * error, ...) must keep reporting that failure, not a successful stat of
+ * the link itself -- masking `PermissionDenied` or `Transient` as a clean
+ * answer would be worse than the dangling-link gap this fallback exists to
+ * close.
+ *
+ * `CreateFileW` rejects the same syntactically invalid names that
+ * `GetFileAttributesExW` does, so an `ERROR_INVALID_NAME` first failure
+ * always fails the fallback open too; that failure is reported as
+ * `ENOENT` (the name is not just missing an exact-match target, it cannot
+ * exist at all), rather than surfacing the unrelated errno the shared
+ * translation happens to produce for `ERROR_INVALID_NAME`. */
+static int ovc_file_native_stat_path_or_link(const char *path,
+                                             ovc_file_stat *out)
+{
+    wchar_t *wide;
+    HANDLE handle;
+    BY_HANDLE_FILE_INFORMATION info;
+    int first_errno;
+    DWORD first_win32_error;
+    bool invalid_name;
+
+    first_win32_error = 0;
+    if (ovc_file_native_stat_path_ex(path, out, &first_win32_error) == 0) {
+        return 0;
+    }
+    first_errno = errno;
+    invalid_name = (first_win32_error == ERROR_INVALID_NAME);
+    if (!invalid_name && !ovc_file_stat_error_means_absent(first_errno)) {
+        errno = first_errno;
+        return -1;
+    }
+    wide = ovc_file_utf8_to_wide(path);
+    if (wide == NULL) {
+        errno = first_errno;
+        return -1;
+    }
+    handle = CreateFileW(wide,
+                         FILE_READ_ATTRIBUTES,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE |
+                             FILE_SHARE_DELETE,
+                         NULL,
+                         OPEN_EXISTING,
+                         FILE_FLAG_OPEN_REPARSE_POINT |
+                             FILE_FLAG_BACKUP_SEMANTICS,
+                         NULL);
+    free(wide);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = invalid_name ? ENOENT : first_errno;
+        return -1;
+    }
+    if (!GetFileInformationByHandle(handle, &info)) {
+        CloseHandle(handle);
+        errno = invalid_name ? ENOENT : first_errno;
+        return -1;
+    }
+    CloseHandle(handle);
+    ovc_file_win32_info_to_stat(info.dwFileAttributes,
+                                info.nFileSizeHigh,
+                                info.nFileSizeLow,
+                                info.ftLastWriteTime,
+                                out);
     return 0;
 }
 
@@ -1292,9 +1429,12 @@ static ovc_file ovc_file_native_create_new(const char *path)
     if (wide == NULL) {
         return OVC_INVALID_FILE;
     }
+    /* FILE_SHARE_DELETE lets MoveFileExW publish the staging file while
+     * the writer's handle, and the lock it carries, is still open. */
     handle = CreateFileW(wide,
                          GENERIC_WRITE | GENERIC_READ,
-                         FILE_SHARE_READ,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE |
+                             FILE_SHARE_DELETE,
                          NULL,
                          CREATE_NEW,
                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
@@ -1318,6 +1458,160 @@ static int ovc_file_native_close(ovc_file file)
     }
     ovc_win32_set_errno(GetLastError());
     return -1;
+}
+
+/* Exclusive staging lock without waiting: 0 when this handle holds it, -1
+ * with errno EWOULDBLOCK when another handle does, -1 with the mapped errno
+ * otherwise.  Win32 locks are mandatory, so the lock covers one byte far
+ * past any possible end of file (0xFFFFFFFFFFFFFFFE), a range no read or
+ * write of the object's bytes can overlap: a reader that finds the published
+ * object before the writer's handle closes reads it normally.  The Rust host
+ * locks the same byte.  Contention on an overlapped handle is reported as
+ * ERROR_IO_PENDING; both spellings are intercepted before ovc_win32_set_errno,
+ * which would read them as EACCES.  LOCKFILE_FAIL_IMMEDIATELY never queues a
+ * request, so a stack OVERLAPPED needs no event or GetOverlappedResult. */
+static int ovc_file_native_lock_exclusive_nonblocking(ovc_file file)
+{
+    OVERLAPPED overlapped;
+    DWORD error;
+
+    memset(&overlapped, 0, sizeof(overlapped));
+    overlapped.Offset = 0xFFFFFFFEu;
+    overlapped.OffsetHigh = 0xFFFFFFFFu;
+    if (LockFileEx(file,
+                   LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                   0,
+                   1,
+                   0,
+                   &overlapped)) {
+        return 0;
+    }
+    error = GetLastError();
+    if (error == ERROR_LOCK_VIOLATION || error == ERROR_IO_PENDING) {
+        errno = EWOULDBLOCK;
+        return -1;
+    }
+    ovc_win32_set_errno(error);
+    return -1;
+}
+
+/* Open a staging-temp probe handle without following a reparse point.  A
+ * link or a directory wearing the name is refused with ELOOP rather than
+ * opened, so the probe never locks or removes through it.  `access` is
+ * accepted for symmetry with the POSIX arm; GENERIC_READ suffices for
+ * LockFileEx and opens a read-only-attribute file. */
+static ovc_file ovc_file_native_open_probe(const char *path, int access)
+{
+    wchar_t *wide;
+    HANDLE handle;
+    BY_HANDLE_FILE_INFORMATION info;
+
+    (void)access;
+    wide = ovc_file_utf8_to_wide(path);
+    if (wide == NULL) {
+        return OVC_INVALID_FILE;
+    }
+    handle = CreateFileW(wide,
+                         GENERIC_READ,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE |
+                             FILE_SHARE_DELETE,
+                         NULL,
+                         OPEN_EXISTING,
+                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT |
+                             FILE_FLAG_BACKUP_SEMANTICS,
+                         NULL);
+    free(wide);
+    if (handle == INVALID_HANDLE_VALUE) {
+        ovc_win32_set_errno(GetLastError());
+        return OVC_INVALID_FILE;
+    }
+    if (!GetFileInformationByHandle(handle, &info)) {
+        DWORD error;
+
+        error = GetLastError();
+        CloseHandle(handle);
+        ovc_win32_set_errno(error);
+        return OVC_INVALID_FILE;
+    }
+    if ((info.dwFileAttributes &
+         (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0) {
+        CloseHandle(handle);
+#ifdef ELOOP
+        errno = ELOOP;
+#else
+        errno = EINVAL;
+#endif
+        return OVC_INVALID_FILE;
+    }
+    return handle;
+}
+
+/* Classify a staging-temp candidate without following a reparse point:
+ * whether it exists and whether it is a plain file.  A missing path reports
+ * out_exists = false, not an error. */
+static int ovc_file_native_probe_kind(const char *path,
+                                      bool *out_exists,
+                                      bool *out_is_regular)
+{
+    wchar_t *wide;
+    DWORD attributes;
+
+    *out_exists = false;
+    *out_is_regular = false;
+    wide = ovc_file_utf8_to_wide(path);
+    if (wide == NULL) {
+        return -1;
+    }
+    attributes = GetFileAttributesW(wide);
+    free(wide);
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        DWORD error;
+
+        error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+            return 0;
+        }
+        ovc_win32_set_errno(error);
+        return -1;
+    }
+    *out_exists = true;
+    *out_is_regular =
+        (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT |
+                       FILE_ATTRIBUTE_DEVICE)) == 0;
+    return 0;
+}
+
+/* A copy staged from a read-only source carries FILE_ATTRIBUTE_READONLY,
+ * which DeleteFileW refuses; clear it by path, as the unlink is. */
+static int ovc_file_native_clear_readonly(const char *path)
+{
+    wchar_t *wide;
+    DWORD attributes;
+
+    wide = ovc_file_utf8_to_wide(path);
+    if (wide == NULL) {
+        return -1;
+    }
+    attributes = GetFileAttributesW(wide);
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        DWORD error;
+
+        error = GetLastError();
+        free(wide);
+        ovc_win32_set_errno(error);
+        return -1;
+    }
+    if ((attributes & FILE_ATTRIBUTE_READONLY) != 0 &&
+        !SetFileAttributesW(wide, attributes & ~(DWORD)FILE_ATTRIBUTE_READONLY)) {
+        DWORD error;
+
+        error = GetLastError();
+        free(wide);
+        ovc_win32_set_errno(error);
+        return -1;
+    }
+    free(wide);
+    return 0;
 }
 
 static int ovc_file_native_sync(ovc_file file)
@@ -1681,6 +1975,52 @@ static int ovc_file_native_stat_path(const char *path, ovc_file_stat *out)
     return ovc_file_stat_from_posix(&native, out);
 }
 
+/* `ovc_file_native_stat_path` follows a symlink, which is right for every
+ * caller that needs the real object a path resolves to (read, write, copy,
+ * list, ...) -- but wrong for the one that reports what is *at* an address:
+ * a dangling link (a real, present object whose target does not exist) has
+ * no "real object" for the follow to land on, and reporting that as
+ * NotFound makes the link itself invisible. 2.x's own `native::stat` fell
+ * back to `lstat` for exactly this case, reporting the link. The top-level
+ * `stat` operation opts into this (see the `report_dangling_link` parameter
+ * on `ovc_file_stat_result`, its sole caller), and so does
+ * `ovc_file_check_destination_precondition`: a dangling link occupies its
+ * directory entry as far as `no_overwrite`/`if_match_etag` are concerned,
+ * so treating it as absent would let a Fail precondition clobber it and let
+ * a MatchEtag precondition compare against a target that was never there.
+ * Every other stat-shaped call in this file (read/copy-source/rename-source/
+ * list/watch/get_latest_version/list_versions/...) keeps the plain
+ * follow-only behavior above, since a dangling link is exactly as absent
+ * for those as a link that was never there -- and, for the version-shaped
+ * calls, pinning a caller's etag to the link's own size/mtime would
+ * describe a version a follow-only read can never reproduce.
+ *
+ * The fallback only ever runs for `ovc_file_stat_error_means_absent` first
+ * failures, for the same reason as the Windows counterpart above: an
+ * accessible symlink whose target lookup failed for an unrelated reason
+ * (EACCES on a target-path component, EIO, ...) must keep reporting that
+ * failure, not the link's own successful metadata. */
+static int ovc_file_native_stat_path_or_link(const char *path,
+                                             ovc_file_stat *out)
+{
+    struct stat native;
+    int first_errno;
+
+    if (ovc_file_native_stat_path(path, out) == 0) {
+        return 0;
+    }
+    first_errno = errno;
+    if (!ovc_file_stat_error_means_absent(first_errno)) {
+        errno = first_errno;
+        return -1;
+    }
+    if (fstatat(AT_FDCWD, path, &native, AT_SYMLINK_NOFOLLOW) != 0) {
+        errno = first_errno;
+        return -1;
+    }
+    return ovc_file_stat_from_posix(&native, out);
+}
+
 static int ovc_file_native_path_is_link(const char *path, bool *out_is_link)
 {
     struct stat native;
@@ -1696,7 +2036,8 @@ static int ovc_file_native_path_is_link(const char *path, bool *out_is_link)
  * Classify `path` without following a final symlink: reports existence,
  * whether it is a symlink, and whether it is a real directory.  A missing
  * path (ENOENT/ENOTDIR) is reported as out_exists = false, not an error.
- * The sidecar sweep uses this so it can never descend through a link.
+ * delete_directory uses this to refuse a link at the addressed path without
+ * following it.
  */
 static int ovc_file_native_lstat_kind(const char *path,
                                       bool *out_exists,
@@ -1761,6 +2102,81 @@ static int ovc_file_native_close(ovc_file file)
      * EINTR; retrying can close an unrelated descriptor that reused the
      * number. */
     return close(file);
+}
+
+/* Exclusive advisory lock without waiting: 0 when this descriptor holds it,
+ * -1 with errno EWOULDBLOCK when another does.  flock, not fcntl: a flock is
+ * owned by the open file description, so a probe from another thread of this
+ * process is excluded like one from another process, and closing the probe
+ * releases only the probe's own lock. */
+static int ovc_file_native_lock_exclusive_nonblocking(ovc_file file)
+{
+    int result;
+
+    do {
+        result = flock(file, LOCK_EX | LOCK_NB);
+    } while (result != 0 && errno == EINTR);
+    return result;
+}
+
+/* Open a staging-temp probe descriptor without following a final link
+ * (ELOOP for a symlink) and without blocking (a fifo with no writer would
+ * otherwise hold the open).  `access` is one of the OVC_FILE_PROBE_* modes:
+ * read-write is asked first because an NFS flock emulation refuses an
+ * exclusive lock on a descriptor not open for writing, and a copied mode
+ * that denies one side falls back to the other; flock works on any. */
+static ovc_file ovc_file_native_open_probe(const char *path, int access)
+{
+    int flags;
+
+    flags = O_NOFOLLOW;
+    switch (access) {
+    case OVC_FILE_PROBE_READ:
+        flags |= O_RDONLY;
+        break;
+    case OVC_FILE_PROBE_WRITE:
+        flags |= O_WRONLY;
+        break;
+    default:
+        flags |= O_RDWR;
+        break;
+    }
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NONBLOCK
+    flags |= O_NONBLOCK;
+#endif
+    return open(path, flags);
+}
+
+/* Classify a staging-temp candidate without following a final link: whether
+ * it exists and whether it is a regular file.  A missing path reports
+ * out_exists = false, not an error. */
+static int ovc_file_native_probe_kind(const char *path,
+                                      bool *out_exists,
+                                      bool *out_is_regular)
+{
+    struct stat native;
+
+    *out_exists = false;
+    *out_is_regular = false;
+    if (fstatat(AT_FDCWD, path, &native, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) {
+            return 0;
+        }
+        return -1;
+    }
+    *out_exists = true;
+    *out_is_regular = S_ISREG(native.st_mode) != 0;
+    return 0;
+}
+
+/* unlink needs only directory permissions here; nothing to clear. */
+static int ovc_file_native_clear_readonly(const char *path)
+{
+    (void)path;
+    return 0;
 }
 
 static int ovc_file_native_sync(ovc_file file)
@@ -2307,17 +2723,24 @@ static bool ovc_file_all_decimal(const char *value,
     return true;
 }
 
-static bool ovc_file_is_atomic_temp_name_n(const char *name, size_t length)
+/* The staging-name shape: a leading '.', a ".tmp" suffix, exactly three
+ * trailing all-decimal dot-groups, and a non-empty segment before them.
+ * exact_suffix selects a case-sensitive suffix compare. */
+static bool ovc_file_staging_temp_name_matches(const char *name,
+                                               size_t length,
+                                               bool exact_suffix)
 {
     size_t end;
     unsigned int numeric_segments;
 
-    if (length < 10 || name[0] != '.' ||
-#if defined(_WIN32)
-        !ovc_file_ascii_equal_nocase(name + length - 4, ".tmp", 4)) {
-#else
-        memcmp(name + length - 4, ".tmp", 4) != 0) {
-#endif
+    if (length < 10 || name[0] != '.') {
+        return false;
+    }
+    if (exact_suffix) {
+        if (memcmp(name + length - 4, ".tmp", 4) != 0) {
+            return false;
+        }
+    } else if (!ovc_file_ascii_equal_nocase(name + length - 4, ".tmp", 4)) {
         return false;
     }
     end = length - 4;
@@ -2336,6 +2759,36 @@ static bool ovc_file_is_atomic_temp_name_n(const char *name, size_t length)
         end = begin - 1;
     }
     return end > 1;
+}
+
+/* Enumeration and address matcher: hides and refuses to address.  Win32
+ * folds the suffix case because its filesystems do; hiding a name the
+ * generator never wrote costs nothing. */
+static bool ovc_file_is_atomic_temp_name_n(const char *name, size_t length)
+{
+#if defined(_WIN32)
+    return ovc_file_staging_temp_name_matches(name, length, false);
+#else
+    return ovc_file_staging_temp_name_matches(name, length, true);
+#endif
+}
+
+/* The one shape a directory removal may unlink: exact-case ".tmp" on every
+ * platform, since neither host's generator writes anything else.  This is the
+ * rule the Rust host's removal applies, so the two hosts agree on every name
+ * over one on-disk format, and a name either host serves as an object
+ * survives the other's removal. */
+static bool ovc_file_is_clearable_staging_temp_name(const char *name)
+{
+    size_t length;
+
+    length = strlen(name);
+    /* Both generators write a UTF-8 object name as the leading segment, and
+     * the Rust host's matchers see a non-UTF-8 name as no temp at all and
+     * serve it as an object; the suffix and digit groups are ASCII, so
+     * validating the whole name validates exactly the leading segment. */
+    return ovc_file_staging_temp_name_matches(name, length, true) &&
+           ovc_utf8_is_valid(name, length);
 }
 
 static bool ovc_file_path_is_internal(const char *path)
@@ -2357,32 +2810,10 @@ static bool ovc_file_path_is_internal(const char *path)
             ++at;
         }
         component_length = at - begin;
-        if ((component_length == sizeof(".ovstorage-meta") - 1 &&
-#if defined(_WIN32)
-             ovc_file_ascii_equal_nocase(path + begin,
-                                         ".ovstorage-meta",
-                                         component_length)) ||
-#else
-             memcmp(path + begin,
-                    ".ovstorage-meta",
-                    component_length) == 0) ||
-#endif
-            ovc_file_is_atomic_temp_name_n(path + begin,
+        if (ovc_file_is_atomic_temp_name_n(path + begin,
                                            component_length)) {
             return true;
         }
-#if defined(_WIN32)
-        {
-            size_t character;
-
-            for (character = 0; character < component_length; ++character) {
-                if (path[begin + character] == ':' &&
-                    !(begin == 0 && character == 1)) {
-                    return true;
-                }
-            }
-        }
-#endif
     }
     return false;
 }
@@ -2409,6 +2840,17 @@ static char *ovc_file_parent_path(const char *path)
     return copy;
 }
 
+/* Walks `path` up toward `canonical_root`, resolving each candidate with
+ * `ovc_file_native_realpath` until one exists, then checks the resolved
+ * ancestor stays within the configured root.  `ENAMETOOLONG` joins
+ * `ENOENT`/`ENOTDIR` as a "keep walking up" signal: on Windows,
+ * `ovc_file_native_realpath`'s `CreateFileW` call rejects a candidate
+ * containing `*` or `?` with `ERROR_INVALID_NAME`, which `ovc_win32_set_errno`
+ * maps to `ENAMETOOLONG` (shared with the over-long-name case); a
+ * syntactically invalid candidate cannot exist at any point in the tree, so
+ * it is absent in the same sense `ENOENT` is, and the walk must continue
+ * toward an existing in-root ancestor rather than failing the whole address
+ * resolution outright. */
 static int ovc_file_validate_canonical_scope(
     const char *path,
     const char *canonical_root,
@@ -2424,7 +2866,11 @@ static int ovc_file_validate_canonical_scope(
         if (canonical != NULL) {
             break;
         }
-        if (errno != ENOENT && errno != ENOTDIR) {
+        if (errno != ENOENT && errno != ENOTDIR
+#ifdef ENAMETOOLONG
+            && errno != ENAMETOOLONG
+#endif
+            ) {
             int saved_error;
 
             saved_error = errno;
@@ -2684,438 +3130,6 @@ static int ovc_file_make_directories(const char *path,
     return 0;
 }
 
-/* User metadata has no portable filesystem primitive.  This mirrors the
- * Rust reference's Unix sidecar layout (metadata.rs metadata_path) exactly:
- *
- *   <parent>/.ovstorage-meta/<lowercase-hex(object-name)>.meta
- *
- * so a tree written by either implementation serves its metadata under the
- * other.  Like the reference, hex-doubling accepts that a NAME_MAX-sized
- * object name yields an over-long sidecar name: writing NON-empty metadata
- * to such a name fails loudly with ENAMETOOLONG rather than silently
- * diverging on disk, but the probe and cleanup paths (guard, existence stat,
- * empty-metadata unlink) treat ENAMETOOLONG — and the Win32
- * ERROR_FILENAME_EXCED_RANGE, which ovc_win32_set_errno maps to it —
- * exactly like ENOENT.  An over-long sidecar name cannot exist, so probing
- * it means "no metadata"; otherwise write/delete/copy/rename of a long-named
- * object would commit the object mutation and then false-fail on the sidecar
- * probe, where the reference's metadata_exists succeeds.
- * The Rust reference stores Windows metadata in an NTFS alternate data
- * stream instead; this backend keeps the same sidecar-directory layout on
- * every platform — that divergence is documented in README.md.  Each payload
- * line is hex(key)=hex(value); hex keeps the payload unambiguous for every
- * byte representable by the frozen Str ABI, including newlines and '='.  The
- * directory is rejected by URL resolution and hidden by list(), so callers
- * cannot forge another object's metadata through the storage API.  Metadata
- * on a configured root is rejected separately so this sibling layout never
- * writes outside the configured jail. */
-
-static char *ovc_file_metadata_path(const char *path,
-                                    OvStoragePlugin_Error **out_error)
-{
-    static const char hex[] = "0123456789abcdef";
-    const char *basename;
-    const char *cursor;
-    char *parent;
-    char *directory;
-    char *encoded;
-    char *result;
-    size_t basename_length;
-    size_t index;
-
-    cursor = path + strlen(path);
-    while (cursor > path && !ovc_path_is_separator(cursor[-1])) {
-        --cursor;
-    }
-    basename = cursor;
-    basename_length = strlen(basename);
-    if (basename_length == 0) {
-        *out_error = ovc_file_error(
-            OvStoragePlugin_ErrorCode_InvalidArgument,
-            "user metadata needs a named filesystem entry");
-        return NULL;
-    }
-    if (basename_length >
-        (SIZE_MAX - sizeof(OVC_FILE_METADATA_SUFFIX)) / 2) {
-        *out_error = ovc_file_error(
-            OvStoragePlugin_ErrorCode_InvalidArgument,
-            "object name is too long for a metadata sidecar");
-        return NULL;
-    }
-    encoded = (char *)ovc_file_allocate(
-        basename_length * 2 + sizeof(OVC_FILE_METADATA_SUFFIX));
-    for (index = 0; index < basename_length; ++index) {
-        unsigned char byte;
-
-        byte = (unsigned char)basename[index];
-        encoded[index * 2] = hex[byte >> 4];
-        encoded[index * 2 + 1] = hex[byte & 0x0f];
-    }
-    memcpy(encoded + basename_length * 2,
-           OVC_FILE_METADATA_SUFFIX,
-           sizeof(OVC_FILE_METADATA_SUFFIX));
-    parent = ovc_file_parent_path(path);
-    directory = ovc_path_join(parent, OVC_FILE_METADATA_DIRECTORY);
-    free(parent);
-    if (directory == NULL) {
-        free(encoded);
-        *out_error = ovc_file_native_error(errno,
-                                           "build metadata directory",
-                                           path);
-        return NULL;
-    }
-    result = ovc_path_join(directory, encoded);
-    free(directory);
-    free(encoded);
-    if (result == NULL) {
-        *out_error = ovc_file_native_error(errno,
-                                           "build metadata sidecar path",
-                                           path);
-    }
-    return result;
-}
-
-static OvStoragePlugin_Error *ovc_file_metadata_path_guard(
-    const char *sidecar)
-{
-    char *directory;
-    bool is_link;
-    ovc_file_stat directory_info;
-
-    directory = ovc_file_parent_path(sidecar);
-    if (ovc_file_native_path_is_link(directory, &is_link) != 0) {
-        int native_error;
-
-        native_error = errno;
-        free(directory);
-        /* ENAMETOOLONG: an over-long sidecar path cannot exist, so the probe
-         * answer is "absent" — see the layout comment above. */
-        if (native_error == ENOENT || native_error == ENOTDIR ||
-            native_error == ENAMETOOLONG) {
-            return NULL;
-        }
-        return ovc_file_native_error(native_error,
-                                     "inspect metadata directory",
-                                     sidecar);
-    }
-    if (is_link) {
-        free(directory);
-        return ovc_file_error(
-            OvStoragePlugin_ErrorCode_PermissionDenied,
-            "file metadata directory must not be a symlink or reparse point");
-    }
-    if (ovc_file_native_stat_path(directory, &directory_info) != 0) {
-        int native_error;
-
-        native_error = errno;
-        free(directory);
-        return ovc_file_native_error(native_error,
-                                     "stat metadata directory",
-                                     sidecar);
-    }
-    free(directory);
-    if (!directory_info.is_directory) {
-        return ovc_file_error(OvStoragePlugin_ErrorCode_CacheCorrupt,
-                              "file metadata directory is not a directory");
-    }
-    if (ovc_file_native_path_is_link(sidecar, &is_link) != 0) {
-        int native_error;
-
-        native_error = errno;
-        /* A hex-doubled basename past NAME_MAX yields ENAMETOOLONG here even
-         * when `.ovstorage-meta` exists; such a sidecar cannot exist, so the
-         * guard must answer "absent" instead of hard-failing an object
-         * mutation that already committed. */
-        if (native_error == ENOENT || native_error == ENOTDIR ||
-            native_error == ENAMETOOLONG) {
-            return NULL;
-        }
-        return ovc_file_native_error(native_error,
-                                     "inspect metadata sidecar",
-                                     sidecar);
-    }
-    if (is_link) {
-        return ovc_file_error(
-            OvStoragePlugin_ErrorCode_CacheCorrupt,
-            "file metadata sidecar must not be a symlink or reparse point");
-    }
-    return NULL;
-}
-
-static OvStoragePlugin_Error *ovc_file_read_path_bytes(
-    const char *path,
-    uint8_t **out_bytes,
-    size_t *out_length)
-{
-    ovc_file file;
-    ovc_file_stat info;
-    uint8_t *bytes;
-    size_t length;
-    size_t offset;
-
-    file = ovc_file_native_open_read(path);
-    if (file == OVC_INVALID_FILE) {
-        return ovc_file_native_error(errno, "open metadata sidecar", path);
-    }
-    if (ovc_file_native_fstat(file, &info) != 0) {
-        int native_error;
-
-        native_error = errno;
-        (void)ovc_file_native_close(file);
-        return ovc_file_native_error(native_error,
-                                     "stat metadata sidecar",
-                                     path);
-    }
-    if (!info.is_regular || info.size > SIZE_MAX) {
-        (void)ovc_file_native_close(file);
-        return ovc_file_error(OvStoragePlugin_ErrorCode_CacheCorrupt,
-                              "file metadata sidecar is not a regular file");
-    }
-    length = (size_t)info.size;
-    bytes = (uint8_t *)ovc_file_allocate(length == 0 ? 1 : length);
-    offset = 0;
-    while (offset < length) {
-        ovc_ssize_t count;
-
-        count = ovc_pread(file,
-                          bytes + offset,
-                          length - offset,
-                          (uint64_t)offset);
-        if (count < 0) {
-            int native_error;
-
-            native_error = errno;
-            free(bytes);
-            (void)ovc_file_native_close(file);
-            return ovc_file_native_error(native_error,
-                                         "read metadata sidecar",
-                                         path);
-        }
-        if (count == 0) {
-            free(bytes);
-            (void)ovc_file_native_close(file);
-            return ovc_file_error(OvStoragePlugin_ErrorCode_CacheCorrupt,
-                                  "file metadata sidecar was truncated");
-        }
-        offset += (size_t)count;
-    }
-    if (ovc_file_native_close(file) != 0) {
-        int native_error;
-
-        native_error = errno;
-        free(bytes);
-        return ovc_file_native_error(native_error,
-                                     "close metadata sidecar",
-                                     path);
-    }
-    if (length == 0) {
-        bytes[0] = 0;
-    }
-    *out_bytes = bytes;
-    *out_length = length;
-    return NULL;
-}
-
-static int ovc_file_decode_hex(const uint8_t *encoded,
-                               size_t length,
-                               OvStoragePlugin_Str *out)
-{
-    size_t index;
-
-    if ((length & 1U) != 0) {
-        return -1;
-    }
-    out->ptr = (char *)ovc_file_abi_allocate(length == 0 ? 1 : length / 2);
-    out->len = length / 2;
-    for (index = 0; index < length; index += 2) {
-        int high;
-        int low;
-
-        high = ovc_file_hex_value((char)encoded[index]);
-        low = ovc_file_hex_value((char)encoded[index + 1]);
-        if (high < 0 || low < 0) {
-            ovc_file_str_clear(out);
-            return -1;
-        }
-        out->ptr[index / 2] = (char)((high << 4) | low);
-    }
-    if (out->len == 0) {
-        out->ptr[0] = '\0';
-    }
-    return 0;
-}
-
-static bool ovc_file_utf8_valid(const OvStoragePlugin_Str *value)
-{
-    return ovc_utf8_is_valid(value->ptr, value->len);
-}
-
-static OvStoragePlugin_Error *ovc_file_user_metadata_read(
-    const char *path,
-    OvStoragePlugin_KeyValueList *out)
-{
-    char *sidecar;
-    uint8_t *bytes;
-    size_t length;
-    size_t line_count;
-    size_t cursor;
-    ovc_file_stat sidecar_info;
-    OvStoragePlugin_Error *error;
-
-    memset(out, 0, sizeof(*out));
-    error = NULL;
-    sidecar = ovc_file_metadata_path(path, &error);
-    if (sidecar == NULL) {
-        return error;
-    }
-    error = ovc_file_metadata_path_guard(sidecar);
-    if (error != NULL) {
-        free(sidecar);
-        return error;
-    }
-    /* ENAMETOOLONG: the over-long sidecar cannot exist => no metadata, the
-     * same answer the reference's metadata_exists gives. */
-    if (ovc_file_native_stat_path(sidecar, &sidecar_info) != 0 &&
-        (errno == ENOENT || errno == ENOTDIR || errno == ENAMETOOLONG)) {
-        free(sidecar);
-        out->ptr = (OvStoragePlugin_KeyValuePair *)
-            ovc_file_abi_allocate(sizeof(*out->ptr));
-        out->len = 0;
-        return NULL;
-    }
-    bytes = NULL;
-    length = 0;
-    error = ovc_file_read_path_bytes(sidecar, &bytes, &length);
-    free(sidecar);
-    if (error != NULL) {
-        return error;
-    }
-    line_count = 0;
-    for (cursor = 0; cursor < length; ++cursor) {
-        if (bytes[cursor] == '\n') {
-            ++line_count;
-        }
-    }
-    if (length != 0 && bytes[length - 1] != '\n') {
-        ++line_count;
-    }
-    out->ptr = (OvStoragePlugin_KeyValuePair *)ovc_file_abi_callocate(
-        line_count == 0 ? 1 : line_count,
-        sizeof(*out->ptr));
-    out->len = 0;
-    cursor = 0;
-    while (cursor < length) {
-        size_t line_start;
-        size_t line_end;
-        size_t separator;
-        OvStoragePlugin_KeyValuePair pair;
-
-        line_start = cursor;
-        while (cursor < length && bytes[cursor] != '\n') {
-            ++cursor;
-        }
-        line_end = cursor;
-        if (cursor < length) {
-            ++cursor;
-        }
-        if (line_end == line_start) {
-            ovc_file_key_value_list_clear(out);
-            free(bytes);
-            return ovc_file_error(OvStoragePlugin_ErrorCode_CacheCorrupt,
-                                  "file metadata sidecar has an empty line");
-        }
-        separator = line_start;
-        while (separator < line_end && bytes[separator] != '=') {
-            ++separator;
-        }
-        memset(&pair, 0, sizeof(pair));
-        if (separator == line_end ||
-            ovc_file_decode_hex(bytes + line_start,
-                                separator - line_start,
-                                &pair.key) != 0 ||
-            ovc_file_decode_hex(bytes + separator + 1,
-                                line_end - separator - 1,
-                                &pair.value) != 0 ||
-            !ovc_file_utf8_valid(&pair.key) ||
-            !ovc_file_utf8_valid(&pair.value)) {
-            ovc_file_str_clear(&pair.key);
-            ovc_file_str_clear(&pair.value);
-            ovc_file_key_value_list_clear(out);
-            free(bytes);
-            return ovc_file_error(
-                OvStoragePlugin_ErrorCode_CacheCorrupt,
-                "file metadata sidecar has invalid hex or UTF-8");
-        }
-        out->ptr[out->len++] = pair;
-    }
-    free(bytes);
-    return NULL;
-}
-
-static bool ovc_file_str_bytes_equal(const OvStoragePlugin_Str *left,
-                                     const OvStoragePlugin_Str *right)
-{
-    return left->len == right->len &&
-           (left->len == 0 || memcmp(left->ptr, right->ptr, left->len) == 0);
-}
-
-static void ovc_file_user_metadata_remove(
-    OvStoragePlugin_KeyValueList *metadata,
-    const OvStoragePlugin_Str *key)
-{
-    size_t index;
-
-    for (index = 0; index < metadata->len; ++index) {
-        if (!ovc_file_str_bytes_equal(&metadata->ptr[index].key, key)) {
-            continue;
-        }
-        ovc_file_str_clear(&metadata->ptr[index].key);
-        ovc_file_str_clear(&metadata->ptr[index].value);
-        if (index + 1 < metadata->len) {
-            memmove(&metadata->ptr[index],
-                    &metadata->ptr[index + 1],
-                    (metadata->len - index - 1) * sizeof(*metadata->ptr));
-        }
-        --metadata->len;
-        return;
-    }
-}
-
-static void ovc_file_user_metadata_set(
-    OvStoragePlugin_KeyValueList *metadata,
-    const OvStoragePlugin_Str *key,
-    const OvStoragePlugin_Str *value)
-{
-    size_t index;
-    OvStoragePlugin_KeyValuePair *next;
-
-    for (index = 0; index < metadata->len; ++index) {
-        if (ovc_file_str_bytes_equal(&metadata->ptr[index].key, key)) {
-            ovc_file_str_clear(&metadata->ptr[index].value);
-            metadata->ptr[index].value =
-                ovc_file_owned_slice(value->ptr, value->len);
-            return;
-        }
-    }
-    /* Metadata lists cross the ABI, so they live on the ABI allocator,
-     * which has no realloc: grow by copy.  These lists are small. */
-    if (metadata->len >= SIZE_MAX / sizeof(*metadata->ptr) - 1) {
-        abort();
-    }
-    next = (OvStoragePlugin_KeyValuePair *)ovc_file_abi_allocate(
-        (metadata->len + 1) * sizeof(*metadata->ptr));
-    if (metadata->len != 0) {
-        memcpy(next, metadata->ptr, metadata->len * sizeof(*metadata->ptr));
-    }
-    ovc_abi_free(metadata->ptr);
-    metadata->ptr = next;
-    metadata->ptr[metadata->len].key =
-        ovc_file_owned_slice(key->ptr, key->len);
-    metadata->ptr[metadata->len].value =
-        ovc_file_owned_slice(value->ptr, value->len);
-    ++metadata->len;
-}
-
 /* ------------------------------------------------------------------------- */
 /* Object metadata and atomic byte I/O. */
 
@@ -3150,12 +3164,10 @@ static uint32_t ovc_file_effective_permissions(const ovc_file_stat *native)
 static OvStoragePlugin_Error *ovc_file_object_info_fill(
     OvStoragePlugin_ObjectInfo *out,
     const char *address,
-    const char *path,
     bool full_metadata,
     const ovc_file_stat *native)
 {
     char *etag;
-    OvStoragePlugin_Error *error;
 
     memset(out, 0, sizeof(*out));
     out->address = ovc_file_owned_string(address);
@@ -3165,6 +3177,7 @@ static OvStoragePlugin_Error *ovc_file_object_info_fill(
     etag = ovc_file_etag(native);
     out->etag.present = true;
     out->etag.value = ovc_file_owned_string(etag);
+    out->etag_strength = OvStoragePlugin_EtagStrengthV1_Weak;
     free(etag);
     if (!native->is_directory) {
         out->size.present = true;
@@ -3179,13 +3192,12 @@ static OvStoragePlugin_Error *ovc_file_object_info_fill(
     out->effective_permissions.value.bits =
         ovc_file_effective_permissions(native);
     if (full_metadata) {
+        /* This backend stores no user metadata, so the map is present and
+         * empty: nothing on disk is consulted. */
         out->user_metadata.present = true;
-        error = ovc_file_user_metadata_read(path,
-                                            &out->user_metadata.value);
-        if (error != NULL) {
-            ovc_file_object_info_clear(out);
-            return error;
-        }
+        out->user_metadata.value.ptr = (OvStoragePlugin_KeyValuePair *)
+            ovc_file_abi_allocate(sizeof(*out->user_metadata.value.ptr));
+        out->user_metadata.value.len = 0;
     }
     return NULL;
 }
@@ -3197,6 +3209,7 @@ static void ovc_file_backend_item_info_take(
     memset(out, 0, sizeof(*out));
     out->kind = source->kind;
     out->etag = source->etag;
+    out->etag_strength = source->etag_strength;
     out->version = source->version;
     out->size = source->size;
     out->mtime_unix_ms = source->mtime_unix_ms;
@@ -3205,6 +3218,7 @@ static void ovc_file_backend_item_info_take(
     out->system_metadata = source->system_metadata;
     out->user_metadata = source->user_metadata;
     out->modified_by = source->modified_by;
+    out->versioned_address = source->versioned_address;
     ovc_file_str_clear(&source->address);
     memset(source, 0, sizeof(*source));
 }
@@ -3254,6 +3268,47 @@ static char *ovc_file_temp_sibling(const char *path, unsigned int attempt)
     return result;
 }
 
+/* True when the lock attempt failed because another handle holds the lock. */
+static bool ovc_file_lock_is_held(int error)
+{
+    return error == EWOULDBLOCK || error == EAGAIN;
+}
+
+/* True when the errno says the lock cannot answer on this filesystem rather
+ * than that this attempt failed: no advisory locks at all, as some FUSE and
+ * network mounts report, or EBADF from an NFS flock emulation that wants a
+ * descriptor open for writing.  The writer's descriptor is always open for
+ * writing, so for it this means staging unlocked; for a probe it means the
+ * entry cannot be classified and the removal refuses. */
+static bool ovc_file_lock_unsupported(int error)
+{
+    if (error == ENOLCK || error == EBADF) {
+        return true;
+    }
+#ifdef EOPNOTSUPP
+    if (error == EOPNOTSUPP) {
+        return true;
+    }
+#endif
+#ifdef ENOTSUP
+    if (error == ENOTSUP) {
+        return true;
+    }
+#endif
+#ifdef ENOSYS
+    if (error == ENOSYS) {
+        return true;
+    }
+#endif
+    return false;
+}
+
+/* Create the staging temp and take the exclusive advisory lock that marks the
+ * write live to a delete_directory probing the name.  A removal that took the
+ * lock first is clearing the name as an orphan, so a held lock, or a name
+ * already gone once the lock is held, means this attempt lost the name and the
+ * loop takes a fresh one.  A filesystem without advisory locks stages
+ * unlocked; the removal side refuses what it cannot classify. */
 static char *ovc_file_create_temp(
     const char *path,
     ovc_file *out_file,
@@ -3266,6 +3321,7 @@ static char *ovc_file_create_temp(
     for (attempt = 0; attempt < OVC_FILE_TEMP_ATTEMPTS; ++attempt) {
         char *candidate;
         ovc_file file;
+        ovc_file_stat present;
 
         candidate = ovc_file_temp_sibling(path, attempt);
         if (candidate == NULL) {
@@ -3273,72 +3329,44 @@ static char *ovc_file_create_temp(
             break;
         }
         file = ovc_file_native_create_new(candidate);
-        if (file != OVC_INVALID_FILE) {
-            *out_file = file;
-            return candidate;
+        if (file == OVC_INVALID_FILE) {
+            last_error = errno;
+            free(candidate);
+            if (last_error != EEXIST) {
+                break;
+            }
+            continue;
         }
-        last_error = errno;
-        free(candidate);
-        if (last_error != EEXIST) {
+        if (ovc_file_native_lock_exclusive_nonblocking(file) != 0) {
+            last_error = errno;
+            if (ovc_file_lock_is_held(last_error)) {
+                (void)ovc_file_native_close(file);
+                free(candidate);
+                last_error = EEXIST;
+                continue;
+            }
+            if (!ovc_file_lock_unsupported(last_error)) {
+                (void)ovc_file_native_close(file);
+                (void)ovc_file_native_unlink(candidate);
+                free(candidate);
+                break;
+            }
+        } else if (ovc_file_native_stat_path(candidate, &present) != 0) {
+            last_error = errno;
+            (void)ovc_file_native_close(file);
+            free(candidate);
+            if (last_error == ENOENT) {
+                last_error = EEXIST;
+                continue;
+            }
             break;
         }
+        *out_file = file;
+        return candidate;
     }
     *out_error = ovc_file_native_error(last_error,
                                        "create atomic-write temp file",
                                        path);
-    return NULL;
-}
-
-static char *ovc_file_create_metadata_temp(
-    const char *sidecar,
-    ovc_file *out_file,
-    OvStoragePlugin_Error **out_error)
-{
-    unsigned int attempt;
-    int last_error;
-    char *parent;
-
-    parent = ovc_file_parent_path(sidecar);
-    last_error = EEXIST;
-    for (attempt = 0; attempt < OVC_FILE_TEMP_ATTEMPTS; ++attempt) {
-        char name[160];
-        char *candidate;
-        int length;
-        ovc_file file;
-
-        /* Do not embed the object basename here: a valid NAME_MAX-sized
-         * object must still leave room for metadata's atomic staging name. */
-        length = snprintf(name,
-                          sizeof(name),
-                          ".metadata.%llu.%lu.%u.tmp",
-                          (unsigned long long)ovc_monotonic_ns(),
-                          ovc_file_process_id(),
-                          attempt);
-        if (length < 0 || (size_t)length >= sizeof(name)) {
-            last_error = ENAMETOOLONG;
-            break;
-        }
-        candidate = ovc_path_join(parent, name);
-        if (candidate == NULL) {
-            last_error = errno;
-            break;
-        }
-        file = ovc_file_native_create_new(candidate);
-        if (file != OVC_INVALID_FILE) {
-            free(parent);
-            *out_file = file;
-            return candidate;
-        }
-        last_error = errno;
-        free(candidate);
-        if (last_error != EEXIST) {
-            break;
-        }
-    }
-    free(parent);
-    *out_error = ovc_file_native_error(last_error,
-                                       "create metadata temp file",
-                                       sidecar);
     return NULL;
 }
 
@@ -3388,218 +3416,6 @@ static int ovc_file_write_all(
     return 0;
 }
 
-static OvStoragePlugin_Error *ovc_file_user_metadata_write(
-    const char *path,
-    const OvStoragePlugin_KeyValueList *metadata,
-    const ovc_file_task *task)
-{
-    static const char hex[] = "0123456789abcdef";
-    char *sidecar;
-    char *temporary;
-    char *metadata_directory;
-    uint8_t *encoded;
-    size_t encoded_length;
-    size_t cursor;
-    size_t index;
-    ovc_file file;
-    OvStoragePlugin_Error *error;
-    bool published;
-
-    error = NULL;
-    sidecar = ovc_file_metadata_path(path, &error);
-    if (sidecar == NULL) {
-        return error;
-    }
-    error = ovc_file_metadata_path_guard(sidecar);
-    if (error != NULL) {
-        free(sidecar);
-        return error;
-    }
-    if (metadata->len == 0) {
-        /* ENAMETOOLONG: nothing with that over-long name can exist, so the
-         * cleanup already holds — do not fail a committed object mutation. */
-        if (ovc_file_native_unlink(sidecar) != 0 &&
-            errno != ENOENT && errno != ENOTDIR &&
-            errno != ENAMETOOLONG) {
-            int native_error;
-
-            native_error = errno;
-            error = ovc_file_native_error(native_error,
-                                          "remove metadata sidecar",
-                                          sidecar);
-            free(sidecar);
-            return error;
-        }
-        metadata_directory = ovc_file_parent_path(sidecar);
-        (void)ovc_file_native_rmdir(metadata_directory);
-        free(metadata_directory);
-        free(sidecar);
-        return NULL;
-    }
-    encoded_length = 0;
-    for (index = 0; index < metadata->len; ++index) {
-        size_t pair_bytes;
-
-        if (metadata->ptr[index].key.ptr == NULL ||
-            metadata->ptr[index].value.ptr == NULL ||
-            metadata->ptr[index].key.len >
-                SIZE_MAX - metadata->ptr[index].value.len ||
-            metadata->ptr[index].key.len +
-                    metadata->ptr[index].value.len >
-                (SIZE_MAX - 2) / 2) {
-            free(sidecar);
-            return ovc_file_error(OvStoragePlugin_ErrorCode_InvalidArgument,
-                                  "user metadata contains an invalid entry");
-        }
-        pair_bytes = (metadata->ptr[index].key.len +
-                      metadata->ptr[index].value.len) * 2;
-        if (pair_bytes > SIZE_MAX - 2 - encoded_length) {
-            free(sidecar);
-            return ovc_file_error(OvStoragePlugin_ErrorCode_ResourceExhausted,
-                                  "user metadata is too large");
-        }
-        encoded_length += pair_bytes + 2;
-    }
-    encoded = (uint8_t *)ovc_file_allocate(encoded_length);
-    cursor = 0;
-    for (index = 0; index < metadata->len; ++index) {
-        size_t byte_index;
-
-        for (byte_index = 0;
-             byte_index < metadata->ptr[index].key.len;
-             ++byte_index) {
-            unsigned char byte;
-
-            byte = (unsigned char)metadata->ptr[index].key.ptr[byte_index];
-            encoded[cursor++] = (uint8_t)hex[byte >> 4];
-            encoded[cursor++] = (uint8_t)hex[byte & 0x0f];
-        }
-        encoded[cursor++] = '=';
-        for (byte_index = 0;
-             byte_index < metadata->ptr[index].value.len;
-             ++byte_index) {
-            unsigned char byte;
-
-            byte = (unsigned char)metadata->ptr[index].value.ptr[byte_index];
-            encoded[cursor++] = (uint8_t)hex[byte >> 4];
-            encoded[cursor++] = (uint8_t)hex[byte & 0x0f];
-        }
-        encoded[cursor++] = '\n';
-    }
-    if (ovc_file_make_parent_directories(sidecar, &error) != 0) {
-        free(encoded);
-        free(sidecar);
-        return error;
-    }
-    error = ovc_file_metadata_path_guard(sidecar);
-    if (error != NULL) {
-        free(encoded);
-        free(sidecar);
-        return error;
-    }
-    temporary = ovc_file_create_metadata_temp(sidecar, &file, &error);
-    if (temporary == NULL) {
-        free(encoded);
-        free(sidecar);
-        return error;
-    }
-    published = false;
-    if (ovc_file_write_all(file,
-                           encoded,
-                           encoded_length,
-                           task,
-                           &error) != 0 ||
-        ovc_file_native_sync(file) != 0) {
-        if (error == NULL) {
-            error = ovc_file_native_error(errno,
-                                          "sync metadata sidecar",
-                                          temporary);
-        }
-    } else if (ovc_file_native_close(file) != 0) {
-        file = OVC_INVALID_FILE;
-        error = ovc_file_native_error(errno,
-                                      "close metadata sidecar",
-                                      temporary);
-    } else {
-        file = OVC_INVALID_FILE;
-        if (ovc_file_native_rename_replace(temporary, sidecar) != 0) {
-            error = ovc_file_native_error(errno,
-                                          "publish metadata sidecar",
-                                          sidecar);
-        } else {
-            published = true;
-            if (ovc_file_native_sync_parent(sidecar) != 0) {
-                error = ovc_file_error(
-                    OvStoragePlugin_ErrorCode_CommitAmbiguous,
-                    "metadata sidecar was published but its directory sync failed for `%s`: %s",
-                    sidecar,
-                    ovc_file_strerror(errno));
-            }
-        }
-    }
-    if (file != OVC_INVALID_FILE) {
-        (void)ovc_file_native_close(file);
-    }
-    if (!published) {
-        (void)ovc_file_native_unlink(temporary);
-    }
-    free(encoded);
-    free(temporary);
-    free(sidecar);
-    return error;
-}
-
-static OvStoragePlugin_Error *ovc_file_user_metadata_copy(
-    const char *source,
-    const char *destination,
-    const char *message,
-    const ovc_file_task *task)
-{
-    static char message_key_bytes[] = "x-ov-message";
-    OvStoragePlugin_KeyValueList metadata;
-    OvStoragePlugin_Str message_key;
-    OvStoragePlugin_Str message_value;
-    OvStoragePlugin_Error *error;
-
-    memset(&metadata, 0, sizeof(metadata));
-    error = ovc_file_user_metadata_read(source, &metadata);
-    if (error != NULL) {
-        return error;
-    }
-    if (message != NULL && message[0] != '\0') {
-        message_key.ptr = message_key_bytes;
-        message_key.len = sizeof(message_key_bytes) - 1;
-        message_value.ptr = (char *)message;
-        message_value.len = strlen(message);
-        ovc_file_user_metadata_set(&metadata,
-                                   &message_key,
-                                   &message_value);
-    }
-    error = ovc_file_user_metadata_write(destination, &metadata, task);
-    ovc_file_key_value_list_clear(&metadata);
-    return error;
-}
-
-static OvStoragePlugin_Error *ovc_file_user_metadata_remove_path(
-    const char *path,
-    const ovc_file_task *task)
-{
-    OvStoragePlugin_KeyValueList empty;
-
-    /* Local-only list, but KeyValueList payloads uniformly live on the ABI
-     * allocator in this file so the shared clear helpers stay correct. */
-    empty.ptr = (OvStoragePlugin_KeyValuePair *)
-        ovc_file_abi_allocate(sizeof(*empty.ptr));
-    empty.len = 0;
-    {
-        OvStoragePlugin_Error *error;
-
-        error = ovc_file_user_metadata_write(path, &empty, task);
-        ovc_abi_free(empty.ptr);
-        return error;
-    }
-}
-
 static int ovc_file_check_destination_precondition(
     const char *path,
     OvStoragePlugin_IfDestExistsTag if_dest,
@@ -3611,7 +3427,13 @@ static int ovc_file_check_destination_precondition(
     if (if_dest == OvStoragePlugin_IfDestExistsTag_Overwrite) {
         return 0;
     }
-    if (ovc_file_native_stat_path(path, &info) != 0) {
+    /* A dangling symlink at the destination is a real, present directory
+     * entry: `no_overwrite` must refuse to replace it, and `if_match_etag`
+     * must compare against its own link metadata, not the target it fails
+     * to resolve to. `ovc_file_native_stat_path_or_link` reports that entry
+     * instead of answering NotFound for it, unlike the plain follow-only
+     * stat every other caller in this file uses. */
+    if (ovc_file_native_stat_path_or_link(path, &info) != 0) {
         int native_error;
 
         native_error = errno;
@@ -3654,10 +3476,19 @@ static int ovc_file_check_destination_precondition(
     return -1;
 }
 
+/* `report_dangling_link` selects between the two stat-shaped operations
+ * that share this function: the top-level `stat` operation passes true,
+ * wanting the "answer for the dangling link itself" behavior of
+ * `ovc_file_native_stat_path_or_link`; `get_latest_version` and
+ * `list_versions` pass false, keeping the plain follow-only behavior, since
+ * a dangling link's own metadata is not a version of an object and would
+ * pin a caller's etag to a size/mtime that a later follow-only read can
+ * never match. */
 static OvStoragePlugin_Error *ovc_file_stat_result(
     ovc_file_layer *layer,
     const char *address,
     bool full_metadata,
+    bool report_dangling_link,
     OvStoragePlugin_ObjectInfo **out)
 {
     char *path;
@@ -3665,6 +3496,7 @@ static OvStoragePlugin_Error *ovc_file_stat_result(
     OvStoragePlugin_Error *error;
     OvStoragePlugin_ObjectInfo *result;
     bool is_connection_root;
+    int stat_result;
 
     error = NULL;
     path = ovc_file_resolve_path_and_root_flag(layer,
@@ -3674,7 +3506,10 @@ static OvStoragePlugin_Error *ovc_file_stat_result(
     if (path == NULL) {
         return error;
     }
-    if (ovc_file_native_stat_path(path, &native) != 0) {
+    stat_result = report_dangling_link
+        ? ovc_file_native_stat_path_or_link(path, &native)
+        : ovc_file_native_stat_path(path, &native);
+    if (stat_result != 0) {
         int native_error;
 
         native_error = errno;
@@ -3686,8 +3521,7 @@ static OvStoragePlugin_Error *ovc_file_stat_result(
         ovc_file_abi_callocate(1, sizeof(*result));
     error = ovc_file_object_info_fill(result,
                                       address,
-                                      path,
-                                      full_metadata && !is_connection_root,
+                                      full_metadata,
                                       &native);
     if (error != NULL) {
         ovc_abi_free(result);
@@ -3785,7 +3619,6 @@ static OvStoragePlugin_Error *ovc_file_read_result(
         free(canonical);
         error = ovc_file_object_info_fill(&result->local_delegate.info,
                                           task->address,
-                                          path,
                                           true,
                                           &before);
         if (error != NULL) {
@@ -3944,7 +3777,6 @@ static OvStoragePlugin_Error *ovc_file_read_result(
     result->bytes.bytes.len = read_length;
     error = ovc_file_object_info_fill(&result->bytes.info,
                                       task->address,
-                                      path,
                                       true,
                                       &before);
     if (error != NULL) {
@@ -3977,6 +3809,15 @@ static OvStoragePlugin_Error *ovc_file_write_result(
                                  &error);
     if (path == NULL) {
         return error;
+    }
+    /* The refusal follows address resolution and precedes every filesystem
+     * step: no parent directory is created and no temp sibling is staged. */
+    if (task->payload.write.refuse_user_metadata) {
+        free(path);
+        return ovc_file_error(
+            OvStoragePlugin_ErrorCode_Unsupported,
+            "file write: backend stores no user metadata; drop user_metadata "
+            "or target a backend that supports it");
     }
     if (ovc_file_make_parent_directories(path, &error) != 0) {
         free(path);
@@ -4021,20 +3862,13 @@ static OvStoragePlugin_Error *ovc_file_write_result(
         free(path);
         return error;
     }
-    if (ovc_file_native_close(file) != 0) {
-        int native_error;
-
-        native_error = errno;
-        (void)ovc_file_native_unlink(temporary);
-        error = ovc_file_native_error(native_error,
-                                      "close temp file",
-                                      temporary);
-        free(temporary);
-        free(path);
-        return error;
-    }
+    /* The handle stays open, and so keeps its staging lock, until the rename
+     * publishes the bytes; a delete_directory probing the temp meanwhile reads
+     * that lock as a live write.  The fsync above already settled durability,
+     * so the eventual close result carries nothing and is discarded. */
     if (ovc_file_cancelled(task)) {
         (void)ovc_file_native_unlink(temporary);
+        (void)ovc_file_native_close(file);
         free(temporary);
         free(path);
         return ovc_file_error(OvStoragePlugin_ErrorCode_Cancelled,
@@ -4057,6 +3891,11 @@ static OvStoragePlugin_Error *ovc_file_write_result(
                 path);
         } else if (ovc_file_native_rename_replace(temporary, path) == 0) {
             renamed = true;
+            /* The handle, and the lock it carries, close once the rename has
+             * published; the lock's range never overlaps content, so a reader
+             * that already found the object is unaffected. */
+            (void)ovc_file_native_close(file);
+            file = OVC_INVALID_FILE;
             if (ovc_file_native_sync_parent(path) != 0) {
                 int native_error;
 
@@ -4066,39 +3905,16 @@ static OvStoragePlugin_Error *ovc_file_write_result(
                     "file was published but its directory sync failed for `%s`: %s",
                     path,
                     ovc_file_strerror(native_error));
-            } else {
-                error = ovc_file_user_metadata_write(
-                    path,
-                    &task->payload.write.user_metadata,
-                    NULL);
-                if (error != NULL) {
-                    /* The bytes are published; only the sidecar stage failed.
-                     * Re-code as PartialCompletion so a caller can tell this
-                     * from a write that did not happen, and so no retry Layer
-                     * replays the write and changes the etag -- the
-                     * multi-stage durability rule in
-                     * docs/public/plugin-storage/CONFORMANCE.md, which names
-                     * this backend as its example.  The Rust file backend
-                     * reports the same code from the same stage.
-                     *
-                     * Code only, no ErrorContext: this backend attaches none
-                     * to any error it mints (see ovc_file_error), including
-                     * the CommitAmbiguous above. */
-                    error->code =
-                        OvStoragePlugin_ErrorCode_PartialCompletion;
-                }
+            } else if (ovc_file_native_stat_path(path, &native) != 0) {
                 /* Re-stat the published destination (as the staged copy
                  * does for out_info): the temp fstat above predates
                  * preserve-destination-permissions, so it would report an
                  * overwritten read-only file as writable.  The reference's
                  * write_atomic likewise ends with a stat of the destination
                  * path. */
-                if (error == NULL &&
-                    ovc_file_native_stat_path(path, &native) != 0) {
-                    error = ovc_file_native_error(errno,
-                                                  "stat published file",
-                                                  path);
-                }
+                error = ovc_file_native_error(errno,
+                                              "stat published file",
+                                              path);
             }
         } else {
             int native_error;
@@ -4112,6 +3928,7 @@ static OvStoragePlugin_Error *ovc_file_write_result(
     (void)ovc_mutex_unlock(&task->layer->mutex);
     if (!renamed) {
         (void)ovc_file_native_unlink(temporary);
+        (void)ovc_file_native_close(file);
         free(temporary);
         free(path);
         return error;
@@ -4125,7 +3942,6 @@ static OvStoragePlugin_Error *ovc_file_write_result(
         ovc_file_abi_callocate(1, sizeof(*result));
     error = ovc_file_object_info_fill(&result->info,
                                       task->address,
-                                      path,
                                       true,
                                       &native);
     if (error != NULL) {
@@ -4172,7 +3988,7 @@ static int ovc_file_check_source_precondition(
 /* Stage a byte-for-byte copy of `source` next to `destination` and publish
  * it with an atomic rename.  The bulk chunk loop runs UNLOCKED so a large
  * copy cannot stall every other operation on the layer; only the short
- * precondition-recheck -> publish-rename -> sidecar window takes
+ * precondition-recheck -> publish-rename window takes
  * task->layer->mutex — the same shape as ovc_file_write_result.  The Rust
  * reference instead holds per-path source+destination locks across the whole
  * byte copy (mod.rs copy); this file has no per-path locks, so `if_source`
@@ -4194,7 +4010,6 @@ static int ovc_file_copy_regular_staged(
     const char *expected_source_etag,
     OvStoragePlugin_IfDestExistsTag if_dest,
     const char *expected_destination_etag,
-    const char *message,
     bool move_source,
     ovc_file_stat *out_info,
     OvStoragePlugin_Error **out_error)
@@ -4323,31 +4138,9 @@ static int ovc_file_copy_regular_staged(
                                "copy source changed while reading");
         goto done;
     }
-#if defined(_WIN32)
-    /* SetFileAttributesW may need a second path handle and the staging handle
-     * intentionally does not share writes.  Flush/close first; the subsequent
-     * MoveFileExW(MOVEFILE_WRITE_THROUGH) commits the copied attributes. */
-    if (ovc_file_native_sync(destination_file) != 0) {
-        error = ovc_file_native_error(errno,
-                                      "sync staged copy",
-                                      temporary);
-        goto done;
-    }
-    if (ovc_file_native_close(destination_file) != 0) {
-        destination_file = OVC_INVALID_FILE;
-        error = ovc_file_native_error(errno,
-                                      "close staged copy",
-                                      temporary);
-        goto done;
-    }
-    destination_file = OVC_INVALID_FILE;
-    if (ovc_file_native_copy_permissions(source, temporary) != 0) {
-        error = ovc_file_native_error(errno,
-                                      "copy source permissions",
-                                      source);
-        goto done;
-    }
-#else
+    /* Permissions are copied by path while the staging handle stays open: the
+     * handle keeps its staging lock until the rename publishes the bytes, and
+     * Win32 attribute writes are exempt from share-mode checks. */
     if (ovc_file_native_copy_permissions(source, temporary) != 0) {
         error = ovc_file_native_error(errno,
                                       "copy source permissions",
@@ -4360,15 +4153,6 @@ static int ovc_file_copy_regular_staged(
                                       temporary);
         goto done;
     }
-    if (ovc_file_native_close(destination_file) != 0) {
-        destination_file = OVC_INVALID_FILE;
-        error = ovc_file_native_error(errno,
-                                      "close staged copy",
-                                      temporary);
-        goto done;
-    }
-    destination_file = OVC_INVALID_FILE;
-#endif
     if (ovc_file_native_close(source_file) != 0) {
         source_file = OVC_INVALID_FILE;
         error = ovc_file_native_error(errno,
@@ -4378,8 +4162,8 @@ static int ovc_file_copy_regular_staged(
     }
     source_file = OVC_INVALID_FILE;
 
-    /* Publish window: only these re-checks, the rename, and the sidecar
-     * mirror hold the layer mutex. */
+    /* Publish window: only these re-checks and the rename hold the layer
+     * mutex. */
     (void)ovc_mutex_lock(&task->layer->mutex);
     {
         ovc_file_stat current;
@@ -4393,9 +4177,9 @@ static int ovc_file_copy_regular_staged(
                                           "re-stat copy source at publish",
                                           source);
         } else if (!ovc_file_stat_identity_equal(&before, &current)) {
-            /* The staged bytes (and the sidecar about to be mirrored) no
-             * longer describe the live source; publishing them would also
-             * bypass a satisfied-at-staging if_source precondition. */
+            /* The staged bytes do not describe the live source any more;
+             * publishing them would also bypass a satisfied-at-staging
+             * if_source precondition. */
             error = ovc_file_error(
                 OvStoragePlugin_ErrorCode_ObjectModified,
                 "copy source changed before publish");
@@ -4411,6 +4195,11 @@ static int ovc_file_copy_regular_staged(
                                               destination);
             } else {
                 published = true;
+                /* The handle, and the lock it carries, close once the rename
+                 * has published; the lock's range never overlaps content, so
+                 * a reader that already found the object is unaffected. */
+                (void)ovc_file_native_close(destination_file);
+                destination_file = OVC_INVALID_FILE;
                 if (ovc_file_native_sync_parent(destination) != 0) {
                     error = ovc_file_error(
                         OvStoragePlugin_ErrorCode_CommitAmbiguous,
@@ -4418,12 +4207,7 @@ static int ovc_file_copy_regular_staged(
                         destination,
                         ovc_file_strerror(errno));
                 } else {
-                    error = ovc_file_user_metadata_copy(source,
-                                                        destination,
-                                                        message,
-                                                        NULL);
-                    if (error == NULL &&
-                        ovc_file_native_stat_path(destination,
+                    if (ovc_file_native_stat_path(destination,
                                                   out_info) != 0) {
                         error = ovc_file_native_error(errno,
                                                       "stat copied file",
@@ -4449,10 +4233,6 @@ static int ovc_file_copy_regular_staged(
                                 OvStoragePlugin_ErrorCode_CommitAmbiguous,
                                 "cross-device rename deleted the source but its directory sync failed: %s",
                                 ovc_file_strerror(errno));
-                        } else {
-                            error = ovc_file_user_metadata_remove_path(
-                                source,
-                                NULL);
                         }
                     }
                 }
@@ -4539,10 +4319,6 @@ static OvStoragePlugin_Error *ovc_file_delete_result(ovc_file_task *task)
             path,
             ovc_file_strerror(errno));
     }
-    if (error == NULL) {
-        /* Also cleans an orphaned sidecar for an already-missing object. */
-        error = ovc_file_user_metadata_remove_path(path, NULL);
-    }
     (void)ovc_mutex_unlock(&task->layer->mutex);
     free(path);
     return error;
@@ -4583,7 +4359,6 @@ static OvStoragePlugin_Error *ovc_file_copy_result(
                                      task->payload.transfer.if_source,
                                      task->payload.transfer.if_dest,
                                      task->payload.transfer.match_etag,
-                                     task->payload.transfer.message,
                                      false,
                                      &info,
                                      &error) == 0) {
@@ -4593,7 +4368,6 @@ static OvStoragePlugin_Error *ovc_file_copy_result(
         error = ovc_file_object_info_fill(
             &result->done.info,
             task->payload.transfer.destination,
-            destination,
             true,
             &info);
         if (error != NULL) {
@@ -4668,12 +4442,9 @@ static OvStoragePlugin_Error *ovc_file_rename_result(ovc_file_task *task)
                ovc_file_make_parent_directories(destination, &error) != 0) {
         /* `error` is populated by the failed helper. */
     } else if (strcmp(source, destination) == 0) {
-        error = ovc_file_user_metadata_copy(
-            source,
-            destination,
-            task->payload.transfer.message,
-            task);
-        moved = error == NULL;
+        /* A rename onto itself has nothing to move: the preconditions above
+         * are satisfied and the object is already at its destination. */
+        moved = true;
     } else if (ovc_file_native_rename_replace(source, destination) == 0) {
         moved = true;
         if (ovc_file_native_sync_parent(destination) != 0 ||
@@ -4682,15 +4453,6 @@ static OvStoragePlugin_Error *ovc_file_rename_result(ovc_file_task *task)
                 OvStoragePlugin_ErrorCode_CommitAmbiguous,
                 "renamed file was published but a directory sync failed: %s",
                 ovc_file_strerror(errno));
-        } else {
-            error = ovc_file_user_metadata_copy(
-                source,
-                destination,
-                task->payload.transfer.message,
-                NULL);
-            if (error == NULL) {
-                error = ovc_file_user_metadata_remove_path(source, NULL);
-            }
         }
     } else if (errno == EXDEV) {
         bool source_is_link;
@@ -4741,7 +4503,6 @@ static OvStoragePlugin_Error *ovc_file_rename_result(ovc_file_task *task)
                 task->payload.transfer.if_source,
                 task->payload.transfer.if_dest,
                 task->payload.transfer.match_etag,
-                task->payload.transfer.message,
                 true,
                 &copied_info,
                 &error) == 0) {
@@ -4758,102 +4519,26 @@ static OvStoragePlugin_Error *ovc_file_update_metadata_result(
     ovc_file_task *task,
     OvStoragePlugin_BackendItemInfo **out)
 {
-    static char message_key_bytes[] = "x-ov-message";
     char *path;
-    ovc_file_stat info;
-    OvStoragePlugin_KeyValueList metadata;
-    OvStoragePlugin_ObjectInfo object_info;
-    OvStoragePlugin_BackendItemInfo *result;
     OvStoragePlugin_Error *error;
-    size_t index;
-    bool is_connection_root;
 
+    /* The address is still resolved first so a malformed or out-of-root URL
+     * reports its own error rather than a blanket Unsupported, matching the
+     * Rust host's update_metadata.  A resolvable address then has nothing to
+     * patch: this backend stores no user metadata, whether or not the target
+     * exists.  A host that needs attribution composes it in a layer over a
+     * backend that stores the map. */
+    (void)out;
     error = NULL;
-    path = ovc_file_resolve_path_and_root_flag(task->layer,
-                                               task->address,
-                                               &is_connection_root,
-                                               &error);
+    path = ovc_file_resolve_path(task->layer, task->address, NULL, &error);
     if (path == NULL) {
         return error;
     }
-    if (is_connection_root) {
-        free(path);
-        return ovc_file_error(
-            OvStoragePlugin_ErrorCode_Unsupported,
-            "user metadata on a configured file root is unsupported");
-    }
-    memset(&metadata, 0, sizeof(metadata));
-    memset(&object_info, 0, sizeof(object_info));
-    result = NULL;
-    (void)ovc_mutex_lock(&task->layer->mutex);
-    if (ovc_file_cancelled(task)) {
-        error = ovc_file_error(OvStoragePlugin_ErrorCode_Cancelled,
-                               "metadata update was cancelled");
-    } else if (ovc_file_native_stat_path(path, &info) != 0) {
-        error = ovc_file_native_error(errno,
-                                      "stat metadata target",
-                                      path);
-    } else if (ovc_file_check_source_precondition(
-                   &info,
-                   task->payload.update_metadata.if_match,
-                   OvStoragePlugin_ErrorCode_PreconditionFailed,
-                   &error) == 0) {
-        error = ovc_file_user_metadata_read(path, &metadata);
-        if (error == NULL) {
-            for (index = 0;
-                 index < task->payload.update_metadata.remove.len;
-                 ++index) {
-                ovc_file_user_metadata_remove(
-                    &metadata,
-                    &task->payload.update_metadata.remove.ptr[index]);
-            }
-            for (index = 0;
-                 index < task->payload.update_metadata.set.len;
-                 ++index) {
-                ovc_file_user_metadata_set(
-                    &metadata,
-                    &task->payload.update_metadata.set.ptr[index].key,
-                    &task->payload.update_metadata.set.ptr[index].value);
-            }
-            if (task->payload.update_metadata.message != NULL &&
-                task->payload.update_metadata.message[0] != '\0') {
-                OvStoragePlugin_Str key;
-                OvStoragePlugin_Str value;
-
-                key.ptr = message_key_bytes;
-                key.len = sizeof(message_key_bytes) - 1;
-                value.ptr = task->payload.update_metadata.message;
-                value.len = strlen(task->payload.update_metadata.message);
-                ovc_file_user_metadata_set(&metadata, &key, &value);
-            }
-            error = ovc_file_user_metadata_write(path, &metadata, task);
-        }
-        if (error == NULL && ovc_file_native_stat_path(path, &info) != 0) {
-            error = ovc_file_native_error(errno,
-                                          "stat metadata target after update",
-                                          path);
-        }
-        if (error == NULL) {
-            error = ovc_file_object_info_fill(&object_info,
-                                              task->address,
-                                              path,
-                                              true,
-                                              &info);
-        }
-        if (error == NULL) {
-            result = (OvStoragePlugin_BackendItemInfo *)
-                ovc_file_abi_callocate(1, sizeof(*result));
-            ovc_file_backend_item_info_take(result, &object_info);
-        }
-    }
-    (void)ovc_mutex_unlock(&task->layer->mutex);
-    ovc_file_key_value_list_clear(&metadata);
-    ovc_file_object_info_clear(&object_info);
     free(path);
-    if (error == NULL) {
-        *out = result;
-    }
-    return error;
+    return ovc_file_error(
+        OvStoragePlugin_ErrorCode_Unsupported,
+        "file update_metadata: backend stores no user metadata; target a "
+        "backend that supports it");
 }
 
 static OvStoragePlugin_Error *ovc_file_materialize_result(
@@ -4915,7 +4600,6 @@ static OvStoragePlugin_Error *ovc_file_materialize_result(
             result->path = ovc_file_owned_string(canonical);
             error = ovc_file_object_info_fill(&result->info,
                                               task->address,
-                                              path,
                                               true,
                                               &info);
             if (error != NULL) {
@@ -4945,6 +4629,7 @@ static OvStoragePlugin_Error *ovc_file_get_latest_version_result(
     error = ovc_file_stat_result(task->layer,
                                  task->address,
                                  true,
+                                 false,
                                  &result);
     if (error != NULL) {
         return error;
@@ -5001,6 +4686,7 @@ static OvStoragePlugin_Error *ovc_file_list_versions_result(
         error = ovc_file_stat_result(task->layer,
                                      task->address,
                                      true,
+                                     false,
                                      &current);
         if (error != NULL) {
             ovc_abi_free(page->items.ptr);
@@ -5050,8 +4736,7 @@ static OvStoragePlugin_Error *ovc_file_create_directory_result(
     } else if (error == NULL) {
         error = ovc_file_object_info_fill(&object_info,
                                           task->address,
-                                          path,
-                                          !is_connection_root,
+                                          true,
                                           &info);
         if (error == NULL) {
             result = (OvStoragePlugin_BackendItemInfo *)
@@ -5068,41 +4753,365 @@ static OvStoragePlugin_Error *ovc_file_create_directory_result(
     return error;
 }
 
-static bool ovc_file_is_cleared_by_directory_removal(const char *name);
 #if defined(_WIN32)
 static char *ovc_file_wide_name_to_utf8(const wchar_t *wide);
 #endif
 
-/* delete_directory support, mirroring the reference (mod.rs
- * delete_directory + metadata.rs remove_directory_metadata_dir): first
- * verify the directory holds no user-visible entries, then remove the
- * .ovstorage-meta sidecar dir with remove_dir_all semantics so an orphaned
- * sidecar (object removed out-of-band) or a crashed metadata staging temp
- * *inside that sidecar dir* does not leave a visually-empty directory
- * undeletable through the API.  That covers the sidecar namespace only; an
- * orphaned object staging temp is a sibling of the object, not a child of
- * the sidecar dir, and the paragraph below says what happens to it.
- * Entries inside .ovstorage-meta are backend-owned by construction — the
- * namespace is unaddressable through URL resolution — so they are unlinked
- * without inspection.
+/* delete_directory support: verify the directory holds no entries, then
+ * rmdir it.  This backend owns nothing inside a directory -- `.ovstorage-meta`
+ * and every other name are ordinary content -- so the scan has no skip set:
+ * every entry blocks the removal, and the scan reaches the verdict the rmdir
+ * would while reporting it as DirectoryNotEmpty on every platform.
  *
- * The scan ignores exactly one name, .ovstorage-meta, which the cleanup
- * below clears; every other entry blocks the rmdir, so for the entries the
- * API can create the scan reaches the verdict the rmdir would.  An
- * atomic-write staging temp is the
- * case that makes this matter: it is hidden from list and watch because it
- * is not yet an object, but the kernel counts it, so a directory holding an
- * in-flight write is reported here as the DirectoryNotEmpty it is instead of
- * scanning as empty, losing its sidecar dir, and only then failing the
- * rmdir.  An entry created after the scan still fails the rmdir with
- * ENOTEMPTY, which the errno table maps to the same DirectoryNotEmpty.
+ * A link at the addressed path is refused before the scan, so the scan never
+ * runs through a link and rmdir's ENOTDIR never reaches the errno table as
+ * NotFound.
  *
- * A staging temp whose writer died holds its directory the same way, and
- * no API call clears it: enumeration hides it and URL resolution refuses
- * to address it, so the refusal stands until something outside the API
- * removes the file.  The rmdir refuses over it either way, and the errno
- * table gives that refusal the same DirectoryNotEmpty either way; what the
- * scan decides here is whether the sidecar dir is destroyed first. */
+ * An atomic-write staging temp is the case that makes the scan matter: it is
+ * hidden from list and watch because it is not yet an object, but the kernel
+ * counts it, so a directory holding an in-flight write is reported here as
+ * the DirectoryNotEmpty it is.  An entry created after the scan still fails
+ * the rmdir with ENOTEMPTY, which the errno table maps to the same
+ * DirectoryNotEmpty.
+ *
+ * A staging temp is decided by the lock its writer holds, not by its name.
+ * The writer takes an exclusive advisory lock on the temp at creation and
+ * releases it after the rename that publishes it, so a temp whose lock the
+ * removal can take was left by a writer that died without unwinding, whatever
+ * pid now wears the number in its name, and the removal clears it.  A temp
+ * whose lock is held is a write in flight and refuses the removal as
+ * DirectoryNotEmpty naming that write.  Every temp is probed before any is
+ * removed, so a refusal destroys nothing.  Enumeration still hides the temp
+ * and URL resolution still refuses
+ * to address it; the removal is the one API call that clears it.  Only a
+ * name the backend's own generator can emit is set aside
+ * (ovc_file_is_clearable_staging_temp_name); any other entry, hidden or not,
+ * keeps the honest DirectoryNotEmpty. */
+
+/* Owned basenames collected by the delete scan; plain realloc/free. */
+typedef struct ovc_file_name_list {
+    char **names;
+    size_t len;
+    size_t capacity;
+} ovc_file_name_list;
+
+static int ovc_file_name_list_push(ovc_file_name_list *list, const char *name)
+{
+    size_t length;
+    char *copy;
+
+    if (list->len == list->capacity) {
+        size_t next_capacity;
+        char **next;
+
+        next_capacity = list->capacity == 0 ? 4 : list->capacity * 2;
+        if (next_capacity < list->capacity ||
+            next_capacity > SIZE_MAX / sizeof(*next)) {
+            errno = ENOMEM;
+            return -1;
+        }
+        next = (char **)realloc(list->names, next_capacity * sizeof(*next));
+        if (next == NULL) {
+            errno = ENOMEM;
+            return -1;
+        }
+        list->names = next;
+        list->capacity = next_capacity;
+    }
+    length = strlen(name);
+    copy = (char *)ovc_file_allocate(length + 1);
+    memcpy(copy, name, length + 1);
+    list->names[list->len++] = copy;
+    return 0;
+}
+
+static void ovc_file_name_list_free(ovc_file_name_list *list)
+{
+    size_t index;
+
+    for (index = 0; index < list->len; ++index) {
+        free(list->names[index]);
+    }
+    free(list->names);
+    list->names = NULL;
+    list->len = 0;
+    list->capacity = 0;
+}
+
+typedef enum ovc_file_staging_probe {
+    /* The name is gone: its writer published or unlinked it since the scan. */
+    OVC_FILE_STAGING_GONE = 0,
+    /* Another handle holds the lock: a write in flight. */
+    OVC_FILE_STAGING_LIVE = 1,
+    /* This handle holds the lock; the writer is gone. */
+    OVC_FILE_STAGING_ORPHAN = 2,
+    /* Not a regular file, not openable, or no advisory locks: not shown to
+     * be an orphan, so not unlinked. */
+    OVC_FILE_STAGING_UNCLASSIFIABLE = 3
+} ovc_file_staging_probe;
+
+static OvStoragePlugin_Error *ovc_file_in_flight_write_refusal(void)
+{
+    return ovc_file_error(OvStoragePlugin_ErrorCode_DirectoryNotEmpty,
+                          "directory holds an in-flight write");
+}
+
+static OvStoragePlugin_Error *ovc_file_unclassifiable_refusal(const char *what)
+{
+    return ovc_file_error(OvStoragePlugin_ErrorCode_DirectoryNotEmpty,
+                          "directory holds %s",
+                          what);
+}
+
+/* A temp the scan saw is gone: its writer published it as the child object
+ * or unlinked it.  Either way the directory is not the one the scan judged,
+ * and proceeding would rmdir over a child just published. */
+static OvStoragePlugin_Error *ovc_file_directory_changed_refusal(void)
+{
+    return ovc_file_error(OvStoragePlugin_ErrorCode_DirectoryNotEmpty,
+                          "directory changed while it was being removed");
+}
+
+#define OVC_FILE_NOT_A_REGULAR_FILE \
+    "an entry wearing a staging temp name that is not a regular file"
+
+/* Descriptor exhaustion is deterministic for the caller, so it is reported as
+ * ResourceExhausted rather than the retryable code the errno table gives an
+ * unknown errno. */
+static OvStoragePlugin_Error *ovc_file_staging_probe_error(int native_error,
+                                                           const char *action,
+                                                           const char *path)
+{
+#ifdef EMFILE
+    if (native_error == EMFILE) {
+        return ovc_file_error(OvStoragePlugin_ErrorCode_ResourceExhausted,
+                              "too many open files while probing staging temps");
+    }
+#endif
+#ifdef ENFILE
+    if (native_error == ENFILE) {
+        return ovc_file_error(OvStoragePlugin_ErrorCode_ResourceExhausted,
+                              "too many open files while probing staging temps");
+    }
+#endif
+    return ovc_file_native_error(native_error, action, path);
+}
+
+/* Open, inspect and lock one staging temp, holding a single descriptor.  On
+ * ORPHAN the locked handle is returned in *out_handle for the caller to
+ * unlink under and close; every other verdict closes it here.  The open
+ * never follows a link, so a symlink wearing the name is refused rather than
+ * probed through, and never blocks, so a fifo cannot hold it. */
+static ovc_file_staging_probe ovc_file_probe_staging_temp(
+    const char *full,
+    ovc_file *out_handle,
+    const char **out_what,
+    OvStoragePlugin_Error **out_error)
+{
+    ovc_file handle;
+    ovc_file_stat info;
+    int native_error;
+    bool exists;
+    bool is_regular;
+
+    *out_handle = OVC_INVALID_FILE;
+    *out_what = NULL;
+    *out_error = NULL;
+    /* Classify before opening, so a socket, a fifo or a link wearing the
+     * name is refused on its kind and never reaches an open whose errno
+     * would read as retryable. */
+    if (ovc_file_native_probe_kind(full, &exists, &is_regular) != 0) {
+        *out_error = ovc_file_staging_probe_error(errno,
+                                                  "classify staging temp",
+                                                  full);
+        return OVC_FILE_STAGING_UNCLASSIFIABLE;
+    }
+    if (!exists) {
+        return OVC_FILE_STAGING_GONE;
+    }
+    if (!is_regular) {
+        *out_what = OVC_FILE_NOT_A_REGULAR_FILE;
+        return OVC_FILE_STAGING_UNCLASSIFIABLE;
+    }
+    handle = ovc_file_native_open_probe(full, OVC_FILE_PROBE_READ_WRITE);
+    if (handle == OVC_INVALID_FILE &&
+        (errno == EACCES || errno == EPERM)) {
+        /* A copy staged from a read-only or a write-only source carries
+         * that mode; whichever side is allowed still carries the lock. */
+        handle = ovc_file_native_open_probe(full, OVC_FILE_PROBE_READ);
+    }
+    if (handle == OVC_INVALID_FILE &&
+        (errno == EACCES || errno == EPERM)) {
+        handle = ovc_file_native_open_probe(full, OVC_FILE_PROBE_WRITE);
+    }
+    if (handle == OVC_INVALID_FILE) {
+        native_error = errno;
+        if (native_error == ENOENT) {
+            return OVC_FILE_STAGING_GONE;
+        }
+        if (native_error == EACCES || native_error == EPERM) {
+            *out_what = "an entry wearing a staging temp name that cannot be opened";
+            return OVC_FILE_STAGING_UNCLASSIFIABLE;
+        }
+        /* An entry swapped since the classification: a link refuses the
+         * no-follow open with ELOOP, a directory the read-write open with
+         * EISDIR, a socket or a reader-less fifo with ENXIO.  None is the
+         * backend's temp. */
+#ifdef ELOOP
+        if (native_error == ELOOP) {
+            *out_what = OVC_FILE_NOT_A_REGULAR_FILE;
+            return OVC_FILE_STAGING_UNCLASSIFIABLE;
+        }
+#endif
+#ifdef EISDIR
+        if (native_error == EISDIR) {
+            *out_what = OVC_FILE_NOT_A_REGULAR_FILE;
+            return OVC_FILE_STAGING_UNCLASSIFIABLE;
+        }
+#endif
+#ifdef ENXIO
+        if (native_error == ENXIO) {
+            *out_what = OVC_FILE_NOT_A_REGULAR_FILE;
+            return OVC_FILE_STAGING_UNCLASSIFIABLE;
+        }
+#endif
+        *out_error = ovc_file_staging_probe_error(native_error,
+                                                  "probe staging temp",
+                                                  full);
+        return OVC_FILE_STAGING_UNCLASSIFIABLE;
+    }
+    /* A staging temp is a regular file; a directory or a special file wearing
+     * the name is not the backend's and is not unlinked. */
+    if (ovc_file_native_fstat(handle, &info) != 0) {
+        native_error = errno;
+        (void)ovc_file_native_close(handle);
+        *out_error = ovc_file_staging_probe_error(native_error,
+                                                  "inspect staging temp",
+                                                  full);
+        return OVC_FILE_STAGING_UNCLASSIFIABLE;
+    }
+    if (!info.is_regular) {
+        (void)ovc_file_native_close(handle);
+        *out_what = OVC_FILE_NOT_A_REGULAR_FILE;
+        return OVC_FILE_STAGING_UNCLASSIFIABLE;
+    }
+    if (ovc_file_native_lock_exclusive_nonblocking(handle) != 0) {
+        native_error = errno;
+        (void)ovc_file_native_close(handle);
+        if (ovc_file_lock_is_held(native_error)) {
+            return OVC_FILE_STAGING_LIVE;
+        }
+        if (ovc_file_lock_unsupported(native_error)) {
+            *out_what = "a staging temp this filesystem cannot classify as orphaned";
+            return OVC_FILE_STAGING_UNCLASSIFIABLE;
+        }
+        *out_error = ovc_file_staging_probe_error(native_error,
+                                                  "lock staging temp",
+                                                  full);
+        return OVC_FILE_STAGING_UNCLASSIFIABLE;
+    }
+    *out_handle = handle;
+    return OVC_FILE_STAGING_ORPHAN;
+}
+
+/* Turn a non-ORPHAN probe verdict into the caller's error. */
+static OvStoragePlugin_Error *ovc_file_staging_probe_refusal(
+    ovc_file_staging_probe verdict,
+    const char *what,
+    OvStoragePlugin_Error *error)
+{
+    switch (verdict) {
+    case OVC_FILE_STAGING_GONE:
+        return ovc_file_directory_changed_refusal();
+    case OVC_FILE_STAGING_LIVE:
+        return ovc_file_in_flight_write_refusal();
+    case OVC_FILE_STAGING_UNCLASSIFIABLE:
+        return error != NULL ? error : ovc_file_unclassifiable_refusal(what);
+    default:
+        return NULL;
+    }
+}
+
+/* Clear the atomic-write staging temps the delete scan set aside, once each
+ * is shown to belong to no live writer (see the block comment above).
+ *
+ * Two passes, one descriptor at a time, so the number of temps a removal can
+ * clear is not bounded by the descriptor limit.  The first pass probes every
+ * temp's lock and releases it; a write in flight, or an entry the probe
+ * cannot classify, refuses the removal before anything is touched.  The
+ * second pass takes each lock again and unlinks under it.  A name is never
+ * created twice, so a temp free in the first pass has no writer to become
+ * live in the second; a lock found busy there is another removal's probe and
+ * is refused the same way.
+ *
+ * A temp the scan saw but the probe no longer finds is refused too: the way
+ * a temp vanishes is its writer's rename publishing it as a child object.
+ * The directory is not the one the scan judged, so the scan's verdict does
+ * not carry.
+ *
+ * Removal is by path, never through the probe handle: a writer that renames
+ * its temp into place between the probe's open and its lock leaves the probe
+ * holding the published inode, and the by-path unlink then finds no such
+ * name, where a handle-based delete would destroy the object just published.
+ *
+ * An entry the probe cannot show to be an orphan — of the wrong kind, not
+ * openable, or on a filesystem without advisory locks — refuses the removal
+ * as the DirectoryNotEmpty the kernel would report at the rmdir, rather than
+ * risk a write in flight or surface a raw errno as retryable. */
+static OvStoragePlugin_Error *ovc_file_directory_clear_orphaned_staging_temps(
+    const char *path,
+    const ovc_file_name_list *temps)
+{
+    size_t index;
+    unsigned int pass;
+
+    for (pass = 0; pass < 2; ++pass) {
+        for (index = 0; index < temps->len; ++index) {
+            char *full;
+            ovc_file handle;
+            const char *what;
+            OvStoragePlugin_Error *error;
+            ovc_file_staging_probe verdict;
+
+            full = ovc_path_join(path, temps->names[index]);
+            if (full == NULL) {
+                return ovc_file_native_error(errno,
+                                             "build staging temp path",
+                                             path);
+            }
+            verdict = ovc_file_probe_staging_temp(full, &handle, &what, &error);
+            if (verdict != OVC_FILE_STAGING_ORPHAN) {
+                error = ovc_file_staging_probe_refusal(verdict, what, error);
+                free(full);
+                if (error != NULL) {
+                    return error;
+                }
+                continue;
+            }
+            error = NULL;
+            if (pass == 1) {
+                if (ovc_file_native_clear_readonly(full) != 0) {
+                    error = errno == ENOENT
+                                ? ovc_file_directory_changed_refusal()
+                                : ovc_file_staging_probe_error(
+                                      errno, "clear staging temp attributes", full);
+                } else if (ovc_file_native_unlink(full) != 0) {
+                    error = errno == ENOENT
+                                ? ovc_file_directory_changed_refusal()
+                                : ovc_file_staging_probe_error(
+                                      errno, "remove orphaned staging temp", full);
+                }
+            }
+            /* Win32 completes the unlink at close, ahead of the rmdir. */
+            (void)ovc_file_native_close(handle);
+            free(full);
+            if (error != NULL) {
+                return error;
+            }
+        }
+    }
+    return NULL;
+}
 
 #if defined(_WIN32)
 
@@ -5114,6 +5123,7 @@ static OvStoragePlugin_Error *ovc_file_directory_reject_visible_entries(
     WIN32_FIND_DATAW entry;
     HANDLE find;
     OvStoragePlugin_Error *error;
+    ovc_file_name_list temps;
 
     pattern = ovc_path_join(path, "*");
     if (pattern == NULL) {
@@ -5137,6 +5147,7 @@ static OvStoragePlugin_Error *ovc_file_directory_reject_visible_entries(
         return ovc_file_native_error(errno, "scan directory for delete", path);
     }
     error = NULL;
+    memset(&temps, 0, sizeof(temps));
     do {
         char *name;
 
@@ -5147,13 +5158,22 @@ static OvStoragePlugin_Error *ovc_file_directory_reject_visible_entries(
                                           path);
             break;
         }
-        if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0 &&
-            !ovc_file_is_cleared_by_directory_removal(name)) {
-            error = ovc_file_error(
-                OvStoragePlugin_ErrorCode_DirectoryNotEmpty,
-                "directory is not empty");
-            free(name);
-            break;
+        if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
+            if (ovc_file_is_clearable_staging_temp_name(name)) {
+                if (ovc_file_name_list_push(&temps, name) != 0) {
+                    error = ovc_file_native_error(errno,
+                                                  "collect staging temps",
+                                                  path);
+                    free(name);
+                    break;
+                }
+            } else {
+                error = ovc_file_error(
+                    OvStoragePlugin_ErrorCode_DirectoryNotEmpty,
+                    "directory is not empty");
+                free(name);
+                break;
+            }
         }
         free(name);
     } while (FindNextFileW(find, &entry));
@@ -5164,13 +5184,17 @@ static OvStoragePlugin_Error *ovc_file_directory_reject_visible_entries(
                                       path);
     }
     FindClose(find);
+    if (error == NULL) {
+        error = ovc_file_directory_clear_orphaned_staging_temps(path, &temps);
+    }
+    ovc_file_name_list_free(&temps);
     return error;
 }
 
 /* True when the attributes describe a reparse point (junction or symlink):
- * such an entry is a link and must be removed as the link itself, never
- * traversed -- FindFirstFileW / opendir would otherwise enumerate the
- * target and the sweep would delete data outside the sidecar namespace. */
+ * such an entry is a link, and delete_directory refuses it rather than
+ * enumerating through it -- FindFirstFileW would otherwise report the
+ * target's contents as the link's own. */
 #if !defined(IsReparseTagNameSurrogate)
 #define IsReparseTagNameSurrogate(tag) (((tag) & 0x20000000) != 0)
 #endif
@@ -5194,175 +5218,57 @@ static bool ovc_file_win32_attributes_are_link(DWORD attributes,
            IsReparseTagNameSurrogate(reparse_tag);
 }
 
-static OvStoragePlugin_Error *ovc_file_metadata_directory_remove_all(
-    const char *metadata_directory)
+static int ovc_file_delete_target_is_link(const char *path,
+                                          bool *out_is_link)
 {
-    char *pattern;
-    wchar_t *root_wide;
-    wchar_t *pattern_wide;
-    WIN32_FIND_DATAW root_entry;
-    WIN32_FIND_DATAW entry;
-    HANDLE root_find;
-    HANDLE find;
-    OvStoragePlugin_Error *error;
-    DWORD root_attributes;
-    DWORD root_reparse_tag;
+    wchar_t *wide;
+    HANDLE handle;
+    FILE_ATTRIBUTE_TAG_INFO tag_info;
 
-    /*
-     * Classify the root without following it.  Rust's remove_dir_all removes
-     * a name-surrogate reparse point (symlink / junction) as the link itself
-     * rather than traversing it.  FindFirstFileW on the root PATH (not the
-     * "\\*" pattern) fills dwReserved0 with the reparse tag, which
-     * GetFileAttributesW cannot report -- needed to tell a symlink/junction
-     * apart from a non-surrogate directory reparse point (a cloud
-     * placeholder / ProjFS directory) that must be recursed into.
-     */
-    root_wide = ovc_file_utf8_to_wide(metadata_directory);
-    if (root_wide == NULL) {
-        return ovc_file_native_error(errno,
-                                     "encode internal metadata directory",
-                                     metadata_directory);
+    *out_is_link = false;
+    wide = ovc_file_utf8_to_wide(path);
+    if (wide == NULL) {
+        return -1;
     }
-    root_find = FindFirstFileW(root_wide, &root_entry);
-    free(root_wide);
-    if (root_find == INVALID_HANDLE_VALUE) {
+    handle = CreateFileW(wide,
+                         FILE_READ_ATTRIBUTES,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE |
+                             FILE_SHARE_DELETE,
+                         NULL,
+                         OPEN_EXISTING,
+                         FILE_FLAG_OPEN_REPARSE_POINT |
+                             FILE_FLAG_BACKUP_SEMANTICS,
+                         NULL);
+    if (handle == INVALID_HANDLE_VALUE) {
         DWORD native_error;
 
         native_error = GetLastError();
-        if (native_error == ERROR_FILE_NOT_FOUND ||
-            native_error == ERROR_PATH_NOT_FOUND) {
-            return NULL;
-        }
+        free(wide);
         ovc_win32_set_errno(native_error);
-        return ovc_file_native_error(errno,
-                                     "inspect internal metadata directory",
-                                     metadata_directory);
-    }
-    root_attributes = root_entry.dwFileAttributes;
-    root_reparse_tag = root_entry.dwReserved0;
-    FindClose(root_find);
-    if (ovc_file_win32_attributes_are_link(root_attributes,
-                                           root_reparse_tag) ||
-        (root_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-        /* A name-surrogate link or a non-directory: remove the entry itself.
-         * RemoveDirectoryW removes a directory reparse point without
-         * following it; DeleteFileW removes a file or file symlink. */
-        int removed;
-
-        removed = (root_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0
-                      ? ovc_file_native_rmdir(metadata_directory)
-                      : ovc_file_native_unlink(metadata_directory);
-        if (removed != 0 && errno != ENOENT && errno != ENOTDIR) {
-            return ovc_file_native_error(errno,
-                                         "remove internal metadata entry",
-                                         metadata_directory);
+        if (errno == ENOENT || errno == ENOTDIR) {
+            return 0;
         }
-        return NULL;
+        return -1;
     }
-
-    pattern = ovc_path_join(metadata_directory, "*");
-    if (pattern == NULL) {
-        return ovc_file_native_error(errno,
-                                     "build metadata scan pattern",
-                                     metadata_directory);
-    }
-    pattern_wide = ovc_file_utf8_to_wide(pattern);
-    free(pattern);
-    if (pattern_wide == NULL) {
-        return ovc_file_native_error(errno,
-                                     "encode metadata scan pattern",
-                                     metadata_directory);
-    }
-    find = FindFirstFileW(pattern_wide, &entry);
-    free(pattern_wide);
-    if (find == INVALID_HANDLE_VALUE) {
+    free(wide);
+    if (!GetFileInformationByHandleEx(handle,
+                                      FileAttributeTagInfo,
+                                      &tag_info,
+                                      sizeof(tag_info))) {
         DWORD native_error;
 
         native_error = GetLastError();
-        if (native_error == ERROR_FILE_NOT_FOUND ||
-            native_error == ERROR_PATH_NOT_FOUND) {
-            return NULL;
-        }
+        (void)CloseHandle(handle);
         ovc_win32_set_errno(native_error);
-        return ovc_file_native_error(errno,
-                                     "open internal metadata directory",
-                                     metadata_directory);
+        if (errno == ENOENT || errno == ENOTDIR) {
+            return 0;
+        }
+        return -1;
     }
-    error = NULL;
-    do {
-        char *name;
-        char *child;
-
-        name = ovc_file_wide_name_to_utf8(entry.cFileName);
-        if (name == NULL) {
-            error = ovc_file_native_error(errno,
-                                          "decode internal metadata entry",
-                                          metadata_directory);
-            break;
-        }
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
-            free(name);
-            continue;
-        }
-        child = ovc_path_join(metadata_directory, name);
-        free(name);
-        if (child == NULL) {
-            error = ovc_file_native_error(errno,
-                                          "join internal metadata entry",
-                                          metadata_directory);
-            break;
-        }
-        if (ovc_file_win32_attributes_are_link(entry.dwFileAttributes,
-                                               entry.dwReserved0)) {
-            /* A name-surrogate reparse point (symlink or junction): remove
-             * the link, never recurse into it.  RemoveDirectoryW unlinks a
-             * directory reparse point; DeleteFileW a file symlink. */
-            int removed;
-
-            removed = (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
-                          ? ovc_file_native_rmdir(child)
-                          : ovc_file_native_unlink(child);
-            if (removed != 0 && errno != ENOENT && errno != ENOTDIR) {
-                error = ovc_file_native_error(errno,
-                                              "remove internal metadata entry",
-                                              child);
-                free(child);
-                break;
-            }
-        } else if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-            /* A real subdirectory (out-of-band creation or a foreign tool's
-             * leftovers) would fail DeleteFileW forever and make the parent
-             * undeletable.  Mirror the reference's remove_dir_all and
-             * recurse; depth is bounded by the backend-internal sidecar
-             * namespace, not by caller input. */
-            error = ovc_file_metadata_directory_remove_all(child);
-            if (error != NULL) {
-                free(child);
-                break;
-            }
-        } else if (ovc_file_native_unlink(child) != 0 && errno != ENOENT) {
-            error = ovc_file_native_error(errno,
-                                          "remove internal metadata entry",
-                                          child);
-            free(child);
-            break;
-        }
-        free(child);
-    } while (FindNextFileW(find, &entry));
-    if (error == NULL && GetLastError() != ERROR_NO_MORE_FILES) {
-        ovc_win32_set_errno(GetLastError());
-        error = ovc_file_native_error(errno,
-                                      "iterate internal metadata directory",
-                                      metadata_directory);
-    }
-    FindClose(find);
-    if (error == NULL && ovc_file_native_rmdir(metadata_directory) != 0 &&
-        errno != ENOENT && errno != ENOTDIR) {
-        error = ovc_file_native_error(errno,
-                                      "remove internal metadata directory",
-                                      metadata_directory);
-    }
-    return error;
+    (void)CloseHandle(handle);
+    *out_is_link = ovc_file_win32_attributes_are_link(
+        tag_info.FileAttributes, tag_info.ReparseTag);
+    return 0;
 }
 
 #else
@@ -5373,6 +5279,7 @@ static OvStoragePlugin_Error *ovc_file_directory_reject_visible_entries(
     DIR *directory;
     struct dirent *entry;
     OvStoragePlugin_Error *error;
+    ovc_file_name_list temps;
 
     directory = opendir(path);
     if (directory == NULL) {
@@ -5381,11 +5288,21 @@ static OvStoragePlugin_Error *ovc_file_directory_reject_visible_entries(
                                      path);
     }
     error = NULL;
+    memset(&temps, 0, sizeof(temps));
     errno = 0;
     while ((entry = readdir(directory)) != NULL) {
         if (strcmp(entry->d_name, ".") == 0 ||
-            strcmp(entry->d_name, "..") == 0 ||
-            ovc_file_is_cleared_by_directory_removal(entry->d_name)) {
+            strcmp(entry->d_name, "..") == 0) {
+            errno = 0;
+            continue;
+        }
+        if (ovc_file_is_clearable_staging_temp_name(entry->d_name)) {
+            if (ovc_file_name_list_push(&temps, entry->d_name) != 0) {
+                error = ovc_file_native_error(errno,
+                                              "collect staging temps",
+                                              path);
+                break;
+            }
             errno = 0;
             continue;
         }
@@ -5399,125 +5316,29 @@ static OvStoragePlugin_Error *ovc_file_directory_reject_visible_entries(
                                       path);
     }
     (void)closedir(directory);
+    if (error == NULL) {
+        error = ovc_file_directory_clear_orphaned_staging_temps(path, &temps);
+    }
+    ovc_file_name_list_free(&temps);
     return error;
 }
 
-static OvStoragePlugin_Error *ovc_file_metadata_directory_remove_all(
-    const char *metadata_directory)
+static int ovc_file_delete_target_is_link(const char *path,
+                                          bool *out_is_link)
 {
-    DIR *directory;
-    struct dirent *entry;
-    OvStoragePlugin_Error *error;
     bool exists;
-    bool is_link;
     bool is_dir;
 
-    /*
-     * Classify the root without following a final symlink.  Rust's
-     * remove_dir_all removes a symlink as the link itself rather than
-     * traversing it, so a symlinked `.ovstorage-meta` (planted by a foreign
-     * tool or an attacker) must be unlinked, never opened, or the recursion
-     * below would enumerate and delete the link target's tree and report
-     * success.  A missing path is nothing to do.  (POSIX has no non-symlink
-     * reparse points; the Win32 variant additionally distinguishes
-     * name-surrogate reparse points from real cloud/ProjFS directories.)
-     */
-    if (ovc_file_native_lstat_kind(metadata_directory,
+    if (ovc_file_native_lstat_kind(path,
                                    &exists,
-                                   &is_link,
+                                   out_is_link,
                                    &is_dir) != 0) {
-        return ovc_file_native_error(errno,
-                                     "inspect internal metadata directory",
-                                     metadata_directory);
+        return -1;
     }
     if (!exists) {
-        return NULL;
+        *out_is_link = false;
     }
-    if (is_link || !is_dir) {
-        /* A link or a non-directory: unlink the entry itself. */
-        if (ovc_file_native_unlink(metadata_directory) != 0 &&
-            errno != ENOENT) {
-            return ovc_file_native_error(errno,
-                                         "remove internal metadata entry",
-                                         metadata_directory);
-        }
-        return NULL;
-    }
-
-    directory = opendir(metadata_directory);
-    if (directory == NULL) {
-        if (errno == ENOENT || errno == ENOTDIR) {
-            return NULL;
-        }
-        return ovc_file_native_error(errno,
-                                     "open internal metadata directory",
-                                     metadata_directory);
-    }
-    error = NULL;
-    errno = 0;
-    while ((entry = readdir(directory)) != NULL) {
-        char *child;
-        bool child_exists;
-        bool child_is_link;
-        bool child_is_dir;
-
-        if (strcmp(entry->d_name, ".") == 0 ||
-            strcmp(entry->d_name, "..") == 0) {
-            errno = 0;
-            continue;
-        }
-        child = ovc_path_join(metadata_directory, entry->d_name);
-        if (child == NULL) {
-            error = ovc_file_native_error(errno,
-                                          "join internal metadata entry",
-                                          metadata_directory);
-            break;
-        }
-        if (ovc_file_native_lstat_kind(child,
-                                       &child_exists,
-                                       &child_is_link,
-                                       &child_is_dir) != 0) {
-            error = ovc_file_native_error(errno,
-                                          "inspect internal metadata entry",
-                                          child);
-            free(child);
-            break;
-        }
-        if (child_exists && child_is_dir && !child_is_link) {
-            /* A real subdirectory (out-of-band creation or a foreign tool's
-             * leftovers) would make the parent undeletable forever; mirror
-             * the reference's remove_dir_all and recurse.  Depth is bounded
-             * by the backend-internal sidecar namespace.  A symlink or
-             * junction is NOT a directory here: it falls through to the
-             * unlink below, which removes the link, never its target. */
-            error = ovc_file_metadata_directory_remove_all(child);
-            if (error != NULL) {
-                free(child);
-                break;
-            }
-        } else if (ovc_file_native_unlink(child) != 0 && errno != ENOENT) {
-            error = ovc_file_native_error(errno,
-                                          "remove internal metadata entry",
-                                          child);
-            free(child);
-            break;
-        }
-        free(child);
-        errno = 0;
-    }
-    if (error == NULL && errno != 0) {
-        error = ovc_file_native_error(errno,
-                                      "iterate internal metadata directory",
-                                      metadata_directory);
-    }
-    (void)closedir(directory);
-    if (error == NULL && ovc_file_native_rmdir(metadata_directory) != 0 &&
-        errno != ENOENT && errno != ENOTDIR) {
-        error = ovc_file_native_error(errno,
-                                      "remove internal metadata directory",
-                                      metadata_directory);
-    }
-    return error;
+    return 0;
 }
 
 #endif
@@ -5526,9 +5347,9 @@ static OvStoragePlugin_Error *ovc_file_delete_directory_result(
     ovc_file_task *task)
 {
     char *path;
-    char *metadata_directory;
     OvStoragePlugin_Error *error;
     bool is_connection_root;
+    bool target_is_link;
 
     error = NULL;
     path = ovc_file_resolve_path_and_root_flag(task->layer,
@@ -5544,27 +5365,24 @@ static OvStoragePlugin_Error *ovc_file_delete_directory_result(
             OvStoragePlugin_ErrorCode_PermissionDenied,
             "cannot delete a configured file root");
     }
-    metadata_directory = ovc_path_join(path, OVC_FILE_METADATA_DIRECTORY);
-    if (metadata_directory == NULL) {
-        error = ovc_file_native_error(errno,
-                                      "build directory metadata path",
-                                      path);
-        free(path);
-        return error;
-    }
     (void)ovc_mutex_lock(&task->layer->mutex);
     if (ovc_file_cancelled(task)) {
         error = ovc_file_error(OvStoragePlugin_ErrorCode_Cancelled,
                                "delete_directory was cancelled");
+    } else if (ovc_file_delete_target_is_link(path, &target_is_link) != 0) {
+        error = ovc_file_native_error(errno,
+                                      "inspect delete_directory target",
+                                      path);
+    } else if (target_is_link) {
+        error = ovc_file_error(
+            OvStoragePlugin_ErrorCode_InvalidArgument,
+            "delete_directory target is a symlink; the entry is "
+            "operator-configured on disk and delete_directory will not "
+            "remove or follow it");
     } else {
-        /* Reference order: refuse a directory that still holds user-visible
-         * entries BEFORE touching the sidecar dir, so a failed delete can
-         * never destroy live objects' metadata as a side effect. */
+        /* Refuse a directory that still holds entries before the rmdir so
+         * the refusal carries DirectoryNotEmpty on every platform. */
         error = ovc_file_directory_reject_visible_entries(path);
-        if (error == NULL) {
-            error = ovc_file_metadata_directory_remove_all(
-                metadata_directory);
-        }
         if (error == NULL && ovc_file_native_rmdir(path) != 0) {
             error = ovc_file_native_error(errno,
                                           "delete directory",
@@ -5577,12 +5395,8 @@ static OvStoragePlugin_Error *ovc_file_delete_directory_result(
                 path,
                 ovc_file_strerror(errno));
         }
-        if (error == NULL) {
-            error = ovc_file_user_metadata_remove_path(path, NULL);
-        }
     }
     (void)ovc_mutex_unlock(&task->layer->mutex);
-    free(metadata_directory);
     free(path);
     return error;
 }
@@ -5648,10 +5462,11 @@ static OvStoragePlugin_Error *ovc_file_check_access_result(
         result->denied_ops.delete_ = true;
     }
     if (task->payload.check_access.operations.update_metadata &&
-        (info.readonly || is_connection_root)) {
-        /* is_connection_root: this backend rejects user metadata on a
-         * configured root (see ovc_file_update_metadata_result), so the
-         * decision reports what update_metadata would actually do. */
+        info.readonly) {
+        /* The decision reports the filesystem's permission verdict only;
+         * update_metadata itself is Unsupported on this backend (see
+         * ovc_file_update_metadata_result), which is a capability answer
+         * rather than an access one. */
         result->denied_ops.update_metadata = true;
     }
     result->allowed = !result->denied_ops.read &&
@@ -5670,42 +5485,19 @@ static OvStoragePlugin_Error *ovc_file_check_access_result(
 /* ------------------------------------------------------------------------- */
 /* Directory enumeration and decimal-offset pagination. */
 
-/* True for the entry name a directory removal clears itself, so the
- * delete-emptiness scan may ignore it: .ovstorage-meta, which
- * ovc_file_metadata_directory_remove_all clears immediately before the
- * rmdir.  This matches the name; that cleanup classifies what the name
- * holds and clears a link or a non-directory outright, which is what the
- * Rust host does for the same occupant.
- *
- * Deliberately narrower than ovc_file_is_internal_entry.  An atomic-write
- * staging temp is internal — enumeration hides it because it is not yet an
- * object — but it is a real directory entry that the kernel counts, so the
- * rmdir refuses while one is present.  A delete scan that skipped it would
- * call the directory empty, destroy the sidecar dir, and only then fail the
- * removal.  For the entries the API can create, this predicate keeps the
- * backend's notion of "empty" identical to the kernel's.  The scan, the
- * cleanup's classification and its removal are separate calls, so an entry
- * that appears or changes kind between them is decided by the kernel at the
- * rmdir. */
-static bool ovc_file_is_cleared_by_directory_removal(const char *name)
-{
-#if defined(_WIN32)
-    return strlen(name) == sizeof(".ovstorage-meta") - 1 &&
-           ovc_file_ascii_equal_nocase(name,
-                                       ".ovstorage-meta",
-                                       sizeof(".ovstorage-meta") - 1);
-#else
-    return strcmp(name, ".ovstorage-meta") == 0;
-#endif
-}
-
-/* True for an entry enumeration must hide: the sidecar dir and an
- * atomic-write staging temp, neither of which is a caller-visible object. */
+/* True for an entry enumeration must hide: an atomic-write staging temp,
+ * which is not yet a caller-visible object.  The delete-emptiness scan does
+ * not consult this predicate: a staging temp is a real directory entry the
+ * kernel counts, so the rmdir refuses while one is present.  The scan sets
+ * aside only a name ovc_file_is_clearable_staging_temp_name accepts, for
+ * ovc_file_directory_clear_orphaned_staging_temps to decide by the lock its
+ * writer would hold: an orphan is unlinked under that lock and a write in
+ * flight refuses the removal.  Every other entry is reported, so the
+ * backend's notion of "empty" stays identical to the kernel's.  Every other
+ * name, `.ovstorage-meta` included, is ordinary content: listed,
+ * addressable, and counted by the scan. */
 static bool ovc_file_is_internal_entry(const char *name)
 {
-    if (ovc_file_is_cleared_by_directory_removal(name)) {
-        return true;
-    }
     return ovc_file_is_atomic_temp_name_n(name, strlen(name));
 }
 
@@ -5924,17 +5716,33 @@ static OvStoragePlugin_Error *ovc_file_collect_list(
         }
         child_path = ovc_path_join(path, name);
         child_address = NULL;
-        if (child_path == NULL ||
-            ovc_file_native_stat_path(child_path, &native) != 0) {
+        if (child_path == NULL) {
+            error = ovc_file_native_error(errno,
+                                          "stat directory entry",
+                                          path);
+            free(name);
+            break;
+        }
+        if (ovc_file_native_stat_path(child_path, &native) != 0) {
             int native_error;
 
             native_error = errno;
-            error = ovc_file_native_error(native_error,
-                                          "stat directory entry",
-                                          child_path == NULL ? path : child_path);
+            if (!ovc_file_stat_error_means_absent(native_error)) {
+                error = ovc_file_native_error(native_error,
+                                              "stat directory entry",
+                                              child_path);
+                free(child_path);
+                free(name);
+                break;
+            }
+            /* SKIPPED rather than failing the whole listing, matching the
+             * POSIX branch: a dangling reparse point or an entry another
+             * process deleted between `FindFirstFileW`/`FindNextFileW` and
+             * this stat both land here, and one unexaminable entry should
+             * not cost the caller every entry beside it. */
             free(child_path);
             free(name);
-            break;
+            continue;
         }
         child_address = ovc_file_join_address(address,
                                               name,
@@ -5966,7 +5774,6 @@ static OvStoragePlugin_Error *ovc_file_collect_list(
         memset(&item, 0, sizeof(item));
         error = ovc_file_object_info_fill(&item,
                                           child_address,
-                                          child_path,
                                           task->payload.list.full_metadata,
                                           &native);
         if (error != NULL) {
@@ -6055,11 +5862,19 @@ static OvStoragePlugin_Error *ovc_file_collect_list(
             int native_error;
 
             native_error = errno;
-            error = ovc_file_native_error(native_error,
-                                          "stat directory entry",
-                                          child_path);
+            if (!ovc_file_stat_error_means_absent(native_error)) {
+                error = ovc_file_native_error(native_error,
+                                              "stat directory entry",
+                                              child_path);
+                free(child_path);
+                break;
+            }
+            /* SKIPPED rather than failing the whole listing, matching the
+             * re-resolve/containment failure just below: one unexaminable
+             * entry should not cost the caller every entry beside it. */
             free(child_path);
-            break;
+            errno = 0;
+            continue;
         }
         child_address = ovc_file_join_address(address,
                                               entry->d_name,
@@ -6091,7 +5906,6 @@ static OvStoragePlugin_Error *ovc_file_collect_list(
         memset(&item, 0, sizeof(item));
         error = ovc_file_object_info_fill(&item,
                                           child_address,
-                                          child_path,
                                           task->payload.list.full_metadata,
                                           &native);
         if (error != NULL) {
@@ -6546,32 +6360,19 @@ static OvStoragePlugin_Error *ovc_file_watch_snapshot_reserve(
 static OvStoragePlugin_Error *ovc_file_watch_snapshot_push(
     ovc_file_watch_snapshot *snapshot,
     const char *address,
-    const char *path,
     const ovc_file_stat *info)
 {
     OvStoragePlugin_Error *error;
-    char *sidecar;
-    ovc_file_stat sidecar_info;
     ovc_file_watch_entry *entry;
 
     error = ovc_file_watch_snapshot_reserve(snapshot);
     if (error != NULL) {
         return error;
     }
-    sidecar = ovc_file_metadata_path(path, &error);
-    if (sidecar == NULL) {
-        return error;
-    }
     entry = &snapshot->items[snapshot->len];
     memset(entry, 0, sizeof(*entry));
     entry->address = ovc_file_string_duplicate(address);
     entry->info = *info;
-    if (ovc_file_native_stat_path(sidecar, &sidecar_info) == 0) {
-        entry->has_metadata_mtime = true;
-        entry->metadata_mtime_unix_nanos =
-            sidecar_info.mtime_unix_nanos;
-    }
-    free(sidecar);
     ++snapshot->len;
     return NULL;
 }
@@ -6677,7 +6478,10 @@ static OvStoragePlugin_Error *ovc_file_watch_scan_directory(
             if (checked_path == NULL) {
                 error = scope_error;
             } else if (info.is_directory) {
-                if (watcher->recursive &&
+                error = ovc_file_watch_snapshot_push(snapshot,
+                                                     child_address,
+                                                     &info);
+                if (error == NULL && watcher->recursive &&
                     (native_entry.dwFileAttributes &
                      FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
                     error = ovc_file_watch_scan_directory(watcher,
@@ -6693,7 +6497,6 @@ static OvStoragePlugin_Error *ovc_file_watch_scan_directory(
             } else {
                 error = ovc_file_watch_snapshot_push(snapshot,
                                                      child_address,
-                                                     child_path,
                                                      &info);
             }
             free(checked_path);
@@ -6801,7 +6604,11 @@ static OvStoragePlugin_Error *ovc_file_watch_scan_directory(
         if (checked_path == NULL) {
             error = scope_error;
         } else if (info.is_directory) {
-            if (watcher->recursive && !S_ISLNK(link_info.st_mode)) {
+            error = ovc_file_watch_snapshot_push(snapshot,
+                                                 child_address,
+                                                 &info);
+            if (error == NULL && watcher->recursive &&
+                !S_ISLNK(link_info.st_mode)) {
                 error = ovc_file_watch_scan_directory(watcher,
                                                       child_path,
                                                       child_address,
@@ -6815,7 +6622,6 @@ static OvStoragePlugin_Error *ovc_file_watch_scan_directory(
         } else {
             error = ovc_file_watch_snapshot_push(snapshot,
                                                  child_address,
-                                                 child_path,
                                                  &info);
         }
         free(checked_path);
@@ -6906,7 +6712,6 @@ static OvStoragePlugin_Error *ovc_file_watch_changes_push(
 static OvStoragePlugin_Error *ovc_file_watch_diff(
     const ovc_file_watch_snapshot *previous,
     const ovc_file_watch_snapshot *current,
-    bool include_metadata_changes,
     ovc_file_watch_changes *changes)
 {
     size_t old_index;
@@ -6951,24 +6756,19 @@ static OvStoragePlugin_Error *ovc_file_watch_diff(
                 &new_entry->info);
             ++new_index;
         } else {
-            if (old_entry->info.size != new_entry->info.size ||
-                old_entry->info.mtime_unix_nanos !=
-                    new_entry->info.mtime_unix_nanos) {
+            /* A directory's inode metadata changes when its children change,
+             * but watch_directory reports object changes, not directory
+             * roll-ups. Keep directories in the snapshot so their own
+             * creation and deletion are observable, while suppressing
+             * metadata-only changes for an entry that remains a directory. */
+            if (!old_entry->info.is_directory &&
+                (old_entry->info.size != new_entry->info.size ||
+                 old_entry->info.mtime_unix_nanos !=
+                     new_entry->info.mtime_unix_nanos)) {
                 error = ovc_file_watch_changes_push(
                     changes,
                     new_entry->address,
                     OvStoragePlugin_ChangeKind_Modified,
-                    &new_entry->info);
-            } else if (include_metadata_changes &&
-                       (old_entry->has_metadata_mtime !=
-                            new_entry->has_metadata_mtime ||
-                        (old_entry->has_metadata_mtime &&
-                         old_entry->metadata_mtime_unix_nanos !=
-                             new_entry->metadata_mtime_unix_nanos))) {
-                error = ovc_file_watch_changes_push(
-                    changes,
-                    new_entry->address,
-                    OvStoragePlugin_ChangeKind_MetadataChanged,
                     &new_entry->info);
             }
             ++old_index;
@@ -7030,8 +6830,10 @@ static void ovc_file_watch_fill_change(
         out_item->object.etag.present = true;
         out_item->object.etag.value = ovc_file_owned_string(etag);
         free(etag);
-        out_item->object.size.present = true;
-        out_item->object.size.value = change->current.size;
+        if (!change->current.is_directory) {
+            out_item->object.size.present = true;
+            out_item->object.size.value = change->current.size;
+        }
         out_item->object.mtime_unix_ms.present = true;
         out_item->object.mtime_unix_ms.value =
             change->current.mtime_unix_ms;
@@ -7246,7 +7048,6 @@ static OvStoragePlugin_StreamStep ovc_file_watch_next(
         if (error == NULL) {
             error = ovc_file_watch_diff(&watcher->snapshot,
                                         &next_snapshot,
-                                        watcher->include_metadata_changes,
                                         &next_changes);
         }
 
@@ -7313,8 +7114,8 @@ static ovc_file_watcher *ovc_file_watcher_create(
     watcher->layer = ovc_file_layer_retain(layer);
     watcher->address = ovc_file_string_duplicate(address);
     watcher->recursive = options->recursive;
-    watcher->include_metadata_changes =
-        options->include_metadata_changes;
+    /* options->include_metadata_changes is accepted and has no effect: this
+     * backend stores no user metadata, so no MetadataChanged event exists. */
     watcher->poll_interval_ms =
         options->poll_interval_ms < OVC_FILE_MIN_WATCH_POLL_MS
             ? OVC_FILE_MIN_WATCH_POLL_MS
@@ -7519,6 +7320,7 @@ static OvStoragePlugin_Error *ovc_file_add_connection_result(
         ovc_file_abi_callocate(1, sizeof(*result));
     ovc_file_connection_to_ffi(
         &task->layer->connections[task->layer->connection_count - 1],
+        task->layer->name,
         result);
     (void)ovc_mutex_unlock(&task->layer->mutex);
     *out = result;
@@ -7590,7 +7392,7 @@ static OvStoragePlugin_Error *ovc_file_update_credentials_result(
             result = (OvStoragePlugin_Connection *)
                 ovc_file_abi_callocate(1, sizeof(*result));
             ovc_file_connection_to_ffi(&task->layer->connections[index],
-                                       result);
+                                       task->layer->name, result);
             break;
         }
     }
@@ -7692,7 +7494,7 @@ static OvStoragePlugin_Error *ovc_file_list_connections_result(
                                    : layer->connection_count,
                                sizeof(*envelope->snapshot.connections.ptr));
     for (index = 0; index < layer->connection_count; ++index) {
-        ovc_file_connection_to_ffi(&layer->connections[index],
+        ovc_file_connection_to_ffi(&layer->connections[index], layer->name,
                                    &envelope->snapshot.connections.ptr[index]);
     }
     (void)ovc_mutex_unlock(&layer->mutex);
@@ -7723,8 +7525,6 @@ static void ovc_file_task_destroy(ovc_file_task *task)
          * ovc_abi_alloc, so it is released with ovc_abi_free. */
         ovc_abi_free(task->payload.write.bytes);
         free(task->payload.write.match_etag);
-        ovc_file_key_value_list_clear(
-            &task->payload.write.user_metadata);
         break;
     case OVC_FILE_TASK_LIST:
         free(task->payload.list.page_token);
@@ -7828,6 +7628,7 @@ static void ovc_file_task_run(void *argument)
             error = ovc_file_stat_result(task->layer,
                                          task->address,
                                          task->payload.stat.full_metadata,
+                                         true,
                                          &typed_result);
             result = typed_result;
             break;
@@ -8379,7 +8180,6 @@ static void ovc_file_layer_write(
     OvStoragePlugin_WriteRequest moved;
     ovc_file_task *task;
     bool invalid;
-    bool exhausted;
     bool unsupported_body;
 
     if (request == NULL || request->struct_size < sizeof(*request) ||
@@ -8410,8 +8210,15 @@ static void ovc_file_layer_write(
         return;
     }
     invalid = false;
-    exhausted = false;
     unsupported_body = moved.body.tag != OvStoragePlugin_BodyTag_Bytes;
+    /* This backend stores no user metadata.  A present-but-empty map asks
+     * for nothing and is accepted; a non-empty map is refused by the task
+     * once the address has resolved, so an address error wins over the
+     * refusal exactly as it does on the Rust host, and nothing touches disk
+     * either way. */
+    task->payload.write.refuse_user_metadata =
+        moved.options.user_metadata.present &&
+        moved.options.user_metadata.value.len > 0;
     task->address = ovc_file_string_from_slice(&moved.address);
     if (task->address == NULL) {
         invalid = true;
@@ -8440,31 +8247,12 @@ static void ovc_file_layer_write(
             invalid = true;
         }
     }
-    if (moved.options.user_metadata.present) {
-        if (!ovc_file_key_value_list_clone(
-                &moved.options.user_metadata.value,
-                &task->payload.write.user_metadata,
-                &exhausted)) {
-            invalid = true;
-        }
-    } else {
-        task->payload.write.user_metadata.ptr =
-            (OvStoragePlugin_KeyValuePair *)ovc_file_abi_allocate(
-                sizeof(*task->payload.write.user_metadata.ptr));
-        task->payload.write.user_metadata.len = 0;
-    }
     /* File has no version annotation slot; message is intentionally ignored. */
     ovstorage_plugin_write_request_release(&moved);
     if (unsupported_body) {
         ovc_file_task_fail(task,
                            OvStoragePlugin_ErrorCode_Unsupported,
                            "buffered file write requires a Bytes body");
-        return;
-    }
-    if (exhausted) {
-        ovc_file_task_fail(task,
-                           OvStoragePlugin_ErrorCode_ResourceExhausted,
-                           "not enough memory to copy the write metadata");
         return;
     }
     if (invalid) {
@@ -9555,7 +9343,8 @@ static const OvStoragePlugin_LayerKindDescriptor
         .struct_size = sizeof(OvStoragePlugin_LayerKindDescriptor),
         .layer_type = OvStoragePlugin_LayerType_Backend,
         .accepts_connections = true,
-        .supports_user_metadata = true,
+        /* Mirrors ovc_file_descriptor_fill: no user metadata is stored. */
+        .supports_user_metadata = false,
         .kind = {g_ovc_file_kind, sizeof(g_ovc_file_kind) - 1},
         .display_name = {g_ovc_file_display_name,
                          sizeof(g_ovc_file_display_name) - 1},
@@ -9594,6 +9383,11 @@ OvStorage_Status ovstorage_c_register_builtin_kinds(
 #include <assert.h>
 
 #include "temp_dir.h"
+
+#if !defined(_WIN32)
+#include <sys/socket.h>
+#include <sys/un.h>
+#endif
 
 #if defined(NDEBUG)
 #error "OVC_FILE_BACKEND_TEST_MAIN requires assertions to be enabled"
@@ -9901,6 +9695,7 @@ static void ovc_file_test_list(OvStoragePlugin_LayerHandle *handle,
     next_token = ovc_file_string_from_slice(&page->next_page_token.value);
     assert(next_token != NULL);
     for (index = 0; index < page->items.len; ++index) {
+        assert(!page->items.ptr[index].versioned_address.present);
         ovc_file_object_info_clear(&page->items.ptr[index]);
     }
     ovc_abi_free(page->items.ptr);
@@ -9928,6 +9723,7 @@ static void ovc_file_test_list(OvStoragePlugin_LayerHandle *handle,
     assert(page->items.len == 1);
     assert(!page->next_page_token.present);
     for (index = 0; index < page->items.len; ++index) {
+        assert(!page->items.ptr[index].versioned_address.present);
         ovc_file_object_info_clear(&page->items.ptr[index]);
     }
     ovc_abi_free(page->items.ptr);
@@ -10081,6 +9877,13 @@ static char *ovc_file_test_connection_id(
     assert(connection->current_addresses.len == 1);
     assert(connection->auth_state.tag ==
            OvStoragePlugin_ConnectionAuthStateTag_Anonymous);
+    /* A connection reports the layer INSTANCE name a connection op routes by
+     * ("files", deliberately different from the "file" kind) -- the same value
+     * this layer's roots report and `owned_targets` publishes. The clear below
+     * frees that owning `Optional<Str>` (leak-clean under the sanitizer gate). */
+    assert(connection->owning_target.present);
+    assert(connection->owning_target.value.len == 5);
+    assert(memcmp(connection->owning_target.value.ptr, "files", 5) == 0);
     id = ovc_file_string_from_slice(&connection->id.id);
     assert(id != NULL);
     ovc_file_connection_ffi_clear(connection);
@@ -10115,6 +9918,15 @@ static void ovc_file_test_connections(OvStoragePlugin_LayerHandle *handle,
         assert(result->updates == NULL);
         assert(result->snapshot.connections.len == 1);
         for (index = 0; index < result->snapshot.connections.len; ++index) {
+            /* Every listed row carries it, not only the one `add_connection`
+             * handed back -- a caller that meets a connection through the
+             * listing is the one that had to discover its owner by probing. */
+            assert(result->snapshot.connections.ptr[index].owning_target
+                       .present);
+            assert(memcmp(result->snapshot.connections.ptr[index]
+                              .owning_target.value.ptr,
+                          "files",
+                          5) == 0);
             ovc_file_connection_ffi_clear(
                 &result->snapshot.connections.ptr[index]);
         }
@@ -10140,6 +9952,8 @@ static void ovc_file_test_connections(OvStoragePlugin_LayerHandle *handle,
     connection = (OvStoragePlugin_Connection *)completion.result;
     assert(connection != NULL);
     assert(connection->id.id.len == strlen(connection_id));
+    assert(connection->owning_target.present);
+    assert(memcmp(connection->owning_target.value.ptr, "files", 5) == 0);
     ovc_file_connection_ffi_clear(connection);
     ovc_abi_free(connection);
 
@@ -10173,96 +9987,9 @@ static void ovc_file_backend_item_info_clear(
     object.system_metadata = info->system_metadata;
     object.user_metadata = info->user_metadata;
     object.modified_by = info->modified_by;
+    object.versioned_address = info->versioned_address;
     ovc_file_object_info_clear(&object);
     memset(info, 0, sizeof(*info));
-}
-
-static void ovc_file_test_update_metadata(
-    OvStoragePlugin_LayerHandle *handle,
-    const char *address)
-{
-    OvStoragePlugin_UpdateMetadataRequest request;
-    ovc_file_test_completion completion;
-    OvStoragePlugin_BackendItemInfo *result;
-
-    memset(&request, 0, sizeof(request));
-    request.struct_size = sizeof(request);
-    request.address = ovc_file_owned_string(address);
-    request.options.struct_size = sizeof(request.options);
-    request.options.user_metadata_set.ptr =
-        (OvStoragePlugin_KeyValuePair *)ovc_file_abi_callocate(
-            1, sizeof(*request.options.user_metadata_set.ptr));
-    request.options.user_metadata_set.len = 1;
-    request.options.user_metadata_set.ptr[0].key =
-        ovc_file_owned_string("purpose");
-    request.options.user_metadata_set.ptr[0].value =
-        ovc_file_owned_string("roundtrip");
-    request.options.user_metadata_remove.ptr =
-        (OvStoragePlugin_Str *)ovc_file_abi_allocate(
-            sizeof(*request.options.user_metadata_remove.ptr));
-    request.options.user_metadata_remove.len = 0;
-    ovc_file_test_completion_init(&completion);
-    handle->vtable->update_metadata(handle->state,
-                                    &request,
-                                    NULL,
-                                    ovc_file_test_complete,
-                                    &completion);
-    ovc_file_test_expect_success("update_metadata", &completion);
-    result = (OvStoragePlugin_BackendItemInfo *)completion.result;
-    assert(result != NULL);
-    assert(result->user_metadata.present);
-    assert(result->user_metadata.value.len == 1);
-    assert(result->user_metadata.value.ptr[0].key.len == 7);
-    assert(memcmp(result->user_metadata.value.ptr[0].key.ptr,
-                  "purpose",
-                  7) == 0);
-    assert(result->user_metadata.value.ptr[0].value.len == 9);
-    assert(memcmp(result->user_metadata.value.ptr[0].value.ptr,
-                  "roundtrip",
-                  9) == 0);
-    ovc_file_backend_item_info_clear(result);
-    ovc_abi_free(result);
-}
-
-/* The on-disk sidecar layout is a cross-implementation contract: the Rust
- * reference must find the metadata this backend writes and vice versa, so
- * assert the exact reference spelling
- * `<parent>/.ovstorage-meta/<lowercase-hex(name)>.meta` (metadata.rs). */
-static void ovc_file_test_metadata_sidecar_layout(
-    const char *parent_directory,
-    const char *object_name)
-{
-    static const char hex[] = "0123456789abcdef";
-    char *encoded;
-    char *metadata_directory;
-    char *sidecar;
-    size_t length;
-    size_t index;
-    ovc_file_stat info;
-
-    length = strlen(object_name);
-    encoded = (char *)ovc_file_allocate(
-        length * 2 + sizeof(OVC_FILE_METADATA_SUFFIX));
-    for (index = 0; index < length; ++index) {
-        unsigned char byte;
-
-        byte = (unsigned char)object_name[index];
-        encoded[index * 2] = hex[byte >> 4];
-        encoded[index * 2 + 1] = hex[byte & 0x0f];
-    }
-    memcpy(encoded + length * 2,
-           OVC_FILE_METADATA_SUFFIX,
-           sizeof(OVC_FILE_METADATA_SUFFIX));
-    metadata_directory = ovc_path_join(parent_directory,
-                                       OVC_FILE_METADATA_DIRECTORY);
-    assert(metadata_directory != NULL);
-    sidecar = ovc_path_join(metadata_directory, encoded);
-    assert(sidecar != NULL);
-    assert(ovc_file_native_stat_path(sidecar, &info) == 0);
-    assert(info.is_regular);
-    free(sidecar);
-    free(metadata_directory);
-    free(encoded);
 }
 
 static void ovc_file_test_copy(OvStoragePlugin_LayerHandle *handle,
@@ -10294,7 +10021,7 @@ static void ovc_file_test_copy(OvStoragePlugin_LayerHandle *handle,
     assert(result->done.info.size.present);
     assert(result->done.info.size.value == expected_size);
     assert(result->done.info.user_metadata.present);
-    assert(result->done.info.user_metadata.value.len == 1);
+    assert(result->done.info.user_metadata.value.len == 0);
     ovc_file_object_info_clear(&result->done.info);
     ovc_abi_free(result);
 }
@@ -10686,6 +10413,167 @@ static void ovc_file_test_delete_directory(
     assert(completion.result == NULL);
 }
 
+static void ovc_file_test_watch_directory_child(
+    OvStoragePlugin_LayerHandle *handle,
+    const char *root_url)
+{
+    static const uint8_t payload[] = "watched child";
+    OvStoragePlugin_BackendChangeStream *stream;
+    ovc_file_test_watch_next call;
+    ovc_thread thread;
+    char *created_address;
+    char *deleted_address;
+    char *old_address;
+    char *new_address;
+    char *child_address;
+    char *descendant_address;
+    char *signal_address;
+    bool saw_deleted;
+    bool saw_created;
+
+    created_address = ovc_file_join_address(root_url,
+                                            "watch-directory-created",
+                                            true);
+    signal_address = ovc_file_join_address(root_url,
+                                           "watch-directory-signal.txt",
+                                           false);
+    stream = ovc_file_test_watch_open(handle, root_url, 0, NULL);
+    ovc_file_test_watch_next_start(&call, stream, &thread);
+    ovc_file_test_create_directory(handle, created_address);
+    ovc_file_test_write(handle, signal_address, payload, sizeof(payload) - 1);
+    assert(ovc_thread_join(&thread) == 0);
+    assert(call.step == OvStoragePlugin_StreamStep_Yielded);
+    assert(call.event.tag == OvStoragePlugin_BackendChangeEventTag_Object);
+    assert(call.event.object.kind == OvStoragePlugin_ChangeKind_Created);
+    assert(call.event.object.address.len == strlen(created_address));
+    assert(memcmp(call.event.object.address.ptr,
+                  created_address,
+                  strlen(created_address)) == 0);
+    assert(!call.event.object.size.present);
+    ovc_file_test_watch_event_clear(&call.event);
+    ovc_file_test_watch_drop_once(stream);
+    ovc_file_test_delete_directory(handle, created_address);
+    ovc_file_test_delete(handle, signal_address);
+
+    deleted_address = ovc_file_join_address(root_url,
+                                            "watch-directory-deleted",
+                                            true);
+    ovc_file_test_create_directory(handle, deleted_address);
+    stream = ovc_file_test_watch_open(handle, root_url, 0, NULL);
+    ovc_file_test_watch_next_start(&call, stream, &thread);
+    ovc_file_test_delete_directory(handle, deleted_address);
+    assert(ovc_thread_join(&thread) == 0);
+    assert(call.step == OvStoragePlugin_StreamStep_Yielded);
+    assert(call.event.tag == OvStoragePlugin_BackendChangeEventTag_Object);
+    assert(call.event.object.kind == OvStoragePlugin_ChangeKind_Deleted);
+    assert(call.event.object.address.len == strlen(deleted_address));
+    assert(memcmp(call.event.object.address.ptr,
+                  deleted_address,
+                  strlen(deleted_address)) == 0);
+    assert(!call.event.object.etag.present);
+    assert(!call.event.object.size.present);
+    assert(!call.event.object.mtime_unix_ms.present);
+    ovc_file_test_watch_event_clear(&call.event);
+    ovc_file_test_watch_drop_once(stream);
+
+    old_address = ovc_file_join_address(root_url,
+                                        "watch-directory-old",
+                                        true);
+    new_address = ovc_file_join_address(root_url,
+                                        "watch-directory-new",
+                                        true);
+    ovc_file_test_create_directory(handle, old_address);
+    stream = ovc_file_test_watch_open(handle, root_url, 0, NULL);
+    ovc_file_test_watch_next_start(&call, stream, &thread);
+    ovc_file_test_rename(handle, old_address, new_address);
+    assert(ovc_thread_join(&thread) == 0);
+    saw_deleted = false;
+    saw_created = false;
+    assert(call.step == OvStoragePlugin_StreamStep_Yielded);
+    assert(call.event.tag == OvStoragePlugin_BackendChangeEventTag_Object);
+    if (call.event.object.kind == OvStoragePlugin_ChangeKind_Deleted) {
+        assert(call.event.object.address.len == strlen(old_address));
+        assert(memcmp(call.event.object.address.ptr,
+                      old_address,
+                      strlen(old_address)) == 0);
+        saw_deleted = true;
+    } else {
+        assert(call.event.object.kind == OvStoragePlugin_ChangeKind_Created);
+        assert(call.event.object.address.len == strlen(new_address));
+        assert(memcmp(call.event.object.address.ptr,
+                      new_address,
+                      strlen(new_address)) == 0);
+        saw_created = true;
+    }
+    ovc_file_test_watch_event_clear(&call.event);
+    memset(&call.event, 0, sizeof(call.event));
+    memset(&call.error, 0, sizeof(call.error));
+    assert(stream->next_fn(stream->state, &call.event, &call.error) ==
+           OvStoragePlugin_StreamStep_Yielded);
+    assert(call.event.tag == OvStoragePlugin_BackendChangeEventTag_Object);
+    if (call.event.object.kind == OvStoragePlugin_ChangeKind_Deleted) {
+        assert(!saw_deleted);
+        assert(call.event.object.address.len == strlen(old_address));
+        assert(memcmp(call.event.object.address.ptr,
+                      old_address,
+                      strlen(old_address)) == 0);
+        saw_deleted = true;
+    } else {
+        assert(call.event.object.kind == OvStoragePlugin_ChangeKind_Created);
+        assert(!saw_created);
+        assert(call.event.object.address.len == strlen(new_address));
+        assert(memcmp(call.event.object.address.ptr,
+                      new_address,
+                      strlen(new_address)) == 0);
+        saw_created = true;
+    }
+    assert(saw_deleted);
+    assert(saw_created);
+    ovc_file_test_watch_event_clear(&call.event);
+    ovc_file_test_watch_drop_once(stream);
+    ovc_file_test_delete_directory(handle, new_address);
+
+    child_address = ovc_file_join_address(root_url,
+                                          "watch-directory-child",
+                                          true);
+    descendant_address = ovc_file_join_address(child_address,
+                                               "descendant.txt",
+                                               false);
+    /* The child is in the opening snapshot. Its descendant write changes
+     * the directory mtime, but the sorted signal event must arrive first:
+     * a directory Modified roll-up would otherwise precede it. */
+    ovc_file_test_create_directory(handle, child_address);
+    stream = ovc_file_test_watch_open(handle, root_url, 0, NULL);
+    ovc_file_test_watch_next_start(&call, stream, &thread);
+    ovc_file_test_write(handle,
+                        descendant_address,
+                        payload,
+                        sizeof(payload) - 1);
+    ovc_file_test_write(handle, signal_address, payload, sizeof(payload) - 1);
+    assert(ovc_thread_join(&thread) == 0);
+    assert(call.step == OvStoragePlugin_StreamStep_Yielded);
+    assert(call.event.tag == OvStoragePlugin_BackendChangeEventTag_Object);
+    assert(call.event.object.kind == OvStoragePlugin_ChangeKind_Created);
+    assert(call.event.object.address.len == strlen(signal_address));
+    assert(memcmp(call.event.object.address.ptr,
+                  signal_address,
+                  strlen(signal_address)) == 0);
+    assert(call.event.object.address.len != strlen(descendant_address));
+    ovc_file_test_watch_event_clear(&call.event);
+    ovc_file_test_watch_drop_once(stream);
+    ovc_file_test_delete(handle, descendant_address);
+    ovc_file_test_delete_directory(handle, child_address);
+    ovc_file_test_delete(handle, signal_address);
+
+    free(created_address);
+    free(deleted_address);
+    free(old_address);
+    free(new_address);
+    free(child_address);
+    free(descendant_address);
+    free(signal_address);
+}
+
 /* Drive delete_directory and require it was refused with `expected`.  The
  * code is asserted, not merely the failure: a removal refused because the
  * directory holds something must not reach the caller as a retryable
@@ -10728,6 +10616,412 @@ static void ovc_file_test_delete_directory_refused(
     assert(completion.error->code == expected);
     assert(completion.result == NULL);
     ovc_file_error_destroy(completion.error);
+}
+
+/* Final path component, past the last separator of either flavour. */
+static const char *ovc_file_test_basename(const char *path)
+{
+    const char *slash;
+    const char *backslash;
+    const char *last;
+
+    slash = strrchr(path, '/');
+    backslash = strrchr(path, '\\');
+    last = slash;
+    if (backslash != NULL && (last == NULL || backslash > last)) {
+        last = backslash;
+    }
+    return last == NULL ? path : last + 1;
+}
+
+/* Like ovc_file_test_delete_directory_refused, and the refusal's message
+ * must also contain `needle`, so a refusal reached for the wrong reason
+ * cannot pass on its code alone. */
+static void ovc_file_test_delete_directory_refused_naming(
+    OvStoragePlugin_LayerHandle *handle,
+    const char *address,
+    OvStoragePlugin_ErrorCode expected,
+    const char *needle)
+{
+    OvStoragePlugin_DeleteDirectoryRequest request;
+    ovc_file_test_completion completion;
+    char *message;
+
+    memset(&request, 0, sizeof(request));
+    request.struct_size = sizeof(request);
+    request.address = ovc_file_owned_string(address);
+    request.options.struct_size = sizeof(request.options);
+    ovc_file_test_completion_init(&completion);
+    handle->vtable->delete_directory(handle->state,
+                                     &request,
+                                     NULL,
+                                     ovc_file_test_complete,
+                                     &completion);
+    ovc_file_test_completion_wait(&completion);
+    assert(completion.status == OvStoragePlugin_FFI_STATUS_ERR);
+    assert(completion.error != NULL);
+    assert(completion.error->code == expected);
+    message = (char *)ovc_file_allocate(completion.error->message_len + 1);
+    memcpy(message, completion.error->message_ptr,
+           completion.error->message_len);
+    message[completion.error->message_len] = '\0';
+    if (strstr(message, needle) == NULL) {
+        (void)fprintf(stderr,
+                      "delete_directory of %s refused with `%s`, "
+                      "expected a message naming `%s`\n",
+                      address, message, needle);
+        (void)fflush(stderr);
+    }
+    assert(strstr(message, needle) != NULL);
+    free(message);
+    ovc_file_error_destroy(completion.error);
+}
+
+/* Drive a write whose options carry `pairs` user-metadata entries (the map
+ * is present even when `pairs` is zero) and, when `message` is non-NULL, a
+ * version message.  `expected` is the refusal code, or one of these
+ * sentinels: the write must succeed, or it must fail with any code except
+ * Unsupported (an address whose own resolution error wins over the
+ * user-metadata refusal). */
+#define OVC_FILE_TEST_EXPECT_SUCCESS (-1)
+#define OVC_FILE_TEST_ANY_ERROR_BUT_UNSUPPORTED (-2)
+
+static void ovc_file_test_write_with_options(
+    OvStoragePlugin_LayerHandle *handle,
+    const char *address,
+    size_t pairs,
+    const char *message,
+    int expected)
+{
+    static const uint8_t payload[] = "metadata option probe";
+    OvStoragePlugin_WriteRequest request;
+    ovc_file_test_completion completion;
+    size_t index;
+
+    memset(&request, 0, sizeof(request));
+    request.struct_size = sizeof(request);
+    request.address = ovc_file_owned_string(address);
+    request.body.tag = OvStoragePlugin_BodyTag_Bytes;
+    request.body.bytes.ptr = (uint8_t *)
+        ovc_file_abi_allocate(sizeof(payload) - 1);
+    request.body.bytes.len = sizeof(payload) - 1;
+    memcpy(request.body.bytes.ptr, payload, sizeof(payload) - 1);
+    request.options.struct_size = sizeof(request.options);
+    request.options.if_dest.tag = OvStoragePlugin_IfDestExistsTag_Overwrite;
+    request.options.user_metadata.present = true;
+    request.options.user_metadata.value.ptr =
+        (OvStoragePlugin_KeyValuePair *)ovc_file_abi_callocate(
+            pairs == 0 ? 1 : pairs,
+            sizeof(*request.options.user_metadata.value.ptr));
+    request.options.user_metadata.value.len = pairs;
+    for (index = 0; index < pairs; ++index) {
+        request.options.user_metadata.value.ptr[index].key =
+            ovc_file_owned_string("purpose");
+        request.options.user_metadata.value.ptr[index].value =
+            ovc_file_owned_string("refused");
+    }
+    if (message != NULL) {
+        request.options.message.present = true;
+        request.options.message.value = ovc_file_owned_string(message);
+    }
+    ovc_file_test_completion_init(&completion);
+    handle->vtable->write(handle->state,
+                          &request,
+                          NULL,
+                          ovc_file_test_complete,
+                          &completion);
+    if (expected == OVC_FILE_TEST_EXPECT_SUCCESS) {
+        OvStoragePlugin_WriteResult *result;
+
+        ovc_file_test_expect_success("write with options", &completion);
+        result = (OvStoragePlugin_WriteResult *)completion.result;
+        assert(result != NULL);
+        assert(result->info.size.present);
+        assert(result->info.size.value == sizeof(payload) - 1);
+        assert(result->info.user_metadata.present);
+        assert(result->info.user_metadata.value.len == 0);
+        ovc_file_object_info_clear(&result->info);
+        ovc_abi_free(result);
+        return;
+    }
+    ovc_file_test_completion_wait(&completion);
+    if (completion.status != OvStoragePlugin_FFI_STATUS_ERR ||
+        completion.error == NULL ||
+        (expected == OVC_FILE_TEST_ANY_ERROR_BUT_UNSUPPORTED
+             ? completion.error->code == OvStoragePlugin_ErrorCode_Unsupported
+             : (int)completion.error->code != expected)) {
+        (void)fprintf(stderr,
+                      "write of %s: status=%d code=%d (expected code=%d)\n",
+                      address,
+                      (int)completion.status,
+                      completion.error == NULL
+                          ? -1
+                          : (int)completion.error->code,
+                      expected);
+        (void)fflush(stderr);
+    }
+    assert(completion.status == OvStoragePlugin_FFI_STATUS_ERR);
+    assert(completion.error != NULL);
+    if (expected == OVC_FILE_TEST_ANY_ERROR_BUT_UNSUPPORTED) {
+        assert(completion.error->code != OvStoragePlugin_ErrorCode_Unsupported);
+    } else {
+        assert((int)completion.error->code == expected);
+    }
+    assert(completion.result == NULL);
+    ovc_file_error_destroy(completion.error);
+}
+
+/* The backend declares, in both descriptor spellings and in its
+ * capabilities, that it stores no user metadata. */
+static void ovc_file_test_no_user_metadata_declared(void)
+{
+    OvStoragePlugin_LayerKindDescriptor descriptor;
+    OvStoragePlugin_Capabilities capabilities;
+
+    ovc_file_descriptor_fill(&descriptor);
+    assert(!descriptor.supports_user_metadata);
+    ovc_file_descriptor_clear(&descriptor);
+    assert(!g_ovc_file_builtin_descriptor.supports_user_metadata);
+
+    capabilities = ovc_file_capabilities();
+    assert(!capabilities.supports_native_metadata_patch);
+    assert(!capabilities.watch_directory_kinds.metadata_changed);
+    assert(capabilities.watch_directory_kinds.modified);
+}
+
+/* A write carrying a non-empty user-metadata map is refused with
+ * Unsupported before the backend touches the filesystem: no object, no temp
+ * sibling, no parent directory.  The refusal follows address resolution, so
+ * an address outside the connection root reports its own error first, as
+ * the Rust host does. */
+static void ovc_file_test_write_user_metadata_refused(
+    OvStoragePlugin_LayerHandle *handle,
+    const char *root_url,
+    const char *outside_address)
+{
+    char *directory_address;
+    char *directory_path;
+    char *address;
+    char *path;
+    OvStoragePlugin_Error *path_error;
+    ovc_file_stat info;
+
+    directory_address = ovc_file_join_address(root_url, "refused-meta", true);
+    address = ovc_file_join_address(directory_address, "refused.txt", false);
+    path_error = NULL;
+    directory_path = ovc_file_url_to_path(directory_address, &path_error);
+    assert(path_error == NULL);
+    path = ovc_file_url_to_path(address, &path_error);
+    assert(path_error == NULL);
+    errno = 0;
+    assert(ovc_file_native_stat_path(directory_path, &info) != 0);
+    assert(errno == ENOENT);
+
+    ovc_file_test_write_with_options(
+        handle,
+        address,
+        1,
+        NULL,
+        (int)OvStoragePlugin_ErrorCode_Unsupported);
+
+    errno = 0;
+    assert(ovc_file_native_stat_path(path, &info) != 0);
+    assert(errno == ENOENT);
+    errno = 0;
+    assert(ovc_file_native_stat_path(directory_path, &info) != 0);
+    assert(errno == ENOENT);
+
+    ovc_file_test_write_with_options(
+        handle,
+        outside_address,
+        1,
+        NULL,
+        OVC_FILE_TEST_ANY_ERROR_BUT_UNSUPPORTED);
+    free(path);
+    free(directory_path);
+    free(address);
+    free(directory_address);
+}
+
+/* A present-but-empty map asks for nothing and is accepted; stat then
+ * reports the same empty map. */
+static void ovc_file_test_write_empty_user_metadata(
+    OvStoragePlugin_LayerHandle *handle,
+    const char *root_url)
+{
+    char *address;
+    OvStoragePlugin_StatRequest request;
+    ovc_file_test_completion completion;
+    OvStoragePlugin_ObjectInfo *result;
+
+    address = ovc_file_join_address(root_url, "empty-meta.txt", false);
+    ovc_file_test_write_with_options(
+        handle, address, 0, NULL, OVC_FILE_TEST_EXPECT_SUCCESS);
+
+    memset(&request, 0, sizeof(request));
+    request.struct_size = sizeof(request);
+    request.address = ovc_file_owned_string(address);
+    request.options.struct_size = sizeof(request.options);
+    request.options.full_metadata = true;
+    ovc_file_test_completion_init(&completion);
+    handle->vtable->stat(handle->state,
+                         &request,
+                         NULL,
+                         ovc_file_test_complete,
+                         &completion);
+    ovc_file_test_expect_success("stat empty-metadata object", &completion);
+    result = (OvStoragePlugin_ObjectInfo *)completion.result;
+    assert(result != NULL);
+    assert(result->user_metadata.present);
+    assert(result->user_metadata.value.len == 0);
+    ovc_file_object_info_clear(result);
+    ovc_abi_free(result);
+
+    ovc_file_test_delete(handle, address);
+    free(address);
+}
+
+/* A write carrying only a version message succeeds: the message is dropped
+ * because the backend has no annotation slot for it. */
+static void ovc_file_test_write_message_only(
+    OvStoragePlugin_LayerHandle *handle,
+    const char *root_url)
+{
+    char *address;
+
+    address = ovc_file_join_address(root_url, "message-only.txt", false);
+    ovc_file_test_write_with_options(handle,
+                                     address,
+                                     0,
+                                     "annotation the backend drops",
+                                     OVC_FILE_TEST_EXPECT_SUCCESS);
+    ovc_file_test_delete(handle, address);
+    free(address);
+}
+
+/* update_metadata answers Unsupported for any address this backend serves,
+ * whether or not the object exists; an address outside the connection root
+ * reports its own resolution error first, as the Rust host does. */
+static void ovc_file_test_update_metadata_unsupported_at(
+    OvStoragePlugin_LayerHandle *handle,
+    const char *address,
+    bool expect_unsupported)
+{
+    OvStoragePlugin_UpdateMetadataRequest request;
+    ovc_file_test_completion completion;
+
+    memset(&request, 0, sizeof(request));
+    request.struct_size = sizeof(request);
+    request.address = ovc_file_owned_string(address);
+    request.options.struct_size = sizeof(request.options);
+    request.options.user_metadata_set.ptr =
+        (OvStoragePlugin_KeyValuePair *)ovc_file_abi_callocate(
+            1, sizeof(*request.options.user_metadata_set.ptr));
+    request.options.user_metadata_set.len = 1;
+    request.options.user_metadata_set.ptr[0].key =
+        ovc_file_owned_string("purpose");
+    request.options.user_metadata_set.ptr[0].value =
+        ovc_file_owned_string("unsupported");
+    request.options.user_metadata_remove.ptr =
+        (OvStoragePlugin_Str *)ovc_file_abi_allocate(
+            sizeof(*request.options.user_metadata_remove.ptr));
+    request.options.user_metadata_remove.len = 0;
+    ovc_file_test_completion_init(&completion);
+    handle->vtable->update_metadata(handle->state,
+                                    &request,
+                                    NULL,
+                                    ovc_file_test_complete,
+                                    &completion);
+    ovc_file_test_completion_wait(&completion);
+    assert(completion.status == OvStoragePlugin_FFI_STATUS_ERR);
+    assert(completion.error != NULL);
+    if (expect_unsupported) {
+        assert(completion.error->code == OvStoragePlugin_ErrorCode_Unsupported);
+    } else {
+        assert(completion.error->code != OvStoragePlugin_ErrorCode_Unsupported);
+    }
+    assert(completion.result == NULL);
+    ovc_file_error_destroy(completion.error);
+}
+
+static void ovc_file_test_update_metadata_unsupported(
+    OvStoragePlugin_LayerHandle *handle,
+    const char *present_address,
+    const char *root_url,
+    const char *outside_address)
+{
+    char *missing_address;
+
+    missing_address = ovc_file_join_address(root_url, "ghost.bin", false);
+    ovc_file_test_update_metadata_unsupported_at(handle, present_address, true);
+    ovc_file_test_update_metadata_unsupported_at(handle, missing_address, true);
+    ovc_file_test_update_metadata_unsupported_at(handle, outside_address, false);
+    free(missing_address);
+}
+
+/* A `.ovstorage-meta` directory found on disk is ordinary content: list
+ * reports it like any other child, and delete_directory of its parent is
+ * DirectoryNotEmpty until it is removed. */
+static void ovc_file_test_metadata_directory_is_ordinary(
+    OvStoragePlugin_LayerHandle *handle,
+    const char *root_url)
+{
+    char *directory_address;
+    char *directory_path;
+    char *metadata_directory;
+    OvStoragePlugin_Error *path_error;
+    OvStoragePlugin_ListRequest request;
+    ovc_file_test_completion completion;
+    OvStoragePlugin_ListPage *page;
+    const OvStoragePlugin_Str *listed;
+    static const char suffix[] = ".ovstorage-meta/";
+
+    directory_address = ovc_file_join_address(root_url, "meta-holder", true);
+    ovc_file_test_create_directory(handle, directory_address);
+    path_error = NULL;
+    directory_path = ovc_file_url_to_path(directory_address, &path_error);
+    assert(path_error == NULL);
+    metadata_directory = ovc_path_join(directory_path, ".ovstorage-meta");
+    assert(metadata_directory != NULL);
+    assert(ovc_file_native_mkdir(metadata_directory) == 0);
+
+    memset(&request, 0, sizeof(request));
+    request.struct_size = sizeof(request);
+    request.prefix = ovc_file_owned_string(directory_address);
+    request.options.struct_size = sizeof(request.options);
+    ovc_file_test_completion_init(&completion);
+    handle->vtable->list(handle->state,
+                         &request,
+                         NULL,
+                         ovc_file_test_complete,
+                         &completion);
+    ovc_file_test_expect_success("list metadata-holder", &completion);
+    page = (OvStoragePlugin_ListPage *)completion.result;
+    assert(page != NULL);
+    assert(page->items.len == 1);
+    assert(page->items.ptr[0].kind == OvStoragePlugin_ObjectKindV1_Directory);
+    listed = &page->items.ptr[0].address;
+    assert(listed->len >= sizeof(suffix) - 1);
+    assert(memcmp(listed->ptr + listed->len - (sizeof(suffix) - 1),
+                  suffix,
+                  sizeof(suffix) - 1) == 0);
+    ovc_file_object_info_clear(&page->items.ptr[0]);
+    ovc_abi_free(page->items.ptr);
+    if (page->next_page_token.present) {
+        ovc_file_str_clear(&page->next_page_token.value);
+    }
+    ovc_abi_free(page);
+
+    ovc_file_test_delete_directory_refused(
+        handle,
+        directory_address,
+        OvStoragePlugin_ErrorCode_DirectoryNotEmpty);
+
+    assert(ovc_file_native_rmdir(metadata_directory) == 0);
+    ovc_file_test_delete_directory(handle, directory_address);
+    free(metadata_directory);
+    free(directory_path);
+    free(directory_address);
 }
 
 static void ovc_file_test_materialize(
@@ -10797,6 +11091,7 @@ static void ovc_file_test_versions(OvStoragePlugin_LayerHandle *handle,
     assert(page != NULL);
     assert(page->items.len == 1);
     assert(!page->items.ptr[0].version.present);
+    assert(!page->items.ptr[0].versioned_address.present);
     ovc_file_object_info_clear(&page->items.ptr[0]);
     ovc_abi_free(page->items.ptr);
     ovc_abi_free(page);
@@ -10815,6 +11110,7 @@ static void ovc_file_test_versions(OvStoragePlugin_LayerHandle *handle,
     latest = (OvStoragePlugin_ObjectInfo *)completion.result;
     assert(latest != NULL);
     assert(!latest->version.present);
+    assert(!latest->versioned_address.present);
     ovc_file_object_info_clear(latest);
     ovc_abi_free(latest);
 }
@@ -10884,6 +11180,8 @@ static void ovc_file_test_stat_permissions(
     ovc_file_test_expect_success("stat_permissions", &completion);
     result = (OvStoragePlugin_ObjectInfo *)completion.result;
     assert(result != NULL);
+    /* The file backend versions nothing, so no answer carries a pin. */
+    assert(!result->versioned_address.present);
     assert(result->effective_permissions.present);
     assert(result->effective_permissions.value.bits == expected_bits);
     ovc_file_object_info_clear(result);
@@ -10952,6 +11250,7 @@ static void ovc_file_test_readonly_access(
         ovc_file_test_expect_success("readonly_access", &completion);
         result = (OvStoragePlugin_WriteResult *)completion.result;
         assert(result != NULL);
+        assert(!result->info.versioned_address.present);
         assert(result->info.effective_permissions.present);
         assert(result->info.effective_permissions.value.bits ==
                OVC_FILE_PERMISSION_READ);
@@ -10974,6 +11273,20 @@ static void ovc_file_test_readonly_access(
                                    OVC_FILE_PERMISSION_ALL);
 }
 #endif
+
+static FILE *ovc_file_test_fopen(const char *path, const char *mode)
+{
+#if defined(_WIN32)
+    FILE *file = NULL;
+
+    if (fopen_s(&file, path, mode) != 0) {
+        return NULL;
+    }
+    return file;
+#else
+    return fopen(path, mode);
+#endif
+}
 
 static void ovc_file_test_namespace_slots(
     OvStoragePlugin_LayerHandle *handle)
@@ -11019,13 +11332,48 @@ int main(void)
         ".ovstorage-stage.123.45.6.tmp"));
     assert(!ovc_file_is_internal_entry(".ordinary.a.b.c.tmp"));
 
-    /* The delete scan's skip set is the sidecar dir alone.  A staging temp
-     * is internal to enumeration but counted by the kernel, so treating it
-     * as absent would make the scan disagree with the rmdir. */
-    assert(ovc_file_is_cleared_by_directory_removal(".ovstorage-meta"));
-    assert(!ovc_file_is_cleared_by_directory_removal(
-        ".ovstorage-stage.123.45.6.tmp"));
-    assert(!ovc_file_is_cleared_by_directory_removal(".object.123.45.6.tmp"));
+    /* `.ovstorage-meta` is ordinary content on this backend: enumeration
+     * lists it and URL resolution addresses it like any other name. */
+    assert(!ovc_file_is_internal_entry(".ovstorage-meta"));
+    assert(!ovc_file_path_is_internal("/root/.ovstorage-meta/x.meta"));
+
+    /* The predicate that may unlink agrees with the Rust host's removal on
+     * every row: no leading segment and an uppercase suffix are objects on
+     * one host or the other and survive both removals; every clearable name
+     * is also hidden. */
+    assert(!ovc_file_is_clearable_staging_temp_name(".2024.01.15.tmp"));
+    assert(!ovc_file_is_clearable_staging_temp_name(".1.2.3.tmp"));
+    assert(!ovc_file_is_clearable_staging_temp_name("..1.2.3.tmp"));
+    assert(!ovc_file_is_clearable_staging_temp_name(".report.1.2.3.TMP"));
+    assert(!ovc_file_is_clearable_staging_temp_name(".report.1.2.3.Tmp"));
+    assert(!ovc_file_is_clearable_staging_temp_name(
+        ".ovstorage-stage.1.2.3.TMP"));
+    assert(ovc_file_is_clearable_staging_temp_name(".report.1.2.3.tmp"));
+    assert(ovc_file_is_clearable_staging_temp_name(
+        ".ovstorage-stage.1.2.3.tmp"));
+    assert(ovc_file_is_clearable_staging_temp_name(".a.b.1.2.3.tmp"));
+    assert(ovc_file_is_clearable_staging_temp_name(".1.2.3.4.tmp"));
+    assert(ovc_file_is_clearable_staging_temp_name(
+        ".12345.123456789.4242.7.tmp"));
+    assert(!ovc_file_is_clearable_staging_temp_name(".report.1.2.tmp"));
+    assert(!ovc_file_is_clearable_staging_temp_name(".report..2.3.tmp"));
+    assert(!ovc_file_is_clearable_staging_temp_name(".report.1.2.3.txt"));
+    assert(!ovc_file_is_clearable_staging_temp_name("report.1.2.3.tmp"));
+    /* A non-UTF-8 leading segment is no temp to the Rust host, which serves
+     * it as an object; the removal must not call it clearable. */
+    assert(!ovc_file_is_clearable_staging_temp_name(".\xFF.1.2.3.tmp"));
+    assert(ovc_file_is_clearable_staging_temp_name(".r\xC3\xA9port.1.2.3.tmp"));
+    assert(ovc_file_is_internal_entry(".report.1.2.3.tmp"));
+    assert(ovc_file_is_internal_entry(".ovstorage-stage.1.2.3.tmp"));
+
+    /* A lock that cannot answer is never a raw error: an NFS flock emulation
+     * refusing a read-only descriptor with EBADF reads as unclassifiable,
+     * and contention reads as held. */
+    assert(ovc_file_lock_unsupported(ENOLCK));
+    assert(ovc_file_lock_unsupported(EBADF));
+    assert(!ovc_file_lock_unsupported(EACCES));
+    assert(ovc_file_lock_is_held(EWOULDBLOCK));
+    assert(!ovc_file_lock_is_held(EBADF));
 
     /* A root spelled with its trailing separator covers the node it names.
      * Comparing against the spelled root refused the very path the connection
@@ -11092,8 +11440,9 @@ int main(void)
      * handle below would suffer from the same defect. */
     ovc_file_test_watch_outlives_layer(root_url);
     ovc_file_test_watch_created(&handle, root_url);
+    ovc_file_test_watch_directory_child(&handle, root_url);
     ovc_file_test_watch_cancel(&handle, root_url);
-    assert(g_ovc_file_watch_test_drop_count == 3);
+    assert(g_ovc_file_watch_test_drop_count == 7);
     first_address = ovc_file_join_address(root_url,
                                           "roundtrip.txt",
                                           false);
@@ -11134,20 +11483,37 @@ int main(void)
     ovc_file_test_list(&handle, root_url);
     ovc_file_test_namespace_slots(&handle);
 
-    ovc_file_test_update_metadata(&handle, first_address);
-    ovc_file_test_metadata_sidecar_layout(directory, "roundtrip.txt");
+    ovc_file_test_no_user_metadata_declared();
+    ovc_file_test_write_empty_user_metadata(&handle, root_url);
+    ovc_file_test_write_message_only(&handle, root_url);
+    {
+        char *outside_directory;
+        char *outside_address;
+
+        outside_directory = ovc_path_join(directory, "..");
+        assert(outside_directory != NULL);
+        outside_address = ovc_file_path_to_url(outside_directory, true);
+        assert(outside_address != NULL);
+        ovc_file_test_write_user_metadata_refused(&handle,
+                                                  root_url,
+                                                  outside_address);
+        ovc_file_test_update_metadata_unsupported(&handle,
+                                                  first_address,
+                                                  root_url,
+                                                  outside_address);
+        free(outside_address);
+        free(outside_directory);
+    }
+    ovc_file_test_metadata_directory_is_ordinary(&handle, root_url);
 
     {
         char long_name[131];
         char *long_address;
 
-        /* hex(name).meta doubles the basename, so a >=126-byte object name
-         * yields a sidecar name past NAME_MAX.  The root already holds
-         * `.ovstorage-meta` (roundtrip.txt has metadata just above), so the
-         * sidecar probes see ENAMETOOLONG instead of ENOENT; write, stat,
-         * and delete of a long-named object with no metadata must still
-         * succeed, matching the reference's metadata_exists treating the
-         * impossible sidecar as absent. */
+        /* A 130-byte basename sits well inside NAME_MAX but past half of
+         * it: write, stat, and delete of a long-named object must succeed
+         * with only the object's own name and its fixed-size staging temp
+         * touching the directory. */
         memset(long_name, 'n', sizeof(long_name) - 1);
         long_name[sizeof(long_name) - 1] = '\0';
         long_address = ovc_file_join_address(root_url, long_name, false);
@@ -11158,41 +11524,6 @@ int main(void)
         ovc_file_test_stat(&handle,
                            long_address,
                            sizeof(first_payload) - 1);
-        {
-            OvStoragePlugin_UpdateMetadataRequest request;
-            ovc_file_test_completion completion;
-
-            /* The documented NAME_MAX caveat still holds: only the
-             * cannot-exist probes and cleanups are benign — writing
-             * NON-empty metadata to the over-long sidecar name must fail
-             * loudly rather than silently diverge on disk. */
-            memset(&request, 0, sizeof(request));
-            request.struct_size = sizeof(request);
-            request.address = ovc_file_owned_string(long_address);
-            request.options.struct_size = sizeof(request.options);
-            request.options.user_metadata_set.ptr =
-                (OvStoragePlugin_KeyValuePair *)ovc_file_abi_callocate(
-                    1, sizeof(*request.options.user_metadata_set.ptr));
-            request.options.user_metadata_set.len = 1;
-            request.options.user_metadata_set.ptr[0].key =
-                ovc_file_owned_string("purpose");
-            request.options.user_metadata_set.ptr[0].value =
-                ovc_file_owned_string("too-long");
-            request.options.user_metadata_remove.ptr =
-                (OvStoragePlugin_Str *)ovc_file_abi_allocate(
-                    sizeof(*request.options.user_metadata_remove.ptr));
-            request.options.user_metadata_remove.len = 0;
-            ovc_file_test_completion_init(&completion);
-            handle.vtable->update_metadata(handle.state,
-                                           &request,
-                                           NULL,
-                                           ovc_file_test_complete,
-                                           &completion);
-            ovc_file_test_completion_wait(&completion);
-            assert(completion.status == OvStoragePlugin_FFI_STATUS_ERR);
-            assert(completion.error != NULL);
-            ovc_file_error_destroy(completion.error);
-        }
         ovc_file_test_delete(&handle, long_address);
         free(long_address);
     }
@@ -11249,16 +11580,14 @@ int main(void)
         char *orphan_directory_address;
         char *orphan_directory_path;
         char *orphan_metadata_directory;
-        char *orphan_sidecar;
-        char *nested_directory;
-        char *nested_file;
+        char *orphan_leftover;
         ovc_file orphan_file;
-        ovc_file nested_handle;
+        ovc_file_stat orphan_info;
 
-        /* An orphaned sidecar (object removed out-of-band) must not make a
-         * visually-empty directory undeletable: delete_directory clears the
-         * backend-owned .ovstorage-meta contents like the reference's
-         * remove_dir_all. */
+        /* A `.ovstorage-meta` tree left on disk by another tool is ordinary
+         * content: delete_directory neither sweeps it nor looks inside it,
+         * so the enclosing directory is DirectoryNotEmpty until the tree is
+         * removed out of band. */
         orphan_directory_address = ovc_file_join_address(root_url,
                                                          "orphan",
                                                          true);
@@ -11267,34 +11596,30 @@ int main(void)
         orphan_directory_path = ovc_file_url_to_path(
             orphan_directory_address, &path_error);
         assert(path_error == NULL);
-        orphan_metadata_directory = ovc_path_join(
-            orphan_directory_path, OVC_FILE_METADATA_DIRECTORY);
+        orphan_metadata_directory = ovc_path_join(orphan_directory_path,
+                                                  ".ovstorage-meta");
         assert(orphan_metadata_directory != NULL);
         assert(ovc_file_native_mkdir(orphan_metadata_directory) == 0);
-        /* hex("orphan.txt") + ".meta": a sidecar whose object is gone. */
-        orphan_sidecar = ovc_path_join(orphan_metadata_directory,
+        orphan_leftover = ovc_path_join(orphan_metadata_directory,
                                        "6f727068616e2e747874.meta");
-        assert(orphan_sidecar != NULL);
-        orphan_file = ovc_file_native_create_new(orphan_sidecar);
+        assert(orphan_leftover != NULL);
+        orphan_file = ovc_file_native_create_new(orphan_leftover);
         assert(orphan_file != OVC_INVALID_FILE);
         assert(ovc_file_native_close(orphan_file) == 0);
-        /* A foreign SUBDIRECTORY (with a file inside) planted in
-         * .ovstorage-meta fails unlink(2) forever; the sweep must recurse
-         * like remove_dir_all instead of leaving the visually-empty
-         * directory permanently undeletable. */
-        nested_directory = ovc_path_join(orphan_metadata_directory,
-                                         "nested");
-        assert(nested_directory != NULL);
-        assert(ovc_file_native_mkdir(nested_directory) == 0);
-        nested_file = ovc_path_join(nested_directory, "leftover.meta");
-        assert(nested_file != NULL);
-        nested_handle = ovc_file_native_create_new(nested_file);
-        assert(nested_handle != OVC_INVALID_FILE);
-        assert(ovc_file_native_close(nested_handle) == 0);
+
+        ovc_file_test_delete_directory_refused(
+            &handle,
+            orphan_directory_address,
+            OvStoragePlugin_ErrorCode_DirectoryNotEmpty);
+
+        /* The refusal leaves the tree exactly as planted. */
+        assert(ovc_file_native_stat_path(orphan_leftover, &orphan_info) == 0);
+        assert(orphan_info.is_regular);
+
+        assert(ovc_file_native_unlink(orphan_leftover) == 0);
+        assert(ovc_file_native_rmdir(orphan_metadata_directory) == 0);
         ovc_file_test_delete_directory(&handle, orphan_directory_address);
-        free(nested_file);
-        free(nested_directory);
-        free(orphan_sidecar);
+        free(orphan_leftover);
         free(orphan_metadata_directory);
         free(orphan_directory_path);
         free(orphan_directory_address);
@@ -11303,22 +11628,23 @@ int main(void)
     {
         char *staging_directory_address;
         char *staging_directory_path;
-        char *staging_metadata_directory;
         char *staging_child;
         char *staging_temp;
         ovc_file staging_handle;
         ovc_file_stat staging_info;
 
-        /* A directory holding an atomic-write staging temp is not empty:
-         * the kernel counts that entry, so the rmdir cannot succeed.  The
-         * refusal must be reported as DirectoryNotEmpty, and must be
-         * reached before the sidecar dir is touched, since no removal
-         * happens.
+        /* A directory holding an atomic-write staging temp is decided by
+         * the lock the temp's writer holds.  Held: the write is in flight,
+         * the kernel counts the entry, and the refusal must be reported as
+         * DirectoryNotEmpty with the temp left in place.  Free: the writer
+         * died without unwinding, and the removal clears the temp and
+         * deletes the directory.
          *
          * The temp is planted directly rather than driven from a parked
-         * concurrent write: what this case pins is the scan predicate's
-         * verdict on a name production generates, and ovc_file_temp_sibling
-         * is the generator itself, so the name on disk is the real one. */
+         * concurrent write: what these cases pin is the verdict on a name
+         * production generates, and ovc_file_temp_sibling is the generator
+         * itself, so the name on disk is the real one; the lock the test
+         * holds is the one ovc_file_create_temp takes. */
         staging_directory_address = ovc_file_join_address(root_url,
                                                           "staging",
                                                           true);
@@ -11327,40 +11653,481 @@ int main(void)
         staging_directory_path = ovc_file_url_to_path(
             staging_directory_address, &path_error);
         assert(path_error == NULL);
-        staging_metadata_directory = ovc_path_join(
-            staging_directory_path, OVC_FILE_METADATA_DIRECTORY);
-        assert(staging_metadata_directory != NULL);
-        assert(ovc_file_native_mkdir(staging_metadata_directory) == 0);
         staging_child = ovc_path_join(staging_directory_path, "child.bin");
         assert(staging_child != NULL);
         staging_temp = ovc_file_temp_sibling(staging_child, 0);
         assert(staging_temp != NULL);
         staging_handle = ovc_file_native_create_new(staging_temp);
         assert(staging_handle != OVC_INVALID_FILE);
-        assert(ovc_file_native_close(staging_handle) == 0);
+        assert(ovc_file_native_lock_exclusive_nonblocking(staging_handle) ==
+               0);
 
         ovc_file_test_delete_directory_refused(
             &handle,
             staging_directory_address,
             OvStoragePlugin_ErrorCode_DirectoryNotEmpty);
 
-        /* The refused removal must leave the sidecar dir standing: a scan
-         * that mistook the temp for absent would have swept it already. */
-        assert(ovc_file_native_stat_path(staging_metadata_directory,
-                                         &staging_info) == 0);
-        assert(staging_info.is_directory);
+        /* The refused removal must leave the live temp in place: a removal
+         * that read the temp as an orphan would have cleared it already. */
+        assert(ovc_file_native_stat_path(staging_temp, &staging_info) == 0);
+        assert(staging_info.is_regular);
 
-        /* Once the write commits its temp away, the directory deletes. */
-        assert(ovc_file_native_unlink(staging_temp) == 0);
+        /* Closing the handle releases the lock, which is what a writer's
+         * death does; the temp is an orphan and the directory deletes,
+         * taking the temp with it. */
+        assert(ovc_file_native_close(staging_handle) == 0);
         ovc_file_test_delete_directory(&handle, staging_directory_address);
+        assert(ovc_file_native_stat_path(staging_temp, &staging_info) != 0);
+        assert(ovc_file_native_stat_path(staging_directory_path,
+                                         &staging_info) != 0);
+
+        /* The same orphan planted without ever taking the lock: the temp is
+         * the removal's only occupant, and the directory still deletes. */
+        ovc_file_test_create_directory(&handle, staging_directory_address);
+        staging_handle = ovc_file_native_create_new(staging_temp);
+        assert(staging_handle != OVC_INVALID_FILE);
+        assert(ovc_file_native_close(staging_handle) == 0);
+        ovc_file_test_delete_directory(&handle, staging_directory_address);
+        assert(ovc_file_native_stat_path(staging_temp, &staging_info) != 0);
+
+        /* A directory wearing the exact staging shape is not the backend's
+         * temp: refused as DirectoryNotEmpty, not surfaced as the raw errno
+         * its unlink would produce, and left standing. */
+        ovc_file_test_create_directory(&handle, staging_directory_address);
+        assert(ovc_file_native_mkdir(staging_temp) == 0);
+        ovc_file_test_delete_directory_refused(
+            &handle,
+            staging_directory_address,
+            OvStoragePlugin_ErrorCode_DirectoryNotEmpty);
+        assert(ovc_file_native_stat_path(staging_temp, &staging_info) == 0);
+        assert(staging_info.is_directory);
+        assert(ovc_file_native_rmdir(staging_temp) == 0);
+
+        /* A name the Rust host hides but this host serves as an object: it
+         * has no leading segment, so the removal must not call it a staging
+         * temp, and the honest DirectoryNotEmpty stands. */
+        {
+            char *object_name;
+            ovc_file object_handle;
+
+            object_name = ovc_path_join(staging_directory_path,
+                                        ".2024.01.15.tmp");
+            assert(object_name != NULL);
+            object_handle = ovc_file_native_create_new(object_name);
+            assert(object_handle != OVC_INVALID_FILE);
+            assert(ovc_file_native_close(object_handle) == 0);
+            ovc_file_test_delete_directory_refused(
+                &handle,
+                staging_directory_address,
+                OvStoragePlugin_ErrorCode_DirectoryNotEmpty);
+            assert(ovc_file_native_stat_path(object_name, &staging_info) == 0);
+            assert(ovc_file_native_unlink(object_name) == 0);
+            free(object_name);
+        }
+
+        /* The writer side: ovc_file_create_temp hands back a handle that
+         * holds the staging lock, so a probe on a second handle reads it as
+         * held and delete_directory refuses naming the in-flight write; the
+         * handle closing is the writer going away, and the removal clears
+         * the temp.  Pins that a future edit restoring a pre-rename close
+         * would be caught by the C suite, not only the Rust one. */
+        {
+            char *live_temp;
+            ovc_file writer_handle;
+            ovc_file probe_handle;
+            OvStoragePlugin_Error *create_error;
+
+            create_error = NULL;
+            live_temp = ovc_file_create_temp(staging_child,
+                                             &writer_handle,
+                                             &create_error);
+            assert(live_temp != NULL);
+            assert(create_error == NULL);
+            assert(ovc_file_is_clearable_staging_temp_name(
+                ovc_file_test_basename(live_temp)));
+            probe_handle = ovc_file_native_open_probe(live_temp,
+                                                      OVC_FILE_PROBE_READ);
+            assert(probe_handle != OVC_INVALID_FILE);
+            assert(ovc_file_native_lock_exclusive_nonblocking(probe_handle) ==
+                   -1);
+            assert(ovc_file_lock_is_held(errno));
+            assert(ovc_file_native_close(probe_handle) == 0);
+
+            ovc_file_test_delete_directory_refused_naming(
+                &handle,
+                staging_directory_address,
+                OvStoragePlugin_ErrorCode_DirectoryNotEmpty,
+                "in-flight write");
+            assert(ovc_file_native_stat_path(live_temp, &staging_info) == 0);
+
+            assert(ovc_file_native_close(writer_handle) == 0);
+            ovc_file_test_delete_directory(&handle, staging_directory_address);
+            assert(ovc_file_native_stat_path(live_temp, &staging_info) != 0);
+            free(live_temp);
+            ovc_file_test_create_directory(&handle, staging_directory_address);
+        }
+
+        /* Helper level: every temp is probed before any is removed, so an
+         * unlocked orphan listed before a live temp survives the refusal in
+         * either order, where an eager loop would have unlinked it on the
+         * way to the live one. */
+        {
+            char *orphan_child;
+            char *orphan_temp;
+            char *live_child;
+            char *live_temp;
+            ovc_file orphan_handle;
+            ovc_file live_handle;
+            ovc_file_name_list temps;
+            OvStoragePlugin_Error *sweep_error;
+            unsigned int order;
+
+            orphan_child = ovc_path_join(staging_directory_path, "orphan.bin");
+            live_child = ovc_path_join(staging_directory_path, "live.bin");
+            assert(orphan_child != NULL && live_child != NULL);
+            orphan_temp = ovc_file_temp_sibling(orphan_child, 1);
+            live_temp = ovc_file_temp_sibling(live_child, 2);
+            assert(orphan_temp != NULL && live_temp != NULL);
+            orphan_handle = ovc_file_native_create_new(orphan_temp);
+            assert(orphan_handle != OVC_INVALID_FILE);
+            assert(ovc_file_native_close(orphan_handle) == 0);
+            live_handle = ovc_file_native_create_new(live_temp);
+            assert(live_handle != OVC_INVALID_FILE);
+            assert(ovc_file_native_lock_exclusive_nonblocking(live_handle) == 0);
+
+            for (order = 0; order < 2; ++order) {
+                const char *first;
+                const char *second;
+
+                first = order == 0 ? orphan_temp : live_temp;
+                second = order == 0 ? live_temp : orphan_temp;
+                memset(&temps, 0, sizeof(temps));
+                assert(ovc_file_name_list_push(
+                           &temps, ovc_file_test_basename(first)) == 0);
+                assert(ovc_file_name_list_push(
+                           &temps, ovc_file_test_basename(second)) == 0);
+                sweep_error = ovc_file_directory_clear_orphaned_staging_temps(
+                    staging_directory_path, &temps);
+                assert(sweep_error != NULL);
+                assert(sweep_error->code ==
+                       OvStoragePlugin_ErrorCode_DirectoryNotEmpty);
+                ovc_file_error_destroy(sweep_error);
+                ovc_file_name_list_free(&temps);
+                assert(ovc_file_native_stat_path(orphan_temp, &staging_info) == 0);
+                assert(ovc_file_native_stat_path(live_temp, &staging_info) == 0);
+            }
+
+            /* A temp the scan saw but the probe no longer finds refuses the
+             * sweep as a changed directory, clearing nothing. */
+            memset(&temps, 0, sizeof(temps));
+            assert(ovc_file_name_list_push(
+                       &temps, ovc_file_test_basename(orphan_temp)) == 0);
+            assert(ovc_file_name_list_push(&temps,
+                                           ".vanished.1.2.3.tmp") == 0);
+            sweep_error = ovc_file_directory_clear_orphaned_staging_temps(
+                staging_directory_path, &temps);
+            assert(sweep_error != NULL);
+            assert(sweep_error->code ==
+                   OvStoragePlugin_ErrorCode_DirectoryNotEmpty);
+            ovc_file_error_destroy(sweep_error);
+            ovc_file_name_list_free(&temps);
+            assert(ovc_file_native_stat_path(orphan_temp, &staging_info) == 0);
+
+            assert(ovc_file_native_close(live_handle) == 0);
+            memset(&temps, 0, sizeof(temps));
+            assert(ovc_file_name_list_push(
+                       &temps, ovc_file_test_basename(orphan_temp)) == 0);
+            assert(ovc_file_name_list_push(
+                       &temps, ovc_file_test_basename(live_temp)) == 0);
+            sweep_error = ovc_file_directory_clear_orphaned_staging_temps(
+                staging_directory_path, &temps);
+            assert(sweep_error == NULL);
+            ovc_file_name_list_free(&temps);
+            assert(ovc_file_native_stat_path(orphan_temp, &staging_info) != 0);
+            assert(ovc_file_native_stat_path(live_temp, &staging_info) != 0);
+            free(live_temp);
+            free(orphan_temp);
+            free(live_child);
+            free(orphan_child);
+        }
+
+#if !defined(_WIN32)
+        /* A symlink or a fifo wearing the staging name is classified without
+         * being followed or read: the link's target survives, the fifo never
+         * holds the probe, and both refuse the removal. */
+        {
+            char *link_target;
+            ovc_file target_handle;
+
+            link_target = ovc_path_join(directory, "link-target.bin");
+            assert(link_target != NULL);
+            target_handle = ovc_file_native_create_new(link_target);
+            assert(target_handle != OVC_INVALID_FILE);
+            assert(ovc_file_native_close(target_handle) == 0);
+            assert(symlink(link_target, staging_temp) == 0);
+            ovc_file_test_delete_directory_refused_naming(
+                &handle,
+                staging_directory_address,
+                OvStoragePlugin_ErrorCode_DirectoryNotEmpty,
+                "not a regular file");
+            assert(ovc_file_native_stat_path(link_target, &staging_info) == 0);
+            assert(ovc_file_native_unlink(staging_temp) == 0);
+            assert(ovc_file_native_unlink(link_target) == 0);
+            free(link_target);
+
+            assert(mkfifo(staging_temp, 0600) == 0);
+            ovc_file_test_delete_directory_refused_naming(
+                &handle,
+                staging_directory_address,
+                OvStoragePlugin_ErrorCode_DirectoryNotEmpty,
+                "not a regular file");
+            assert(ovc_file_native_unlink(staging_temp) == 0);
+
+            /* A fifo whose mode denies read, and a socket: neither can be
+             * opened as a file, and both must still read as not a regular
+             * file rather than as the retryable errno the open gives. */
+            assert(mkfifo(staging_temp, 0200) == 0);
+            ovc_file_test_delete_directory_refused_naming(
+                &handle,
+                staging_directory_address,
+                OvStoragePlugin_ErrorCode_DirectoryNotEmpty,
+                "not a regular file");
+            assert(ovc_file_native_unlink(staging_temp) == 0);
+            {
+                char *socket_path;
+                struct sockaddr_un address;
+                int socket_fd;
+
+                socket_path = ovc_path_join(staging_directory_path,
+                                            ".s.1.2.3.tmp");
+                assert(socket_path != NULL);
+                assert(ovc_file_is_clearable_staging_temp_name(".s.1.2.3.tmp"));
+                socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+                assert(socket_fd >= 0);
+                memset(&address, 0, sizeof(address));
+                address.sun_family = AF_UNIX;
+                if (strlen(socket_path) < sizeof(address.sun_path)) {
+                    memcpy(address.sun_path, socket_path, strlen(socket_path));
+                    assert(bind(socket_fd, (struct sockaddr *)&address,
+                                sizeof(address)) == 0);
+                    ovc_file_test_delete_directory_refused_naming(
+                        &handle,
+                        staging_directory_address,
+                        OvStoragePlugin_ErrorCode_DirectoryNotEmpty,
+                        "not a regular file");
+                    assert(ovc_file_native_unlink(socket_path) == 0);
+                }
+                assert(close(socket_fd) == 0);
+                free(socket_path);
+            }
+
+            /* A regular file whose leading segment is not UTF-8 is an object
+             * on the Rust host; this removal must leave it standing. */
+            {
+                char *foreign_name;
+                ovc_file foreign_handle;
+
+                foreign_name = ovc_path_join(staging_directory_path,
+                                             ".\xFF.1.2.3.tmp");
+                assert(foreign_name != NULL);
+                foreign_handle = ovc_file_native_create_new(foreign_name);
+                assert(foreign_handle != OVC_INVALID_FILE);
+                assert(ovc_file_native_close(foreign_handle) == 0);
+                ovc_file_test_delete_directory_refused(
+                    &handle,
+                    staging_directory_address,
+                    OvStoragePlugin_ErrorCode_DirectoryNotEmpty);
+                assert(ovc_file_native_stat_path(foreign_name, &staging_info) == 0);
+                assert(ovc_file_native_unlink(foreign_name) == 0);
+                free(foreign_name);
+            }
+        }
+
+        /* A copy staged from a write-only source carries that mode; the
+         * probe falls back to a write-only open and the orphan still clears.
+         * Root reads anything, so the case is checked for its premise. */
+        {
+            ovc_file mode_handle;
+
+            mode_handle = ovc_file_native_create_new(staging_temp);
+            assert(mode_handle != OVC_INVALID_FILE);
+            assert(ovc_file_native_close(mode_handle) == 0);
+            assert(chmod(staging_temp, 0200) == 0);
+            mode_handle = ovc_file_native_open_read(staging_temp);
+            if (mode_handle == OVC_INVALID_FILE) {
+                ovc_file_test_delete_directory(&handle,
+                                               staging_directory_address);
+                assert(ovc_file_native_stat_path(staging_temp,
+                                                 &staging_info) != 0);
+                ovc_file_test_create_directory(&handle,
+                                               staging_directory_address);
+            } else {
+                assert(ovc_file_native_close(mode_handle) == 0);
+                assert(ovc_file_native_unlink(staging_temp) == 0);
+            }
+        }
+#endif
+
+        /* The sweep holds one descriptor at a time, so many orphans clear
+         * in one removal; under a reduced descriptor limit this is the case
+         * that discriminates. */
+        {
+            unsigned int index;
+
+            for (index = 0; index < 600; ++index) {
+                char child_name[64];
+                char *many_child;
+                char *many_temp;
+                ovc_file many_handle;
+
+                (void)snprintf(child_name, sizeof(child_name),
+                               "child-%u.bin", index);
+                many_child = ovc_path_join(staging_directory_path, child_name);
+                assert(many_child != NULL);
+                many_temp = ovc_file_temp_sibling(many_child, index);
+                assert(many_temp != NULL);
+                many_handle = ovc_file_native_create_new(many_temp);
+                assert(many_handle != OVC_INVALID_FILE);
+                assert(ovc_file_native_close(many_handle) == 0);
+                free(many_temp);
+                free(many_child);
+            }
+        }
+        ovc_file_test_delete_directory(&handle, staging_directory_address);
+        assert(ovc_file_native_stat_path(staging_directory_path,
+                                         &staging_info) != 0);
         free(staging_temp);
         free(staging_child);
-        free(staging_metadata_directory);
         free(staging_directory_path);
         free(staging_directory_address);
     }
 
+#if defined(_WIN32)
+    {
+        char *real_target_address;
+        char *real_target_path;
+        char *real_target_sentinel;
+        char *vlink_address;
+        char *vlink_path;
+        wchar_t *real_target_wide;
+        wchar_t *vlink_wide;
+        DWORD link_attributes;
+        ovc_file_stat target_info;
+
+        /* Exercise the Win32 no-follow classifier, not just its tag helper:
+         * delete_directory must open the directory symlink itself, identify
+         * its name-surrogate tag, and refuse it without scanning or removing
+         * anything in the target.  The Windows CI runner is elevated; the
+         * unprivileged flag also supports non-elevated development machines
+         * with Developer Mode enabled. */
+        real_target_address = ovc_file_join_address(root_url,
+                                                    "vlink-target",
+                                                    true);
+        ovc_file_test_create_directory(&handle, real_target_address);
+        path_error = NULL;
+        real_target_path = ovc_file_url_to_path(real_target_address,
+                                                &path_error);
+        assert(path_error == NULL);
+        real_target_sentinel = ovc_path_join(real_target_path, "sentinel");
+        assert(real_target_sentinel != NULL);
+        assert(ovc_file_native_mkdir(real_target_sentinel) == 0);
+
+        vlink_address = ovc_file_join_address(root_url, "vlink", true);
+        path_error = NULL;
+        vlink_path = ovc_file_url_to_path(vlink_address, &path_error);
+        assert(path_error == NULL);
+        real_target_wide = ovc_file_utf8_to_wide(real_target_path);
+        vlink_wide = ovc_file_utf8_to_wide(vlink_path);
+        assert(real_target_wide != NULL);
+        assert(vlink_wide != NULL);
+        assert(CreateSymbolicLinkW(
+            vlink_wide,
+            real_target_wide,
+            SYMBOLIC_LINK_FLAG_DIRECTORY |
+                SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE));
+
+        ovc_file_test_delete_directory_refused(
+            &handle,
+            vlink_address,
+            OvStoragePlugin_ErrorCode_InvalidArgument);
+
+        link_attributes = GetFileAttributesW(vlink_wide);
+        assert(link_attributes != INVALID_FILE_ATTRIBUTES);
+        assert((link_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+        assert((link_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
+        assert(ovc_file_native_stat_path(real_target_path, &target_info) == 0);
+        assert(target_info.is_directory);
+        assert(ovc_file_native_stat_path(real_target_sentinel,
+                                         &target_info) == 0);
+        assert(target_info.is_directory);
+
+        assert(RemoveDirectoryW(vlink_wide));
+        assert(ovc_file_native_rmdir(real_target_sentinel) == 0);
+        ovc_file_test_delete_directory(&handle, real_target_address);
+        free(vlink_wide);
+        free(real_target_wide);
+        free(vlink_path);
+        free(vlink_address);
+        free(real_target_sentinel);
+        free(real_target_path);
+        free(real_target_address);
+    }
+#endif
+
 #if !defined(_WIN32)
+    {
+        char *real_target_address;
+        char *real_target_path;
+        char *real_target_sentinel;
+        char *vlink_address;
+        char *vlink_path;
+        struct stat link_info;
+        struct stat target_info;
+
+        /* A link at the addressed path is operator-managed state, so
+         * delete_directory must refuse it before scanning through its
+         * target; the sentinel inside the target proves nothing was
+         * touched. */
+        real_target_address = ovc_file_join_address(root_url,
+                                                    "vlink-target",
+                                                    true);
+        ovc_file_test_create_directory(&handle, real_target_address);
+        path_error = NULL;
+        real_target_path = ovc_file_url_to_path(real_target_address,
+                                                &path_error);
+        assert(path_error == NULL);
+        real_target_sentinel = ovc_path_join(real_target_path, "sentinel");
+        assert(real_target_sentinel != NULL);
+        assert(ovc_file_native_mkdir(real_target_sentinel) == 0);
+
+        vlink_address = ovc_file_join_address(root_url, "vlink", true);
+        path_error = NULL;
+        vlink_path = ovc_file_url_to_path(vlink_address, &path_error);
+        assert(path_error == NULL);
+        assert(symlink(real_target_path, vlink_path) == 0);
+
+        ovc_file_test_delete_directory_refused(
+            &handle,
+            vlink_address,
+            OvStoragePlugin_ErrorCode_InvalidArgument);
+
+        assert(lstat(vlink_path, &link_info) == 0);
+        assert(S_ISLNK(link_info.st_mode));
+        assert(stat(real_target_path, &target_info) == 0);
+        assert(S_ISDIR(target_info.st_mode));
+        assert(stat(real_target_sentinel, &target_info) == 0);
+        assert(S_ISDIR(target_info.st_mode));
+
+        assert(unlink(vlink_path) == 0);
+        assert(rmdir(real_target_sentinel) == 0);
+        ovc_file_test_delete_directory(&handle, real_target_address);
+        free(vlink_path);
+        free(vlink_address);
+        free(real_target_sentinel);
+        free(real_target_path);
+        free(real_target_address);
+    }
+
     {
         char *linked_directory_address;
         char *linked_directory_path;
@@ -11370,13 +12137,11 @@ int main(void)
         ovc_file canary_handle;
         struct stat canary_info;
 
-        /* A symlinked `.ovstorage-meta` ROOT must be removed as the link
-         * itself, never opened: Rust's remove_dir_all never follows a link.
-         * A sweep that opendir'd the symlinked root would recursively
-         * DELETE the link target's tree and report success.  Plant an
-         * outside directory holding a canary, point a symlinked sidecar root
-         * at it, and assert delete_directory succeeds while the canary and
-         * its directory survive untouched. */
+        /* A symlink named `.ovstorage-meta` is ordinary content like any
+         * other entry: delete_directory reports DirectoryNotEmpty and never
+         * opens the link.  Plant an outside directory holding a canary,
+         * point the link at it, and assert the refusal leaves the link, the
+         * canary, and its directory untouched. */
         linked_directory_address = ovc_file_join_address(root_url,
                                                          "linked-meta",
                                                          true);
@@ -11385,8 +12150,8 @@ int main(void)
         linked_directory_path = ovc_file_url_to_path(linked_directory_address,
                                                      &path_error);
         assert(path_error == NULL);
-        linked_metadata_directory = ovc_path_join(
-            linked_directory_path, OVC_FILE_METADATA_DIRECTORY);
+        linked_metadata_directory = ovc_path_join(linked_directory_path,
+                                                  ".ovstorage-meta");
         assert(linked_metadata_directory != NULL);
         outside_directory = ovc_path_join(directory, "sweep-outside");
         assert(outside_directory != NULL);
@@ -11398,13 +12163,18 @@ int main(void)
         assert(ovc_file_native_close(canary_handle) == 0);
         assert(symlink(outside_directory, linked_metadata_directory) == 0);
 
-        ovc_file_test_delete_directory(&handle, linked_directory_address);
+        ovc_file_test_delete_directory_refused(
+            &handle,
+            linked_directory_address,
+            OvStoragePlugin_ErrorCode_DirectoryNotEmpty);
 
-        /* The link target and its canary must be untouched, and the
-         * symlinked sidecar root itself removed. */
+        /* The link, its target, and the canary are all untouched. */
         assert(stat(outside_canary, &canary_info) == 0);
-        assert(lstat(linked_metadata_directory, &canary_info) != 0);
-        assert(errno == ENOENT);
+        assert(lstat(linked_metadata_directory, &canary_info) == 0);
+        assert(S_ISLNK(canary_info.st_mode));
+
+        assert(unlink(linked_metadata_directory) == 0);
+        ovc_file_test_delete_directory(&handle, linked_directory_address);
         assert(unlink(outside_canary) == 0);
         assert(rmdir(outside_directory) == 0);
         free(outside_canary);
@@ -11434,6 +12204,321 @@ int main(void)
         assert(errno == ENOENT);
         free(dangling_path);
         free(dangling_address);
+    }
+
+    /* Ask #2: `stat` on a dangling symlink must report the link itself
+     * (2.x's `native::stat` fell back to `lstat` for exactly this), not
+     * `NotFound` -- the link is a real, present object even though its
+     * target is not. */
+    {
+        char *dangling_address;
+        char *dangling_path;
+        OvStoragePlugin_StatRequest request;
+        ovc_file_test_completion completion;
+        OvStoragePlugin_ObjectInfo *result;
+
+        dangling_address = ovc_file_join_address(root_url,
+                                                  "dangling-stat-link",
+                                                  false);
+        path_error = NULL;
+        dangling_path = ovc_file_url_to_path(dangling_address, &path_error);
+        assert(path_error == NULL);
+        assert(symlink("missing-stat-target", dangling_path) == 0);
+
+        memset(&request, 0, sizeof(request));
+        request.struct_size = sizeof(request);
+        request.address = ovc_file_owned_string(dangling_address);
+        request.options.struct_size = sizeof(request.options);
+        ovc_file_test_completion_init(&completion);
+        handle.vtable->stat(handle.state,
+                            &request,
+                            NULL,
+                            ovc_file_test_complete,
+                            &completion);
+        ovc_file_test_expect_success("stat dangling link", &completion);
+        result = (OvStoragePlugin_ObjectInfo *)completion.result;
+        assert(result != NULL);
+        /* `OvStoragePlugin_ObjectKindV1` has no dedicated symlink kind, so
+         * the fallback's answer is classified `File` like any other
+         * non-directory -- the meaningful check is that this is the
+         * *link's own* lstat, not a failed follow onto the (absent)
+         * target: its reported size is the length of the stored target
+         * path string ("missing-stat-target", 20 bytes), which no real
+         * target file at this address could coincidentally produce, since
+         * none exists. */
+        assert(result->size.present);
+        assert(result->size.value == strlen("missing-stat-target"));
+        ovc_file_object_info_clear(result);
+        ovc_abi_free(result);
+
+        assert(unlink(dangling_path) == 0);
+        free(dangling_path);
+        free(dangling_address);
+    }
+
+    /* Ask #3: a dangling symlink at a copy/rename destination occupies its
+     * directory entry -- `no_overwrite` (`IfDestExistsTag_Fail`) must refuse
+     * to replace it (AlreadyExists), not treat the follow-only ENOENT as
+     * "nothing here" and let the rename/copy clobber the link, and
+     * `if_match_etag` must report a mismatch (PreconditionFailed) rather
+     * than NotFound. */
+    {
+        char *source_address;
+        char *source_path;
+        char *dangling_address;
+        char *dangling_path;
+        OvStoragePlugin_CopyRequest request;
+        ovc_file_test_completion completion;
+        char link_target[64];
+        ssize_t link_length;
+
+        source_address =
+            ovc_file_join_address(root_url, "dangling-precondition-source.txt", false);
+        path_error = NULL;
+        source_path = ovc_file_url_to_path(source_address, &path_error);
+        assert(path_error == NULL);
+        {
+            FILE *f = fopen(source_path, "wb");
+            assert(f != NULL);
+            assert(fwrite("payload", 1, 7, f) == 7);
+            assert(fclose(f) == 0);
+        }
+
+        dangling_address =
+            ovc_file_join_address(root_url, "dangling-precondition-dest", false);
+        path_error = NULL;
+        dangling_path = ovc_file_url_to_path(dangling_address, &path_error);
+        assert(path_error == NULL);
+        assert(symlink("missing-precondition-target", dangling_path) == 0);
+
+        memset(&request, 0, sizeof(request));
+        request.struct_size = sizeof(request);
+        request.source = ovc_file_owned_string(source_address);
+        request.destination = ovc_file_owned_string(dangling_address);
+        request.options.struct_size = sizeof(request.options);
+        request.options.if_dest.tag = OvStoragePlugin_IfDestExistsTag_Fail;
+        ovc_file_test_completion_init(&completion);
+        handle.vtable->copy(handle.state,
+                            &request,
+                            NULL,
+                            ovc_file_test_complete,
+                            &completion);
+        ovc_file_test_completion_wait(&completion);
+        if (completion.status != OvStoragePlugin_FFI_STATUS_ERR ||
+            completion.error == NULL ||
+            completion.error->code != OvStoragePlugin_ErrorCode_AlreadyExists) {
+            (void)fprintf(stderr,
+                          "no_overwrite copy onto a dangling destination "
+                          "link: status=%d code=%d (expected refusal with "
+                          "AlreadyExists)\n",
+                          (int)completion.status,
+                          completion.error == NULL
+                              ? -1
+                              : (int)completion.error->code);
+            (void)fflush(stderr);
+        }
+        assert(completion.status == OvStoragePlugin_FFI_STATUS_ERR);
+        assert(completion.error != NULL);
+        assert(completion.error->code == OvStoragePlugin_ErrorCode_AlreadyExists);
+        assert(completion.result == NULL);
+        ovc_file_error_destroy(completion.error);
+
+        /* The link itself, not a real file, must still occupy the
+         * destination, and it must still point at its original target. */
+        errno = 0;
+        link_length = readlink(dangling_path, link_target, sizeof(link_target) - 1);
+        assert(link_length > 0);
+        link_target[link_length] = '\0';
+        assert(strcmp(link_target, "missing-precondition-target") == 0);
+
+        memset(&request, 0, sizeof(request));
+        request.struct_size = sizeof(request);
+        request.source = ovc_file_owned_string(source_address);
+        request.destination = ovc_file_owned_string(dangling_address);
+        request.options.struct_size = sizeof(request.options);
+        request.options.if_dest.tag =
+            OvStoragePlugin_IfDestExistsTag_MatchEtag;
+        request.options.if_dest.match_etag.etag =
+            ovc_file_owned_string("stale-etag");
+        ovc_file_test_completion_init(&completion);
+        handle.vtable->copy(handle.state,
+                            &request,
+                            NULL,
+                            ovc_file_test_complete,
+                            &completion);
+        ovc_file_test_completion_wait(&completion);
+        if (completion.status != OvStoragePlugin_FFI_STATUS_ERR ||
+            completion.error == NULL ||
+            completion.error->code !=
+                OvStoragePlugin_ErrorCode_PreconditionFailed) {
+            (void)fprintf(stderr,
+                          "if_match_etag copy onto a dangling destination "
+                          "link: status=%d code=%d (expected refusal with "
+                          "PreconditionFailed)\n",
+                          (int)completion.status,
+                          completion.error == NULL
+                              ? -1
+                              : (int)completion.error->code);
+            (void)fflush(stderr);
+        }
+        assert(completion.status == OvStoragePlugin_FFI_STATUS_ERR);
+        assert(completion.error != NULL);
+        assert(completion.error->code ==
+               OvStoragePlugin_ErrorCode_PreconditionFailed);
+        assert(completion.result == NULL);
+        ovc_file_error_destroy(completion.error);
+
+        errno = 0;
+        link_length = readlink(dangling_path, link_target, sizeof(link_target) - 1);
+        assert(link_length > 0);
+        link_target[link_length] = '\0';
+        assert(strcmp(link_target, "missing-precondition-target") == 0);
+
+        assert(unlink(dangling_path) == 0);
+        assert(unlink(source_path) == 0);
+        free(dangling_path);
+        free(dangling_address);
+        free(source_path);
+        free(source_address);
+    }
+
+    /* Ask #1: a listing must not fail entirely because one entry (here, a
+     * dangling symlink) cannot be stat'd -- it should be skipped, and every
+     * other entry still reported. */
+    {
+        char *ok_address;
+        char *ok_path;
+        char *broken_address;
+        char *broken_path;
+        OvStoragePlugin_ListRequest request;
+        ovc_file_test_completion completion;
+        OvStoragePlugin_ListPage *page;
+        bool saw_ok_entry;
+        size_t index;
+
+        ok_address = ovc_file_join_address(root_url, "listing-ok.txt", false);
+        path_error = NULL;
+        ok_path = ovc_file_url_to_path(ok_address, &path_error);
+        assert(path_error == NULL);
+        {
+            FILE *f = fopen(ok_path, "wb");
+            assert(f != NULL);
+            assert(fclose(f) == 0);
+        }
+
+        broken_address =
+            ovc_file_join_address(root_url, "listing-broken-link", false);
+        path_error = NULL;
+        broken_path = ovc_file_url_to_path(broken_address, &path_error);
+        assert(path_error == NULL);
+        assert(symlink("missing-listing-target", broken_path) == 0);
+
+        memset(&request, 0, sizeof(request));
+        request.struct_size = sizeof(request);
+        request.prefix = ovc_file_owned_string(root_url);
+        request.options.struct_size = sizeof(request.options);
+        ovc_file_test_completion_init(&completion);
+        handle.vtable->list(handle.state,
+                            &request,
+                            NULL,
+                            ovc_file_test_complete,
+                            &completion);
+        ovc_file_test_expect_success("list with a dangling entry", &completion);
+        page = (OvStoragePlugin_ListPage *)completion.result;
+        assert(page != NULL);
+        saw_ok_entry = false;
+        for (index = 0; index < page->items.len; ++index) {
+            char *item_address =
+                ovc_file_string_from_slice(&page->items.ptr[index].address);
+            assert(item_address != NULL);
+            assert(strcmp(item_address, broken_address) != 0);
+            if (strcmp(item_address, ok_address) == 0) {
+                saw_ok_entry = true;
+            }
+            free(item_address);
+            ovc_file_object_info_clear(&page->items.ptr[index]);
+        }
+        assert(saw_ok_entry);
+        ovc_abi_free(page->items.ptr);
+        if (page->next_page_token.present) {
+            ovc_file_str_clear(&page->next_page_token.value);
+        }
+        ovc_abi_free(page);
+
+        assert(unlink(broken_path) == 0);
+        assert(unlink(ok_path) == 0);
+        free(broken_path);
+        free(broken_address);
+        free(ok_path);
+        free(ok_address);
+    }
+#endif
+
+#if defined(_WIN32)
+    {
+        /* The dangling-link fallback (`ovc_file_native_stat_path_or_link`)
+         * must perform an exact, no-follow lookup of the requested path and
+         * never hand it to a directory-enumeration API: `*` and `?` are
+         * wildcards to `FindFirstFileW`, so a literal address containing
+         * one could otherwise match and disclose an unrelated sibling
+         * file's metadata.  Neither `*` nor `?` can appear in a real
+         * Windows filename, so the exact-match first lookup always fails
+         * for this address and the fallback always runs; the only question
+         * is whether it answers with the wildcard's absence (correct) or
+         * with a sibling file's stat (the leak this test guards against). */
+        char *victim_address;
+        char *victim_path;
+        char *probe_address;
+        FILE *victim_file;
+        OvStoragePlugin_StatRequest request;
+        ovc_file_test_completion completion;
+
+        victim_address =
+            ovc_file_join_address(root_url, "secret.txt", false);
+        path_error = NULL;
+        victim_path = ovc_file_url_to_path(victim_address, &path_error);
+        assert(path_error == NULL);
+        victim_file = ovc_file_test_fopen(victim_path, "wb");
+        assert(victim_file != NULL);
+        assert(fwrite("s3cr3t-payload", 1, 14, victim_file) == 14);
+        assert(fclose(victim_file) == 0);
+
+        probe_address = ovc_file_join_address(root_url, "secret*", false);
+
+        memset(&request, 0, sizeof(request));
+        request.struct_size = sizeof(request);
+        request.address = ovc_file_owned_string(probe_address);
+        request.options.struct_size = sizeof(request.options);
+        ovc_file_test_completion_init(&completion);
+        handle.vtable->stat(handle.state,
+                            &request,
+                            NULL,
+                            ovc_file_test_complete,
+                            &completion);
+        ovc_file_test_completion_wait(&completion);
+        if (completion.status != OvStoragePlugin_FFI_STATUS_ERR ||
+            completion.error == NULL ||
+            completion.error->code != OvStoragePlugin_ErrorCode_NotFound) {
+            (void)fprintf(stderr,
+                          "stat of a literal wildcard address must report "
+                          "NotFound, not disclose a sibling file's "
+                          "metadata: status=%d code=%d\n",
+                          (int)completion.status,
+                          completion.error == NULL
+                              ? -1
+                              : (int)completion.error->code);
+            (void)fflush(stderr);
+        }
+        assert(completion.status == OvStoragePlugin_FFI_STATUS_ERR);
+        assert(completion.error != NULL);
+        assert(completion.error->code == OvStoragePlugin_ErrorCode_NotFound);
+        assert(completion.result == NULL);
+        ovc_file_error_destroy(completion.error);
+
+        assert(ovc_file_native_unlink(victim_path) == 0);
+        free(victim_path);
+        free(victim_address);
+        free(probe_address);
     }
 #endif
 
@@ -11478,7 +12563,6 @@ int main(void)
                    move_destination_path,
                    NULL,
                    OvStoragePlugin_IfDestExistsTag_Overwrite,
-                   NULL,
                    NULL,
                    true,
                    &moved_info,

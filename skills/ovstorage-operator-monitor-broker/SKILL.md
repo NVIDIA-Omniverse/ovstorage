@@ -38,11 +38,12 @@ trail.
    - `broker_authz_decisions_total{outcome}` — labels are
      `allow`, `deny`, `error`.
    - `broker_watch_fanout` (gauge) — **dormant.**
-   - `broker_policy_epoch_advances_total` — increments per
-     successful SIGHUP reload.
    - `broker_redirect_emissions_total{kind}` — labels are
      `read`, `write`. Increments at every fixture-driven and
      plugin-driven redirect emission site.
+   - `broker_continuation_seal_refusals_total{reason}` — labels are
+     `malformed`, `tag`, `mac`. All three series start at zero. `mac`
+     includes wrong-key, wrong-address, and edited-envelope failures.
    - `broker_lifecycle_events_total{event}` — labels are
      `reload_ok`, `reload_failed`, `drain_start`,
      `drain_complete`.
@@ -102,9 +103,13 @@ credential bytes, or usable signed URLs.
 - `rate(ovstorage_auth_decisions_total{outcome="error"}[5m]) > 0` —
   the built-in auth Layer returned evaluation errors (not denies). Check the
   active policy and listener authentication configuration.
-- `broker_uptime_seconds` reset implies a restart — pair with
-  `broker_policy_epoch_advances_total` to distinguish a clean
-  reload-induced advance from a process crash.
+- `broker_uptime_seconds` reset implies a process restart. Successful
+  in-process reloads increment
+  `broker_lifecycle_events_total{event="reload_ok"}` instead.
+- `rate(broker_continuation_seal_refusals_total{reason="mac"}[5m]) > 0`
+  — check for a mismatched shared key or an incomplete key rotation when the
+  failures concentrate on part of a replica fleet. Address substitution and
+  continuation edits produce the same reason.
 - `rate(broker_redirect_emissions_total{kind="write"}[5m])` falling
   to zero on a route that previously emitted them suggests the
   plugin can no longer mint redirects (and the broker is falling

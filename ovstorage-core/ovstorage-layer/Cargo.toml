@@ -15,17 +15,30 @@ futures = "0.3.32"
 parking_lot = "0.12.5"
 percent-encoding = "2.3.2"
 regex = "1.12.3"
+serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.52.3", features = ["sync"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
+toml = "0.8.23"
 tracing = "0.1.44"
 url = "2.5.8"
 zeroize = "1.8.2"
 
 [dev-dependencies]
+# Pinned exactly: bench baselines and CI trend extraction read criterion's
+# on-disk output layout, which is stable in practice but undocumented.
+criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
 tokio = { version = "1.52.3", features = ["macros", "rt", "test-util", "time"] }
 
 [lib]
+# `cargo bench` must not run the libtest lib harness: it rejects
+# criterion-only CLI flags such as `--quick` and `--save-baseline`.
+bench = false
 path = "src/lib.rs"
+
+# Criterion provides `main`; see the bench's module docs for what it prices.
+[[bench]]
+harness = false
+name = "address"
 
 [lints]
 workspace = true

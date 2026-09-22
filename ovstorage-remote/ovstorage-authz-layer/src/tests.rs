@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ovstorage::fallback::{is_scheme_fallback_root, scheme_fallback_root};
 use ovstorage::layers::ALIAS_KIND;
 use ovstorage::wrappers::ext;
 use ovstorage::{
@@ -82,6 +83,12 @@ struct RecordingInner {
     calls: Mutex<Vec<(&'static str, Option<String>)>>,
     list_items: Vec<Url>,
     roots: Vec<Url>,
+    /// The marked scheme root a fallback-serving backend reports for an address
+    /// no configured root covers. When set, `root_info_for` answers it for
+    /// every address and `list_address_roots` publishes it after `roots`, so
+    /// the gate is exercised against a hidden root the inner itself reports
+    /// rather than one synthesised from the probed address.
+    scheme_root: Option<RootInfo>,
     /// Update-stream changes the recording inner emits from
     /// `list_address_roots`; empty → no stream (the common case), non-empty → a
     /// `Some(stream)` yielding these `RootInfoChange`s (stream-filter test).
@@ -196,7 +203,7 @@ impl Layer for RecordingInner {
         _cancel: Option<CancellationToken>,
     ) -> Result<RootInfo> {
         self.rec("root_info_for", Some(url));
-        Ok(test_root(url))
+        Ok(self.scheme_root.clone().unwrap_or_else(|| test_root(url)))
     }
 
     fn list_kinds(&self, _cx: &Extensions) -> Result<Vec<LayerKindDescriptor>> {
@@ -219,7 +226,12 @@ impl Layer for RecordingInner {
         };
         Ok((
             RootInfoSnapshot {
-                roots: self.roots.iter().map(test_root).collect(),
+                roots: self
+                    .roots
+                    .iter()
+                    .map(test_root)
+                    .chain(self.scheme_root.clone())
+                    .collect(),
                 updates: updates.is_some(),
             },
             updates,
@@ -521,6 +533,7 @@ fn canned_connection(backend_kind: &str) -> Connection {
         auth_state: ovstorage::ConnectionAuthState::Anonymous,
         last_probed: None,
         user_metadata: UserMetadata::default(),
+        owning_target: None,
     }
 }
 
@@ -3961,4 +3974,264 @@ async fn watch_authorization_does_not_depend_on_recursion() {
             "an ungranted prefix must be refused with recursive={recursive}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Anonymous scheme fallback: routability is not authority
+//
+// A backend granted the anonymous fallback publishes a hidden, marked scheme
+// root (`s3:///`) that routes every unconfigured bucket. The gate sits above
+// routing and judges the caller's address, so the tier changes what is
+// reachable and nothing about what is authorized: a deny-all policy stops a
+// fallback-reachable address before any layer below is consulted, a bucket
+// grant covers that bucket alone, and the scheme root is visible only to a
+// principal whose rule is written on the bare scheme — a rule that covers no
+// bucket.
+// ---------------------------------------------------------------------------
+
+/// The marked `s3:///` root a fallback-granted S3 layer publishes.
+fn marked_s3_root() -> RootInfo {
+    let root = scheme_fallback_root("s3", "s3", Capabilities::empty(), None).unwrap();
+    assert!(is_scheme_fallback_root(&root));
+    root
+}
+
+/// A recording inner that serves the `s3://public/` bucket and the hidden
+/// scheme fallback root beside it.
+fn fallback_inner() -> Arc<RecordingInner> {
+    Arc::new(RecordingInner {
+        roots: vec![url("s3://public/")],
+        scheme_root: Some(marked_s3_root()),
+        ..RecordingInner::default()
+    })
+}
+
+/// `uid:7` may read and list `s3://public/` and nothing else.
+const UID7_PUBLIC_BUCKET: &str = r#"
+    [[policy]]
+    id = "public-bucket"
+    effect = "allow"
+    principal = "uid:7"
+    operations = ["read", "list"]
+    prefix = "s3://public/"
+"#;
+
+/// `uid:7` may enumerate roots, and may read and list `s3://public/`.
+const UID7_ROOTS_AND_PUBLIC_BUCKET: &str = r#"
+    [[policy]]
+    id = "roots-introspect"
+    effect = "allow"
+    principal = "uid:7"
+    operations = ["list_address_roots"]
+    prefix = "*"
+
+    [[policy]]
+    id = "public-bucket"
+    effect = "allow"
+    principal = "uid:7"
+    operations = ["read", "list"]
+    prefix = "s3://public/"
+"#;
+
+/// `uid:7` may enumerate roots, and may read and list the bare `s3://` scheme.
+const UID7_ROOTS_AND_BARE_SCHEME: &str = r#"
+    [[policy]]
+    id = "roots-introspect"
+    effect = "allow"
+    principal = "uid:7"
+    operations = ["list_address_roots"]
+    prefix = "*"
+
+    [[policy]]
+    id = "bare-scheme"
+    effect = "allow"
+    principal = "uid:7"
+    operations = ["read", "list"]
+    prefix = "s3://"
+"#;
+
+/// A `stat` for `uid = 7` against `address`.
+fn stat_of(address: &str) -> Request<StatRequest> {
+    auth_request(
+        &uds_credential(7),
+        StatRequest {
+            address: url(address),
+            options: StatOptions::default(),
+        },
+    )
+}
+
+/// A `read` for `uid = 7` against `address`.
+fn read_of(address: &str) -> Request<ReadRequest> {
+    auth_request(
+        &uds_credential(7),
+        ReadRequest {
+            address: url(address),
+            options: ReadOptions::default(),
+        },
+    )
+}
+
+/// Deny-by-default holds for an address only the fallback tier could route:
+/// the gate refuses it before any layer below is consulted, so a denied caller
+/// can never cause an anonymous outbound request.
+#[tokio::test]
+async fn a_fallback_reachable_address_is_denied_before_the_inner_stack_is_consulted() {
+    let (inner, layer) = deny_all_pair();
+
+    let err = layer.stat(stat_of("s3://x/y"), None).await.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::PermissionDenied);
+    let err = layer.read(read_of("s3://x/y"), None).await.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::PermissionDenied);
+    assert_eq!(
+        inner.call_count(),
+        0,
+        "a deny must not reach the stack below"
+    );
+}
+
+/// A bucket grant is exactly a bucket grant: it lets a read reach the stack
+/// below for that bucket, and covers neither a sibling bucket the tier would
+/// route just as readily nor the scheme root the tier publishes.
+#[tokio::test]
+async fn a_bucket_grant_lets_a_read_reach_the_inner_stack_but_not_a_sibling_bucket() {
+    let inner = Arc::new(RecordingInner::default());
+    let layer = builtin_layer(inner.clone(), policy(UID7_PUBLIC_BUCKET));
+
+    layer
+        .read(read_of("s3://public/k"), None)
+        .await
+        .expect("the granted bucket is readable");
+    assert!(
+        inner.saw("read"),
+        "the granted read reaches the stack below"
+    );
+    assert_eq!(inner.call_count(), 1);
+
+    for address in ["s3://other/k", "s3://publicx/k", "s3:///"] {
+        let err = layer.read(read_of(address), None).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::PermissionDenied, "{address}");
+    }
+    assert_eq!(
+        inner.call_count(),
+        1,
+        "an ungranted bucket must not reach the stack below"
+    );
+}
+
+/// The inner reports the hidden marked scheme root for an address it routes
+/// through the tier. A caller with no rule covering that address sees the
+/// router's own `NoRoute`, byte for byte, never `PermissionDenied`: the tier
+/// must not turn the gate into an existence probe for buckets it would route.
+/// A caller whose rule covers the address receives the marked root verbatim.
+#[tokio::test]
+async fn root_info_for_on_an_ungranted_address_is_noroute_not_permission_denied() {
+    let inner = fallback_inner();
+    let layer = builtin_layer(inner.clone(), policy(UID7_PUBLIC_BUCKET));
+
+    let err = layer
+        .root_info_for(&url("s3://x/y"), &auth_cx(&uds_credential(7)), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        ErrorCode::NoRoute,
+        "a hidden root must be indistinguishable from an absent one"
+    );
+    assert_eq!(err.message(), "no route matches address");
+    assert_eq!(
+        inner.call_count(),
+        0,
+        "a hidden probe must not reach the stack below"
+    );
+
+    // The same address under a rule that covers it: the gate passes the marked
+    // root through untouched, connection-less and hidden as published.
+    let covering = r#"
+        [[policy]]
+        id = "x-bucket"
+        effect = "allow"
+        principal = "uid:7"
+        operations = ["read"]
+        prefix = "s3://x/"
+    "#;
+    let inner = fallback_inner();
+    let layer = builtin_layer(inner.clone(), policy(covering));
+    let root = layer
+        .root_info_for(&url("s3://x/y"), &auth_cx(&uds_credential(7)), None)
+        .await
+        .expect("a covered address reaches the stack below");
+    assert!(is_scheme_fallback_root(&root));
+    assert_eq!(root.root.as_str(), "s3:///");
+    assert_eq!(root.connection_id, None);
+    assert_eq!(root.visibility, AddressVisibility::Hidden);
+    assert!(inner.saw("root_info_for"));
+}
+
+/// The scheme root is hidden and a bucket grant does not cover it, so a
+/// principal holding only a bucket rule sees that bucket's root and nothing
+/// else: the listing never hints that the tier exists.
+#[tokio::test]
+async fn the_hidden_scheme_root_is_withheld_from_list_address_roots_without_a_covering_rule() {
+    let inner = fallback_inner();
+    let layer = builtin_layer(inner.clone(), policy(UID7_ROOTS_AND_PUBLIC_BUCKET));
+
+    let (snapshot, _) = layer
+        .list_address_roots(&auth_cx(&uds_credential(7)), None)
+        .await
+        .unwrap();
+    let listed: Vec<&str> = snapshot
+        .roots
+        .iter()
+        .map(|root| root.root.as_str())
+        .collect();
+    assert_eq!(listed, ["s3://public/"]);
+    assert!(
+        inner.saw("list_address_roots"),
+        "the filter runs over what the stack below published"
+    );
+}
+
+/// A rule on the bare scheme is the one spelling that makes the scheme root
+/// visible, and it is exactly that narrow: the root is listed verbatim, still
+/// hidden and marked, while a bucket's own root stays withheld and a read or
+/// a probe on any bucket stays denied.
+#[tokio::test]
+async fn a_bare_scheme_rule_lists_the_scheme_root_and_grants_nothing_on_a_bucket() {
+    let inner = fallback_inner();
+    let layer = builtin_layer(inner.clone(), policy(UID7_ROOTS_AND_BARE_SCHEME));
+
+    let (snapshot, _) = layer
+        .list_address_roots(&auth_cx(&uds_credential(7)), None)
+        .await
+        .unwrap();
+    let listed: Vec<&str> = snapshot
+        .roots
+        .iter()
+        .map(|root| root.root.as_str())
+        .collect();
+    assert_eq!(listed, ["s3:///"]);
+    let root = &snapshot.roots[0];
+    assert!(is_scheme_fallback_root(root));
+    assert_eq!(root.visibility, AddressVisibility::Hidden);
+    assert!(!root.visible);
+
+    let before = inner.call_count();
+    for address in ["s3://public/k", "s3://other/k"] {
+        let err = layer.read(read_of(address), None).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::PermissionDenied, "{address}");
+    }
+    let probe = layer
+        .root_info_for(&url("s3://public/k"), &auth_cx(&uds_credential(7)), None)
+        .await;
+    assert_eq!(
+        probe.err().map(|error| error.code()),
+        Some(ErrorCode::NoRoute),
+        "the bare rule covers no bucket, so a bucket probe is hidden too"
+    );
+    assert_eq!(
+        inner.call_count(),
+        before,
+        "a bare-scheme rule must not let a bucket read or probe through"
+    );
 }

@@ -274,6 +274,7 @@ impl RecordingStreamLayer {
             auth_state: ConnectionAuthState::Anonymous,
             last_probed: Some(SystemTime::now()),
             user_metadata: UserMetadata::new(),
+            owning_target: None,
         };
         *self.connection.lock().expect("recording connection") = Some(RecordingConnection {
             root,
@@ -474,6 +475,7 @@ pub fn recording_stream_connection_request(prefix: &str) -> ConnectionRequest {
 
 fn dummy_info(address: Url, size: u64) -> ObjectInfo {
     ObjectInfo {
+        etag_strength: Default::default(),
         address,
         kind: ObjectKind::File,
         etag: None,
@@ -485,6 +487,7 @@ fn dummy_info(address: Url, size: u64) -> ObjectInfo {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 

@@ -34,6 +34,14 @@ and pointers.
   (header regeneration, format, license/advisory/clippy, skill frontmatter,
   `cargo test`). Don't paper over a missed cancel plumb-through with a
   leading underscore.
+- **Layer ownership is registered, not inferred.** Which Layer owns a
+  concern is recorded in
+  [`../plugin-storage/OWNERSHIP.md`](../plugin-storage/OWNERSHIP.md)
+  and checked against the tree by `make lint-layer-ownership`. A slot
+  listed there as host-owned stays at its trait default in a backend
+  Layer, and a new `Capabilities` bit needs a registry row. Moving a
+  boundary is allowed and means editing the row in the same change
+  that moves the code.
 - **Streaming-seam tests are mandatory.** If your change adds a seam
   through which a `Body::Stream` flows — a new plugin, a new
   transport, a new cross-process boundary — add a
@@ -101,6 +109,13 @@ and pointers.
   same surface. Some application helpers compose multiple Layer calls, while
   some Layer calls exist only for routing or lifecycle. See
   [README § Surface boundary](README.md#surface-boundary--host-apis-vs-plugin-layer).
+- Host-owned behavior is not in a backend plugin. Local
+  materialization, retry, caching, redirect following, alias
+  rewriting, and `copy` / `rename` fallback live in wrapper Layers the
+  host composes above the backend. An `Unsupported` answer from a
+  backend for one of those slots is the contract working, not a gap
+  to fill. See
+  [`../plugin-storage/OWNERSHIP.md`](../plugin-storage/OWNERSHIP.md).
 - Conformance scenarios are not free-form scripts. They live in the
   `ScenarioRegistry`. Adding a new behavior means a new registry
   entry, not new test-only config keys. See

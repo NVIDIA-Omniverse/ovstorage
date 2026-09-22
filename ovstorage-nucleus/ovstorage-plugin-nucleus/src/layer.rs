@@ -33,6 +33,30 @@ use crate::config::{
 };
 use crate::driver::NucleusDriver;
 
+/// Adapt one complete omni1 `list2` result into the pull-based Layer stream.
+///
+/// `list2` has no continuation cursor, so the vector (and therefore one whole
+/// directory level) remains resident until the consumer drains or drops the
+/// stream. Each poll releases at most one entry and observes the token supplied
+/// when the stream was opened.
+fn stream_complete_list(items: Vec<ObjectInfo>, cancel: Option<CancellationToken>) -> ListStream {
+    Box::pin(futures::stream::unfold(
+        (items.into_iter(), cancel, false),
+        |(mut items, cancel, finished)| async move {
+            if finished {
+                return None;
+            }
+            if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                return Some((
+                    Err(Error::new(ErrorCode::Cancelled, "cancelled by host")),
+                    (items, cancel, true),
+                ));
+            }
+            items.next().map(|item| (Ok(item), (items, cancel, false)))
+        },
+    ))
+}
+
 /// The static backend descriptor; converted to the v2 `LayerKindDescriptor`
 /// via `descriptor_to_layer_kind` at the factory/layer surface.
 pub(crate) fn kind_descriptor() -> StorageBackendKindDescriptor {
@@ -264,6 +288,12 @@ impl NucleusLayer {
             },
             last_probed: None,
             user_metadata: UserMetadata::new(),
+            // This layer owns the connection, and its instance name is the
+            // `ConnectionKey::target` that reaches it -- the same name
+            // `owned_targets` reports and `remove_connection` gates on. Stamped
+            // at construction so the row carries it wherever it goes, including
+            // out of `ConnectionSet`'s change stream.
+            owning_target: Some(self.name.clone()),
         };
         // `ConnectionSet` validates (via the driver) and records auth state; a
         // soft obtain/verify failure parks the connection (`AwaitingAuth`)
@@ -666,6 +696,36 @@ impl Layer for NucleusLayer {
         paginate_list_items(items, max_results, page_token)
     }
 
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        if request.input.options.max_results.is_some() || request.input.options.page_token.is_some()
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+
+        // omni1 `list2` is a complete one-level fetch with no wire cursor. The
+        // stream is still pull-based between entries, but its unavoidable
+        // protocol-level residency is the complete fetched directory level.
+        // Preserve the backend's recursive refusal by passing that option
+        // through unchanged, exactly as buffered `list` does.
+        let options = request.input.options;
+        let stream_cancel = cancel.clone();
+        let items = self
+            .recover(&request.input.prefix, move |instance, target| {
+                let options = options.clone();
+                let cancel = cancel.clone();
+                async move { instance.backend.list(target, options, cancel).await }
+            })
+            .await?;
+        Ok(stream_complete_list(items, stream_cancel))
+    }
+
     async fn list_versions(
         &self,
         request: Request<ListVersionsRequest>,
@@ -924,6 +984,12 @@ impl Layer for NucleusLayer {
             },
             last_probed: None,
             user_metadata: UserMetadata::new(),
+            // This layer owns the connection, and its instance name is the
+            // `ConnectionKey::target` that reaches it -- the same name
+            // `owned_targets` reports and `remove_connection` gates on. Stamped
+            // at construction so the row carries it wherever it goes, including
+            // out of `ConnectionSet`'s change stream.
+            owning_target: Some(self.name.clone()),
         };
         let outcome = self
             .connection_set
@@ -1140,6 +1206,7 @@ impl Layer for NucleusLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt as _;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
 
@@ -1978,6 +2045,118 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
     }
 
+    #[tokio::test]
+    async fn list_stream_yields_complete_fetch_and_cancels_between_entries() {
+        let (mock, _handshakes) = install_mock_handshake();
+        let layer = empty_layer().await;
+        add(&layer, api_token_request("srv")).await;
+        clear_handshake_override();
+
+        enqueue_three_entry_listing(&mock);
+        let stream = layer
+            .list_stream(
+                Request::new(ListRequest {
+                    prefix: address::parse("omniverse://srv/Users/alice/").unwrap(),
+                    options: ListOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .expect("the complete one-level fetch opens a stream");
+        let addresses: Vec<_> = stream
+            .map(|item| item.expect("streamed entry succeeds").address)
+            .collect()
+            .await;
+        assert_eq!(
+            addresses.iter().map(Url::as_str).collect::<Vec<_>>(),
+            vec![
+                "omniverse://srv/Users/alice/a.usd",
+                "omniverse://srv/Users/alice/b.usd",
+                "omniverse://srv/Users/alice/c.usd",
+            ]
+        );
+
+        enqueue_three_entry_listing(&mock);
+        let cancel = CancellationToken::new();
+        let mut stream = layer
+            .list_stream(
+                Request::new(ListRequest {
+                    prefix: address::parse("omniverse://srv/Users/alice/").unwrap(),
+                    options: ListOptions::default(),
+                }),
+                Some(cancel.clone()),
+            )
+            .await
+            .expect("the complete one-level fetch opens a stream");
+
+        let first = stream
+            .next()
+            .await
+            .expect("the listing has a first entry")
+            .expect("the first entry succeeds");
+        assert_eq!(first.address.as_str(), "omniverse://srv/Users/alice/a.usd");
+
+        cancel.cancel();
+        let error = stream
+            .next()
+            .await
+            .expect("cancellation is observable")
+            .expect_err("a fired token stops before the next entry");
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert!(stream.next().await.is_none(), "cancellation is terminal");
+    }
+
+    #[tokio::test]
+    async fn list_stream_rejects_paging_and_preserves_recursive_refusal() {
+        let layer = empty_layer().await;
+        for options in [
+            ListOptions {
+                max_results: Some(1),
+                ..ListOptions::default()
+            },
+            ListOptions {
+                page_token: Some("offset".into()),
+                ..ListOptions::default()
+            },
+        ] {
+            let error = match layer
+                .list_stream(
+                    Request::new(ListRequest {
+                        prefix: address::parse("omniverse://srv/Users/alice/").unwrap(),
+                        options,
+                    }),
+                    None,
+                )
+                .await
+            {
+                Ok(_) => panic!("list_stream must reject caller paging"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        }
+
+        let (_mock, _handshakes) = install_mock_handshake();
+        add(&layer, api_token_request("srv")).await;
+        clear_handshake_override();
+        let error = match layer
+            .list_stream(
+                Request::new(ListRequest {
+                    prefix: address::parse("omniverse://srv/Users/alice/").unwrap(),
+                    options: ListOptions {
+                        recursive: true,
+                        ..ListOptions::default()
+                    },
+                }),
+                None,
+            )
+            .await
+        {
+            Ok(_) => panic!("recursive Nucleus list_stream must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ErrorCode::Unsupported);
+    }
+
     /// `continue_write`'s finalization is replayable (keyed by content_id):
     /// a `TOKEN_EXPIRED` at finalize time refreshes once and retries instead
     /// of stranding fully-uploaded multipart content.
@@ -1992,6 +2171,13 @@ mod tests {
         add(&layer, api_token_request("srv")).await;
         clear_handshake_override();
 
+        // The finalize ensures the parent folder first; the recovered re-run
+        // finds it in the connection's set, so one frame serves both passes.
+        mock.enqueue(CannedResponse {
+            interface: "Connection".into(),
+            method: "create_directory".into(),
+            frames: vec![RawFrame::from_json(&json!({"status": "OK", "ts": {}}))],
+        });
         mock.enqueue(CannedResponse {
             interface: "Connection".into(),
             method: "create_asset".into(),

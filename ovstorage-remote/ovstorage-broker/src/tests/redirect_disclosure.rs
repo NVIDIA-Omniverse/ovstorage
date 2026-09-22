@@ -334,6 +334,7 @@ async fn a_later_round_declaring_a_broader_credential_is_refused() {
         .await
         .expect("round one is request-scoped and delegable");
     assert_eq!(batch.redirects.len(), 1);
+    let continuation_seal_key = permissive.continuation_seal_key();
 
     // The same upload, continued against a broker whose backend now declares
     // the broader credential: the second round is refused, and hard, because
@@ -345,7 +346,8 @@ async fn a_later_round_declaring_a_broader_credential_is_refused() {
             config
         })
         .build_broker()
-        .await;
+        .await
+        .with_continuation_seal_key(continuation_seal_key);
     let results = RedirectResultBatch {
         results: batch
             .redirects

@@ -1111,6 +1111,7 @@ fn conn(id: &str) -> Connection {
         auth_state: ConnectionAuthState::Anonymous,
         last_probed: None,
         user_metadata: UserMetadata::new(),
+        owning_target: None,
     }
 }
 

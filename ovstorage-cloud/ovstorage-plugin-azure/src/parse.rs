@@ -19,8 +19,8 @@ use std::time::SystemTime;
 
 use base64::Engine as _;
 use ovstorage_plugin::{
-    ChecksumAlgorithm, ChecksumSet, Error, ErrorCode, ObjectInfo, ObjectKind, Result,
-    SystemMetadata, Url, UserMetadata, address,
+    ChecksumAlgorithm, ChecksumSet, Error, ErrorCode, EtagStrength, ObjectInfo, ObjectKind, Result,
+    SystemMetadata, Url, UserMetadata, address, normalize_optional_wire_etag, normalize_wire_etag,
 };
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -53,7 +53,7 @@ pub(crate) fn parse_object_info(
     headers: &HeaderMap,
     include_hns_headers: bool,
 ) -> Result<ObjectInfo> {
-    let etag = headers.first("etag").map(strip_quotes);
+    let (etag, etag_strength) = normalize_optional_wire_etag(headers.first("etag"));
     let version = headers.first("x-ms-version-id").map(str::to_string);
     let size = headers.first("content-length").and_then(|s| s.parse().ok());
     let mtime = headers
@@ -113,6 +113,7 @@ pub(crate) fn parse_object_info(
         _ => ObjectKind::File,
     };
     Ok(ObjectInfo {
+        etag_strength,
         address,
         kind,
         etag,
@@ -132,17 +133,31 @@ pub(crate) fn parse_object_info(
             Some(user_metadata)
         },
         modified_by: None,
+        versioned_address: None,
     })
 }
 
-/// Strip Azure's literal-double-quote ETag wrapping so cross-provider comparisons work.
-fn strip_quotes(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
-        trimmed[1..trimmed.len() - 1].to_string()
+/// Normalize an etag from an Azure list-response body.
+///
+/// Azure serializes the typed `Etag` / `etag` members in List Blobs XML and
+/// List Paths JSON without the quotes required by an HTTP `ETag` header. The
+/// member's schema still identifies it as Azure's strong object validator, so
+/// a nonempty bare value is `Strong` at this provider-specific boundary. Raw
+/// HTTP headers continue to use [`normalize_wire_etag`] directly and therefore
+/// leave a nonconformant bare value `Unspecified`.
+fn normalize_azure_list_etag(raw: &str) -> (String, EtagStrength) {
+    let trimmed = raw.trim();
+    let (etag, strength) = normalize_wire_etag(trimmed);
+    let strength = if strength == EtagStrength::Unspecified
+        && !etag.is_empty()
+        && !trimmed.starts_with('"')
+        && !trimmed.ends_with('"')
+    {
+        EtagStrength::Strong
     } else {
-        trimmed.to_string()
-    }
+        strength
+    };
+    (etag, strength)
 }
 
 /// Case-insensitive header lookup that preserves insertion order.
@@ -198,6 +213,7 @@ pub(crate) struct ParsedBlobList {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct BlobListEntry {
     pub name: String,
+    pub etag_strength: EtagStrength,
     pub etag: Option<String>,
     pub size: Option<u64>,
     pub last_modified: Option<SystemTime>,
@@ -237,6 +253,7 @@ pub(crate) fn parse_blob_list_xml(xml: &str) -> Result<ParsedBlobList> {
                 if name == "Blob" {
                     current_blob = Some(BlobListEntry {
                         name: String::new(),
+                        etag_strength: EtagStrength::Unspecified,
                         etag: None,
                         size: None,
                         last_modified: None,
@@ -290,7 +307,9 @@ pub(crate) fn parse_blob_list_xml(xml: &str) -> Result<ParsedBlobList> {
                     }
                     "Etag" => {
                         if let Some(blob) = current_blob.as_mut() {
-                            blob.etag = Some(strip_quotes(&text));
+                            let (etag, strength) = normalize_azure_list_etag(&text);
+                            blob.etag = Some(etag);
+                            blob.etag_strength = strength;
                         }
                     }
                     "Last-Modified" => {
@@ -358,6 +377,7 @@ pub(crate) struct ParsedPathList {
 pub(crate) struct DfsPathEntry {
     pub name: String,
     pub is_directory: bool,
+    pub etag_strength: EtagStrength,
     pub etag: Option<String>,
     pub size: Option<u64>,
     pub last_modified: Option<SystemTime>,
@@ -397,22 +417,32 @@ pub(crate) fn parse_dfs_path_list_json(
     let paths = raw
         .paths
         .into_iter()
-        .map(|p| DfsPathEntry {
-            name: p.name,
-            is_directory: p
-                .is_directory
-                .map(|s| s.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
-            etag: p.etag.map(|e| strip_quotes(&e)),
-            size: p.content_length.and_then(|value| match value {
-                serde_json::Value::Number(n) => n.as_u64(),
-                serde_json::Value::String(s) => s.parse().ok(),
-                _ => None,
-            }),
-            last_modified: p
-                .last_modified
-                .as_deref()
-                .and_then(|s| httpdate::parse_http_date(s).ok()),
+        .map(|p| {
+            let (etag, etag_strength) =
+                p.etag
+                    .as_deref()
+                    .map_or((None, EtagStrength::Unspecified), |raw| {
+                        let (etag, strength) = normalize_azure_list_etag(raw);
+                        (Some(etag), strength)
+                    });
+            DfsPathEntry {
+                name: p.name,
+                is_directory: p
+                    .is_directory
+                    .map(|s| s.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
+                etag_strength,
+                etag,
+                size: p.content_length.and_then(|value| match value {
+                    serde_json::Value::Number(n) => n.as_u64(),
+                    serde_json::Value::String(s) => s.parse().ok(),
+                    _ => None,
+                }),
+                last_modified: p
+                    .last_modified
+                    .as_deref()
+                    .and_then(|s| httpdate::parse_http_date(s).ok()),
+            }
         })
         .collect();
     Ok(ParsedPathList {
@@ -429,6 +459,15 @@ pub(crate) fn list_xml_to_object_infos(
     let mut items = Vec::new();
     let mut marker_addresses = std::collections::HashSet::new();
     for blob in &parsed.items {
+        // Under `include=versions` every version of every blob travels. Only
+        // the current version is an object a caller can list, so a superseded
+        // one is skipped before it can stand in as a marker fact for a
+        // BlobPrefix. A blob whose current version was deleted has no `true`
+        // entry and vanishes, as it does without the include. Entries without
+        // the element (versioning off) are kept.
+        if blob.is_current_version == Some(false) {
+            continue;
+        }
         let Ok(blob_address) = address::join_relative(address_root, &blob.name) else {
             tracing::warn!(
                 target: "ovstorage.azure.parse",
@@ -438,7 +477,7 @@ pub(crate) fn list_xml_to_object_infos(
             );
             continue;
         };
-        let info = blob_to_object_info(blob, blob_address);
+        let info = blob_to_object_info(blob, blob_address)?;
         if info.kind == ObjectKind::DirectoryMarker {
             marker_addresses.insert(info.address.as_str().to_string());
         }
@@ -460,6 +499,7 @@ pub(crate) fn list_xml_to_object_infos(
         // Azure flat-blob `BlobPrefix` is the wire's `CommonPrefix` analogue —
         // there's no backing object, so tag the entry as `DirectoryInferred`.
         items.push(ObjectInfo {
+            etag_strength: Default::default(),
             address,
             kind: ObjectKind::DirectoryInferred,
             etag: None,
@@ -471,6 +511,7 @@ pub(crate) fn list_xml_to_object_infos(
             system_metadata: None,
             user_metadata: None,
             modified_by: None,
+            versioned_address: None,
         });
     }
     Ok(items)
@@ -497,6 +538,7 @@ pub(crate) fn dfs_paths_to_object_infos(
             // HNS reports real directory inodes via the filesystem path API; mark
             // `ObjectKind::Directory` so the host dispatcher skips the marker-fold pass.
             Some(Ok(ObjectInfo {
+                etag_strength: path.etag_strength,
                 address,
                 kind: if path.is_directory {
                     ObjectKind::Directory
@@ -512,12 +554,25 @@ pub(crate) fn dfs_paths_to_object_infos(
                 system_metadata: None,
                 user_metadata: None,
                 modified_by: None,
+                // The DFS path list carries no version id; HNS entries have
+                // no pin.
+                versioned_address: None,
             }))
         })
         .collect()
 }
 
-pub(crate) fn blob_to_object_info(blob: &BlobListEntry, address: Url) -> ObjectInfo {
+/// The pinned spelling of `addr` at `version_id`. Query and fragment are
+/// rebuilt from the version id alone, so a caller's own pin re-spells to the
+/// address the service's id produces.
+pub(crate) fn version_address(addr: &Url, version_id: &str) -> Result<Url> {
+    let mut base = addr.clone();
+    base.set_query(None);
+    base.set_fragment(None);
+    address::with_query_pair(&base, "versionid", version_id)
+}
+
+pub(crate) fn blob_to_object_info(blob: &BlobListEntry, address: Url) -> Result<ObjectInfo> {
     let mut checksums = ChecksumSet::new();
     if let Some(md5) = &blob.content_md5 {
         checksums.insert(ChecksumAlgorithm::md5(), md5.clone());
@@ -527,7 +582,18 @@ pub(crate) fn blob_to_object_info(blob: &BlobListEntry, address: Url) -> ObjectI
         system_metadata.insert("content-type".into(), content_type.clone());
     }
     let is_marker = blob.name.ends_with('/') && blob.size.unwrap_or(0) == 0;
-    ObjectInfo {
+    // A directory kind carries no pin; a File is pinned whenever the entry
+    // carries a version id, which only an `include=versions` listing does.
+    let versioned_address = if is_marker {
+        None
+    } else {
+        blob.version_id
+            .as_deref()
+            .map(|version_id| version_address(&address, version_id))
+            .transpose()?
+    };
+    Ok(ObjectInfo {
+        etag_strength: blob.etag_strength,
         address,
         kind: if is_marker {
             ObjectKind::DirectoryMarker
@@ -547,7 +613,8 @@ pub(crate) fn blob_to_object_info(blob: &BlobListEntry, address: Url) -> ObjectI
         },
         user_metadata: None,
         modified_by: None,
-    }
+        versioned_address,
+    })
 }
 
 /// Build a pinned-address `ObjectInfo` from a parsed list entry (when XML carries `include=versions`).
@@ -571,8 +638,11 @@ pub(crate) fn blob_to_version_item(
         );
         return Ok(None);
     };
-    let address = address::with_query_pair(&blob_address, "versionid", &version_id)?;
-    Ok(Some(blob_to_object_info(blob, address)))
+    let address = version_address(&blob_address, &version_id)?;
+    let mut info = blob_to_object_info(blob, address)?;
+    // A version item's address is already the pin.
+    info.versioned_address = Some(info.address.clone());
+    Ok(Some(info))
 }
 
 #[cfg(test)]
@@ -600,6 +670,7 @@ mod tests {
         let address = address::parse("azure://acct/container/blob").unwrap();
         let info = parse_object_info(address, &headers, false).unwrap();
         assert_eq!(info.etag.as_deref(), Some("0x8DBABCD"));
+        assert_eq!(info.etag_strength, EtagStrength::Strong);
         assert_eq!(info.size, Some(1024));
         assert_eq!(
             info.version.as_deref(),
@@ -642,6 +713,7 @@ mod tests {
         assert_eq!(blob.name, "logs/2024-01-01.log");
         assert_eq!(blob.size, Some(500));
         assert_eq!(blob.etag.as_deref(), Some("0x8DC0A"));
+        assert_eq!(blob.etag_strength, EtagStrength::Strong);
         assert_eq!(blob.content_type.as_deref(), Some("application/json"));
         assert_eq!(
             blob.version_id.as_deref(),
@@ -650,6 +722,20 @@ mod tests {
         assert_eq!(blob.is_current_version, Some(true));
         assert_eq!(parsed.prefixes, vec!["logs/sub/"]);
         assert_eq!(parsed.next_marker.as_deref(), Some("opaque-marker"));
+
+        let root = address::parse("azure://acct/container/").unwrap();
+        let infos = list_xml_to_object_infos(&parsed, &root).unwrap();
+        let file = infos
+            .iter()
+            .find(|info| info.kind == ObjectKind::File)
+            .unwrap();
+        assert_eq!(file.etag_strength, EtagStrength::Strong);
+        let inferred = infos
+            .iter()
+            .find(|info| info.kind == ObjectKind::DirectoryInferred)
+            .unwrap();
+        assert_eq!(inferred.etag, None);
+        assert_eq!(inferred.etag_strength, EtagStrength::Unspecified);
     }
 
     #[test]
@@ -665,7 +751,9 @@ mod tests {
         assert_eq!(parsed.paths.len(), 2);
         assert!(!parsed.paths[0].is_directory);
         assert_eq!(parsed.paths[0].size, Some(12345));
+        assert_eq!(parsed.paths[0].etag_strength, EtagStrength::Strong);
         assert!(parsed.paths[1].is_directory);
+        assert_eq!(parsed.paths[1].etag_strength, EtagStrength::Unspecified);
         assert!(parsed.paths[1].size.is_none());
     }
 
@@ -673,6 +761,7 @@ mod tests {
     fn version_listing_uses_versionid_query_address() {
         let blob = BlobListEntry {
             name: "blob.bin".into(),
+            etag_strength: EtagStrength::Strong,
             etag: Some("0x1".into()),
             size: Some(7),
             last_modified: None,
@@ -689,6 +778,7 @@ mod tests {
             item.address.as_str(),
             "azure://acct/container/blob.bin?versionid=v1"
         );
+        assert_eq!(item.versioned_address.as_ref(), Some(&item.address));
     }
 
     /// A version listing omits an unaddressable blob instead of failing.
@@ -701,6 +791,7 @@ mod tests {
     fn a_version_whose_name_has_no_address_is_omitted_not_propagated() {
         let blob = BlobListEntry {
             name: "a//b.bin".into(),
+            etag_strength: EtagStrength::Strong,
             etag: Some("0x1".into()),
             size: Some(7),
             last_modified: None,
@@ -718,11 +809,179 @@ mod tests {
         );
     }
 
+    /// One `include=versions` page: every version travels, only the current
+    /// one is listable, and a superseded marker version is skipped before it
+    /// can dedup a live BlobPrefix.
     #[test]
-    fn quoted_etag_round_trips_to_unquoted() {
-        assert_eq!(strip_quotes("\"abc\""), "abc");
-        assert_eq!(strip_quotes("abc"), "abc");
-        assert_eq!(strip_quotes("\"\""), "");
+    fn versioned_listing_skips_superseded_versions_and_pins_current() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ServiceEndpoint="https://acct.blob.core.windows.net/" ContainerName="container">
+  <Prefix></Prefix>
+  <Blobs>
+    <Blob>
+      <Name>a.bin</Name>
+      <Properties><Etag>0xA1</Etag><Content-Length>1</Content-Length></Properties>
+      <VersionId>v1</VersionId>
+      <IsCurrentVersion>false</IsCurrentVersion>
+    </Blob>
+    <Blob>
+      <Name>a.bin</Name>
+      <Properties><Etag>0xA2</Etag><Content-Length>2</Content-Length></Properties>
+      <VersionId>v2</VersionId>
+      <IsCurrentVersion>true</IsCurrentVersion>
+    </Blob>
+    <Blob>
+      <Name>b.bin</Name>
+      <Properties><Etag>0xB3</Etag><Content-Length>3</Content-Length></Properties>
+      <VersionId>v3</VersionId>
+      <IsCurrentVersion>false</IsCurrentVersion>
+    </Blob>
+    <Blob>
+      <Name>dir/</Name>
+      <Properties><Etag>0xD1</Etag><Content-Length>0</Content-Length></Properties>
+      <VersionId>m1</VersionId>
+      <IsCurrentVersion>false</IsCurrentVersion>
+    </Blob>
+    <Blob>
+      <Name>dir/</Name>
+      <Properties><Etag>0xD2</Etag><Content-Length>0</Content-Length></Properties>
+      <VersionId>m2</VersionId>
+      <IsCurrentVersion>true</IsCurrentVersion>
+    </Blob>
+    <Blob>
+      <Name>old/</Name>
+      <Properties><Etag>0xO1</Etag><Content-Length>0</Content-Length></Properties>
+      <VersionId>o1</VersionId>
+      <IsCurrentVersion>false</IsCurrentVersion>
+    </Blob>
+    <BlobPrefix><Name>dir/</Name></BlobPrefix>
+    <BlobPrefix><Name>old/</Name></BlobPrefix>
+    <BlobPrefix><Name>sub/</Name></BlobPrefix>
+  </Blobs>
+  <NextMarker />
+</EnumerationResults>"#;
+        let parsed = parse_blob_list_xml(xml).unwrap();
+        let root = address::parse("azure://acct/container/").unwrap();
+        let infos = list_xml_to_object_infos(&parsed, &root).unwrap();
+        let summary: Vec<(&str, ObjectKind, Option<&str>)> = infos
+            .iter()
+            .map(|info| {
+                (
+                    info.address.as_str(),
+                    info.kind,
+                    info.versioned_address.as_ref().map(Url::as_str),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                // The current version, pinned; `b.bin` has no current
+                // version and is absent.
+                (
+                    "azure://acct/container/a.bin",
+                    ObjectKind::File,
+                    Some("azure://acct/container/a.bin?versionid=v2"),
+                ),
+                // The current marker version dedups its BlobPrefix and, as a
+                // directory kind, carries no pin.
+                (
+                    "azure://acct/container/dir/",
+                    ObjectKind::DirectoryMarker,
+                    None
+                ),
+                // A superseded-only marker is skipped before dedup, so its
+                // BlobPrefix survives.
+                (
+                    "azure://acct/container/old/",
+                    ObjectKind::DirectoryInferred,
+                    None
+                ),
+                (
+                    "azure://acct/container/sub/",
+                    ObjectKind::DirectoryInferred,
+                    None
+                ),
+            ]
+        );
+        assert_eq!(infos[0].etag.as_deref(), Some("0xA2"));
+        assert_eq!(infos[0].version.as_deref(), Some("v2"));
+    }
+
+    /// A container without versioning reports neither `VersionId` nor
+    /// `IsCurrentVersion`; its entries are listed and carry no pin.
+    #[test]
+    fn unversioned_listing_keeps_entries_without_is_current_version() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ServiceEndpoint="https://acct.blob.core.windows.net/" ContainerName="container">
+  <Prefix>logs/</Prefix>
+  <Delimiter>/</Delimiter>
+  <Blobs>
+    <Blob>
+      <Name>logs/plain.log</Name>
+      <Properties><Etag>0x1</Etag><Content-Length>5</Content-Length></Properties>
+    </Blob>
+    <BlobPrefix><Name>logs/sub/</Name></BlobPrefix>
+  </Blobs>
+  <NextMarker />
+</EnumerationResults>"#;
+        let parsed = parse_blob_list_xml(xml).unwrap();
+        assert_eq!(parsed.items[0].is_current_version, None);
+        let root = address::parse("azure://acct/container/").unwrap();
+        let infos = list_xml_to_object_infos(&parsed, &root).unwrap();
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].kind, ObjectKind::File);
+        assert_eq!(infos[0].version, None);
+        assert_eq!(infos[0].versioned_address, None);
+        assert_eq!(infos[1].kind, ObjectKind::DirectoryInferred);
+        assert_eq!(infos[1].versioned_address, None);
+    }
+
+    #[test]
+    fn dfs_paths_report_no_versioned_address() {
+        let body = r#"{
+  "paths": [
+    { "name": "data/file1.bin", "contentLength": "12345", "etag": "0x8DC1A" },
+    { "name": "data/sub", "isDirectory": "true" }
+  ]
+}"#;
+        let parsed = parse_dfs_path_list_json(body, None).unwrap();
+        let root = address::parse("azure://acct/container/").unwrap();
+        let infos = dfs_paths_to_object_infos(&parsed, &root).unwrap();
+        assert_eq!(infos.len(), 2);
+        assert!(infos.iter().all(|info| info.versioned_address.is_none()));
+    }
+
+    #[test]
+    fn wire_etag_normalization_preserves_strength_out_of_band() {
+        assert_eq!(
+            normalize_optional_wire_etag(Some("\"abc\"")),
+            (Some("abc".into()), EtagStrength::Strong)
+        );
+        assert_eq!(
+            normalize_optional_wire_etag(Some("W/\"weak\"")),
+            (Some("weak".into()), EtagStrength::Weak)
+        );
+        assert_eq!(
+            normalize_optional_wire_etag(None),
+            (None, EtagStrength::Unspecified)
+        );
+        assert_eq!(
+            normalize_optional_wire_etag(Some("abc")),
+            (Some("abc".into()), EtagStrength::Unspecified)
+        );
+        assert_eq!(
+            normalize_azure_list_etag("abc"),
+            ("abc".into(), EtagStrength::Strong)
+        );
+        assert_eq!(
+            normalize_azure_list_etag("W/\"weak\""),
+            ("weak".into(), EtagStrength::Weak)
+        );
+        assert_eq!(
+            normalize_azure_list_etag(""),
+            (String::new(), EtagStrength::Unspecified)
+        );
     }
 
     #[test]

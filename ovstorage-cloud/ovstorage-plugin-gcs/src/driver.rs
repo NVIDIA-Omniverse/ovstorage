@@ -40,8 +40,22 @@ use crate::{GcsBackend, GcsConnectionConfig, build_http_client, validate_credent
 /// too. Delegating rather than restating it makes the subset relation
 /// structural: the two cannot drift into disagreeing about which grant
 /// failures are definitive.
+///
+/// The park set is deliberately WIDER than the latch set by one reason:
+/// `impersonation_http_403`. On `iamcredentials` a 403 means the
+/// principal-to-service-account binding refuses this caller (the classic
+/// missing `roles/iam.serviceAccountTokenCreator` / `workloadIdentityUser`
+/// setup mistake) — no bearer can ever be minted, so committing
+/// `Authenticated` would misreport a deterministic misconfiguration, but it
+/// can also be IAM propagation lag, so latching a promotion veto on it would
+/// be wrong. Parking at add time is recoverable (remove/re-add); a false
+/// `Authenticated` is not, `refresh` being unsupported. The storage-side 403
+/// stays lenient: there the bearer WAS accepted and only object-level
+/// authorization is in question.
 fn reason_is_credential_rejection(reason: &str) -> bool {
-    reason == "gcs_unauthorized" || crate::auth::reason_is_grant_refusal(reason)
+    reason == "gcs_unauthorized"
+        || reason == "impersonation_http_403"
+        || crate::auth::reason_is_grant_refusal(reason)
 }
 
 pub(crate) struct GcsDriver {
@@ -109,14 +123,25 @@ impl ConnectionAuthDriver for GcsDriver {
         // One read-only `objects.list maxResults=1`, judged LENIENTLY on the
         // MAPPED error:
         // - Ok: accepted.
-        // - 401 (`gcs_unauthorized`) or a definitive token-endpoint failure
-        //   (`crate::auth::reason_is_grant_refusal`: a 400/401 grant refusal,
-        //   or a 200 that produced no usable bearer): rejected — the
-        //   credential itself is bad.
-        // - Everything else (403 `PermissionDenied` from IAM scoping,
-        //   token-endpoint 429/5xx, `token_transport`, storage transport
-        //   blips, GCS-compatible error shapes): accepted. The credential
-        //   was not refuted; authorization scope is a data-path concern.
+        // - 401 (`gcs_unauthorized`), a definitive token-endpoint failure
+        //   (`crate::auth::reason_is_grant_refusal`: a 400/401 grant or
+        //   impersonation refusal, or a 200 that produced no usable bearer),
+        //   or an `iamcredentials` 403 (`impersonation_http_403`, the
+        //   missing-binding setup mistake): rejected — no bearer this
+        //   credential mints will ever sign a request.
+        // - `CredentialUnavailable`, regardless of reason: rejected. It only
+        //   arises when the subject-token SOURCE could not produce a token
+        //   (missing/unreadable file, an endpoint that did not serve one) —
+        //   the same deterministic local misconfiguration an unreadable
+        //   `file_path` ADC file parks in `obtain`, just discovered at token
+        //   time because external-account sources are read per exchange.
+        //   Without this arm the probe would swallow it and report
+        //   `Authenticated` for a connection that can never sign anything.
+        // - Everything else (403 `PermissionDenied` from IAM scoping on
+        //   STORAGE, token-endpoint 429/5xx, `token_transport`, storage
+        //   transport blips, GCS-compatible error shapes): accepted. The
+        //   credential was not refuted; authorization scope is a data-path
+        //   concern.
         let outcome =
             race_cancel(cancel.as_ref(), async { Ok(backend.verify_probe().await) }).await?;
         match outcome {
@@ -126,7 +151,9 @@ impl ConnectionAuthDriver for GcsDriver {
                     Some(ErrorContext::Auth { reason, .. }) => reason.as_deref().unwrap_or(""),
                     _ => "",
                 };
-                if reason_is_credential_rejection(reason) {
+                if error.code() == ErrorCode::CredentialUnavailable
+                    || reason_is_credential_rejection(reason)
+                {
                     Err(error)
                 } else {
                     tracing::debug!(
@@ -178,20 +205,37 @@ mod tests {
         GcsDriver::new(test_config())
     }
 
-    /// Only DEFINITIVE refusals park: a storage-side 401 and token-endpoint
-    /// 400/401 reject the credential; token-endpoint 429/5xx, transport
-    /// failures, and storage 403s are transient/scoped and must pass the
-    /// lenient verify — with `refresh` unsupported, parking on a transient
-    /// would strand a valid credential until manual remove/re-add.
+    /// Only DEFINITIVE refusals park: a storage-side 401, token-endpoint
+    /// 400/401, impersonation 400/401/empty, and the `iamcredentials` 403
+    /// (a missing principal-to-SA binding — no bearer will ever be minted)
+    /// reject the credential; token-endpoint 429/5xx, transport failures,
+    /// and STORAGE 403s are transient/scoped and must pass the lenient
+    /// verify — with `refresh` unsupported, parking on a transient would
+    /// strand a valid credential until manual remove/re-add.
     #[test]
     fn rejection_is_limited_to_definitive_reasons() {
-        assert!(reason_is_credential_rejection("gcs_unauthorized"));
-        assert!(reason_is_credential_rejection("token_exchange_http_400"));
-        assert!(reason_is_credential_rejection("token_exchange_http_401"));
+        for definitive in [
+            "gcs_unauthorized",
+            "token_exchange_http_400",
+            "token_exchange_http_401",
+            "token_exchange_empty",
+            "impersonation_http_400",
+            "impersonation_http_401",
+            "impersonation_http_403",
+            "impersonation_empty",
+        ] {
+            assert!(
+                reason_is_credential_rejection(definitive),
+                "'{definitive}' is a definitive rejection and must park"
+            );
+        }
         for transient in [
             "token_exchange_http_429",
             "token_exchange_http_500",
             "token_exchange_http_503",
+            "token_exchange_http_403",
+            "impersonation_http_429",
+            "impersonation_http_503",
             "token_transport",
             "non_oauth",
             "",
@@ -201,6 +245,82 @@ mod tests {
                 "'{transient}' must be treated as transient, not a credential rejection"
             );
         }
+    }
+
+    /// The latch set stays a strict subset of the park set: the
+    /// `iamcredentials` 403 parks (deterministic misconfiguration at add
+    /// time) but must not latch a promotion veto (it can be IAM propagation
+    /// lag on a credential that is about to work).
+    #[test]
+    fn the_impersonation_403_parks_without_latching() {
+        assert!(reason_is_credential_rejection("impersonation_http_403"));
+        assert!(!crate::auth::reason_is_grant_refusal(
+            "impersonation_http_403"
+        ));
+    }
+
+    fn external_account_bundle(json: &serde_json::Value) -> SecretBundle {
+        let mut bundle = SecretBundle::default();
+        bundle.fields.insert(
+            "service_account_key".into(),
+            SecretValue::Bytes(SecretBytes(json.to_string().into_bytes())),
+        );
+        bundle
+    }
+
+    /// A subject-token source the platform did not serve (here: a missing
+    /// file) yields `CredentialUnavailable` with no auth reason. verify must
+    /// REJECT it, not take the lenient arm: it is the same deterministic
+    /// local misconfiguration an unreadable `file_path` ADC file parks in
+    /// `obtain`, just discovered at token time because external-account
+    /// sources are read per exchange. No storage request is ever made, so
+    /// this runs hermetically.
+    #[tokio::test]
+    async fn verify_rejects_an_unservable_subject_token_source() {
+        let bundle = external_account_bundle(&serde_json::json!({
+            "type": "external_account",
+            "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/v",
+            "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+            "token_url": "https://sts.googleapis.com/v1/token",
+            "credential_source": {"file": "/nonexistent/projected/token"},
+        }));
+        let err = driver()
+            .verify(&bundle, None)
+            .await
+            .expect_err("no bearer can ever be minted from a missing subject-token file");
+        assert_eq!(err.code(), ErrorCode::CredentialUnavailable);
+    }
+
+    /// A 403 from the impersonation hop (the classic missing
+    /// `workloadIdentityUser` / `serviceAccountTokenCreator` binding) must
+    /// park verify rather than commit `Authenticated` for a connection whose
+    /// bearer can never be minted. Scripted endpoints; no storage request.
+    #[tokio::test]
+    async fn verify_rejects_a_refused_impersonation_binding() {
+        use ovstorage_plugin_test::{CannedHttpResponse, ScriptedHttpServer};
+        let file = tempfile::NamedTempFile::new().expect("subject-token file");
+        std::fs::write(file.path(), "github-oidc-jwt").expect("write subject token");
+        let sts = ScriptedHttpServer::spawn(CannedHttpResponse::json(
+            "200 OK",
+            "{\"access_token\": \"sts-federated-token\", \"expires_in\": 3599}",
+        ));
+        let iam = ScriptedHttpServer::spawn(CannedHttpResponse::json(
+            "403 Forbidden",
+            "{\"error\": {\"status\": \"PERMISSION_DENIED\"}}",
+        ));
+        let bundle = external_account_bundle(&serde_json::json!({
+            "type": "external_account",
+            "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/v",
+            "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+            "token_url": sts.endpoint(),
+            "credential_source": {"file": file.path().to_str().unwrap()},
+            "service_account_impersonation_url": iam.endpoint(),
+        }));
+        let err = driver()
+            .verify(&bundle, None)
+            .await
+            .expect_err("a refused impersonation binding must park, not pass");
+        assert_eq!(err.code(), ErrorCode::AuthRequired);
     }
 
     #[tokio::test]
@@ -265,6 +385,7 @@ mod tests {
             auth_state: ConnectionAuthState::Anonymous,
             last_probed: None,
             user_metadata: UserMetadata::new(),
+            owning_target: None,
         };
         // Every capability, because the claim is that there is no flow under
         // any of them — not that the default happens to be refused.

@@ -43,8 +43,8 @@ use ovstorage::{
     ConnectionSnapshot, ConnectionUpdateStream, ContinueWriteRequest, CopyRequest,
     CreateDirectoryRequest, DeleteDirectoryRequest, DeleteRequest, Error, ErrorCode, Extensions,
     Layer, LayerConfig, LayerConnectionRequest, LayerHandle, LayerKindDescriptor, LayerType,
-    ListPage, ListRequest, ListVersionsRequest, LoadedLayerFactory, LocalDelegate, ObjectInfo,
-    ReadRequest, ReadResult, RenameRequest, Request, Result, RootInfo, RootInfoChange,
+    ListPage, ListRequest, ListStream, ListVersionsRequest, LoadedLayerFactory, LocalDelegate,
+    ObjectInfo, ReadRequest, ReadResult, RenameRequest, Request, Result, RootInfo, RootInfoChange,
     RootInfoSnapshot, RootInfoUpdateStream, Stack, StatRequest, UpdateConnectionAttributesRequest,
     UpdateConnectionCredentialsRequest, UpdateMetadataRequest, Url, VersionPage,
     WatchDirectoryRequest, WrapperFactory, WriteRedirectBatch, WriteRequest, WriteResult,
@@ -472,6 +472,7 @@ impl_plugin_credential_boundary!(
     (check_access, CheckAccessRequest, AccessDecision),
     (materialize, ReadRequest, LocalDelegate),
     (list, ListRequest, ListPage),
+    (list_stream, ListRequest, ListStream),
     (list_versions, ListVersionsRequest, VersionPage),
     (get_latest_version, ReadRequest, ObjectInfo),
     (watch_directory, WatchDirectoryRequest, ChangeStream),
@@ -2636,6 +2637,35 @@ impl Layer for BuiltinAuthLayer {
 
     /// # Errors
     ///
+    /// The [`Layer::list_stream`] contract with the same prefix authorization
+    /// and per-entry `stat` visibility filter as [`Self::list`]. Authorization
+    /// failures are returned while opening the stream, before inner is called.
+    async fn list_stream(
+        &self,
+        mut request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        let (principal, policy) = self.authorize(
+            &request.extensions,
+            Operation::List,
+            Some(&mut request.input.prefix),
+        )?;
+        let principal_id = principal.id.clone();
+        self.stamp(&mut request.extensions, &principal);
+        let stream = self.inner.list_stream(request, cancel).await?;
+        Ok(Box::pin(stream.filter_map(move |entry| {
+            let entry = match entry {
+                Ok(entry) => policy
+                    .is_allowed(&principal_id, Operation::Stat, Some(&entry.address))
+                    .then_some(Ok(entry)),
+                Err(error) => Some(Err(error)),
+            };
+            futures::future::ready(entry)
+        })))
+    }
+
+    /// # Errors
+    ///
     /// The [`Layer::list_versions`] contract with extended
     /// [`ErrorCode::PermissionDenied`] semantics: includes authz denial by
     /// policy. Plus:
@@ -2827,6 +2857,240 @@ fn filter_root_change(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod list_stream_tests {
+    use super::*;
+    use ovstorage::IncrementalListFold;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct ListingInner {
+        items: Vec<Url>,
+        list_calls: AtomicUsize,
+        stream_open_calls: AtomicUsize,
+        stream_deliveries: Arc<AtomicUsize>,
+        list_principal: Mutex<Option<String>>,
+        stream_principal: Mutex<Option<String>>,
+        fold_recursive_flat_stream: bool,
+    }
+
+    impl ListingInner {
+        fn principal(request: &Request<ListRequest>) -> Option<String> {
+            request
+                .extensions
+                .get(ext::PRINCIPAL_ID)
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        }
+
+        fn info(address: Url) -> ObjectInfo {
+            ObjectInfo::from((address, BackendItemInfo::default()))
+        }
+    }
+
+    #[async_trait]
+    impl Layer for ListingInner {
+        fn name(&self) -> &str {
+            "listing-inner"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            LayerKindDescriptor {
+                kind: "listing-inner".to_string(),
+                layer_type: LayerType::Backend,
+                display_name: "listing inner".to_string(),
+                description: None,
+                config_schema: Vec::new(),
+                credential_schema: Vec::new(),
+                credential_methods: Vec::new(),
+                icon: None,
+                accepts_connections: false,
+                auth_capable: false,
+                supports_user_metadata: false,
+            }
+        }
+
+        async fn list(
+            &self,
+            request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ListPage> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            *self.list_principal.lock().unwrap() = Self::principal(&request);
+            Ok(ListPage {
+                items: self.items.iter().cloned().map(Self::info).collect(),
+                next_page_token: None,
+            })
+        }
+
+        async fn list_stream(
+            &self,
+            request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ListStream> {
+            self.stream_open_calls.fetch_add(1, Ordering::SeqCst);
+            *self.stream_principal.lock().unwrap() = Self::principal(&request);
+            let prefix = request.input.prefix;
+            let deliveries = Arc::clone(&self.stream_deliveries);
+            let entries = self.items.clone().into_iter().map(move |address| {
+                deliveries.fetch_add(1, Ordering::SeqCst);
+                Ok(Self::info(address))
+            });
+            let stream: ListStream = Box::pin(futures::stream::iter(entries));
+            if self.fold_recursive_flat_stream {
+                Ok(Box::pin(IncrementalListFold::new(
+                    stream, &prefix, false, true,
+                )))
+            } else {
+                Ok(stream)
+            }
+        }
+    }
+
+    fn auth_layer(inner: Arc<ListingInner>, policy: &str) -> BuiltinAuthLayer {
+        BuiltinAuthLayer::new(
+            BUILTIN_AUTH_KIND,
+            inner as LayerHandle,
+            Arc::new(ArcSwap::from_pointee(Policy::from_toml(policy).unwrap())),
+            BuiltinAuthn::new(TcpAuthnMode::Anonymous, PeerConfig::default()),
+        )
+    }
+
+    fn list_request() -> Request<ListRequest> {
+        Request::new(ListRequest {
+            prefix: ovstorage::address::parse("file:///root/").unwrap(),
+            options: Default::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn denied_list_and_list_stream_fail_at_open_with_the_same_code() {
+        let inner = Arc::new(ListingInner {
+            items: vec![ovstorage::address::parse("file:///root/secret").unwrap()],
+            ..Default::default()
+        });
+        let layer = auth_layer(Arc::clone(&inner), "");
+
+        let list_error = layer.list(list_request(), None).await.unwrap_err();
+        let stream_error = layer
+            .list_stream(list_request(), None)
+            .await
+            .err()
+            .expect("list_stream must be denied while opening");
+
+        assert_eq!(list_error.code(), ErrorCode::PermissionDenied);
+        assert_eq!(stream_error.code(), list_error.code());
+        assert_eq!(inner.list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.stream_open_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.stream_deliveries.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn allowed_list_stream_matches_buffered_stat_filter_and_principal_stamp() {
+        const POLICY: &str = r#"
+            [[policy]]
+            id = "list-root"
+            effect = "allow"
+            principal = "anonymous"
+            operations = ["list"]
+            prefix = "file:///root/"
+
+            [[policy]]
+            id = "stat-public"
+            effect = "allow"
+            principal = "anonymous"
+            operations = ["stat"]
+            prefix = "file:///root/public/"
+        "#;
+        let inner = Arc::new(ListingInner {
+            items: [
+                "file:///root/public/a",
+                "file:///root/private/secret",
+                "file:///root/public/b",
+            ]
+            .into_iter()
+            .map(|address| ovstorage::address::parse(address).unwrap())
+            .collect(),
+            ..Default::default()
+        });
+        let layer = auth_layer(Arc::clone(&inner), POLICY);
+
+        let buffered = layer.list(list_request(), None).await.unwrap();
+        let streamed = layer
+            .list_stream(list_request(), None)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(streamed, buffered.items);
+        assert_eq!(streamed.len(), 2);
+        assert!(
+            streamed
+                .iter()
+                .all(|item| item.address.path().starts_with("/root/public/"))
+        );
+        assert_eq!(
+            inner.list_principal.lock().unwrap().as_deref(),
+            Some(ANONYMOUS_PRINCIPAL_ID)
+        );
+        assert_eq!(
+            inner.stream_principal.lock().unwrap().as_deref(),
+            Some(ANONYMOUS_PRINCIPAL_ID)
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_fold_error_does_not_expose_stat_hidden_sibling() {
+        const POLICY: &str = r#"
+            [[policy]]
+            id = "list-root"
+            effect = "allow"
+            principal = "anonymous"
+            operations = ["list"]
+            prefix = "file:///root/"
+
+            [[policy]]
+            id = "stat-public"
+            effect = "allow"
+            principal = "anonymous"
+            operations = ["stat"]
+            prefix = "file:///root/public/"
+        "#;
+        let hidden = "file:///root/secret/sibling";
+        let inner = Arc::new(ListingInner {
+            // This deliberate raw-key regression makes IncrementalListFold
+            // surface its terminal contract error after the hidden entry.
+            items: [hidden, "file:///root/public/visible"]
+                .into_iter()
+                .map(|address| ovstorage::address::parse(address).unwrap())
+                .collect(),
+            fold_recursive_flat_stream: true,
+            ..Default::default()
+        });
+        let layer = auth_layer(inner, POLICY);
+        let mut request = list_request();
+        request.input.options.recursive = true;
+
+        let results = layer
+            .list_stream(request, None)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(results.len(), 1, "the stat-hidden item is filtered");
+        let error = results[0].as_ref().unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert_eq!(error.message(), "recursive flat listing is not byte-sorted");
+        assert!(!error.message().contains(hidden));
+        assert!(!error.message().contains("secret/sibling"));
+    }
+}
 
 #[cfg(test)]
 mod auth_config_tests {

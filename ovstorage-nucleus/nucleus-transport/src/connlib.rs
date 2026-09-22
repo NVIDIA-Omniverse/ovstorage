@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::error::TransportError;
-use crate::redact::{message_kind, message_len, redact_url};
+use crate::redact::{message_kind, message_len, redact_server_text, redact_url};
 use crate::runtime::io_runtime;
 use crate::transport::{RawResponse, Subscription, Transport, TransportDescriptor};
 
@@ -154,7 +154,7 @@ impl ConnLibTransport {
                     let meta = match serde_json::from_slice::<ResponseMeta>(json) {
                         Ok(m) => m,
                         Err(e) => {
-                            warn!(conn_id = %conn_id, err = %e, "failed to parse response metadata");
+                            warn!(conn_id = %conn_id, err = %redact_server_text(&e.to_string()), "failed to parse response metadata");
                             continue;
                         }
                     };
@@ -223,7 +223,7 @@ impl ConnLibTransport {
                     return;
                 }
                 Some(Err(e)) => {
-                    let msg = e.to_string();
+                    let msg = redact_server_text(&e.to_string());
                     warn!(conn_id = %conn_id, err = %msg, "websocket error");
                     cancel.cancel();
                     Self::notify_pending_error(&conn_id, &pending, || {
@@ -371,10 +371,10 @@ impl Transport for ConnLibTransport {
         _interface: &str,
         method: &str,
         params: serde_json::Value,
-        binary: Option<Vec<u8>>,
+        binary: Option<&[u8]>,
     ) -> Result<Subscription> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let frame = self.build_frame(id, method, params, binary.as_deref())?;
+        let frame = self.build_frame(id, method, params, binary)?;
         let json_len = frame.iter().position(|&b| b == 0).unwrap_or(frame.len());
         let blob_len = frame.len().saturating_sub(json_len + 1);
         // `authorize_token` carries the access token in its request body, so

@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+interface:
+  display_name: "Run Integration Tests"
+  short_description: "Run ovstorage integration tests locally"
+  default_prompt: "Use $ovstorage-contributor-run-integration-tests to run the appropriate hermetic or live ovstorage integration tests locally."

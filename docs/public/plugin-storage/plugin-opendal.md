@@ -64,7 +64,7 @@ releases.
 | Service  | What it gives you                                                                  | Driver options                                                  |
 | -------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------- |
 | `fs`     | Local filesystem. Real directories, recursive + one-level list, atomic single-file writes, server-side copy/rename. No version listing. | `root` (via `config_json`)                                      |
-| `s3`     | S3-compatible object storage via OpenDAL. Flat namespace, recursive + one-level list with delimiter, no-overwrite-write. | `bucket`, `region`, `endpoint`, `root`, `access_key_id`, `secret_access_key` |
+| `s3`     | S3-compatible object storage via OpenDAL. Flat namespace, recursive list without a delimiter, one-level list with a delimiter, no-overwrite-write. | `bucket`, `region`, `endpoint`, `root`, `access_key_id`, `secret_access_key` |
 | `webdav` | WebDAV servers. Real directories, recursive + one-level list, overwrite, server-side copy. | `endpoint`, `username`, `root`, `password`                      |
 
 For the `s3` service through OpenDAL, conditional writes
@@ -121,7 +121,10 @@ Mutating operations reject addresses that pin a version —
 `?checkpoint=` — with `InvalidArgument`. OpenDAL's adapter cannot
 pass version pins through to most drivers, and silently dropping the
 pin would route the write to head while the caller asked for a
-historical pin.
+historical pin. `ObjectInfo.versioned_address` is always `None` for the
+same reason: the adapter cannot serve a read at a pinned address, so
+`stat` and `list` leave it unset whatever `StatOptions::versioned_address`
+/ `ListOptions::versioned_address` says.
 
 ## Layer-to-API mapping
 
@@ -140,6 +143,7 @@ API.
 | `continue_write` | Re-stats the destination after the host POSTs the body; maps non-2xx HTTP status through `map_redirect_status` (401/403 → `PermissionDenied`/`AuthRequired`, 404/410 → `NotFound`, 408/5xx → `Transient`, 412 → `PreconditionFailed`, 416 → `InvalidArgument`, 429 → `ResourceExhausted`). |
 | `delete` | `Operator::delete` |
 | `list` | `Operator::lister_with(..)`. Recursive listings preserve directory facts from the driver: real-directory profiles return `Directory`, flat profiles return `DirectoryInferred` for directory entries, and zero-byte slash files return `DirectoryMarker`. |
+| `list_stream` | The same pull-based `Operator::lister_with(..)` walk, yielding one converted provider page at a time. The Layer preserves provider emission order and folds directory facts incrementally. Recursive flat streams reject a provider-key ordering regression with `Internal` rather than emitting incorrect inferred ancestors. |
 | `copy` / `rename` | `Operator::copy` / `rename` for drivers in the per-driver allow-list; otherwise typed `Unsupported`. |
 | `create_directory` (real-directory profile) | `Operator::create_dir` |
 | `delete_directory` (real-directory profile: `fs`, `webdav`) | Descendant scan + delete; non-empty surfaces `DirectoryNotEmpty`. |
@@ -162,9 +166,13 @@ Whole-object reads are forwarded as a
 bridge or `to_vec()` copy. Streamed writes pump each `BodyStream`
 chunk straight into `Operator::writer().write(...)` so the adapter
 never buffers a full payload at the host (matching the workspace
-streaming-writes invariant). Both `Operator` and the `OpenDalLayer`
-methods are async, so the adapter forwards each call directly with
-`.await`. There is no internal `block_on` / runtime construction.
+streaming-writes invariant). `list_stream` retains the current provider
+page plus bounded incremental-fold state and requests the next page only as
+the consumer advances. The open-time cancellation token terminates the stream
+and prevents an unfetched continuation page from being requested. Both
+`Operator` and the `OpenDalLayer` methods are async, so the adapter forwards
+each call directly with `.await`. There is no internal `block_on` / runtime
+construction.
 
 ## Capability bits
 
@@ -176,6 +184,11 @@ adapter can prove the Layer's behaviour end-to-end.
 `supports_if_match_write`, `supports_native_metadata_patch`, and
 `supports_watch_directory` are off for every OpenDAL driver until a
 native conformance test pins them per driver.
+`supports_list_stream` is on for every configured profile because each uses
+OpenDAL's pull-based `Lister`; it describes the bounded native path, not a
+claim that every S3-compatible endpoint orders keys correctly. Recursive flat
+streams enforce the fold's byte-order precondition and fail loudly if it is
+violated.
 
 Preconditions follow the same rule.
 `WriteOptions::if_dest = IfDestExists::MatchEtag(_)` is rejected
@@ -248,6 +261,10 @@ Metadata mapping is intentionally thin. `ObjectInfo` carries `size`
 (when OpenDAL `Metakey::ContentLength` is present), `mtime` (from
 `Metadata::last_modified()`), `etag` (from `Metadata::etag()`), and
 `version` (from `Metadata::version()` when the driver populates it).
+The etag token and strength are derived together from the driver's wire value:
+an explicit `W/` declares `Weak`, a conformant nonempty quoted entity-tag
+declares `Strong`, and a bare or malformed unmarked value declares
+`Unspecified`. `versioned_address` is always `None`.
 `UserMetadata` is forwarded as-is from
 `Metadata::user_metadata()` when the driver returns it.
 `ObjectInfo.checksums`, `system_metadata`, and
@@ -267,11 +284,22 @@ metadata headers; that refusal is about the *mechanism*, and the host's
 redirect follower falls back to the buffered or streaming slot — which
 then applies the rule above.
 
+Key names are a per-driver fact too. The adapter hands them to the
+driver unchanged and normalises nothing, so what a name becomes —
+lowercased on `s3`, refused or preserved elsewhere — is the driver's
+service rule. The portable subset of
+[User-metadata keys](CONFORMANCE.md#user-metadata-keys) is the safe
+choice on every driver with metadata support, and the reserved
+`ovstorage_` names sit inside it.
+
 `WriteOptions.message` is weaker: the adapter stashes it under the
-reserved user-metadata key `x-ov-message` where the driver can keep it,
-and drops it where the driver cannot. A write carrying only a message
-therefore still succeeds on `fs` — the plugin contract treats a
-per-operation annotation as droppable, and `user_metadata` as not.
+`x_ov_message` user-metadata key, outside the `ovstorage_` namespace,
+where the driver can keep it, and drops it where the driver cannot. A
+write carrying only a message therefore still succeeds on `fs` — the
+plugin contract treats a per-operation annotation as droppable, and
+`user_metadata` as not. A caller entry under that key in any ASCII case
+wins and the message is dropped, because the one driver that stores
+user metadata, `s3`, lowercases key names on the way in.
 
 ## Threat model
 

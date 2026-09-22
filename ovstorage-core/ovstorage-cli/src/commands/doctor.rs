@@ -3,6 +3,7 @@
 
 //! Aggregate Stack diagnostic state for operators and agents.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ovstorage::ext::LayerExt;
@@ -18,6 +19,8 @@ pub struct DoctorReport {
     pub connections: Vec<ConnectionEntry>,
     pub address_roots: Vec<AddressRootEntry>,
     pub aliases: Vec<AliasEntry>,
+    /// Nodes more than one layer publishes. Empty in a healthy graph.
+    pub contested_roots: Vec<ContestedRootEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,6 +46,65 @@ pub struct AddressRootEntry {
     pub backend_kind: String,
     pub display_name: Option<String>,
     pub visibility: String,
+    /// The connection serving this root, spelled as `ConnectionEntry::id` is
+    /// so the two sections cross-reference. `None` for a root no connection
+    /// owns: a static route, an alias projection, or a scheme fallback.
+    pub connection_id: Option<String>,
+    /// The root's `user_metadata`, keyed in sorted order so the report is
+    /// stable across runs. A scheme fallback root carries its marker here, and
+    /// that marker is the only thing in the report that tells a granted
+    /// `s3:///` apart from an ordinary hostless root.
+    pub user_metadata: BTreeMap<String, String>,
+}
+
+impl From<ovstorage::RootInfo> for AddressRootEntry {
+    fn from(r: ovstorage::RootInfo) -> Self {
+        AddressRootEntry {
+            address: redact_message(r.root.as_str()).into_owned(),
+            backend_kind: redact_message(&r.layer_kind).into_owned(),
+            display_name: r.display_name.map(|s| redact_message(&s).into_owned()),
+            visibility: format!("{:?}", r.visibility),
+            connection_id: r.connection_id.map(|id| id.0),
+            // Both halves are operator- or plugin-authored free text, so each
+            // is scrubbed the way every other free-text field here is.
+            user_metadata: r
+                .user_metadata
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        redact_message(key).into_owned(),
+                        redact_message(value).into_owned(),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+/// One address root that two or more layers publish — only one of them can
+/// serve it, and the others are unreachable with their credentials unused.
+///
+/// Reported here because it is the state an operator cannot otherwise see: the
+/// route table shadows the losers, so reads keep working and nothing in a
+/// successful command says a layer is dead. The router logs it too, but a log
+/// line at startup is gone by the time anyone asks what is wrong.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContestedRootEntry {
+    /// Origin only: a route prefix's path and query can each carry a secret
+    /// that no redaction list recognises.
+    pub origin: String,
+    /// The layers publishing it, in the order the graph aggregated them — the
+    /// first is the one that serves.
+    ///
+    /// Each is the layer INSTANCE name (`[ovstorage.layers.<name>]`, what an
+    /// operator edits) where the published root reports one, and the backend
+    /// KIND where it does not — a loaded plugin's `list_address_roots` is not
+    /// host-filled with `owning_target` the way its `root_info_for` is, so two
+    /// contesting `http` layers currently read as `http, http`. That still says
+    /// how many layers are fighting and over which origin, which is what makes
+    /// the finding actionable; the router's own report names the instances,
+    /// because at the aggregation the association is still in hand.
+    pub layers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +132,7 @@ pub async fn gather(stack: &Stack) -> ovstorage::Result<DoctorReport> {
         connections: gather_connections(stack).await?,
         address_roots: gather_address_roots(stack).await?,
         aliases: gather_aliases(stack)?,
+        contested_roots: gather_contested_roots(stack).await?,
     })
 }
 
@@ -106,15 +169,51 @@ pub async fn gather_connections(stack: &Stack) -> ovstorage::Result<Vec<Connecti
 
 pub async fn gather_address_roots(stack: &Stack) -> ovstorage::Result<Vec<AddressRootEntry>> {
     let roots = stack.list_address_roots(None).await?;
-    Ok(roots
-        .into_iter()
-        .map(|r| AddressRootEntry {
-            address: redact_message(r.root.as_str()).into_owned(),
-            backend_kind: redact_message(&r.layer_kind).into_owned(),
-            display_name: r.display_name.map(|s| redact_message(&s).into_owned()),
-            visibility: format!("{:?}", r.visibility),
-        })
-        .collect())
+    Ok(roots.into_iter().map(AddressRootEntry::from).collect())
+}
+
+/// Find the address roots more than one layer publishes.
+///
+/// Compared by NODE, matching the route table and the router's own refusal:
+/// `assets` and `assets/` are one node, while a broader root that merely
+/// contains another is independently routable and is not contested.
+///
+/// The graph-wide refusal covers connections ADDED through it; a connection a
+/// backend builds from its own `[ovstorage.layers.<name>]` block is installed
+/// before the router exists, and one arriving on a child's update stream never
+/// passes an add either. Both land here, which is why this reads the published
+/// roots rather than trusting that nothing could have collided.
+pub async fn gather_contested_roots(stack: &Stack) -> ovstorage::Result<Vec<ContestedRootEntry>> {
+    let roots = stack.list_address_roots(None).await?;
+    let mut contested: Vec<ContestedRootEntry> = Vec::new();
+    for (index, root) in roots.iter().enumerate() {
+        let sharers: Vec<&ovstorage::RootInfo> = roots
+            .iter()
+            .filter(|other| ovstorage::address::same_node(&other.root, &root.root))
+            .collect();
+        if sharers.len() < 2 {
+            continue;
+        }
+        // Report each contested node once, from its first appearance.
+        if roots
+            .iter()
+            .take(index)
+            .any(|earlier| ovstorage::address::same_node(&earlier.root, &root.root))
+        {
+            continue;
+        }
+        contested.push(ContestedRootEntry {
+            origin: ovstorage::origin_only(&root.root),
+            layers: sharers
+                .iter()
+                .map(|r| {
+                    let name = r.owning_target.as_deref().unwrap_or(&r.layer_kind);
+                    redact_message(name).into_owned()
+                })
+                .collect(),
+        });
+    }
+    Ok(contested)
 }
 
 /// Surface the operator-declared alias rewrite rules the stack was built with.
@@ -238,7 +337,7 @@ fn emit_human(r: &DoctorReport) {
     println!("Version: {}", r.ovstorage_version);
     println!();
 
-    println!("Backend kinds loaded: {}", r.backend_kinds.len());
+    println!("Backend kinds declared: {}", r.backend_kinds.len());
     for k in &r.backend_kinds {
         println!("  - {} ({})", k.display_name, k.kind);
         if let Some(desc) = &k.description {
@@ -260,12 +359,39 @@ fn emit_human(r: &DoctorReport) {
     println!("Address roots: {}", r.address_roots.len());
     for a in &r.address_roots {
         let name = a.display_name.as_deref().unwrap_or("(unnamed)");
+        let connection = a
+            .connection_id
+            .as_deref()
+            .map(|id| format!(" connection={id}"))
+            .unwrap_or_default();
         println!(
-            "  - {} ({}) [{}] visibility={}",
+            "  - {} ({}) [{}] visibility={}{connection}",
             a.address, a.backend_kind, name, a.visibility
         );
+        if !a.user_metadata.is_empty() {
+            let pairs: Vec<String> = a
+                .user_metadata
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect();
+            println!("    metadata: {}", pairs.join(" "));
+        }
     }
     println!();
+
+    if !r.contested_roots.is_empty() {
+        println!("Contested address roots: {}", r.contested_roots.len());
+        for c in &r.contested_roots {
+            println!(
+                "  - {} is published by {} layers ({}); only the first serves it, \
+                 the rest are unreachable",
+                c.origin,
+                c.layers.len(),
+                c.layers.join(", "),
+            );
+        }
+        println!();
+    }
 
     println!("Aliases: {}", r.aliases.len());
     for al in &r.aliases {
@@ -347,6 +473,66 @@ root = "{root}"
         // The suppressed override targets the physical `to`, which does not
         // prefix the virtual `from`, so the advertised alias root is Visible.
         assert_eq!(aliases[0].visibility, "Visible");
+    }
+
+    /// A scheme fallback root is the one root whose meaning lives entirely in
+    /// fields the report did not carry: it owns no connection, and its marker
+    /// rides `user_metadata`. Without both, `s3:///` in the roots section would
+    /// read as an ordinary hostless route.
+    #[test]
+    fn doctor_address_root_entry_serializes_connection_id_and_user_metadata() {
+        let root = ovstorage::fallback::scheme_fallback_root(
+            "s3",
+            "s3",
+            ovstorage::Capabilities::empty(),
+            None,
+        )
+        .unwrap();
+        let json = serde_json::to_value(AddressRootEntry::from(root)).unwrap();
+
+        assert_eq!(json["address"], "s3:///");
+        assert_eq!(json["backend_kind"], "s3");
+        assert_eq!(json["visibility"], "Hidden");
+        assert!(
+            json["connection_id"].is_null(),
+            "a fallback owns no connection: {json}"
+        );
+        assert_eq!(
+            json["user_metadata"][ovstorage::fallback::SCHEME_FALLBACK_METADATA_KEY],
+            ovstorage::fallback::SCHEME_FALLBACK_ANONYMOUS,
+        );
+        assert_eq!(
+            json["user_metadata"].as_object().map(serde_json::Map::len),
+            Some(1),
+            "the marker is the root's only metadata: {json}"
+        );
+    }
+
+    /// The id is carried in the same spelling `connections[].id` uses, so an
+    /// operator can pair a root with the connection serving it by eye.
+    #[test]
+    fn doctor_address_root_entry_carries_the_owning_connection_id() {
+        let root = ovstorage::RootInfo {
+            root: ovstorage::address::parse("s3://bucket/").unwrap(),
+            display_name: Some("bucket".into()),
+            layer_kind: "s3".into(),
+            connection_id: Some(ovstorage::ConnectionId("c1".into())),
+            owning_target: Some("s3".into()),
+            capabilities: ovstorage::Capabilities::empty(),
+            range_read_strategy: ovstorage::RangeReadStrategy::default(),
+            source: ovstorage::RouteSource::Static {
+                layer: ovstorage::ConfigLayer::Programmatic,
+            },
+            visible: true,
+            visibility: ovstorage::AddressVisibility::Visible,
+            alias_state: None,
+            icon: None,
+            user_metadata: ovstorage::UserMetadata::new(),
+        };
+        let json = serde_json::to_value(AddressRootEntry::from(root)).unwrap();
+
+        assert_eq!(json["connection_id"], "c1");
+        assert_eq!(json["user_metadata"], serde_json::json!({}));
     }
 
     #[test]

@@ -65,6 +65,96 @@
 typedef int (*ExportParkedFn)(OvStoragePlugin_LayerHandle *);
 typedef void (*ParkVoidFn)(void);
 
+/* Prove config-driven composition resolves a non-built-in kind through the
+ * caller's Registry. The same fixture also exports the parked root used below,
+ * but its ordinary plugin manifest advertises the `test` backend factory. */
+static int config_builds_registered_plugin_kind(const char *fixture_path)
+{
+    static const char source[] =
+        "[ovstorage]\n"
+        "root = \"custom\"\n"
+        "[ovstorage.layers.custom]\n"
+        "kind = \"test\"\n";
+    OvStorage_Plugin *plugin = NULL;
+    OvStorage_Registry *registry = NULL;
+    OvStorage_Registry *unregistered = NULL;
+    OvStorage_StackConfig *config = NULL;
+    OvStorage_LayerHandle *handle = NULL;
+    OvStorage_Error error = {0};
+    OvStorage_Status status;
+    int result = 0;
+
+    status = ovstorage_load_plugin(fixture_path, true, &plugin, &error);
+    if (status != OvStorage_Status_Ok) {
+        fprintf(stderr,
+                "could not load the config-build plugin: %s\n",
+                error.message == NULL ? "(null)" : error.message);
+        goto cleanup;
+    }
+    registry = ovstorage_registry_create();
+    if (registry == NULL) {
+        fprintf(stderr, "could not create the config-build registry\n");
+        goto cleanup;
+    }
+    status = ovstorage_registry_add_plugin(registry, plugin, &error);
+    if (status != OvStorage_Status_Ok) {
+        fprintf(stderr,
+                "could not register the config-build plugin: %s\n",
+                error.message == NULL ? "(null)" : error.message);
+        goto cleanup;
+    }
+    status = ovstorage_stack_config_from_toml_str(source, &config, &error);
+    if (status != OvStorage_Status_Ok) {
+        fprintf(stderr,
+                "could not parse the plugin-backed Stack config: %s\n",
+                error.message == NULL ? "(null)" : error.message);
+        goto cleanup;
+    }
+    unregistered = ovstorage_registry_create();
+    if (unregistered == NULL) {
+        fprintf(stderr, "could not create the unregistered-kind registry\n");
+        goto cleanup;
+    }
+    handle = (OvStorage_LayerHandle *)(uintptr_t)1;
+    status = ovstorage_stack_build_from_config(config,
+                                               unregistered,
+                                               NULL,
+                                               &handle,
+                                               &error);
+    if (status != OvStorage_Status_InvalidArgument || handle != NULL) {
+        fprintf(stderr,
+                "unregistered `test` kind returned status=%d handle=%p\n",
+                (int)status,
+                (void *)handle);
+        goto cleanup;
+    }
+    ovstorage_registry_destroy(unregistered);
+    unregistered = NULL;
+    ovstorage_error_clear(&error);
+    status = ovstorage_stack_build_from_config(config,
+                                               registry,
+                                               NULL,
+                                               &handle,
+                                               &error);
+    if (status != OvStorage_Status_Ok || handle == NULL) {
+        fprintf(stderr,
+                "could not build the registered `test` kind: status=%d %s\n",
+                (int)status,
+                error.message == NULL ? "(null)" : error.message);
+        goto cleanup;
+    }
+    result = 1;
+
+cleanup:
+    ovstorage_layer_handle_destroy(handle);
+    ovstorage_stack_config_destroy(config);
+    ovstorage_registry_destroy(unregistered);
+    ovstorage_registry_destroy(registry);
+    ovstorage_plugin_destroy(plugin);
+    ovstorage_error_clear(&error);
+    return result;
+}
+
 /* --- root-discovery completion latch ------------------------------------- */
 
 typedef struct {
@@ -159,10 +249,23 @@ static void on_stat(OvStorage_Status status,
     (void)pthread_mutex_unlock(&c->mutex);
 }
 
-/* Dispatch `stat` and block on its callback latch. Returns 1 on Ok. */
-static int stat_sync(OvStorage_LayerHandle *handle, const char *address)
+/* The version pin the Rust fixture answers for its one object when asked. */
+static const char PARKED_OBJECT_PIN[] = "park://data/a.bin?version=1";
+
+/* Dispatch `stat` and block on its callback latch. The Rust fixture declares
+ * its synthetic validator strong, pinning that the imported ABI field reaches
+ * the public C snapshot intact, and answers its version pin only when the
+ * options ask for one: with `ask_pin` the pin must arrive, so a request path
+ * that drops the flag fails here; without it none may arrive, so a path that
+ * invents the flag fails here too. */
+static int stat_sync(OvStorage_LayerHandle *handle,
+                     const char *address,
+                     bool ask_pin)
 {
     InfoCompletion c;
+    OvStorage_StatOptions options;
+    const char *pin;
+    int pin_ok;
     int ok;
 
     memset(&c, 0, sizeof(c));
@@ -174,13 +277,39 @@ static int stat_sync(OvStorage_LayerHandle *handle, const char *address)
         return 0;
     }
     c.status = OvStorage_Status_Internal;
-    ovstorage_stat(handle, address, NULL, NULL, on_stat, &c);
+    memset(&options, 0, sizeof(options));
+    options.versioned_address = ask_pin;
+    ovstorage_stat(handle, address, &options, NULL, on_stat, &c);
     (void)pthread_mutex_lock(&c.mutex);
     while (!c.done) {
         (void)pthread_cond_wait(&c.changed, &c.mutex);
     }
     (void)pthread_mutex_unlock(&c.mutex);
-    ok = c.status == OvStorage_Status_Ok;
+    pin = c.info == NULL ? NULL : c.info->versioned_address;
+    pin_ok = ask_pin ? (pin != NULL && strcmp(pin, PARKED_OBJECT_PIN) == 0)
+                     : pin == NULL;
+    ok = c.status == OvStorage_Status_Ok && c.info != NULL &&
+         c.info->etag_strength == OVSTORAGE_ETAG_STRENGTH_STRONG && pin_ok;
+    if (c.status == OvStorage_Status_Ok &&
+        (c.info == NULL ||
+         c.info->etag_strength != OVSTORAGE_ETAG_STRENGTH_STRONG)) {
+        fprintf(stderr,
+                "imported Rust stat did not preserve its strong etag "
+                "declaration\n");
+    }
+    if (c.status == OvStorage_Status_Ok && c.info != NULL && !pin_ok) {
+        if (ask_pin) {
+            fprintf(stderr,
+                    "imported Rust stat lost the versioned address it asked "
+                    "for: %s\n",
+                    pin == NULL ? "(NULL)" : pin);
+        } else {
+            fprintf(stderr,
+                    "imported Rust stat carried a versioned address it never "
+                    "asked for: %s\n",
+                    pin);
+        }
+    }
     if (c.info != NULL) {
         ovstorage_info_destroy(c.info);
     }
@@ -272,8 +401,11 @@ static int run_cancel_while_parked(ExportParkedFn export_parked,
         fprintf(stderr, "parked discovery completed before cancel\n");
         goto cleanup;
     }
-    /* Unrelated work progresses on this thread while the discovery is parked. */
-    if (!stat_sync(handle, "park://data/a.bin")) {
+    /* Unrelated work progresses on this thread while the discovery is parked;
+     * one stat asks for the version pin and one does not, so the pure-C
+     * request path is proven to carry the flag in both directions. */
+    if (!stat_sync(handle, "park://data/a.bin", true) ||
+        !stat_sync(handle, "park://data/a.bin", false)) {
         fprintf(stderr, "sibling stat failed while the discovery was parked\n");
         goto cleanup;
     }
@@ -408,6 +540,9 @@ int ovstorage_c_source_stack_build_parked_contract(const char *fixture_path)
 
     if (fixture_path == NULL) {
         fprintf(stderr, "fixture path is null\n");
+        return 1;
+    }
+    if (!config_builds_registered_plugin_kind(fixture_path)) {
         return 1;
     }
     /* RTLD_LOCAL so the fixture's own bundled plugin-SDK symbols never

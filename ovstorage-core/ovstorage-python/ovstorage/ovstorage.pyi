@@ -13,6 +13,7 @@ import ovstorage.alias as alias
 import ovstorage.byte_cache as byte_cache
 import ovstorage.copy_rename_fallback as copy_rename_fallback
 import ovstorage.file as file
+import ovstorage.hub_cache as hub_cache
 import ovstorage.metadata_cache as metadata_cache
 import ovstorage.plugin as plugin
 import ovstorage.redirect_follower as redirect_follower
@@ -118,6 +119,7 @@ __all__ = [
     "byte_cache",
     "copy_rename_fallback",
     "file",
+    "hub_cache",
     "init_auth_substrate",
     "metadata_cache",
     "plugin",
@@ -234,6 +236,8 @@ class Info:
     size: int | None
     mtime_unix_nanos: int | None
     etag: str | None
+    etag_strength: str | None
+    versioned_address: str | None
     version: str | None
     system_metadata: dict[str, str]
     user_metadata: dict[str, str]
@@ -349,6 +353,10 @@ class ConnectionRequest:
 
 class Capabilities:
     @property
+    def supports_write(self) -> bool: ...
+    @property
+    def supports_list(self) -> bool: ...
+    @property
     def supports_if_match_write(self) -> bool: ...
     @property
     def supports_no_overwrite_write(self) -> bool: ...
@@ -379,6 +387,8 @@ class Connection:
     def backend_kind(self) -> str: ...
     @property
     def display_name(self) -> str: ...
+    @property
+    def owning_target(self) -> str | None: ...
     @property
     def addresses(self) -> list[str]: ...
     @property
@@ -608,7 +618,12 @@ class LayerBase:
     ) -> AsyncAuthEventStream: ...
     async def list_connections(self) -> list[Connection]: ...
     async def list_address_roots(self) -> list[AddressRoot]: ...
-    async def stat(self, address: str, full_metadata: bool = False) -> Info: ...
+    async def stat(
+        self,
+        address: str,
+        full_metadata: bool = False,
+        versioned_address: bool = False,
+    ) -> Info: ...
     async def read_bytes(
         self,
         address: str,
@@ -678,6 +693,7 @@ class LayerBase:
         max_results: int | None = None,
         page_token: str | None = None,
         full_metadata: bool = False,
+        versioned_address: bool = False,
     ) -> ListPage: ...
     async def delete(self, address: str, if_match: str | None = None) -> None: ...
     async def materialize(
@@ -759,6 +775,16 @@ class Stack:
         principal_id: str | None = None,
         allow_test_plugins: bool = False,
     ) -> Stack: ...
+    # StackConfig stays opaque and declares the terminal graph: graph mutators raise.
+    # With path=None, resolution matches the CLI; only with_registry may compose.
+    @staticmethod
+    def from_config(
+        path: str | os.PathLike[str] | None = None,
+        *,
+        toml: str | None = None,
+        allow_test_plugins: bool = False,
+    ) -> Stack: ...
+    # Each graph mutator below raises InvalidArgumentError on a from_config composer.
     def layer(self, layer: LayerBase) -> Stack: ...
     def backend(self, layer: LayerBase) -> Stack: ...
     def wrapper(self, layer: LayerBase) -> Stack: ...

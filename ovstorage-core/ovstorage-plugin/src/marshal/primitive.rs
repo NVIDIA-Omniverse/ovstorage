@@ -226,6 +226,93 @@ pub unsafe fn optional_from_ffi<T, U, E>(
     }
 }
 
+/// The shape of an [`ffi::Str`] a producer never wrote: a null pointer and a
+/// zero length, which is what a zeroed struct already holds. A well-formed
+/// producer never emits it — the empty string carries a one-byte sentinel
+/// allocation — so inside a present `Optional` it says the producer raised
+/// `present` over a payload it left alone. The C host applies the same test
+/// before copying an optional string to its client.
+pub fn str_is_unset(raw: &ffi::Str) -> bool {
+    raw.ptr.is_null() && raw.len == 0
+}
+
+/// Consume an [`ffi::Optional<ffi::Str>`] whose `present` flag can outrun its
+/// payload, distinguishing a field the producer never wrote from one it wrote
+/// as an empty string.
+///
+/// `present == true` with `ptr == NULL && len == 0` is the shape a `calloc`'d
+/// struct already has, so it carries no statement from the producer at all; it
+/// decodes to `None`. `present == true` with a non-NULL pointer and a zero
+/// length is a producer that encoded the empty string deliberately, and it
+/// decodes to `Some("")`. Those are different statements on the wire, and
+/// [`str_from_ffi`] alone cannot tell them apart because it maps both to an
+/// empty `String`.
+///
+/// A NULL pointer with a NON-zero length is neither shape: it is malformed,
+/// and it decodes as an empty `String` the same way [`str_from_ffi`] handles
+/// it. The two shapes above are the taxonomy for a well-formed producer, not
+/// for every bit pattern that can reach this function.
+///
+/// The optional strings a plugin returns through root info and operation
+/// results decode through this function, so the Rust host and the C host
+/// answer the same way for the same wire bytes on those fields: the C client
+/// sees NULL where this returns `None`. The set is `RootInfo::display_name`,
+/// the route-source, alias-source and alias-state strings, `next_page_token`,
+/// `ObjectInfo` / `BackendItemInfo` `etag` / `version` / `modified_by`,
+/// `AccessDecision::reason` and the change-event `etag` / `version`; the
+/// connection-id wrapper has [`optional_connection_id_unset_as_none`].
+/// Descriptor, error-context and redirect strings decode with
+/// [`optional_from_ffi`] and [`str_from_ffi`], as do the optional strings the
+/// host sends to a plugin, whose encoder never emits the unset shape.
+///
+/// # Safety
+///
+/// Same contract as [`optional_from_ffi`]: `value`'s `present` discriminant
+/// must match how it was constructed, and the conversion takes ownership of
+/// the payload.
+pub unsafe fn optional_str_unset_as_none(
+    value: ffi::Optional<ffi::Str>,
+) -> Result<Option<String>, Error> {
+    unsafe {
+        optional_from_ffi(value, |raw| {
+            // Read the discriminating fields BEFORE `str_from_ffi` takes
+            // ownership and frees the buffer.
+            if str_is_unset(&raw) {
+                // `Str::drop` is null-safe, so letting `raw` fall out of scope
+                // here releases nothing and leaks nothing.
+                return Ok(None);
+            }
+            str_from_ffi(raw).map(Some)
+        })
+        .map(Option::flatten)
+    }
+}
+
+/// [`optional_str_unset_as_none`] over the connection-id wrapper, whose
+/// payload is a [`ffi::Str`] one struct further in. The unset test is applied
+/// to that inner string; an id the producer encoded as empty survives as
+/// `Some(ConnectionId(""))`, which the caller may then refuse on its own
+/// terms.
+///
+/// # Safety
+///
+/// Same contract as [`optional_from_ffi`]: `value`'s `present` discriminant
+/// must match how it was constructed, and the conversion takes ownership of
+/// the payload.
+pub unsafe fn optional_connection_id_unset_as_none(
+    value: ffi::Optional<ffi::ConnectionId>,
+) -> Result<Option<crate::ConnectionId>, Error> {
+    unsafe {
+        optional_from_ffi(value, |raw| {
+            if str_is_unset(&raw.id) {
+                return Ok(None);
+            }
+            str_from_ffi(raw.id).map(|id| Some(crate::ConnectionId(id)))
+        })
+        .map(Option::flatten)
+    }
+}
+
 /// Convert a `SystemTime` into Unix milliseconds. Sub-ms precision
 /// is intentionally lossy; negative results encode pre-epoch.
 pub fn system_time_to_unix_ms(time: SystemTime) -> i64 {

@@ -35,7 +35,7 @@ use support::minio_sigv4::{ACCESS_KEY, BUCKET, FakeMinio, REGION, SECRET_KEY, se
 
 // === Composition ===
 
-fn credentials() -> SecretBundle {
+fn credentials_with_secret(secret: &str) -> SecretBundle {
     let mut bundle = SecretBundle::default();
     bundle.fields.insert(
         "aws_access_key_id".into(),
@@ -43,15 +43,30 @@ fn credentials() -> SecretBundle {
     );
     bundle.fields.insert(
         "aws_secret_access_key".into(),
-        SecretValue::Bytes(SecretBytes(SECRET_KEY.as_bytes().to_vec())),
+        SecretValue::Bytes(SecretBytes(secret.as_bytes().to_vec())),
     );
     bundle
+}
+
+fn credentials() -> SecretBundle {
+    credentials_with_secret(SECRET_KEY)
 }
 
 /// An `S3Layer` with one authenticated connection pointed at `fake`, under the
 /// `minio` compatibility profile with path-style addressing — the configuration
 /// the reporter used.
 async fn s3_layer_against(fake: &FakeMinio) -> LayerHandle {
+    s3_layer_against_with_credentials(fake, credentials()).await
+}
+
+async fn s3_layer_against_with_secret(fake: &FakeMinio, secret: &str) -> LayerHandle {
+    s3_layer_against_with_credentials(fake, credentials_with_secret(secret)).await
+}
+
+async fn s3_layer_against_with_credentials(
+    fake: &FakeMinio,
+    credentials: SecretBundle,
+) -> LayerHandle {
     let layer = S3LayerFactory::default()
         .create_backend("s3", &LayerConfig::new(), None)
         .await
@@ -75,7 +90,7 @@ async fn s3_layer_against(fake: &FakeMinio) -> LayerHandle {
                 connection: ConnectionRequest {
                     backend_kind: "s3".into(),
                     config,
-                    credentials: credentials(),
+                    credentials,
                     persist: false,
                     display_name: None,
                 },
@@ -157,6 +172,104 @@ async fn follower_write_bytes_survives_minio_presign_verification() {
     assert!(put.presigned, "the PUT must be the presigned redirect");
 }
 
+/// A message that cannot travel as an `x-amz-meta-*` header value is dropped
+/// rather than refused: the redirected write still verifies and stores the
+/// bytes, and no annotation header reaches the origin. The annotation is
+/// droppable by contract; a request-construction failure surfacing as
+/// `Internal` would turn it into a hard failure on the default S3 write route.
+#[tokio::test]
+async fn follower_write_drops_a_message_that_cannot_travel_as_a_header() {
+    let fake = FakeMinio::spawn();
+    let stack = follower_over(s3_layer_against(&fake).await).await;
+
+    let payload = b"annotated-through-the-follower".to_vec();
+    let result = stack
+        .write(
+            Request::new(WriteRequest {
+                address: object_address("unstorable-note.bin"),
+                body: Body::Bytes(payload.clone()),
+                options: WriteOptions {
+                    message: Some("line one\r\nx-amz-meta-injected: yes".into()),
+                    ..WriteOptions::default()
+                },
+            }),
+            None,
+        )
+        .await;
+
+    assert_no_rejections(&fake, "write(bytes) with an unstorable message");
+    result.expect("a message that cannot be carried is dropped, not refused");
+    assert_eq!(fake.object("unstorable-note.bin"), Some(payload));
+    let put = fake
+        .requests()
+        .into_iter()
+        .find(|request| request.method == "PUT")
+        .expect("a PUT reached the origin");
+    assert!(put.presigned, "the PUT must be the presigned redirect");
+    assert!(
+        put.header("x-amz-meta-x_ov_message").is_none(),
+        "the unstorable annotation must not reach the origin"
+    );
+    assert!(
+        put.header("x-amz-meta-injected").is_none(),
+        "no header is smuggled in through the message"
+    );
+}
+
+#[tokio::test]
+async fn follower_write_surfaces_provider_error_code_on_presign_rejection() {
+    let fake = FakeMinio::spawn();
+    let layer = s3_layer_against_with_secret(&fake, "intentionally-wrong-secret").await;
+    let stack = follower_over(layer).await;
+
+    let error = stack
+        .write(
+            Request::new(WriteRequest {
+                address: object_address("rejected-redirect.bin"),
+                body: Body::Bytes(b"small redirected payload".to_vec()),
+                options: WriteOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect_err("the presigned PUT must fail signature verification");
+
+    assert_eq!(error.code(), ErrorCode::PermissionDenied, "{error}");
+    let message = error.message();
+    assert!(
+        message.contains("SignatureDoesNotMatch"),
+        "the sanitized provider code must be surfaced: {message}"
+    );
+    assert!(
+        message.contains("403"),
+        "the origin status must be surfaced: {message}"
+    );
+
+    let rejections = fake.rejections();
+    assert!(
+        !rejections.is_empty(),
+        "the 403 must come from the fake's presigned-request verifier"
+    );
+    assert!(
+        rejections.iter().any(|reason| reason.contains(ACCESS_KEY)),
+        "the fixture rejection must contain the access key signing marker: {rejections:#?}"
+    );
+    for reason in &rejections {
+        // The diagnostic is XML-escaped before it reaches the follower. Check
+        // the exact on-wire spelling as well as the fixture's raw record so a
+        // verbatim-body leak fails this test.
+        let escaped = reason.replace('&', "&amp;").replace('<', "&lt;");
+        assert!(
+            !message.contains(reason.as_str()) && !message.contains(escaped.as_str()),
+            "the raw signature-verification reason must not leak: {message}"
+        );
+    }
+    assert!(
+        !message.contains(ACCESS_KEY),
+        "the access key id must not leak: {message}"
+    );
+}
+
 #[tokio::test]
 async fn follower_write_stream_with_size_hint_survives_minio_presign_verification() {
     // The second failing row of the report: a known-size `write_stream` takes
@@ -186,17 +299,16 @@ async fn follower_write_stream_with_size_hint_survives_minio_presign_verificatio
 
 // === Multipart part PUTs ===
 
-/// A layer that hands the follower one pre-built redirect and then completes.
-/// Lets a genuine presigned `UploadPart` URL — minted by the real S3 layer for
-/// a 200 MiB write — be replayed with a few bytes instead of a hundred
-/// megabytes. The signature under test is identical either way; only the body
-/// is smaller.
-struct ReplayOneRedirect {
-    redirect: WriteRedirect,
+/// A layer that hands the follower a pre-built batch. Tests can either finish
+/// synthetically or delegate `continue_write` to the real S3 layer, while
+/// replaying genuine `UploadPart` URLs with a small body.
+struct ReplayRedirectBatch {
+    batch: WriteRedirectBatch,
+    continuation_layer: Option<LayerHandle>,
 }
 
 #[async_trait]
-impl Layer for ReplayOneRedirect {
+impl Layer for ReplayRedirectBatch {
     fn name(&self) -> &str {
         "replay-one-redirect"
     }
@@ -222,17 +334,17 @@ impl Layer for ReplayOneRedirect {
         _request: Request<WriteRequest>,
         _cancel: Option<CancellationToken>,
     ) -> Result<WriteRedirectBatch> {
-        Ok(WriteRedirectBatch {
-            continuation: Vec::new(),
-            redirects: vec![self.redirect.clone()],
-        })
+        Ok(self.batch.clone())
     }
 
     async fn continue_write(
         &self,
         request: Request<ContinueWriteRequest>,
-        _cancel: Option<CancellationToken>,
+        cancel: Option<CancellationToken>,
     ) -> Result<WriteStep> {
+        if let Some(layer) = &self.continuation_layer {
+            return layer.continue_write(request, cancel).await;
+        }
         // Surface a non-2xx part upload as an error rather than a silent Done,
         // so a rejected signature fails the test at the assertion that names it.
         for result in &request.input.results.results {
@@ -249,6 +361,7 @@ impl Layer for ReplayOneRedirect {
         }
         Ok(WriteStep::Done(WriteResult {
             info: ObjectInfo {
+                etag_strength: Default::default(),
                 address: request.input.address,
                 kind: ObjectKind::File,
                 etag: Some("multipart-etag".into()),
@@ -260,6 +373,7 @@ impl Layer for ReplayOneRedirect {
                 system_metadata: None,
                 user_metadata: None,
                 modified_by: None,
+                versioned_address: None,
             },
         }))
     }
@@ -300,6 +414,12 @@ async fn multipart_part_presign_survives_minio_verification() {
         "a 200 MiB write must plan multiple parts, got {}",
         batch.redirects.len()
     );
+    for redirect in &batch.redirects {
+        assert!(
+            redirect.result_capture.body_max_bytes > 0,
+            "minted UploadPart redirect must capture an error body"
+        );
+    }
 
     let payload = b"part-one!".to_vec();
     let mut redirect = batch.redirects[0].clone();
@@ -313,7 +433,14 @@ async fn multipart_part_presign_survives_minio_verification() {
         redirect.request.url
     );
 
-    let stack = follower_over(Arc::new(ReplayOneRedirect { redirect })).await;
+    let stack = follower_over(Arc::new(ReplayRedirectBatch {
+        batch: WriteRedirectBatch {
+            continuation: Vec::new(),
+            redirects: vec![redirect],
+        },
+        continuation_layer: None,
+    }))
+    .await;
     let result = stack
         .write(
             Request::new(WriteRequest {
@@ -327,6 +454,90 @@ async fn multipart_part_presign_survives_minio_verification() {
 
     assert_no_rejections(&fake, "multipart part PUT");
     result.expect("the presigned UploadPart must verify against MinIO");
+}
+
+#[tokio::test]
+async fn truncated_multipart_error_body_still_aborts_the_upload() {
+    let fake = FakeMinio::spawn_truncating_upload_part_error();
+    let layer = s3_layer_against(&fake).await;
+    let mut batch = multipart_batch(&layer, "truncated-error.bin").await;
+    assert!(batch.redirects.len() >= 2, "expected multiple parts");
+    for redirect in &batch.redirects {
+        assert!(
+            redirect.result_capture.body_max_bytes > 0,
+            "minted UploadPart redirect must capture an error body"
+        );
+    }
+
+    let payload = b"part-one!".to_vec();
+    batch.redirects.truncate(1);
+    batch.redirects[0].body_source = RedirectBodySource::UserBytes {
+        offset: 0,
+        len: payload.len() as u64,
+    };
+
+    let replay: LayerHandle = Arc::new(ReplayRedirectBatch {
+        batch,
+        continuation_layer: Some(layer),
+    });
+    let mut follower_config = LayerConfig::new();
+    follower_config.insert("max_attempts".into(), ConfigValue::Int(2));
+    follower_config.insert("initial_delay_ms".into(), ConfigValue::Int(0));
+    follower_config.insert("max_delay_ms".into(), ConfigValue::Int(0));
+    let stack = RedirectFollowerWrapperFactory
+        .create_wrapper("follower", &follower_config, replay, None)
+        .await
+        .expect("create redirect_follower");
+
+    let error = stack
+        .write(
+            Request::new(WriteRequest {
+                address: object_address("truncated-error.bin"),
+                body: Body::Bytes(payload),
+                options: WriteOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect_err("truncated response framing must fail the write");
+
+    assert_eq!(
+        error.code(),
+        ErrorCode::Transient,
+        "the original response-body transport error must be preserved: {error}"
+    );
+    assert_no_rejections(&fake, "truncated multipart error response");
+
+    let requests = fake.requests();
+    let upload_part_attempts = requests
+        .iter()
+        .filter(|request| {
+            request.method == "PUT"
+                && request.presigned
+                && request.query.contains("uploadId=")
+                && request.query.contains("partNumber=")
+                && request.status == 403
+        })
+        .count();
+    assert_eq!(
+        upload_part_attempts, 2,
+        "the follower must exhaust its configured retries before cleanup: {requests:#?}"
+    );
+    assert!(
+        requests.iter().any(|request| {
+            request.method == "DELETE"
+                && !request.presigned
+                && request.query.contains("uploadId=fake-upload-id")
+                && request.status == 204
+        }),
+        "the real S3 continuation must abort the multipart upload: {requests:#?}"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| { request.method == "POST" && request.query.contains("uploadId=") }),
+        "a failed multipart upload must not be completed: {requests:#?}"
+    );
 }
 
 // === Construction-level guard ===

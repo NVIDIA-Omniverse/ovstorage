@@ -435,7 +435,37 @@ impl RedirectFollowerWrapper {
                 }
             };
             let results =
-                crate::redirect::follow_write_redirects(redirect_body, &batch, &self.retry).await?;
+                match crate::redirect::follow_write_redirects(redirect_body, &batch, &self.retry)
+                    .await
+                {
+                    Ok(results) => results,
+                    Err(error) => {
+                        // A backend may have allocated server-side state while
+                        // minting this batch. Give it one best-effort abandonment
+                        // notification after redirect execution exhausts retries:
+                        // an empty result batch cannot be mistaken for successful
+                        // completion of a non-empty redirect batch. In particular,
+                        // S3 uses the cardinality mismatch to abort a multipart
+                        // upload. Do not pass a possibly-triggered cancellation
+                        // token to cleanup, and preserve the original execution
+                        // error (including its retry classification) for the
+                        // caller.
+                        if error.code().retryable() && !batch.redirects.is_empty() {
+                            let cleanup_request = Request {
+                                extensions: extensions.clone(),
+                                input: ContinueWriteRequest {
+                                    address: address.clone(),
+                                    redirects: batch.clone(),
+                                    results: RedirectResultBatch {
+                                        results: Vec::new(),
+                                    },
+                                },
+                            };
+                            let _ = self.inner.continue_write(cleanup_request, None).await;
+                        }
+                        return Err(error);
+                    }
+                };
             let continue_request = Request {
                 extensions: extensions.clone(),
                 input: ContinueWriteRequest {
@@ -531,9 +561,18 @@ impl Layer for RedirectFollowerWrapper {
     /// Slots with no redirect concern delegate to `inner` via the trait
     /// defaults — including the explicit `write_redirect`/`continue_write`
     /// protocol ops, which callers driving the redirect protocol themselves
-    /// expect to reach the backend untouched.
+    /// expect to reach the backend untouched. `list_stream` is overridden
+    /// below because its trait default is a buffered compatibility adapter.
     fn inner_layer(&self) -> Option<&LayerHandle> {
         Some(&self.inner)
+    }
+
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        self.inner.list_stream(request, cancel).await
     }
 
     // --- redirect-following read --------------------------------------------

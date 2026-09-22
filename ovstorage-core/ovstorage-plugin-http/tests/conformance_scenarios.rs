@@ -384,6 +384,16 @@ async fn invoke_slot(layer: &LayerHandle, server: &ScriptedHttpServer, method: &
             )
             .await
             .map(|_| ()),
+        "materialize" => layer
+            .materialize(
+                Request::new(ReadRequest {
+                    address,
+                    options: ReadOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .map(|_| ()),
         "check_access" => layer
             .check_access(
                 Request::new(CheckAccessRequest {
@@ -491,6 +501,12 @@ async fn conformance_scenarios_cover_the_registry() {
                 driven.push(scenario.name);
                 drive_unsupported_refusal(scenario, "delete").await
             }
+            // Backend-side: this layer itself must refuse `materialize`, which
+            // is observable here without any host wrapper above it.
+            "materialize-unsupported-without-cache" => {
+                driven.push(scenario.name);
+                drive_unsupported_refusal(scenario, "materialize").await
+            }
             "metadata-unsupported-not-called" => runner.skip(
                 scenario.name,
                 "recorder-based negative assertion; expected_calls verification is \
@@ -547,6 +563,7 @@ async fn conformance_scenarios_cover_the_registry() {
             "capability-gate-watch-directory-unsupported",
             "capability-gate-write-redirect-unsupported",
             "compat-gates-v1-capability",
+            "materialize-unsupported-without-cache",
             "read-streamed-empty",
             "readonly-connection-rejects-mutations",
             "stat-basic-objectinfo",

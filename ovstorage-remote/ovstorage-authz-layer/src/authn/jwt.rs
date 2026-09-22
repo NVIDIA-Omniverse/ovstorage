@@ -403,10 +403,10 @@ fn validate_unsigned_times(claims: &JwtClaims) -> Result<()> {
 /// key's family (`kty`, plus curve for EC/OKP) — the sole source of truth for
 /// which `alg` a token may carry, independent of the token header. RSA keys
 /// accept the PKCS#1v1.5 and PSS families; EC keys accept the ECDSA algorithm
-/// for their curve (`ring`/`jsonwebtoken` support P-256/P-384 only — P-521 has
-/// no `ES512`); Ed25519 OKP keys accept `EdDSA`; symmetric `oct` keys accept the
-/// HMAC family. An EC/OKP key on an unsupported curve is a clean auth error, not
-/// a silent admit.
+/// for their curve (`jsonwebtoken` supports P-256/P-384 only — P-521 has no
+/// `ES512`); Ed25519 OKP keys accept `EdDSA`; symmetric `oct` keys accept the
+/// HMAC family. An EC/OKP key on an unsupported curve, or a key of any other
+/// type, is a clean auth error, not a silent admit.
 fn accepted_algorithms(jwk: &Jwk) -> Result<Vec<Algorithm>> {
     let algorithms = match &jwk.algorithm {
         AlgorithmParameters::RSA(_) => vec![
@@ -438,6 +438,15 @@ fn accepted_algorithms(jwk: &Jwk) -> Result<Vec<Algorithm>> {
         },
         AlgorithmParameters::OctetKey(_) => {
             vec![Algorithm::HS256, Algorithm::HS384, Algorithm::HS512]
+        }
+        // `AlgorithmParameters` is non-exhaustive and a JWKS may carry a `kty`
+        // this verifier has no signature family for. Refuse it instead of
+        // guessing.
+        other => {
+            return Err(Error::new(
+                ErrorCode::AuthRequired,
+                format!("unsupported JWKS key type for bearer JWT: {other:?}"),
+            ));
         }
     };
     Ok(algorithms)

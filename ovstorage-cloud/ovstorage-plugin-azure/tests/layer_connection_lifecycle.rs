@@ -11,18 +11,25 @@
 use std::collections::HashMap;
 
 use base64::Engine as _;
+use futures::StreamExt as _;
 use ovstorage_plugin::{
     AuthenticateRequest, BackendFactory, Body, ConfigValue, ConnectionAuthState, ConnectionKey,
     ConnectionRequest, ContinueWriteRequest, ErrorCode, InteractiveAuthCapability, LayerConfig,
-    LayerConnectionRequest, LayerHandle, ListOptions, ListRequest, ObjectKind, ReadOptions,
-    ReadRequest, ReadResult, RedirectResult, RedirectResultBatch, RenameOptions, RenameRequest,
-    Request, SecretBundle, SecretBytes, SecretValue, StatOptions, StatRequest,
-    UpdateConnectionCredentialsRequest, WatchDirectoryOptions, WatchDirectoryRequest, WriteOptions,
-    WriteRequest, address,
+    LayerConnectionRequest, LayerHandle, ListOptions, ListRequest, ObjectKind, RangeReadStrategy,
+    ReadOptions, ReadRequest, ReadResult, RedirectResult, RedirectResultBatch, RenameOptions,
+    RenameRequest, Request, RootInfo, SecretBundle, SecretBytes, SecretValue, StatOptions,
+    StatRequest, UpdateConnectionCredentialsRequest, WatchDirectoryOptions, WatchDirectoryRequest,
+    WriteOptions, WriteRequest, address,
 };
 use ovstorage_plugin_azure::AzureLayerFactory;
 use ovstorage_plugin_test::{
     CannedHttpResponse, Responder, Route, ScriptedHttpServer, ScriptedResponse,
+};
+
+mod support;
+use support::{
+    ANONYMOUS_FALLBACK_KEY, anonymous_fallback_grant, capture_logs, create_layer,
+    fallback_layer_config,
 };
 
 // === Scripted mock Azure server ===
@@ -1635,4 +1642,580 @@ async fn hns_list_passes_real_directories_through_unfolded() {
         .expect("file entry listed");
     assert_eq!(file.kind, ObjectKind::File);
     assert!(page.next_page_token.is_none());
+}
+
+/// Native streaming uses the same per-instance directory model as buffered
+/// listing: flat markers are folded, while HNS directory inodes remain real.
+#[tokio::test]
+async fn streamed_list_matches_buffered_fold_for_flat_and_hns_instances() {
+    for (hierarchical_namespace, body, expected_directory_kind) in [
+        (false, LIST_BODY, ObjectKind::DirectoryMarker),
+        (true, HNS_LIST_BODY, ObjectKind::Directory),
+    ] {
+        let server = spawn_scripted_server("200 OK", None, body);
+        let layer = empty_layer().await;
+        let mut connection = connection_request("assets", server.endpoint(), account_key_bundle());
+        connection.config.insert(
+            "hierarchical_namespace".into(),
+            ConfigValue::Bool(hierarchical_namespace),
+        );
+        let connection = add(&layer, connection).await;
+        assert!(connection.capabilities.supports_list_stream);
+
+        let prefix = address::parse("azure://acct123/assets/").unwrap();
+        let buffered = layer
+            .list(
+                Request::new(ListRequest {
+                    prefix: prefix.clone(),
+                    options: ListOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .unwrap()
+            .items;
+        let mut stream = layer
+            .list_stream(
+                Request::new(ListRequest {
+                    prefix,
+                    options: ListOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut streamed = Vec::new();
+        while let Some(item) = stream.next().await {
+            streamed.push(item.unwrap());
+        }
+
+        assert_eq!(streamed, buffered, "hns={hierarchical_namespace}");
+        assert_eq!(
+            streamed[0].kind, expected_directory_kind,
+            "hns={hierarchical_namespace} must select its own fold mode"
+        );
+    }
+}
+
+// === Anonymous scheme fallback: layer policy, routing precedence, refusals ===
+//
+// The fallback is a layer-table grant, not a connection: it is built by the
+// factory, publishes one hidden `azure:///` root, registers nothing in the
+// connection set, and answers only the addresses no connection's root is a
+// prefix of. The wire-level assertions (unsigned requests, refused mutations)
+// live in `anonymous_public_container.rs`; this section pins the lifecycle
+// side.
+
+const FALLBACK_BUILT: &str = "anonymous fallback backend built";
+
+async fn root_info(layer: &LayerHandle, address: &str) -> ovstorage_plugin::Result<RootInfo> {
+    layer
+        .root_info_for(
+            &address::parse(address).unwrap(),
+            &ovstorage_plugin::Extensions::new(),
+            None,
+        )
+        .await
+}
+
+async fn root_for(layer: &LayerHandle, address: &str) -> ovstorage_plugin::Result<String> {
+    root_info(layer, address)
+        .await
+        .map(|root| root.root.as_str().to_string())
+}
+
+async fn stat_code(layer: &LayerHandle, address: &str) -> ovstorage_plugin::Error {
+    layer
+        .stat(
+            Request::new(StatRequest {
+                address: address::parse(address).unwrap(),
+                options: StatOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect_err("the stat must be refused")
+}
+
+async fn list_prefix(layer: &LayerHandle, prefix: &str) -> ovstorage_plugin::Result<()> {
+    layer
+        .list(
+            Request::new(ListRequest {
+                prefix: address::parse(prefix).unwrap(),
+                options: ListOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .map(|_| ())
+}
+
+/// No grant, no fallback: an address no connection serves is `NoRoute` with
+/// the message every miss has always carried, whether the layer is empty or
+/// serves some other container.
+#[tokio::test]
+async fn fallback_is_off_by_default() {
+    let layer = empty_layer().await;
+    let err = stat_code(&layer, "azure://acct123/assets/x").await;
+    assert_eq!(err.code(), ErrorCode::NoRoute);
+    assert_eq!(err.message(), "no route matches address");
+
+    let server = spawn_scripted_server("200 OK", None, EMPTY_LIST_BODY);
+    add(
+        &layer,
+        connection_request("alpha", server.endpoint(), SecretBundle::default()),
+    )
+    .await;
+    let err = stat_code(&layer, "azure://acct123/beta/x").await;
+    assert_eq!(err.code(), ErrorCode::NoRoute);
+    assert_eq!(err.message(), "no route matches address");
+    assert_eq!(server.hits(), 0, "a miss reaches no service");
+
+    let (snapshot, _) = layer
+        .list_address_roots(&ovstorage_plugin::Extensions::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .roots
+            .iter()
+            .map(|root| root.root.as_str().to_string())
+            .collect::<Vec<_>>(),
+        ["azure://acct123/alpha/"],
+        "no scheme root is published without a grant"
+    );
+}
+
+/// A layer table holding only the grant is policy, not a connection: the
+/// factory seeds nothing, and the one root it publishes is the hidden, marked
+/// scheme root with no connection behind it.
+#[tokio::test]
+async fn a_layer_holding_only_the_fallback_key_seeds_no_static_connection() {
+    let mut config = LayerConfig::new();
+    config.insert(
+        ANONYMOUS_FALLBACK_KEY.into(),
+        anonymous_fallback_grant(&["azure"]),
+    );
+    let layer = create_layer(&config)
+        .await
+        .expect("a grant alone is not a connection with a missing account");
+
+    let (snapshot, _) = layer
+        .list_address_roots(&ovstorage_plugin::Extensions::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.roots.len(), 1, "{:?}", snapshot.roots);
+    let root = &snapshot.roots[0];
+    assert_eq!(root.root.as_str(), "azure:///");
+    assert!(ovstorage_plugin::fallback::is_scheme_fallback_root(root));
+    assert_eq!(root.visibility, ovstorage_plugin::AddressVisibility::Hidden);
+    assert!(!root.visible);
+    assert_eq!(root.connection_id, None);
+    assert_eq!(root.owning_target, None);
+    assert_eq!(root.layer_kind, "azure");
+    assert_eq!(
+        root.user_metadata
+            .get(ovstorage_plugin::fallback::SCHEME_FALLBACK_METADATA_KEY)
+            .map(String::as_str),
+        Some(ovstorage_plugin::fallback::SCHEME_FALLBACK_ANONYMOUS)
+    );
+    assert_eq!(
+        root.range_read_strategy,
+        RangeReadStrategy::Native,
+        "the fallback advertises the ranged reads its client supports"
+    );
+
+    let (connections, _) = layer
+        .list_connections(&ovstorage_plugin::Extensions::new(), None)
+        .await
+        .unwrap();
+    assert!(
+        connections.connections.is_empty(),
+        "the fallback registers no connection: {:?}",
+        connections.connections
+    );
+
+    // The loopback-only test hook beside the grant is the fallback's, not a
+    // half-written connection.
+    let layer = create_layer(&fallback_layer_config("http://127.0.0.1:1", &[]))
+        .await
+        .expect("grant plus test hook seeds nothing");
+    let (connections, _) = layer
+        .list_connections(&ovstorage_plugin::Extensions::new(), None)
+        .await
+        .unwrap();
+    assert!(connections.connections.is_empty());
+}
+
+/// The grant is checked against the schemes this kind serves. A scheme
+/// another kind owns is refused at startup, naming both.
+#[tokio::test]
+async fn a_fallback_key_naming_a_scheme_this_layer_does_not_serve_is_refused() {
+    for schemes in [&["s3"][..], &["azure", "gs"][..], &["https"][..]] {
+        let mut config = LayerConfig::new();
+        config.insert(
+            ANONYMOUS_FALLBACK_KEY.into(),
+            anonymous_fallback_grant(schemes),
+        );
+        let err = create_layer(&config)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{schemes:?} must be refused"));
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{schemes:?}");
+        let foreign = schemes
+            .iter()
+            .find(|scheme| **scheme != "azure")
+            .expect("each case names a foreign scheme");
+        assert!(
+            err.message().contains(&format!("`{foreign}`")),
+            "{schemes:?}: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("it serves azure"),
+            "{schemes:?}: {}",
+            err.message()
+        );
+    }
+}
+
+/// The grant must be a TOML array of scheme strings, and every other
+/// `anonymous_fallback_*` key must be one this kind reads. Both are refused
+/// at `create_backend`, before any connection is seeded.
+#[tokio::test]
+async fn a_non_array_fallback_key_is_refused_at_create_backend() {
+    for value in [
+        ConfigValue::String("azure".into()),
+        ConfigValue::Bool(true),
+        ConfigValue::Toml("anonymous_fallback = \"azure\"\n".into()),
+    ] {
+        let mut config = LayerConfig::new();
+        config.insert(ANONYMOUS_FALLBACK_KEY.into(), value.clone());
+        let err = create_layer(&config)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{value:?} must be refused"));
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{value:?}");
+        assert!(
+            err.message().contains("must be a TOML array"),
+            "{value:?}: {}",
+            err.message()
+        );
+    }
+
+    // A tunable another kind reads is refused by name, granted or not.
+    for granted in [true, false] {
+        let mut config = LayerConfig::new();
+        if granted {
+            config.insert(
+                ANONYMOUS_FALLBACK_KEY.into(),
+                anonymous_fallback_grant(&["azure"]),
+            );
+        }
+        config.insert(
+            "anonymous_fallback_endpoint".into(),
+            ConfigValue::String("http://127.0.0.1:1".into()),
+        );
+        let err = create_layer(&config)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("granted={granted}: the S3 key must be refused"));
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert!(
+            err.message().contains("anonymous_fallback_endpoint"),
+            "granted={granted}: {}",
+            err.message()
+        );
+    }
+}
+
+/// A fallback key on a CONNECTION request — probe or add — is refused with a
+/// message that says where the key belongs, and nothing is registered or
+/// sent.
+#[tokio::test]
+async fn a_connection_request_carrying_a_fallback_key_is_refused() {
+    let server = spawn_scripted_server("200 OK", None, EMPTY_LIST_BODY);
+    let layer = empty_layer().await;
+    for key in ["anonymous_fallback", "anonymous_fallback_max_backends"] {
+        let mut request = connection_request("assets", server.endpoint(), account_key_bundle());
+        request
+            .config
+            .insert(key.into(), anonymous_fallback_grant(&["azure"]));
+        let expected = format!(
+            "`{key}` is a layer key, not connection config; set it on [ovstorage.layers.azure]"
+        );
+
+        let err = layer
+            .add_connection(
+                Request::new(LayerConnectionRequest {
+                    target: "azure".into(),
+                    connection: request.clone(),
+                }),
+                None,
+            )
+            .await
+            .expect_err("add must refuse a fallback key");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), expected);
+
+        let err = layer
+            .probe(
+                Request::new(LayerConnectionRequest {
+                    target: "azure".into(),
+                    connection: request,
+                }),
+                None,
+            )
+            .await
+            .expect_err("probe must refuse a fallback key");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), expected);
+    }
+    assert_eq!(server.hits(), 0, "refused before any verify");
+    let (snapshot, _) = layer
+        .list_connections(&ovstorage_plugin::Extensions::new(), None)
+        .await
+        .unwrap();
+    assert!(snapshot.connections.is_empty());
+}
+
+/// A connection's root is a prefix hit and outranks the fallback for its
+/// node; every other node keeps falling back. Installing the connection also
+/// evicts the fallback backend cached for that node, which is what lets the
+/// node be minted afresh when the connection goes away again.
+#[tokio::test]
+async fn a_configured_root_outranks_the_fallback_and_install_evicts_the_cached_backend() {
+    let logs = capture_logs();
+    let fallback_server = spawn_scripted_server("200 OK", None, EMPTY_LIST_BODY);
+    let connection_server = spawn_scripted_server("200 OK", None, EMPTY_LIST_BODY);
+    let layer = create_layer(&fallback_layer_config(fallback_server.endpoint(), &[]))
+        .await
+        .unwrap();
+
+    list_prefix(&layer, "azure://acct123/assets/")
+        .await
+        .expect("the fallback lists the container");
+    assert_eq!(fallback_server.hits(), 1);
+    assert_eq!(
+        root_for(&layer, "azure://acct123/assets/x").await.unwrap(),
+        "azure:///",
+        "a tier-2 hit answers the scheme root verbatim"
+    );
+    assert_eq!(logs.containing(FALLBACK_BUILT).len(), 1);
+
+    let connection = add(
+        &layer,
+        connection_request(
+            "assets",
+            connection_server.endpoint(),
+            SecretBundle::default(),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        connection.auth_state,
+        ConnectionAuthState::Anonymous
+    ));
+    list_prefix(&layer, "azure://acct123/assets/")
+        .await
+        .expect("the connection lists the container");
+    assert_eq!(connection_server.hits(), 1, "the configured root answers");
+    assert_eq!(
+        fallback_server.hits(),
+        1,
+        "and the fallback is not consulted"
+    );
+    assert_eq!(
+        root_for(&layer, "azure://acct123/assets/x").await.unwrap(),
+        "azure://acct123/assets/"
+    );
+    // A sibling container on the same account is still the fallback's.
+    list_prefix(&layer, "azure://acct123/other/")
+        .await
+        .expect("an unconfigured sibling still falls back");
+    assert_eq!(fallback_server.hits(), 2);
+    assert_eq!(connection_server.hits(), 1);
+
+    layer
+        .remove_connection(
+            Request::new(ConnectionKey {
+                target: "azure".into(),
+                id: connection.id.clone(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    list_prefix(&layer, "azure://acct123/assets/")
+        .await
+        .expect("the fallback answers again once the connection is gone");
+    assert_eq!(fallback_server.hits(), 3);
+    assert_eq!(
+        logs.containing(FALLBACK_BUILT).len(),
+        3,
+        "assets was rebuilt after the install evicted it; other was built once: {:?}",
+        logs.containing(FALLBACK_BUILT)
+    );
+}
+
+/// The scheme root names no account, and neither does a hostless address
+/// with a path; both reach the fallback through the prefix tier and are
+/// refused before any backend exists. `root_info_for` on the root still
+/// returns the root — introspection, not an operation.
+#[tokio::test]
+async fn the_scheme_root_itself_is_invalid_argument() {
+    let server = spawn_scripted_server("200 OK", None, EMPTY_LIST_BODY);
+    let layer = create_layer(&fallback_layer_config(server.endpoint(), &[]))
+        .await
+        .unwrap();
+    for spelling in ["azure:///", "azure:///assets/x"] {
+        let err = stat_code(&layer, spelling).await;
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{spelling}");
+        assert_eq!(
+            err.message(),
+            "an azure:// address names no storage account",
+            "{spelling}"
+        );
+        let err = list_prefix(&layer, spelling).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{spelling}");
+    }
+    assert_eq!(server.hits(), 0);
+    assert_eq!(root_for(&layer, "azure:///").await.unwrap(), "azure:///");
+}
+
+/// `root_info_for` answers the scheme root verbatim for a fallback-served
+/// address, so what that root advertises is what a consumer reads. The
+/// fallback drives the same blob client a connection does and a ranged read
+/// works the same way through either, so the strategy it advertises is the
+/// connection root's: a store must not look less capable for being reached
+/// anonymously than for being configured. Introspection only — nothing
+/// reaches the wire.
+#[tokio::test]
+async fn a_fallback_served_address_advertises_the_range_read_strategy_of_a_configured_root() {
+    let server = spawn_scripted_server("200 OK", None, EMPTY_LIST_BODY);
+    let layer = create_layer(&fallback_layer_config(server.endpoint(), &[]))
+        .await
+        .unwrap();
+    add(
+        &layer,
+        connection_request("assets", server.endpoint(), SecretBundle::default()),
+    )
+    .await;
+
+    let configured = root_info(&layer, "azure://acct123/assets/x").await.unwrap();
+    let fallback = root_info(&layer, "azure://acct123/other/x").await.unwrap();
+    assert_eq!(configured.root.as_str(), "azure://acct123/assets/");
+    assert_eq!(fallback.root.as_str(), "azure:///");
+    assert_eq!(configured.range_read_strategy, RangeReadStrategy::Native);
+    assert_eq!(
+        fallback.range_read_strategy, configured.range_read_strategy,
+        "the direct and the fallback answer for one store agree"
+    );
+    assert_eq!(server.hits(), 0);
+}
+
+/// The fallback's `__test_endpoint` is read by the same endpoint parser the
+/// connection keys use, so URL-embedded credentials, a query and a fragment
+/// are refused at `create_backend` — before the fallback exists, let alone a
+/// backend or a request — and the refusal names the hook and the shape
+/// without echoing the value. A loopback host is used so the loopback guard
+/// is not what refuses them.
+#[tokio::test]
+async fn a_fallback_test_endpoint_with_userinfo_a_query_or_a_fragment_is_refused_at_create_backend()
+{
+    for (endpoint, shape) in [
+        ("http://user:s3cret@127.0.0.1:1", "credentials"),
+        ("http://s3cret@127.0.0.1:1", "credentials"),
+        ("http://127.0.0.1:1?sig=s3cret", "query string"),
+        ("http://127.0.0.1:1#s3cret", "fragment"),
+    ] {
+        let Err(err) = create_layer(&fallback_layer_config(endpoint, &[])).await else {
+            panic!("{endpoint} must be refused at create_backend");
+        };
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{endpoint}");
+        assert!(
+            err.message().contains("__test_endpoint"),
+            "{endpoint}: the refusal names the hook: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains(shape),
+            "{endpoint}: the refusal names the shape: {}",
+            err.message()
+        );
+        assert!(
+            !err.message().contains("s3cret"),
+            "{endpoint}: the refusal echoes the value: {}",
+            err.message()
+        );
+    }
+}
+
+/// An address whose query carries anything but a version id authenticates
+/// itself — a SAS — and never takes the fallback: the miss is the same
+/// `NoRoute` an ungranted layer answers. A version id alone still routes.
+#[tokio::test]
+async fn a_presigned_or_sas_query_falls_through_to_no_route() {
+    let server = spawn_scripted_server("200 OK", None, EMPTY_LIST_BODY);
+    let layer = create_layer(&fallback_layer_config(server.endpoint(), &[]))
+        .await
+        .unwrap();
+    for address in [
+        "azure://acct123/assets/x?sv=2024-01-01&sr=b&sig=abc",
+        "azure://acct123/assets/x?sig=abc",
+        "azure://acct123/assets/x?snapshot=2026-01-01T00:00:00Z",
+    ] {
+        let err = root_for(&layer, address).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::NoRoute, "{address}");
+        assert_eq!(err.message(), "no route matches address", "{address}");
+        let err = stat_code(&layer, address).await;
+        assert_eq!(err.code(), ErrorCode::NoRoute, "{address}");
+    }
+    assert_eq!(
+        server.hits(),
+        0,
+        "a credential-bearing address reaches nothing"
+    );
+
+    assert_eq!(
+        root_for(&layer, "azure://acct123/assets/x?versionid=7")
+            .await
+            .unwrap(),
+        "azure:///"
+    );
+    list_prefix(&layer, "azure://acct123/assets/?versionid=7")
+        .await
+        .expect("a version id is carried, not a credential");
+    assert_eq!(server.hits(), 1);
+}
+
+/// A connection an operator points at an instance-metadata host is honoured,
+/// with one warning naming the host. The unconditional refusal is for hosts
+/// derived from a caller's address, which no configured connection has.
+#[tokio::test]
+async fn a_configured_instance_metadata_endpoint_is_honoured_with_a_warning() {
+    let logs = capture_logs();
+    let layer = empty_layer().await;
+    let mut request = connection_request("assets", "http://127.0.0.1:1", SecretBundle::default());
+    request.config.remove("__test_endpoint");
+    request.config.insert(
+        "blob_endpoint".into(),
+        ConfigValue::String("http://169.254.169.254".into()),
+    );
+    let connection = add(&layer, request).await;
+    assert!(matches!(
+        connection.auth_state,
+        ConnectionAuthState::Anonymous
+    ));
+    let warnings = logs
+        .lines_at_least(tracing::Level::WARN)
+        .into_iter()
+        .filter(|line| line.contains("instance-metadata"))
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "{warnings:#?}");
+    assert!(
+        warnings[0].contains("169.254.169.254"),
+        "the warning names the host: {}",
+        warnings[0]
+    );
 }

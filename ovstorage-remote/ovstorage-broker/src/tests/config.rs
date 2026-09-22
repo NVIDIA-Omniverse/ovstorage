@@ -3,6 +3,68 @@
 
 use super::*;
 
+#[derive(Clone, Default)]
+struct CapturedTraceEvents(Arc<std::sync::Mutex<Vec<CapturedTraceEvent>>>);
+
+struct CapturedTraceEvent {
+    level: tracing::Level,
+    target: &'static str,
+    fields: String,
+}
+
+impl CapturedTraceEvents {
+    fn install(&self) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(CaptureLayer(self.clone())),
+        )
+    }
+
+    fn continuation_seal_events(&self) -> Vec<(tracing::Level, String)> {
+        self.0
+            .lock()
+            .expect("trace capture lock is not poisoned")
+            .iter()
+            .filter(|event| event.target == "ovstorage.broker.continuation_seal")
+            .map(|event| (event.level, event.fields.clone()))
+            .collect()
+    }
+}
+
+struct CaptureLayer(CapturedTraceEvents);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = TraceFieldVisitor(String::new());
+        event.record(&mut visitor);
+        self.0
+            .0
+            .lock()
+            .expect("trace capture lock is not poisoned")
+            .push(CapturedTraceEvent {
+                level: *event.metadata().level(),
+                target: event.metadata().target(),
+                fields: visitor.0,
+            });
+    }
+}
+
+struct TraceFieldVisitor(String);
+
+impl tracing::field::Visit for TraceFieldVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        let _ = write!(self.0, "{}={value:?}", field.name());
+    }
+}
+
 // A broker config that declares `[listener]`/`auth` but no
 // `[ovstorage.layers]` must be refused (`require_configured_stack`, called both on
 // the operator-config path in `main` and inside every build path), so the broker
@@ -1044,7 +1106,8 @@ kind = "file"
 // The shipped default `ovstorage-broker.toml` declares the full
 // broker graph as `[ovstorage]` config; it must parse through
 // `StackConfig::from_toml_str` and `build_stack` to a real (non-`EmptyLayer`)
-// Stack rooted at `alias`. The shipped file ships example absolute paths;
+// Stack rooted at `upstream_credential`, with `watch_limit` immediately inside
+// that broker-owned boundary. The shipped file ships example absolute paths;
 // point them at a tempdir so the byte cache opens and the `file` connection
 // roots at a real directory — otherwise the graph is exactly as shipped.
 #[tokio::test]
@@ -1076,22 +1139,28 @@ async fn shipped_default_config_ovstorage_builds_to_nonempty_stack() {
     assert_eq!(config.root.as_deref(), Some("upstream_credential"));
     assert_eq!(
         config.layers["upstream_credential"].inner.as_deref(),
+        Some("watch_limit"),
+        "the shipped broker-owned boundary wraps the watch admission chokepoint"
+    );
+    assert_eq!(
+        config.layers["watch_limit"].inner.as_deref(),
         Some("alias"),
-        "the shipped broker-owned boundary wraps the alias-rooted operator graph"
+        "watch admission guards the shared alias-rooted data plane"
     );
-    // Attribution is a router branch, not the root: the shipped `file` branch
-    // carries it, so the router's child is the wrapper and not the backend.
-    assert_eq!(
-        config.layers["router"].children,
-        vec!["attribution_file".to_string()]
-    );
-    assert_eq!(
-        config.layers["attribution_file"].inner.as_deref(),
-        Some("file")
+    // The shipped `file` branch carries no attribution wrapper: `file` stores
+    // no user metadata, so the router's child is the backend layer itself and
+    // the graph declares no `attribution` layer at all.
+    assert_eq!(config.layers["router"].children, vec!["file".to_string()]);
+    assert!(
+        !config
+            .layers
+            .values()
+            .any(|table| table.kind.as_deref() == Some("attribution")),
+        "the shipped broker graph declares no attribution layer"
     );
 
     // `file` is the only generic built-in. Register the broker's private
-    // wrappers (attribution + upstream_credential) and the rlib forms of every
+    // wrappers (attribution + upstream_credential + watch_limit) and the rlib forms of every
     // public plugin layer named by the shipped graph.
     let factories: Vec<LoadedLayerFactory> = vec![
         LoadedLayerFactory::Wrapper(Arc::new(ovstorage_authz::AttributionWrapperFactory::new(
@@ -1118,6 +1187,9 @@ async fn shipped_default_config_ovstorage_builds_to_nonempty_stack() {
             Arc::new(OAuthProviderRegistry::new()),
             BrokerOAuthRouteBindings::new(),
         ))),
+        LoadedLayerFactory::Wrapper(Arc::new(
+            crate::watch_limit::WatchLimitWrapperFactory::default(),
+        )),
     ];
     // The shipped graph must be a FIXED POINT of the branch-attribution
     // guarantee, which runs over every graph the host builds. If it changed this
@@ -1237,6 +1309,365 @@ fn an_unknown_redirect_disclosure_value_is_a_startup_error() {
     );
 }
 
+/// The operator-facing wire for the anonymous fallback, end to end: shipped
+/// TOML -> `BrokerConfig` -> `anonymous_fallback_set()`.
+///
+/// Both keys ship closed, and both are top-level, so the same misplacement
+/// hazard as the sibling keys applies: a grant written below the first table
+/// header would nest under `[listener]` and silently stay closed. The
+/// substitute-and-reparse shape proves a non-default value lands where the
+/// code reads it.
+#[test]
+fn shipped_broker_config_anonymous_fallback_is_closed_and_top_level() {
+    let shipped = include_str!("../../ovstorage-broker.toml");
+    let config = crate::parse_broker_config(shipped).expect("shipped config parses");
+    assert!(
+        config.anonymous_fallback_schemes.is_empty(),
+        "the shipped default grants no cloud scheme"
+    );
+    assert_eq!(
+        config.anonymous_http_fallback,
+        AnonymousHttpFallbackConfig::Refuse,
+        "the shipped default refuses the http fallback"
+    );
+    assert!(!config.anonymous_http_fallback.allows());
+    assert!(config.anonymous_fallback_set().is_empty());
+
+    let granted = shipped.replace(
+        "anonymous_fallback_schemes = []",
+        "anonymous_fallback_schemes = [\"s3\", \"gs\"]",
+    );
+    assert_ne!(
+        granted, shipped,
+        "the shipped file must carry the key for this substitution to mean anything"
+    );
+    let config = crate::parse_broker_config(&granted).expect("granted config parses");
+    assert_eq!(
+        config.anonymous_fallback_schemes,
+        vec![CloudFallbackScheme::S3, CloudFallbackScheme::Gs],
+        "a top-level anonymous_fallback_schemes must reach BrokerConfig"
+    );
+    assert_eq!(
+        config.anonymous_fallback_set(),
+        ["gs", "s3"].into_iter().map(String::from).collect()
+    );
+
+    let allowed = shipped.replace(
+        "anonymous_http_fallback = \"refuse\"",
+        "anonymous_http_fallback = \"allow\"",
+    );
+    assert_ne!(allowed, shipped, "the substitution must have applied");
+    let config = crate::parse_broker_config(&allowed).expect("the parser accepts `allow`");
+    assert!(config.anonymous_http_fallback.allows());
+    assert_eq!(
+        config.anonymous_fallback_set(),
+        ["http", "https"].into_iter().map(String::from).collect(),
+        "the http key grants both spellings together; the stamp is what refuses them"
+    );
+}
+
+/// The cloud scheme list is a closed enum, so a typo — or `http`, which has
+/// its own key — is a startup error rather than a grant that silently never
+/// applies.
+#[test]
+fn an_unknown_anonymous_fallback_scheme_is_rejected() {
+    let shipped = include_str!("../../ovstorage-broker.toml");
+    for bad_scheme in ["s4", "http"] {
+        let bad = shipped.replace(
+            "anonymous_fallback_schemes = []",
+            &format!("anonymous_fallback_schemes = [\"{bad_scheme}\"]"),
+        );
+        assert_ne!(bad, shipped, "the substitution must have applied");
+        let error = crate::parse_broker_config(&bad)
+            .expect_err("a scheme the enum does not name must refuse to start");
+        assert!(
+            error.to_string().contains("anonymous_fallback_schemes"),
+            "the error must name the key the operator got wrong, got: {error}"
+        );
+    }
+}
+
+/// Same for the http switch: `refuse` is the safe direction, so a typo landing
+/// there silently would leave an operator believing they had configured
+/// something.
+#[test]
+fn an_unknown_anonymous_http_fallback_value_is_rejected() {
+    let shipped = include_str!("../../ovstorage-broker.toml");
+    let bad = shipped.replace(
+        "anonymous_http_fallback = \"refuse\"",
+        "anonymous_http_fallback = \"permit\"",
+    );
+    assert_ne!(bad, shipped, "the substitution must have applied");
+    let error = crate::parse_broker_config(&bad)
+        .expect_err("an unrecognised http fallback value must refuse to start");
+    assert!(
+        error.to_string().contains("anonymous_http_fallback"),
+        "the error must name the key the operator got wrong, got: {error}"
+    );
+}
+
+/// The layer key is host-stamped, not operator-set. A graph that sets it by
+/// hand is a startup error naming the top-level keys, rather than two spellings
+/// of one grant disagreeing where nobody can see it — and it is refused even
+/// when the top-level keys grant nothing, which is exactly when the two would
+/// disagree most quietly.
+#[test]
+fn a_graph_setting_the_fallback_key_by_hand_is_refused() {
+    use ovstorage::StackConfig;
+
+    let config = StackConfig::from_toml_str(&format!(
+        r#"
+[ovstorage]
+root = "router"
+
+[ovstorage.layers.router]
+kind = "router"
+children = ["file", "s3"]
+
+[ovstorage.layers.file]
+kind = "file"
+
+[ovstorage.layers.s3]
+kind = "s3"
+{} = ["s3"]
+"#,
+        ovstorage::fallback::ANONYMOUS_FALLBACK_KEY
+    ))
+    .expect("the fixture graph parses");
+    // The fixture must actually carry the key, or this asserts nothing.
+    assert!(
+        config.layers["s3"]
+            .config
+            .contains_key(ovstorage::fallback::ANONYMOUS_FALLBACK_KEY),
+        "the fixture graph does not carry the layer key it is meant to be refused for"
+    );
+
+    let error = ovstorage::host::stamp_anonymous_fallback(
+        config,
+        &BrokerConfig::default().anonymous_fallback_set(),
+    )
+    .expect_err("a hand-set layer key must be refused, not silently overridden");
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    let message = error.to_string();
+    assert!(
+        message.contains("anonymous_fallback_schemes")
+            && message.contains("anonymous_http_fallback"),
+        "the refusal must name the keys the operator should set instead, got: {message}"
+    );
+}
+
+/// With the shipped keys closed, the stamp is a no-op on the shipped graph: no
+/// layer gains the fallback key, and the graph is byte-identical. Every backend
+/// factory reads a non-empty layer table as a static connection seed, so a
+/// stray empty stamp would turn a declared-but-unconnected backend into a
+/// failed connection attempt at startup.
+#[test]
+fn the_default_broker_graph_carries_no_fallback_key() {
+    let shipped = include_str!("../../ovstorage-broker.toml");
+    let config = crate::parse_broker_config(shipped).expect("shipped config parses");
+    let stamped = ovstorage::host::stamp_anonymous_fallback(
+        config.ovstorage.clone(),
+        &config.anonymous_fallback_set(),
+    )
+    .expect("the shipped graph accepts the shipped (empty) grant");
+    assert_eq!(
+        stamped, config.ovstorage,
+        "an empty grant must leave the shipped graph untouched"
+    );
+    for (name, table) in &stamped.layers {
+        assert!(
+            !table
+                .config
+                .contains_key(ovstorage::fallback::ANONYMOUS_FALLBACK_KEY),
+            "layer `{name}` carries `anonymous_fallback` with nothing granted"
+        );
+    }
+}
+
+#[test]
+fn continuation_seal_key_path_parses_and_defaults_to_none() {
+    let absent = crate::parse_broker_config("").expect("empty config parses");
+    assert_eq!(absent.continuation_seal, ContinuationSealConfig::default());
+
+    let configured = crate::parse_broker_config(
+        r#"
+[continuation_seal]
+key_path = "/etc/ovstorage/continuation-seal.key"
+"#,
+    )
+    .expect("continuation seal config parses");
+    assert_eq!(
+        configured.continuation_seal,
+        ContinuationSealConfig {
+            key_path: Some(PathBuf::from("/etc/ovstorage/continuation-seal.key")),
+        }
+    );
+}
+
+#[test]
+fn continuation_seal_rejects_unknown_fields() {
+    let error = crate::parse_broker_config(
+        r#"
+[continuation_seal]
+key_file = "/etc/ovstorage/continuation-seal.key"
+"#,
+    )
+    .expect_err("unknown continuation seal fields must be rejected");
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert!(
+        error.message().contains("key_file"),
+        "the error must name the unknown field, got: {error}"
+    );
+}
+
+#[tokio::test]
+async fn fresh_process_local_continuation_key_announces_its_replica_limits_once() {
+    ensure_test_plugin_env();
+    let config = crate::parse_broker_config(
+        r#"
+[listener]
+bind = "127.0.0.1:0"
+auth = "anonymous"
+
+[ovstorage]
+root = "file"
+
+[ovstorage.layers.file]
+kind = "file"
+"#,
+    )
+    .expect("fallback-key test config parses");
+    let events = CapturedTraceEvents::default();
+    {
+        let _guard = events.install();
+        crate::build_broker_with_context(&config, BrokerBuildContext::default())
+            .await
+            .expect("broker with a fresh fallback key builds");
+
+        let carried = crate::continuation_seal::ContinuationSealKey::from_bytes(&[0x5a; 32])
+            .expect("carried test key is valid");
+        crate::build_broker_with_context(
+            &config,
+            BrokerBuildContext::default().with_continuation_seal_key(carried),
+        )
+        .await
+        .expect("broker with a reload-carried key builds");
+    }
+
+    let matching = events.continuation_seal_events();
+    assert_eq!(
+        matching.len(),
+        1,
+        "only fresh fallback generation emits the mode signal: {matching:?}"
+    );
+    let (level, fields) = &matching[0];
+    assert_eq!(*level, tracing::Level::INFO);
+    assert!(fields.contains("mode=\"process_local_random\""), "{fields}");
+    assert!(fields.contains("every other broker process"), "{fields}");
+    assert!(fields.contains("after a restart"), "{fields}");
+    assert!(fields.contains("set `key_path`"), "{fields}");
+}
+
+#[tokio::test]
+async fn configured_continuation_seal_key_reaches_broker_and_wins_over_context() {
+    ensure_test_plugin_env();
+    let root = unique_temp_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let key_path = root.join("continuation-seal.key");
+    let configured_bytes = [0x42; 32];
+    std::fs::write(&key_path, configured_bytes).unwrap();
+    let path = key_path.to_string_lossy().replace('\\', "/");
+    let config = crate::parse_broker_config(&format!(
+        r#"
+[continuation_seal]
+key_path = "{path}"
+
+[listener]
+bind = "127.0.0.1:0"
+auth = "anonymous"
+
+[ovstorage]
+root = "file"
+
+[ovstorage.layers.file]
+kind = "file"
+"#
+    ))
+    .unwrap();
+    let carried_key = crate::continuation_seal::ContinuationSealKey::from_bytes(&[0x24; 32])
+        .expect("carried fixture key is valid");
+    let broker = crate::build_broker_with_context(
+        &config,
+        BrokerBuildContext::default().with_continuation_seal_key(carried_key.clone()),
+    )
+    .await
+    .unwrap();
+    let address = Url::parse("s3://bucket/configured-key").unwrap();
+    let batch = WriteRedirectBatch {
+        continuation: b"configured continuation".to_vec(),
+        redirects: Vec::new(),
+    };
+    let configured_key =
+        crate::continuation_seal::ContinuationSealKey::from_bytes(&configured_bytes).unwrap();
+    let sealed = crate::continuation_seal::seal_batch(&configured_key, &address, batch.clone());
+    assert_eq!(
+        crate::continuation_seal::unseal_batch(&broker.continuation_seal_key(), &address, sealed)
+            .expect("the built broker uses the configured key"),
+        batch
+    );
+
+    let sealed_with_carried = crate::continuation_seal::seal_batch(&carried_key, &address, batch);
+    let error = crate::continuation_seal::unseal_batch(
+        &broker.continuation_seal_key(),
+        &address,
+        sealed_with_carried,
+    )
+    .expect_err("the configured key must take precedence over the carried key");
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn short_continuation_seal_key_is_a_startup_error_naming_the_path() {
+    ensure_test_plugin_env();
+    let root = unique_temp_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let key_path = root.join("short-continuation-seal.key");
+    std::fs::write(&key_path, [0x42; 31]).unwrap();
+    let path = key_path.to_string_lossy().replace('\\', "/");
+    let config = crate::parse_broker_config(&format!(
+        r#"
+[continuation_seal]
+key_path = "{path}"
+
+[listener]
+bind = "127.0.0.1:0"
+auth = "anonymous"
+
+[ovstorage]
+root = "file"
+
+[ovstorage.layers.file]
+kind = "file"
+"#
+    ))
+    .unwrap();
+    let error = match crate::build_broker_from_config(&config).await {
+        Ok(_) => panic!("a short continuation seal key must prevent startup"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert!(
+        error.message().contains(&path),
+        "the error must name the invalid key path, got: {error}"
+    );
+    assert!(
+        error.message().contains("at least 32 bytes"),
+        "the error must state the key length requirement, got: {error}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
 // The trust-boundary attribution wrapper is a declared layer, not a
 // composer-prepended one. A broker graph that omits it (an operator pasting the
 // CLI's cache-only default, say) must still get one, matching how the
@@ -1252,7 +1683,10 @@ root = "router"
 
 [ovstorage.layers.router]
 kind = "router"
-children = ["file", "http"]
+children = ["test", "file", "http"]
+
+[ovstorage.layers.test]
+kind = "test"
 
 [ovstorage.layers.file]
 kind = "file"
@@ -1277,10 +1711,15 @@ kind = "http"
     // built-in `file` classifies as "not a backend", `placement` short-circuits
     // before it ever reads a kind's user-metadata declaration, and this test
     // passes whatever those declarations say — asserting a reason that is not
-    // the one operating.
-    let factories = vec![LoadedLayerFactory::Backend(Arc::new(
-        ovstorage_plugin_http::HttpBackendLayerFactory::default(),
-    ))];
+    // the one operating. The conformance `test` kind declares user-metadata
+    // support; `file` (core built-in, stores none) and `http` (read-only)
+    // decline.
+    let factories = vec![
+        LoadedLayerFactory::Backend(Arc::new(ovstorage_plugin_test::TestLayerFactory::default())),
+        LoadedLayerFactory::Backend(Arc::new(
+            ovstorage_plugin_http::HttpBackendLayerFactory::default(),
+        )),
+    ];
     let ensured = ovstorage_authz::ensure_branch_attribution(
         config,
         &ovstorage_authz::layer_types(&factories),
@@ -1296,13 +1735,17 @@ kind = "http"
     children.sort();
     assert_eq!(
         children,
-        vec!["attribution_file".to_string(), "http".to_string()],
-        "the file branch gains a wrapper; the http branch, which cannot carry \
-         user metadata, must not"
+        vec![
+            "attribution_test".to_string(),
+            "file".to_string(),
+            "http".to_string()
+        ],
+        "the test branch gains a wrapper; the file and http branches, whose \
+         backends cannot carry user metadata, must not"
     );
     assert_eq!(
-        ensured.layers["attribution_file"].inner.as_deref(),
-        Some("file")
+        ensured.layers["attribution_test"].inner.as_deref(),
+        Some("test")
     );
 
     // Idempotent: a graph already covered over its backend is unchanged.
@@ -1313,14 +1756,14 @@ root = "router"
 
 [ovstorage.layers.router]
 kind = "router"
-children = ["attribution_file"]
+children = ["attribution_test"]
 
-[ovstorage.layers.attribution_file]
+[ovstorage.layers.attribution_test]
 kind = "attribution"
-inner = "file"
+inner = "test"
 
-[ovstorage.layers.file]
-kind = "file"
+[ovstorage.layers.test]
+kind = "test"
 "#,
     )
     .unwrap();
@@ -1335,7 +1778,7 @@ kind = "file"
     assert_eq!(count(&ensured), before, "no extra layer injected");
     assert_eq!(
         ensured.layers["router"].children,
-        vec!["attribution_file".to_string()]
+        vec!["attribution_test".to_string()]
     );
 }
 
@@ -1496,9 +1939,9 @@ fn every_layer_the_broker_twin_emits_is_a_backend_kind_or_a_reserved_name() {
 //
 // The refusal it catches is a duplicate alias `from`: the host emitted both
 // `broker:/` and `broker:///`, which name one node once address identity stops
-// reading the trailing-authority spelling, and `build_broker_from_config_with_aliases`
-// builds the Stack eagerly, so the rejection is a startup failure rather than a
-// deferred one.
+// reading the trailing-authority spelling, and `build_broker_with_context`
+// builds the Stack eagerly, so the rejection is a startup failure rather than
+// a deferred one.
 #[tokio::test]
 async fn zero_config_broker_builds_with_its_host_generated_aliases() {
     let sandbox = unique_temp_dir();

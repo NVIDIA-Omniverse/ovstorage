@@ -70,6 +70,24 @@ const LIST_BODY: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
     <BlobPrefix><Name>docs/</Name></BlobPrefix>\
     </Blobs><NextMarker /></EnumerationResults>";
 
+const LIST_STREAM_BODY: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+    <EnumerationResults ServiceEndpoint=\"http://127.0.0.1/\" ContainerName=\"assets\">\
+    <Blobs>\
+    <Blob><Name>a.txt</Name><Properties>\
+    <Last-Modified>Mon, 01 Jan 2024 00:00:00 GMT</Last-Modified>\
+    <Etag>0x8DCA</Etag><Content-Length>1</Content-Length>\
+    </Properties></Blob>\
+    <Blob><Name>team/</Name><Properties>\
+    <Last-Modified>Mon, 01 Jan 2024 00:00:00 GMT</Last-Modified>\
+    <Etag>0x8DCM</Etag><Content-Length>0</Content-Length>\
+    </Properties></Blob>\
+    <Blob><Name>team/file.txt</Name><Properties>\
+    <Last-Modified>Mon, 01 Jan 2024 00:00:00 GMT</Last-Modified>\
+    <Etag>0x8DCF</Etag><Content-Length>5</Content-Length>\
+    </Properties></Blob>\
+    <BlobPrefix><Name>z-last/</Name></BlobPrefix>\
+    </Blobs><NextMarker /></EnumerationResults>";
+
 const ERROR_BODY: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
     <Error><Code>scripted</Code><Message>scripted</Message></Error>";
 
@@ -254,6 +272,66 @@ async fn drive_write_done_inline(scenario: &Scenario) -> ScenarioReport {
     pass(scenario)
 }
 
+/// A write creates its path: a blob several levels deep whose ancestors
+/// were never created commits as one signed Put Blob of that name, with
+/// no `resource=directory` PUTs. Blob storage is a flat namespace, so this
+/// holds by construction; the wire shape pins that the plugin does not
+/// try to synthesize ancestors anyway.
+async fn drive_write_creates_missing_ancestors(scenario: &Scenario) -> ScenarioReport {
+    let (layer, server, verify_hits) = credentialed_layer("200 OK", None, EMPTY_LIST_BODY).await;
+    if let Err(err) = layer
+        .write(
+            Request::new(WriteRequest {
+                address: object_address("fresh/nested/tree/leaf.bin"),
+                body: Body::Bytes(b"leaf".to_vec()),
+                options: WriteOptions::default(),
+            }),
+            None,
+        )
+        .await
+    {
+        return fail(
+            scenario,
+            format!("write into a fresh nested path failed: {err}"),
+        );
+    }
+    let raw = server.requests();
+    let after_verify = &raw[verify_hits..];
+    if after_verify.len() != 1 {
+        return fail(
+            scenario,
+            format!(
+                "write must be exactly one Put Blob RPC, got {} requests: {after_verify:?}",
+                after_verify.len()
+            ),
+        );
+    }
+    let request_line = after_verify[0].lines().next().unwrap_or_default();
+    if !request_line.starts_with("PUT ")
+        || !request_line.contains("/assets/fresh/nested/tree/leaf.bin")
+    {
+        return fail(
+            scenario,
+            format!("expected a PUT of the leaf blob, got: {request_line}"),
+        );
+    }
+    if raw.iter().any(|req| {
+        let line = req.lines().next().unwrap_or_default();
+        line.starts_with("PUT ")
+            && (line.contains("resource=directory")
+                || line
+                    .split_whitespace()
+                    .nth(1)
+                    .is_some_and(|path| path.ends_with('/')))
+    }) {
+        return fail(
+            scenario,
+            format!("write must not create directory markers: {raw:?}"),
+        );
+    }
+    pass(scenario)
+}
+
 /// write then delete both succeed (one RPC each; the canned 200 stands
 /// in for the blob existing).
 async fn drive_delete_existing_object(scenario: &Scenario) -> ScenarioReport {
@@ -357,6 +435,24 @@ async fn drive_list_one_level_vs_recursive(scenario: &Scenario) -> ScenarioRepor
         );
     }
     pass(scenario)
+}
+
+async fn drive_list_stream_parity_and_cancel(scenario: &Scenario) -> ScenarioReport {
+    let (layer, _server, _verify_hits) = credentialed_layer("200 OK", None, LIST_STREAM_BODY).await;
+    // Keep the provider's injectable scripted transport while forcing this
+    // scenario through the same producer/consumer v17 slot bridge as a
+    // cross-image plugin handle. The loaded test-plugin suite separately owns
+    // dlopen and staged-cdylib freshness coverage.
+    let handle = ovstorage_plugin::thunks_v2::export_handle(layer);
+    let layer: LayerHandle =
+        ovstorage_plugin::consume_v2::ForeignVtableLayer::from_handle(handle, None)
+            .expect("import Azure layer through the foreign vtable bridge");
+    scenario
+        .drive_list_stream_parity_and_cancel(
+            layer.as_ref(),
+            address::parse("azure://acct123/assets/").unwrap(),
+        )
+        .await
 }
 
 /// Drives `write-no-overwrite-existing` on its refusal half (the
@@ -663,6 +759,10 @@ async fn conformance_scenarios_cover_the_registry() {
                 driven.push(scenario.name);
                 drive_write_done_inline(scenario).await
             }
+            "write-creates-missing-ancestors" => {
+                driven.push(scenario.name);
+                drive_write_creates_missing_ancestors(scenario).await
+            }
             "delete-existing-object" => {
                 driven.push(scenario.name);
                 drive_delete_existing_object(scenario).await
@@ -670,6 +770,10 @@ async fn conformance_scenarios_cover_the_registry() {
             "list-one-level-vs-recursive" => {
                 driven.push(scenario.name);
                 drive_list_one_level_vs_recursive(scenario).await
+            }
+            "list-stream-parity-and-cancel" => {
+                driven.push(scenario.name);
+                drive_list_stream_parity_and_cancel(scenario).await
             }
             "write-no-overwrite-existing" => {
                 driven.push(scenario.name);
@@ -748,7 +852,8 @@ async fn conformance_scenarios_cover_the_registry() {
             ),
             "write-redirect-commits-on-done"
             | "retry-never-replays-continue-write"
-            | "protocol-slots-pass-through" => runner.skip(
+            | "protocol-slots-pass-through"
+            | "materialize-unsupported-without-cache" => runner.skip(
                 scenario.name,
                 "host/wrapper-side protocol-slot contract; driven in ovstorage's \
                  conformance_protocol_slots.rs",
@@ -783,10 +888,12 @@ async fn conformance_scenarios_cover_the_registry() {
             "capability-gate-watch-directory-unsupported",
             "delete-existing-object",
             "list-one-level-vs-recursive",
+            "list-stream-parity-and-cancel",
             "read-on-directory-type-mismatch",
             "rename-no-overwrite-existing",
             "stat-basic-objectinfo",
             "stat-not-found",
+            "write-creates-missing-ancestors",
             "write-done-inline",
             "write-no-overwrite-existing",
         ],

@@ -16,7 +16,9 @@ Workspace-pinned to OpenDAL `0.50` with the `services-fs`,
   plugin maps each SPI call to OpenDAL's `Operator` API. Whole-object
   reads return `ReadResult::Stream` from
   `Operator::reader(...).into_bytes_stream(..)`; range reads stay
-  buffered.
+  buffered. Listings expose OpenDAL's pull-based `Lister` directly;
+  `list_stream` retains one provider page and folds directory facts
+  incrementally without collecting the prefix.
 - Per-driver allow-list lives in `DRIVER_SPECS`. The descriptor's
   `service` enum is sourced from those specs (so the variants stay
   in lock-step with the workspace-compiled OpenDAL features), and
@@ -36,6 +38,9 @@ Workspace-pinned to OpenDAL `0.50` with the `services-fs`,
     read, recursive + one-level list, delete, copy, rename).
   - Percent-encoded key round-tripping, recursive listings omitting
     `Subdirectory` entries.
+  - A signed loopback S3-compatible fixture covering paginated recursive
+    `list_stream`, delimiter-free wire requests, cancellation before the next
+    page, and fail-loud handling of provider-order regressions.
   - Cancellation surfacing as `ErrorCode::Cancelled`.
   - `WriteOptions.user_metadata` handling on both body-typed write
     paths: a driver that cannot store it refuses a non-empty caller
@@ -49,7 +54,7 @@ Workspace-pinned to OpenDAL `0.50` with the `services-fs`,
     `IfDestExists::Fail` rejection.
   - The `config_json` parser handling multibyte UTF-8 plus `\uXXXX`
     escapes.
-- No in-process test performs I/O against a driver other than `fs`, and
-  presigned writes are not exercised at all; the `s3` coverage reaches only
-  what is readable without a server, such as the advertised capability set.
+- No test contacts a live remote service. The `fs` profile uses a `TempDir`,
+  while credentialed S3-compatible and WebDAV wire behavior uses scripted
+  loopback servers. Presigned writes are not exercised end to end.
   Per-driver conformance against a test-container suite is aspirational.

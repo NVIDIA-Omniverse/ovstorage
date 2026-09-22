@@ -21,6 +21,22 @@ pub fn object_kind_from_ffi(value: ffi::ObjectKindV1) -> ObjectKind {
     }
 }
 
+pub fn etag_strength_to_ffi(value: crate::EtagStrength) -> ffi::EtagStrengthV1 {
+    match value {
+        crate::EtagStrength::Unspecified => ffi::EtagStrengthV1::Unspecified,
+        crate::EtagStrength::Strong => ffi::EtagStrengthV1::Strong,
+        crate::EtagStrength::Weak => ffi::EtagStrengthV1::Weak,
+    }
+}
+
+pub fn etag_strength_from_ffi(value: ffi::EtagStrengthV1) -> crate::EtagStrength {
+    match value {
+        ffi::EtagStrengthV1::Unspecified => crate::EtagStrength::Unspecified,
+        ffi::EtagStrengthV1::Strong => crate::EtagStrength::Strong,
+        ffi::EtagStrengthV1::Weak => crate::EtagStrength::Weak,
+    }
+}
+
 pub fn if_dest_exists_to_ffi(value: IfDestExists) -> ffi::IfDestExistsV1 {
     match value {
         IfDestExists::Overwrite => ffi::IfDestExistsV1::overwrite(),

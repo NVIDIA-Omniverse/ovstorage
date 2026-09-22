@@ -65,6 +65,8 @@ Internal architecture and dev notes follow.
   `RedactedUrl` for `object.address`).
 - `src/watch.rs` — broker watch-RPC shutdown state; concurrent-subscription
   coalescing is a backend concern (SDK `WatchCoalescer`).
+- `src/watch_limit.rs` — broker-native root Layer enforcing process-wide
+  per-principal and total watch admission limits.
 - `src/client_transport.rs` — broker-as-client transport plumbing
   for chained brokers.
 - `src/test_utils.rs` — fixture builders for the test suite.
@@ -83,7 +85,7 @@ in the `ovstorage-authz-layer` crate, not here.
 ## Conformance test gaps
 
 Crash-injection coverage (mid-redirect-issuance, mid-write
-truncation), per-principal quota mapping to `ResourceExhausted`,
+truncation), per-principal connection/RPC quota enforcement,
 durable audit sinks, mTLS certificate validation, certificate
 hot-reload, and an end-to-end SIGHUP-driven reload test via real
 signal injection are tracked in the broker's `Implementation

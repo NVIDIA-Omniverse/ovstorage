@@ -31,10 +31,12 @@ from pathlib import Path
 import ovstorage
 from ovstorage import (
     ConfigValue,
+    ConnectionRequest,
     alias,
     byte_cache,
     copy_rename_fallback,
     file,
+    hub_cache,
     metadata_cache,
     plugin,
     redirect_follower,
@@ -49,6 +51,7 @@ BACKEND_KINDS = (
     "s3",
     "gcs",
     "azure",
+    "huggingface",
     "opendal",
     "nucleus",
     "broker",
@@ -68,6 +71,7 @@ WRAPPER_LAYERS = (
     ("alias", alias.Alias, False),
     ("redirect_follower", redirect_follower.RedirectFollower, False),
     ("copy_rename_fallback", copy_rename_fallback.CopyRenameFallback, False),
+    ("hub_cache", hub_cache.HubCache, False),
 )
 
 
@@ -77,7 +81,7 @@ WRAPPER_LAYERS = (
 # notice if that list itself were wrong. This number and the probe tables below
 # have to be updated by hand when a plugin is added, which is the point --
 # a new plugin that nobody exercises fails here rather than shipping untested.
-EXPECTED_PLUGIN_COUNT = 10
+EXPECTED_PLUGIN_COUNT = 12
 
 
 def _check_inventory(directory: Path) -> int:
@@ -149,6 +153,90 @@ async def _build_every_layer(directory: Path, tmp: Path) -> None:
     await stack.build()
 
 
+async def _read_through_hub_cache_without_a_hub(directory: Path) -> None:
+    """Read an object through `hub_cache` while nothing listens on its endpoint.
+
+    Construction performs no I/O for any layer in `WRAPPER_LAYERS`, `hub_cache`
+    included, so the build loop above cannot tell a wrapper that only *looks*
+    like a pass-through from one that hangs or errors the moment it is used.
+
+    The stack pairs `hub_cache` with the bundled `http` backend against an
+    in-process origin, because the hub is only consulted for a validator
+    declared strong: the built-in `file` backend synthesizes a weak one, so a
+    file-backed read would take the no-validator bypass and never dial —
+    proving nothing about the degrade path. The origin serves a strong
+    (quoted) ETag, and the hub endpoint is an ephemeral port that was bound
+    and released, so the dial is deterministically refused. A successful
+    read here proves the degrade-to-pass-through contract actually runs: the
+    refusal is swallowed and the object is served from `inner` unchanged.
+    """
+    import http.server
+    import socket
+    import threading
+
+    payload = b"hub-cache-smoke"
+
+    class Origin(http.server.BaseHTTPRequestHandler):
+        def _answer(self, body: bool) -> None:
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("ETag", '"hub-cache-smoke-v1"')
+            self.end_headers()
+            if body:
+                self.wfile.write(payload)
+
+        def do_HEAD(self) -> None:  # noqa: N802 - http.server's naming
+            self._answer(body=False)
+
+        def do_GET(self) -> None:  # noqa: N802 - http.server's naming
+            self._answer(body=True)
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Origin)
+    origin_port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    # Bound and immediately released: nothing listens on it afterwards, so
+    # the hub dial is refused regardless of whether the machine running the
+    # release check happens to have a real hub on the default port.
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    hub_port = probe.getsockname()[1]
+    probe.close()
+
+    try:
+        registry = ovstorage.PluginRegistry([directory])
+        request = ConnectionRequest("http")
+        request.add_config(
+            "root_url", ConfigValue.string(f"http://127.0.0.1:{origin_port}/")
+        )
+        stack = await (
+            ovstorage.Stack(root="hub-cache-read")
+            .with_registry(registry)
+            .wrapper(
+                hub_cache.HubCache(
+                    "hub-cache-read",
+                    "hub-cache-read-http",
+                    {"endpoint": ConfigValue.string(f"127.0.0.1:{hub_port}")},
+                )
+            )
+            .backend(plugin.PluginBackend("http", name="hub-cache-read-http"))
+            .connection("hub-cache-read-http", request)
+            .build()
+        )
+        data, _info = await stack.read(f"http://127.0.0.1:{origin_port}/object.bin")
+        if data != payload:
+            raise SystemExit(
+                "hub_cache read-without-a-hub smoke check returned unexpected bytes"
+            )
+    finally:
+        server.shutdown()
+        thread.join()
+
+
 def main() -> int:
     directory = ovstorage.bundled_plugins_dir()
     count = _check_inventory(directory)
@@ -169,13 +257,16 @@ def main() -> int:
     # every bundled library loads and builds; a temp directory that outlives it
     # does not contradict that, and must not fail a release.
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-        asyncio.run(_build_every_layer(directory, Path(tmp)))
+        tmp_path = Path(tmp)
+        asyncio.run(_build_every_layer(directory, tmp_path))
+        asyncio.run(_read_through_hub_cache_without_a_hub(directory))
 
     print(
         f"every bundled library loaded and ABI-validated: "
         f"{len(BACKEND_KINDS)} backend kind(s) + {len(WRAPPER_LAYERS)} wrapper(s) "
         f"+ router"
     )
+    print("hub_cache read succeeded with no hub listening (transparent pass-through)")
     return 0
 
 

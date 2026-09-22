@@ -5,7 +5,7 @@ info:
   license:
     name: Apache-2.0
     identifier: Apache-2.0
-  version: 0.2.1
+  version: 0.3.0
 paths:
   /v1/address-roots:
     get:
@@ -13,7 +13,8 @@ paths:
       - discovery
       summary: |-
         List every address root currently routed by this gateway.
-        Aliases appear only if their `visibility` is `visible`.
+        Visible and hidden roots appear carrying their visibility; suppressed
+        prefixes are omitted.
       operationId: list_address_roots
       responses:
         '200':
@@ -448,6 +449,12 @@ paths:
         required: false
         schema:
           type: boolean
+      - name: versioned_address
+        in: query
+        description: Populate `versioned_address`, paying for the version lookup where it is not free
+        required: false
+        schema:
+          type: boolean
       responses:
         '200':
           description: ''
@@ -593,6 +600,12 @@ paths:
       - name: full_metadata
         in: query
         description: Include user metadata (may require an extra backend call on listing-backed stat implementations)
+        required: false
+        schema:
+          type: boolean
+      - name: versioned_address
+        in: query
+        description: Populate `versioned_address`, paying for the version lookup where it is not free
         required: false
         schema:
           type: boolean
@@ -769,6 +782,7 @@ components:
       - address
       - backend_kind
       - capabilities
+      - visibility
       properties:
         address:
           type: string
@@ -789,6 +803,16 @@ components:
           - string
           - 'null'
           description: Operator-supplied human-readable label.
+        visibility:
+          $ref: '#/components/schemas/AddressVisibilityResponse'
+          description: Advertised visibility. Suppressed roots are omitted from the response.
+    AddressVisibilityResponse:
+      type: string
+      description: Visibility carried by an advertised address root.
+      enum:
+      - visible
+      - hidden
+      - suppressed
     BackendKindList:
       type: object
       description: Returned by `GET /v1/backend-kinds`.
@@ -1090,7 +1114,7 @@ components:
           description: |-
             Optional annotation attached to this operation; backends that
             support per-operation annotations stash it under the
-            `x-ov-message` user-metadata key.
+            `x_ov_message` user-metadata key.
         remove:
           type: array
           items:
@@ -1128,6 +1152,16 @@ components:
             (`If-Match: "<etag>"` on read/delete/update_metadata and the
             destination side of write/copy/rename; `X-OV-If-Source-Match:
             <etag>` on the source side of copy/rename).
+        etag_strength:
+          oneOf:
+          - type: string
+            description: Trust declaration attached to an object etag.
+            enum:
+            - strong
+            - weak
+          description: |-
+            Declared validator strength: `strong` or `weak`. Omitted when the
+            producer makes no declaration.
         kind:
           type: string
           description: One of `file`, `directory`, `directory_marker`, `directory_inferred`.
@@ -1160,6 +1194,14 @@ components:
           - string
           - 'null'
           description: Backend-assigned version identifier (descriptive; not a precondition).
+        versioned_address:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Address that names this version of the object (a pin, not an
+            identity). Omitted when the backend does not version it or the
+            caller did not ask.
     PartialBody:
       type: object
       description: |-

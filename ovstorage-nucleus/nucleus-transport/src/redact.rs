@@ -3,15 +3,18 @@
 
 //! Redaction for values that reach `tracing` events.
 //!
-//! The transports carry credentials in two shapes. Request and response bodies
-//! carry them as JSON fields — `Tokens.auth_with_api_token` sends a literal API
-//! token as a parameter, and the corresponding response envelope carries
-//! `access_token` and `refresh_token`. Connection URLs carry them as query
-//! parameters when a caller splices one in.
+//! The transports carry credentials in three shapes. Request and response
+//! bodies carry them as JSON fields — `Tokens.auth_with_api_token` sends a
+//! literal API token as a parameter, and the corresponding response envelope
+//! carries `access_token` and `refresh_token`. Connection URLs carry them as
+//! query parameters when a caller splices one in. Free-form text chosen by a
+//! server can repeat either a credential-bearing URL or a bearer literal.
 //!
-//! Both shapes are handled by keeping the body out of the event entirely (the
-//! logging sites emit only structured metadata) and by passing every URL
-//! through [`redact_url`] before it becomes a field value.
+//! Structured credential fields are handled by keeping their bodies out of an
+//! event entirely (the logging sites emit only structured metadata), and
+//! standalone URLs pass through [`redact_url`] before becoming field values.
+//! [`redact_server_text`] handles free-form text by finding those same URLs in
+//! prose, removing bearer literals, and bounding the resulting diagnostic.
 //!
 //! `redact_url` is a lexical transform over a URL's userinfo and its delimited
 //! parameters, covering both the query and the fragment. It does not parse the
@@ -49,7 +52,7 @@
 //! The `ovstorage-layer` crate carries a richer redactor of the same name. The
 //! `nucleus-*` crates are omni1 protocol bindings that depend on no ovstorage
 //! crate, so this one stands alone deliberately. Its parameter-name list is a
-//! superset of that redactor's generic token names, and both redact userinfo.
+//! superset of that redactor's list, and both redact userinfo.
 
 use tokio_tungstenite::tungstenite::Message;
 
@@ -59,22 +62,57 @@ use tokio_tungstenite::tungstenite::Message;
 /// does not stand in for `page_token`: a continuation cursor is not a
 /// credential and redacting it would cost real diagnostic value.
 ///
-/// A name belongs here when possessing its value lets a holder authenticate,
-/// and it stays out when the value only identifies or paginates. Matching is
-/// exact, so a new spelling needs its own entry — adding `bearer_token` does
-/// not follow from `token` being present.
+/// A name belongs here when its value is a credential or part of a provider's
+/// signed-URL authentication material. It stays out when the value only
+/// identifies or paginates. Matching is exact, so a new spelling needs its
+/// own entry — adding `bearer_token` does not follow from `token` being
+/// present.
 ///
 /// The two costs are not symmetric, which is why the cloud-provider signing
-/// parameters are listed even though a Nucleus URL is not expected to carry
-/// one: redacting a name that never appears costs nothing, while missing one
-/// that does puts a credential in a log. What keeps the list from growing
-/// without limit is the other cost — a name whose value a reader of the log
-/// needs, such as `page_token`, stays out however token-shaped it reads.
+/// parameter groups are listed even though a Nucleus URL is not expected to
+/// carry one: redacting a name that never appears costs nothing, while
+/// retaining one produces a partial signed URL and can put a credential in a
+/// log. What keeps the list from growing without limit is the other cost — a
+/// name whose value a reader of the log needs, such as `page_token`, stays out
+/// however token-shaped it reads.
 ///
 /// `every_listed_parameter_is_covered` pins this list against a literal copy,
 /// so removing an entry fails a test rather than silently widening what
 /// reaches a log.
 const CREDENTIAL_PARAMS: &[&str] = &[
+    // S3 SigV4.
+    "X-Amz-Signature",
+    "X-Amz-Credential",
+    "X-Amz-SignedHeaders",
+    "X-Amz-Security-Token",
+    "X-Amz-Date",
+    "X-Amz-Expires",
+    "X-Amz-Algorithm",
+    // Azure SAS.
+    "sig",
+    "sv",
+    "se",
+    "st",
+    "sp",
+    "sip",
+    "srt",
+    "ss",
+    "tn",
+    "skoid",
+    "sktid",
+    "skt",
+    "ske",
+    "sks",
+    "skv",
+    // GCS V4 signed URLs.
+    "X-Goog-Signature",
+    "X-Goog-Credential",
+    "X-Goog-SignedHeaders",
+    "X-Goog-Date",
+    "X-Goog-Expires",
+    "X-Goog-Algorithm",
+    // Generic token names, including the standalone transport's additional
+    // Nucleus and authentication spellings.
     "access_token",
     "api_key",
     "api_token",
@@ -94,9 +132,6 @@ const CREDENTIAL_PARAMS: &[&str] = &[
     "sas_token",
     "secret",
     "session_token",
-    // Azure spells its shared-access signature `sig`; `signature` alone would
-    // miss it.
-    "sig",
     "signature",
     "token",
 ];
@@ -105,6 +140,20 @@ const CREDENTIAL_PARAMS: &[&str] = &[
 /// keeps the event useful for diagnosis — "the token was present" is the fact
 /// a reader of the log actually needs.
 const PLACEHOLDER: &str = "REDACTED";
+
+/// Maximum bytes of redacted server prose retained before a truncation marker.
+///
+/// Real Nucleus error prose fits within 512 bytes. Text chosen by a server
+/// must not be able to fill a log or an error handed to a caller.
+const MAX_SERVER_TEXT_BYTES: usize = 512;
+
+/// Maximum bytes of server prose inspected for credential shapes.
+///
+/// The scan allowance is deliberately larger than the retained diagnostic so
+/// an ordinary URL or bearer literal crossing the output boundary is still
+/// seen whole. Bounding it prevents a multi-megabyte server frame from making
+/// either synchronous scanner monopolize the shared transport runtime.
+const MAX_SERVER_TEXT_SCAN_BYTES: usize = MAX_SERVER_TEXT_BYTES * 8;
 
 fn names_a_credential(name: &str) -> bool {
     CREDENTIAL_PARAMS
@@ -303,6 +352,254 @@ pub fn redact_url(url: &str) -> String {
     out
 }
 
+/// Redact credential shapes in server-chosen prose and bound its length.
+///
+/// The lexical scan recognises conventional `scheme://` URLs embedded in
+/// prose, including URLs stopped by whitespace, quotes, closing prose
+/// brackets, commas, and semicolons. A closing bracket belonging to an IPv6
+/// authority remains part of its URL. Each span is passed through this
+/// module's [`redact_url`]. It also replaces the token after a
+/// case-insensitive `bearer` word and whitespace with `PLACEHOLDER`.
+///
+/// This covers ordinary URL query credentials, URL userinfo, and bearer
+/// authorization literals. It does not infer that arbitrary secret-looking
+/// prose is a credential, and the evasions documented for [`redact_url`]
+/// remain evasions here. A split or obfuscated `bearer` spelling, or a token
+/// with no separating whitespace, is likewise outside what the lexical scan
+/// can identify.
+///
+/// Redaction deliberately runs over a working prefix eight times larger than
+/// the retained diagnostic before the final truncation. Truncating directly
+/// to the output bound could cut an ordinary URL before the scanner has seen
+/// its complete credential-bearing shape while leaving credential bytes in
+/// the retained prefix. The working prefix itself is bounded so a
+/// multi-megabyte server frame cannot monopolize the shared I/O runtime with
+/// synchronous diagnostic work. At most `MAX_SERVER_TEXT_BYTES` redacted
+/// bytes are retained, walking backward to a UTF-8 character boundary, and a
+/// marker names the original input's byte length whenever either bound cuts
+/// the diagnostic.
+///
+/// This helper is total over arbitrary `str` input: it performs no parsing,
+/// every byte offset used for slicing is either an ASCII delimiter or a known
+/// UTF-8 boundary, and truncation checks [`str::is_char_boundary`] before it
+/// slices. It has no input-dependent panic path, which is required because it
+/// runs while constructing diagnostics for an already failing connection.
+pub fn redact_server_text(text: &str) -> String {
+    let original_len = text.len();
+    let mut scan_end = original_len.min(MAX_SERVER_TEXT_SCAN_BYTES);
+    while !text.is_char_boundary(scan_end) {
+        scan_end -= 1;
+    }
+    let urls_redacted = redact_urls_in_text(&text[..scan_end]);
+    let mut redacted = redact_bearer_literals(&urls_redacted);
+
+    let working_prefix_was_cut = scan_end < original_len;
+    if !working_prefix_was_cut && redacted.len() <= MAX_SERVER_TEXT_BYTES {
+        return redacted;
+    }
+
+    if redacted.len() > MAX_SERVER_TEXT_BYTES {
+        let mut end = MAX_SERVER_TEXT_BYTES;
+        while !redacted.is_char_boundary(end) {
+            end -= 1;
+        }
+        redacted.truncate(end);
+    }
+    redacted.push_str(&format!(
+        "… [truncated; original length: {original_len} bytes]"
+    ));
+    redacted
+}
+
+/// Replace credential-bearing URL spans while preserving surrounding prose.
+fn redact_urls_in_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    while cursor < text.len() {
+        match scan_url_at(text, cursor) {
+            UrlScan::Url(end) => {
+                out.push_str(&redact_url(&text[cursor..end]));
+                cursor = end;
+                continue;
+            }
+            UrlScan::SchemeRun(end) => {
+                // Every offset inside this run reaches the same end before it
+                // can look for `://`, so none can begin a URL. Copying the run
+                // in one step keeps this scan linear in server-chosen input.
+                out.push_str(&text[cursor..end]);
+                cursor = end;
+                continue;
+            }
+            UrlScan::None => {}
+        }
+
+        // `cursor` starts at zero and advances by complete characters or a URL
+        // end returned by `scan_url_at`, so this slice always starts on a
+        // character boundary. `next` exists because the loop excludes `len`.
+        let Some(character) = text[cursor..].chars().next() else {
+            break;
+        };
+        let end = cursor + character.len_utf8();
+        out.push_str(&text[cursor..end]);
+        cursor = end;
+    }
+
+    out
+}
+
+/// Replace bearer tokens while preserving their label and separating space.
+fn redact_bearer_literals(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    while cursor < text.len() {
+        if let Some((token_start, token_end)) = scan_bearer_at(text, cursor) {
+            out.push_str(&text[cursor..token_start]);
+            out.push_str(PLACEHOLDER);
+            cursor = token_end;
+            continue;
+        }
+
+        // The same boundary invariant as `redact_urls_in_text` applies here.
+        let Some(character) = text[cursor..].chars().next() else {
+            break;
+        };
+        let end = cursor + character.len_utf8();
+        out.push_str(&text[cursor..end]);
+        cursor = end;
+    }
+
+    out
+}
+
+/// If a bearer literal starts at `start`, return its token's byte range.
+fn scan_bearer_at(text: &str, start: usize) -> Option<(usize, usize)> {
+    let before = text.get(..start)?.chars().next_back();
+    if before.is_some_and(|character| character.is_alphanumeric() || character == '_') {
+        return None;
+    }
+
+    let bearer_end = start.checked_add("bearer".len())?;
+    if !text.get(start..bearer_end)?.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+
+    let mut token_start = bearer_end;
+    for (offset, character) in text.get(bearer_end..)?.char_indices() {
+        if !character.is_whitespace() {
+            break;
+        }
+        token_start = bearer_end + offset + character.len_utf8();
+    }
+    if token_start == bearer_end || token_start == text.len() {
+        return None;
+    }
+
+    let token_end = text[token_start..]
+        .char_indices()
+        .find_map(|(offset, character)| {
+            (character.is_whitespace() || character == ',').then_some(token_start + offset)
+        })
+        .unwrap_or(text.len());
+    (token_end > token_start).then_some((token_start, token_end))
+}
+
+/// Result of looking for a URL at one character boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UrlScan {
+    /// A URL was found; the value is its exclusive end.
+    Url(usize),
+    /// An ASCII scheme-character run was found but was not followed by `://`.
+    ///
+    /// No later offset within the run can be a URL start: scanning from one
+    /// reaches the same run end and rejects the same following bytes. The
+    /// caller can therefore copy the whole run rather than rescan every
+    /// suffix, which prevents quadratic work on a long server-chosen word.
+    SchemeRun(usize),
+    /// The character at this position cannot begin an ASCII URL scheme.
+    None,
+}
+
+/// Classify a possible URL starting at `start` and return its exclusive end.
+fn scan_url_at(text: &str, start: usize) -> UrlScan {
+    let bytes = text.as_bytes();
+    let Some(scheme_end) = scan_scheme(bytes, start) else {
+        return UrlScan::None;
+    };
+    if bytes.get(scheme_end) != Some(&b':')
+        || bytes.get(scheme_end + 1) != Some(&b'/')
+        || bytes.get(scheme_end + 2) != Some(&b'/')
+    {
+        return UrlScan::SchemeRun(scheme_end);
+    }
+
+    let mut end = scheme_end + 3;
+    let mut in_authority = true;
+    let mut in_bracketed_authority = false;
+    while end < bytes.len() {
+        let byte = bytes[end];
+        if byte.is_ascii_whitespace()
+            || matches!(
+                byte,
+                b'"' | b'<' | b'>' | b'`' | b'\'' | b')' | b'}' | b',' | b';'
+            )
+        {
+            break;
+        }
+
+        if byte == b']' {
+            if in_authority && in_bracketed_authority {
+                // The closing bracket is structural host syntax in an IPv6
+                // authority, not punctuation closing the surrounding prose.
+                in_bracketed_authority = false;
+                end += 1;
+                continue;
+            }
+            break;
+        }
+
+        if in_authority {
+            match byte {
+                b'[' => in_bracketed_authority = true,
+                b'/' | b'?' | b'#' if !in_bracketed_authority => in_authority = false,
+                _ => {}
+            }
+        }
+        end += 1;
+    }
+
+    // Sentence punctuation is not part of a URL, but must remain in the
+    // surrounding prose. `redact_urls_in_text` copies it on the next pass.
+    while end > scheme_end + 3 {
+        match bytes[end - 1] {
+            b'.' | b',' | b':' | b';' | b'!' | b'?' => end -= 1,
+            _ => break,
+        }
+    }
+
+    UrlScan::Url(end)
+}
+
+/// Return the end of an ASCII URL scheme starting at `start`.
+fn scan_scheme(bytes: &[u8], start: usize) -> Option<usize> {
+    let first = *bytes.get(start)?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+
+    let mut end = start + 1;
+    while end < bytes.len() {
+        let byte = bytes[end];
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-') {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    Some(end)
+}
+
 /// The variant name of a websocket message, carrying none of its payload.
 ///
 /// The unexpected-message arms of both read loops report what arrived. A
@@ -331,6 +628,216 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_url_in_server_prose_is_redacted() {
+        let redacted = redact_server_text(
+            "request failed at wss://nucleus.example/p?access_token=abcdef&v=2 during login",
+        );
+        assert_eq!(
+            redacted,
+            "request failed at wss://nucleus.example/p?access_token=REDACTED&v=2 during login"
+        );
+    }
+
+    #[test]
+    fn a_serde_quoted_url_is_redacted_without_losing_the_quote() {
+        let redacted = redact_server_text(
+            "invalid value: \"https://nucleus.example/p?api_token=abcdef\", expected metadata",
+        );
+        assert_eq!(
+            redacted,
+            "invalid value: \"https://nucleus.example/p?api_token=REDACTED\", expected metadata"
+        );
+    }
+
+    #[test]
+    fn cloud_signing_credentials_in_server_prose_are_redacted() {
+        for url in [
+            "https://bucket.example/k?X-Amz-Signature=cloud-signing-secret&versionId=7",
+            "https://storage.example/k?X-Goog-Signature=cloud-signing-secret&generation=7",
+            "https://account.example/c/k?sv=2026-01-01&sig=cloud-signing-secret",
+        ] {
+            let redacted = redact_server_text(&format!("server rejected {url}"));
+            assert!(
+                redacted.contains(PLACEHOLDER),
+                "`{url}` lost no value, so the assertion premise failed: `{redacted}`"
+            );
+            assert!(
+                !redacted.contains("cloud-signing-secret"),
+                "`{url}` retained its signing credential: `{redacted}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_url_with_a_bracketed_ipv6_authority_is_redacted() {
+        let redacted = redact_server_text(
+            "denied wss://[::1]/p?access_token=ipv6-secret], expected authorization",
+        );
+        assert_eq!(
+            redacted,
+            "denied wss://[::1]/p?access_token=REDACTED], expected authorization"
+        );
+    }
+
+    #[test]
+    fn a_bearer_literal_is_redacted_case_insensitively() {
+        let redacted = redact_server_text("authorization failed for BeArEr\tabcdef, retry denied");
+        assert_eq!(
+            redacted,
+            "authorization failed for BeArEr\tREDACTED, retry denied"
+        );
+        assert_eq!(
+            redact_server_text("unbearer abcdef"),
+            "unbearer abcdef",
+            "bearer must begin at a word boundary"
+        );
+    }
+
+    #[test]
+    fn short_plain_server_prose_is_unchanged() {
+        let prose = "the requested object does not exist";
+        assert_eq!(redact_server_text(prose), prose);
+    }
+
+    #[test]
+    fn oversized_server_prose_is_bounded_and_names_its_original_length() {
+        let prose = "x".repeat(600);
+        let marker = "… [truncated; original length: 600 bytes]";
+        let redacted = redact_server_text(&prose);
+
+        assert_eq!(&redacted[..MAX_SERVER_TEXT_BYTES], "x".repeat(512));
+        assert_eq!(&redacted[MAX_SERVER_TEXT_BYTES..], marker);
+        assert_eq!(redacted.len(), MAX_SERVER_TEXT_BYTES + marker.len());
+    }
+
+    #[test]
+    fn multibyte_server_prose_truncates_at_a_character_boundary() {
+        // Byte 512 falls in the middle of `é`.
+        let prose = format!("{}étail", "a".repeat(511));
+        assert!(!prose.is_char_boundary(MAX_SERVER_TEXT_BYTES));
+
+        let redacted = redact_server_text(&prose);
+        let marker = format!("… [truncated; original length: {} bytes]", prose.len());
+        assert_eq!(&redacted[..511], "a".repeat(511));
+        assert_eq!(&redacted[511..], marker);
+    }
+
+    #[test]
+    fn the_working_prefix_ends_at_a_character_boundary() {
+        // Byte 4096 falls in the middle of `é`, independently of the final
+        // 512-byte output cutoff exercised by the test above.
+        let prose = format!("{}étail{}", "a".repeat(4095), "z".repeat(4096));
+        assert!(!prose.is_char_boundary(MAX_SERVER_TEXT_SCAN_BYTES));
+
+        let redacted = redact_server_text(&prose);
+        let marker = format!("… [truncated; original length: {} bytes]", prose.len());
+        assert_eq!(&redacted[..MAX_SERVER_TEXT_BYTES], "a".repeat(512));
+        assert_eq!(&redacted[MAX_SERVER_TEXT_BYTES..], marker);
+    }
+
+    /// Redacting one credential can shrink an oversized working prefix below
+    /// the output bound. The unscanned tail still has to be disclosed as a
+    /// truncation, with the length of the complete server input rather than
+    /// the prefix or the redacted intermediate string.
+    #[test]
+    fn a_shrunk_working_prefix_still_reports_the_original_length() {
+        let prose = format!(
+            "wss://h/p?access_token={}",
+            "x".repeat(MAX_SERVER_TEXT_SCAN_BYTES * 2)
+        );
+        let marker = format!("… [truncated; original length: {} bytes]", prose.len());
+        let redacted = redact_server_text(&prose);
+
+        assert_eq!(
+            redacted,
+            format!("wss://h/p?access_token={PLACEHOLDER}{marker}")
+        );
+    }
+
+    /// The URL begins before the cap and its credential begins within the raw
+    /// prefix that a truncate-first implementation would retain. Seeing the
+    /// placeholder proves the complete input was redacted before it was cut.
+    #[test]
+    fn a_credential_crossing_the_cap_is_redacted_before_truncation() {
+        let credential = "credential-that-must-not-survive";
+        let prose = format!(
+            "{} wss://h/p?access_token={credential} {}",
+            "x".repeat(469),
+            "tail".repeat(200)
+        );
+        let redacted = redact_server_text(&prose);
+
+        assert!(redacted.contains(PLACEHOLDER), "got `{redacted}`");
+        assert!(!redacted.contains(credential), "got `{redacted}`");
+        assert!(redacted.contains("original length:"), "got `{redacted}`");
+    }
+
+    /// Every shape here is valid UTF-8 but awkward for one of the lexical
+    /// scanners. Diagnostic redaction must return a bounded string for all of
+    /// them rather than turning an existing connection failure into a panic.
+    #[test]
+    fn odd_server_text_shapes_neither_panic_nor_exceed_the_bound() {
+        let shapes = [
+            ("", ""),
+            ("://", "://"),
+            ("x://", "x://"),
+            ("\"wss://h/p?\"", "\"wss://h/p?\""),
+            ("bearer", "bearer"),
+            ("bearer ", "bearer "),
+            ("bearer\t,", "bearer\t,"),
+            ("ébearer secret", "ébearer secret"),
+            ("😀://?token=secret", "😀://?token=secret"),
+            (
+                "wss://h/p?access_token=😀",
+                "wss://h/p?access_token=REDACTED",
+            ),
+            ("\0bearer\nsecret", "\0bearer\nREDACTED"),
+        ];
+
+        for (text, expected) in shapes {
+            let redacted = redact_server_text(text);
+            let marker = format!("… [truncated; original length: {} bytes]", text.len());
+            assert_eq!(redacted, expected, "`{text:?}` was corrupted");
+            assert!(
+                redacted.len() <= MAX_SERVER_TEXT_BYTES + marker.len(),
+                "`{text:?}` produced {} bytes",
+                redacted.len()
+            );
+        }
+        assert_eq!(redact_server_text(""), "");
+    }
+
+    #[test]
+    fn server_text_output_is_bounded_for_varied_inputs() {
+        for repetitions in [0, 1, 63, 127, 128, 255, 511, 512, 513, 1024] {
+            for unit in ["a", "é", "😀", "wss://h/p?token=x ", "Bearer x "] {
+                let text = unit.repeat(repetitions);
+                let redacted = redact_server_text(&text);
+                let marker = format!("… [truncated; original length: {} bytes]", text.len());
+                assert!(
+                    redacted.len() <= MAX_SERVER_TEXT_BYTES + marker.len(),
+                    "unit `{unit}` repeated {repetitions} times produced {} bytes",
+                    redacted.len()
+                );
+            }
+        }
+    }
+
+    /// A failed URL probe reports the whole ASCII scheme-character run to the
+    /// caller. If the caller resumed one byte later, a word this large would
+    /// rescan every suffix and turn server-chosen input into quadratic work.
+    #[test]
+    fn a_long_non_url_scheme_run_is_skipped_as_one_span() {
+        let text = "a".repeat(1024 * 1024);
+        assert_eq!(scan_url_at(&text, 0), UrlScan::SchemeRun(text.len()));
+
+        let redacted = redact_server_text(&text);
+        let marker = format!("… [truncated; original length: {} bytes]", text.len());
+        assert_eq!(&redacted[..MAX_SERVER_TEXT_BYTES], "a".repeat(512));
+        assert_eq!(&redacted[MAX_SERVER_TEXT_BYTES..], marker);
+    }
+
+    #[test]
     fn a_credential_query_parameter_loses_its_value() {
         let redacted = redact_url("wss://nucleus.example/connection?access_token=abcdef");
         assert_eq!(
@@ -348,6 +855,34 @@ mod tests {
     /// green, and a password in a URL query would start reaching logs. A
     /// literal copy is what gives the assertion an independent expectation.
     const EXPECTED_PARAMS: &[&str] = &[
+        "X-Amz-Signature",
+        "X-Amz-Credential",
+        "X-Amz-SignedHeaders",
+        "X-Amz-Security-Token",
+        "X-Amz-Date",
+        "X-Amz-Expires",
+        "X-Amz-Algorithm",
+        "sig",
+        "sv",
+        "se",
+        "st",
+        "sp",
+        "sip",
+        "srt",
+        "ss",
+        "tn",
+        "skoid",
+        "sktid",
+        "skt",
+        "ske",
+        "sks",
+        "skv",
+        "X-Goog-Signature",
+        "X-Goog-Credential",
+        "X-Goog-SignedHeaders",
+        "X-Goog-Date",
+        "X-Goog-Expires",
+        "X-Goog-Algorithm",
         "access_token",
         "api_key",
         "api_token",
@@ -367,7 +902,6 @@ mod tests {
         "sas_token",
         "secret",
         "session_token",
-        "sig",
         "signature",
         "token",
     ];

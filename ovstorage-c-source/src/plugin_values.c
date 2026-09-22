@@ -185,6 +185,7 @@ static void ovc_pval_object_info_clear(OvStoragePlugin_ObjectInfo *info)
         info->user_metadata.present = false;
     }
     ovc_pval_opt_str_clear(&info->modified_by);
+    ovc_pval_opt_str_clear(&info->versioned_address);
 }
 
 static void ovc_pval_object_info_list_clear(
@@ -294,6 +295,7 @@ static void ovc_pval_connection_clear(OvStoragePlugin_Connection *value)
     ovc_pval_str_list_clear(&value->current_addresses);
     ovc_pval_auth_state_clear(&value->auth_state);
     ovc_pval_key_values_clear(&value->user_metadata);
+    ovc_pval_opt_str_clear(&value->owning_target);
 }
 
 static void ovc_pval_connection_list_clear(
@@ -1143,6 +1145,16 @@ void ovstorage_plugin_connection_change_free(
 
 void ovstorage_plugin_connection_change_stream_free(
     OvStoragePlugin_ConnectionChangeStream *value)
+{
+    if (value == NULL) {
+        return;
+    }
+    ovc_pval_stream_drop(value->state, value->drop_fn);
+    ovc_abi_free(value);
+}
+
+void ovstorage_plugin_list_entry_stream_free(
+    OvStoragePlugin_ListEntryStream *value)
 {
     if (value == NULL) {
         return;

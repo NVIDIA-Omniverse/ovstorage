@@ -29,6 +29,7 @@ pub fn stat_options_to_ffi(value: StatOptions) -> ffi::StatOptions {
     ffi::StatOptions {
         struct_size: std::mem::size_of::<ffi::StatOptions>(),
         full_metadata: value.full_metadata,
+        versioned_address: value.versioned_address,
     }
 }
 
@@ -36,6 +37,7 @@ pub fn stat_options_from_ffi(value: ffi::StatOptions) -> Result<StatOptions, Err
     ffi::validate_struct_size::<ffi::StatOptions>(value.struct_size, "StatOptions")?;
     Ok(StatOptions {
         full_metadata: value.full_metadata,
+        versioned_address: value.versioned_address,
     })
 }
 
@@ -138,6 +140,7 @@ pub fn list_options_to_ffi(value: ListOptions) -> ffi::ListOptions {
         max_results: primitive::optional_to_ffi(value.max_results, |v| v),
         page_token: primitive::optional_to_ffi(value.page_token, primitive::str_to_ffi),
         full_metadata: value.full_metadata,
+        versioned_address: value.versioned_address,
     }
 }
 
@@ -158,6 +161,7 @@ pub unsafe fn list_options_from_ffi(value: ffi::ListOptions) -> Result<ListOptio
             max_results: max_results?,
             page_token: page_token?,
             full_metadata: value.full_metadata,
+            versioned_address: value.versioned_address,
         })
     }
 }

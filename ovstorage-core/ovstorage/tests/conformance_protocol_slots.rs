@@ -11,16 +11,21 @@
 //! `tests/conformance_contracts.rs`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use futures::StreamExt as _;
 use ovstorage::ext::LayerExt;
 use ovstorage::{
-    BackendFactory as _, Body, ConfigValue, ContinueWriteRequest, DeleteOptions, ErrorCode,
-    Extensions, LayerConfig, LayerHandle, RedirectResult, RedirectResultBatch, Request,
-    StatOptions, StatRequest, Url, WrapperFactory as _, WriteOptions, WriteRedirectBatch,
-    WriteRequest, WriteStep, address,
+    BackendFactory as _, Body, CancellationToken, ConfigValue, ContinueWriteRequest, DeleteOptions,
+    ErrorCode, Extensions, Layer, LayerConfig, LayerHandle, LayerKindDescriptor, ListOptions,
+    ListPage, ListRequest, ListStream, ReadOptions, ReadRequest, RedirectResult,
+    RedirectResultBatch, Request, Result, StatOptions, StatRequest, Url, WrapperFactory as _,
+    WriteOptions, WriteRedirectBatch, WriteRequest, WriteStep, address,
 };
 use ovstorage_plugin_cache::{ByteCacheWrapperFactory, MetadataCacheWrapperFactory};
-use ovstorage_plugin_core::RetryWrapperFactory;
+use ovstorage_plugin_core::{CopyRenameFallbackWrapperFactory, RetryWrapperFactory};
+use ovstorage_plugin_http::RedirectFollowerWrapperFactory;
 use ovstorage_plugin_test::{
     ConformanceReport, ObservedCall, Recorder, ScenarioRegistry, ScenarioRunner, TestLayerFactory,
 };
@@ -361,6 +366,11 @@ async fn protocol_slots_pass_through_default_wrappers() {
             LayerConfig::new(),
             Box::new(MetadataCacheWrapperFactory::default()),
         ),
+        (
+            "hub_cache",
+            LayerConfig::new(),
+            Box::new(ovstorage_plugin_hub_cache::HubCacheWrapperFactory),
+        ),
     ] {
         let (inner, recorder) = test_layer(&[(
             "test_redirect_url",
@@ -389,7 +399,99 @@ async fn protocol_slots_pass_through_default_wrappers() {
     }
 
     assert!(report.ok(), "{}", report.render_human());
-    assert_eq!(report.passed(), 3);
+    assert_eq!(report.passed(), 4);
+}
+
+struct NativeListProbe {
+    buffered_calls: AtomicUsize,
+    stream_calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Layer for NativeListProbe {
+    fn name(&self) -> &str {
+        "native-list-probe"
+    }
+
+    fn descriptor(&self) -> LayerKindDescriptor {
+        TestLayerFactory::default().descriptor()
+    }
+
+    async fn list(
+        &self,
+        _request: Request<ListRequest>,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<ListPage> {
+        self.buffered_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ListPage {
+            items: Vec::new(),
+            next_page_token: None,
+        })
+    }
+
+    async fn list_stream(
+        &self,
+        _request: Request<ListRequest>,
+        _cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(futures::stream::empty()))
+    }
+}
+
+/// Wrappers with no listing semantics must forward the native stream slot
+/// itself. Relying on `Layer`'s default would call buffered `list` and silently
+/// discard the inner layer's bounded streaming implementation.
+#[tokio::test]
+async fn transparent_wrappers_preserve_native_list_streams() {
+    for (label, factory) in [
+        (
+            "copy_rename_fallback",
+            Box::new(CopyRenameFallbackWrapperFactory) as Box<dyn ovstorage::WrapperFactory>,
+        ),
+        (
+            "redirect_follower",
+            Box::new(RedirectFollowerWrapperFactory),
+        ),
+    ] {
+        let probe = Arc::new(NativeListProbe {
+            buffered_calls: AtomicUsize::new(0),
+            stream_calls: AtomicUsize::new(0),
+        });
+        let inner: LayerHandle = probe.clone();
+        let wrapped = factory
+            .create_wrapper(label, &LayerConfig::new(), inner, None)
+            .await
+            .unwrap_or_else(|error| panic!("wrap with {label}: {error}"));
+
+        let entries = wrapped
+            .list_stream(
+                Request::new(ListRequest {
+                    prefix: address_of(""),
+                    options: ListOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{label} list_stream open: {error}"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(
+            entries.is_empty(),
+            "the fixture starts with an empty prefix"
+        );
+        assert_eq!(
+            probe.stream_calls.load(Ordering::SeqCst),
+            1,
+            "{label} must delegate the native streaming slot"
+        );
+        assert_eq!(
+            probe.buffered_calls.load(Ordering::SeqCst),
+            0,
+            "{label} must not materialize the buffered listing"
+        );
+    }
 }
 
 /// Sync-metadata no-I/O conformance: the four structural introspection
@@ -544,4 +646,85 @@ async fn type_mismatch_contracts_hold_through_layer_ext() {
     LayerExt::delete_directory(&*layer, address_of("subdir"), DeleteDirectoryOptions, None)
         .await
         .expect("delete_directory on an empty directory succeeds");
+}
+
+/// `materialize` is host-owned (`docs/public/plugin-storage/OWNERSHIP.md`):
+/// a remote backend leaves the trait default in place and the composed
+/// Stack supplies local availability. Composing the real
+/// `RedirectFollowerWrapper` over the harness backend must therefore stage
+/// a readable local file, and the only call the backend observes is `read`.
+#[tokio::test]
+async fn materialize_over_a_default_backend_is_served_by_the_host_wrapper() {
+    let (layer, recorder) = test_layer(&[]).await;
+    let address = address_of("staged.txt");
+    LayerExt::write(
+        &*layer,
+        address.clone(),
+        Body::Bytes(b"staged-bytes".to_vec()),
+        WriteOptions::default(),
+        None,
+    )
+    .await
+    .expect("seed write");
+
+    let stack = RedirectFollowerWrapperFactory
+        .create_wrapper("follower", &LayerConfig::new(), layer.clone(), None)
+        .await
+        .expect("compose the host materialize wrapper");
+    recorder.clear();
+
+    let local = stack
+        .materialize(
+            Request::new(ReadRequest {
+                address,
+                options: ReadOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect("the host wrapper stages the object");
+    let staged = std::fs::read(&local.path).expect("staged file readable");
+    assert_eq!(staged, b"staged-bytes");
+    std::fs::remove_file(&local.path).ok();
+
+    // The backend never sees `materialize`: it leaves the slot at its
+    // default, so the wrapper reaches it through `read`.
+    let recorded: Vec<&str> = without_probes(&recorder)
+        .iter()
+        .map(|call| call.method_name())
+        .collect();
+    assert_eq!(
+        recorded,
+        vec!["read"],
+        "a host-served materialize must reach the backend only as `read`"
+    );
+}
+
+/// A bare backend leaves `materialize` at the Layer default. The host wrapper
+/// supplies local staging when the composition requires it.
+#[tokio::test]
+async fn materialize_without_a_cache_or_redirect_wrapper_is_unsupported() {
+    let (layer, recorder) = test_layer(&[]).await;
+    recorder.clear();
+
+    let err = layer
+        .materialize(
+            Request::new(ReadRequest {
+                address: address_of("bare.txt"),
+                options: ReadOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .expect_err("a bare backend must not materialize locally");
+    assert_eq!(err.code(), ErrorCode::Unsupported, "{err}");
+
+    let registry = ScenarioRegistry::with_defaults();
+    let runner = ScenarioRunner::new(&registry);
+    let mut report = ConformanceReport::new();
+    report.push(runner.verify_recorded(
+        "materialize-unsupported-without-cache",
+        without_probes(&recorder),
+    ));
+    assert!(report.ok(), "{}", report.render_human());
 }

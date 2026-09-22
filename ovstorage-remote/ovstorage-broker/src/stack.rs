@@ -8,21 +8,22 @@
 //! graph, byte/metadata cache roots, and follower follow policy are all caller
 //! data (config), not a hard-coded chain. [`BrokerStackBuilder`] loads the
 //! plugin directory, adds the broker's bespoke wrapper factories (the
-//! `attribution` overlay and the `upstream_credential` handler) to the
-//! plugin-provided factory set, normalizes the mandatory upstream-credential
-//! boundary, discovers the connectable backend kinds, and hands `build_stack`
-//! the [`StackConfig`]. It then attaches the selected per-listener auth layer
-//! over that inner. The
+//! `watch_limit` admission guard, `attribution` overlay, and
+//! `upstream_credential` handler) to the plugin-provided factory set, composes
+//! and validates the mandatory upstream-credential and watch-admission
+//! boundaries, discovers the connectable backend kinds, and hands `build_stack`
+//! the [`StackConfig`].
+//! It then attaches the selected per-listener auth layer over that inner. The
 //! immutable Stack advertises only its *connected* kinds via `list_kinds`, so
 //! discovery reads the captured set instead.
 //!
 //! The canonical broker graph (shipped `ovstorage-broker.toml`, and
 //! [`broker_stack_config`]'s programmatic twin) is `upstream_credential →
-//! alias → copy_rename_fallback → [byte_cache] → [metadata_cache] →
-//! redirect_follower → retry → router → [attribution_<kind> →]
-//! backend-per-kind`. The attribution overlay sits per-branch below the
-//! router, on the branches whose backend can carry the reserved
-//! `user_metadata` key. The
+//! watch_limit → alias → copy_rename_fallback → [byte_cache] →
+//! [metadata_cache] → redirect_follower → retry → router →
+//! [attribution_<kind> →] backend-per-kind`. The attribution overlay sits
+//! per-branch below the router, on the branches whose backend can carry the
+//! reserved `user_metadata` key. The
 //! follower carries a daemon-wide follow policy from its layer config: a byte
 //! cache with a `max_object_bytes` cap ⇒ `follow_reads = true` with that cap, so
 //! small reads are followed and teed into the byte cache while oversize reads
@@ -44,6 +45,7 @@ use ovstorage_authz_layer::{AUTH_LAYER_NAME, ListenerAuth, ListenerAuthBuildPlan
 use crate::{
     BrokerOAuthRouteBindings, OAuthProviderRegistry, UPSTREAM_CREDENTIAL_KIND,
     UpstreamCredentialWrapperFactory,
+    watch_limit::{SharedWatchBudget, WATCH_LIMIT_KIND, WatchLimitWrapperFactory},
 };
 
 /// Broker-owned wrappers in their fixed outer-to-inner order.
@@ -169,12 +171,15 @@ pub struct BrokerStack {
     /// The exact route bindings shared with the immutable
     /// `upstream_credential` wrapper composed into `stack`.
     pub(crate) oauth_bindings: Arc<BrokerOAuthRouteBindings>,
+    /// Daemon-lived admission counters shared with every Stack generation
+    /// built by a lifecycle reload.
+    pub(crate) watch_budget: SharedWatchBudget,
 }
 
 /// Builder for the broker daemon's [`BrokerStack`]. Loads plugins from a
-/// directory, adds the broker's bespoke wrapper factories (`attribution` +
-/// `upstream_credential`) to the plugin-provided factory set, and builds the
-/// shared inner [`Stack`] from the declared [`StackConfig`] via
+/// directory, adds the broker's bespoke wrapper factories (`watch_limit` +
+/// `attribution` + `upstream_credential`) to the plugin-provided factory set,
+/// and builds the shared inner [`Stack`] from the declared [`StackConfig`] via
 /// [`ovstorage::host::build_stack`] — then attaches the selected per-listener
 /// auth layer over it. The graph, cache roots, and follow
 /// policy are all `[ovstorage]` config; the builder carries only the host
@@ -188,11 +193,11 @@ pub struct BrokerStackBuilder {
     /// The shared inner data-plane graph + its connections, declared as
     /// `[ovstorage]` config. Broker-owned security wrappers are normalized
     /// before it is handed to `build_stack`: the upstream-credential boundary
-    /// is injected at the root when missing, and the attribution guarantee may
-    /// add an instance to a branch that declares none, re-pointing the one
-    /// edge that must then point at it. Normalization removes, reorders and
-    /// reconfigures nothing, and refuses the graph rather than moving a
-    /// misplaced instance.
+    /// is injected at the root when missing, omitted watch admission is injected
+    /// at the shared data-plane root, and the attribution guarantee may add an
+    /// instance to a branch that declares none. An explicit watch guard is
+    /// accepted only at that shared root; invalid watch, security-boundary, or
+    /// attribution placement is refused.
     stack_config: StackConfig,
     auth: ListenerAuthBuildPlan,
     auth_host_config: Option<BrokerAuthHostConfig>,
@@ -204,6 +209,10 @@ pub struct BrokerStackBuilder {
     /// `upstream_credential` wrapper factory at compose time.
     oauth_providers: Arc<OAuthProviderRegistry>,
     oauth_bindings: Arc<BrokerOAuthRouteBindings>,
+    /// Admission counters injected into the broker-owned watch-limit factory.
+    /// A normal builder owns a fresh budget; lifecycle reload explicitly
+    /// carries the running broker's budget into its replacement builder.
+    watch_budget: SharedWatchBudget,
     /// Extra in-process Layer factories registered after the plugins. This is
     /// used by private broker Layers and test fixtures.
     extra_factories: Vec<LoadedLayerFactory>,
@@ -228,6 +237,7 @@ impl Default for BrokerStackBuilder {
             attribution_strategy: AttributionStrategy::default(),
             oauth_providers: Arc::new(OAuthProviderRegistry::new()),
             oauth_bindings: Arc::new(BrokerOAuthRouteBindings::new()),
+            watch_budget: SharedWatchBudget::default(),
             extra_factories: Vec::new(),
         }
     }
@@ -323,6 +333,14 @@ impl BrokerStackBuilder {
         self
     }
 
+    /// Reuse the daemon's live-watch counters while rebuilding an immutable
+    /// Stack. Kept crate-private because only the broker lifecycle owns this
+    /// process-level state.
+    pub(crate) fn watch_budget(mut self, budget: SharedWatchBudget) -> Self {
+        self.watch_budget = budget;
+        self
+    }
+
     /// Register an in-process Layer factory (in addition to the plugins loaded
     /// from the directory). Registered after the plugins, so an override
     /// (such as a host-shared cache instance) wins over the plugin factory of
@@ -335,10 +353,10 @@ impl BrokerStackBuilder {
     /// Build the shared inner Stack from the declared config and attach the
     /// per-listener auth layer over it.
     ///
-    /// Loads the plugin directory, appends the broker's `attribution` +
-    /// `upstream_credential` wrapper factories (and any extra factories, which
-    /// override plugin-provided factories), guarantees the per-principal
-    /// upstream-credential boundary, builds the inner via
+    /// Loads the plugin directory, appends the broker's `watch_limit` +
+    /// `attribution` + `upstream_credential` wrapper factories (and any extra
+    /// factories, which override plugin-provided factories), guarantees both
+    /// broker-owned boundaries, builds the inner via
     /// [`ovstorage::host::build_stack`], then composes the selected auth layer as
     /// the single child of a thin auth `Stack` the daemon dispatches through —
     /// the degenerate N=1 case of the per-listener-auth-over-shared-inner design.
@@ -359,6 +377,7 @@ impl BrokerStackBuilder {
         let auth_host_config = self.auth_host_config;
         let require_configured_stack = self.require_configured_stack;
         let stack_config = self.stack_config;
+        let watch_budget = self.watch_budget;
         let plugin_dir = match self.plugin_dir {
             Some(dir) => Some(dir),
             None => ovstorage::default_plugin_dir(),
@@ -374,12 +393,12 @@ impl BrokerStackBuilder {
             },
             None => Vec::new(),
         };
-        let stack_config = compose_broker_owned_boundary(stack_config)?;
-        let (stack_config, mut factories) = prepare_listener_inner_stack(
+        let (stack_config, mut factories) = prepare_broker_inner_stack(
             stack_config,
             factories,
             self.attribution_strategy,
             self.extra_factories,
+            watch_budget.clone(),
         )?;
         let oauth_providers = self.oauth_providers;
         let oauth_bindings = self.oauth_bindings;
@@ -464,8 +483,136 @@ impl BrokerStackBuilder {
             backend_kinds,
             oauth_providers,
             oauth_bindings,
+            watch_budget,
         })
     }
+}
+
+/// Register the broker-native wrapper factories and guarantee their ordered
+/// trust boundaries. The credential boundary is normalized first, attribution
+/// is prepared on backend branches, then the admission guard is ensured at the
+/// shared data-plane root immediately inside the credential boundary. An
+/// explicit `watch_limit` declaration anywhere else is rejected rather than
+/// moved, so preparation never changes the meaning of an operator-authored
+/// graph.
+fn prepare_broker_inner_stack(
+    stack_config: StackConfig,
+    factories: Vec<LoadedLayerFactory>,
+    attribution_strategy: AttributionStrategy,
+    mut extra_factories: Vec<LoadedLayerFactory>,
+    watch_budget: SharedWatchBudget,
+) -> ovstorage::Result<(StackConfig, Vec<LoadedLayerFactory>)> {
+    extra_factories.push(LoadedLayerFactory::Wrapper(Arc::new(
+        WatchLimitWrapperFactory::new(watch_budget),
+    )));
+    let stack_config = compose_broker_owned_boundary(stack_config)?;
+    let (stack_config, factories) = prepare_listener_inner_stack(
+        stack_config,
+        factories,
+        attribution_strategy,
+        extra_factories,
+    )?;
+    Ok((
+        ensure_watch_limit_inside_credential_boundary(stack_config)?,
+        factories,
+    ))
+}
+
+/// Put the process-wide watch chokepoint directly inside `upstream_credential`.
+///
+/// `upstream_credential` remains the outer security boundary because it owns
+/// credential-establishing slots. Temporarily treating its child as the graph
+/// root lets [`ensure_watch_limit_root`] validate or inject the guard without
+/// ever lifting watch admission above that security boundary.
+fn ensure_watch_limit_inside_credential_boundary(
+    mut config: StackConfig,
+) -> ovstorage::Result<StackConfig> {
+    let Some(boundary_name) = config.root.clone() else {
+        return Ok(config);
+    };
+    let data_root = config
+        .layers
+        .get(&boundary_name)
+        .and_then(|layer| layer.inner.clone())
+        .ok_or_else(|| {
+            ovstorage::Error::new(
+                ovstorage::ErrorCode::InvalidArgument,
+                "broker upstream_credential boundary must wrap an inner layer",
+            )
+        })?;
+
+    config.root = Some(data_root);
+    let mut config = ensure_watch_limit_root(config)?;
+    let watch_root = config
+        .root
+        .clone()
+        .expect("a configured data graph retains a root");
+    config
+        .layers
+        .get_mut(&boundary_name)
+        .expect("the broker-owned boundary remains declared")
+        .inner = Some(watch_root);
+    config.root = Some(boundary_name);
+    Ok(config)
+}
+
+/// Guarantee that the effective data-plane root resolves to `watch_limit`.
+///
+/// The shared host helper treats a wrapper kind anywhere in the graph as
+/// satisfying its invariant. That is appropriate for optional overlays, but
+/// the broker admission budget is a process-wide chokepoint: an orphan or
+/// branch-local declaration must not leave the effective root unguarded.
+/// Refuse such a graph rather than moving the declared layer and changing which
+/// calls its configured limits govern. An omitted declaration is safely
+/// injected because it has no operator-authored position to preserve.
+fn ensure_watch_limit_root(mut config: StackConfig) -> ovstorage::Result<StackConfig> {
+    let Some(current_root) = config.root.clone() else {
+        return Ok(config);
+    };
+
+    let mut declarations: Vec<String> = config
+        .layers
+        .iter()
+        .filter(|(name, layer)| layer.kind.as_deref().unwrap_or(name.as_str()) == WATCH_LIMIT_KIND)
+        .map(|(name, _)| name.clone())
+        .collect();
+    declarations.sort();
+    if declarations.len() > 1 {
+        return Err(ovstorage::Error::new(
+            ovstorage::ErrorCode::InvalidArgument,
+            format!(
+                "broker stack declares multiple `{WATCH_LIMIT_KIND}` layers: {}",
+                declarations.join(", ")
+            ),
+        ));
+    }
+
+    if let Some(name) = declarations.pop() {
+        if name == current_root {
+            return Ok(config);
+        }
+        return Err(ovstorage::Error::new(
+            ovstorage::ErrorCode::InvalidArgument,
+            format!(
+                "broker `{name}` watch_limit layer is misplaced: it must be the shared data-plane \
+                 root immediately inside `{UPSTREAM_CREDENTIAL_KIND}` (current data-plane root is \
+                 `{current_root}`)"
+            ),
+        ));
+    }
+
+    let mut name = WATCH_LIMIT_KIND.to_string();
+    let mut suffix = 1;
+    while config.layers.contains_key(&name) {
+        name = format!("{WATCH_LIMIT_KIND}_{suffix}");
+        suffix += 1;
+    }
+    config.layers.insert(
+        name.clone(),
+        ovstorage::host::wrapper_layer(WATCH_LIMIT_KIND, &current_root),
+    );
+    config.root = Some(name);
+    Ok(config)
 }
 
 /// Optional layers + follow policy for [`broker_stack_config`]. Named fields so
@@ -588,7 +735,7 @@ pub(crate) fn with_alias_rules(
 /// fall back to this graph — an empty `[ovstorage.layers]` is refused.)
 ///
 /// Chain (top→bottom), rooted at `upstream_credential`: `upstream_credential →
-/// alias → copy_rename_fallback →
+/// watch_limit → alias → copy_rename_fallback →
 /// [byte_cache →] [metadata_cache →] redirect_follower → retry → router →
 /// [attribution_<kind> →] <kind>*`. The
 /// optional byte/metadata cache layers are present only when requested. Alias and
@@ -619,6 +766,11 @@ pub(crate) fn broker_stack_config(
         follow_cap,
     } = options;
     let mut layers: HashMap<String, LayerTable> = HashMap::new();
+
+    layers.insert(
+        WATCH_LIMIT_KIND.into(),
+        ovstorage::host::wrapper_layer(WATCH_LIMIT_KIND, "alias"),
+    );
 
     layers.insert(
         "alias".into(),
@@ -703,7 +855,7 @@ pub(crate) fn broker_stack_config(
     layers.extend(attributed_router_layers(&kinds, declared));
 
     compose_broker_owned_boundary(StackConfig {
-        root: Some("alias".into()),
+        root: Some(WATCH_LIMIT_KIND.into()),
         layers,
         connections,
     })
@@ -829,7 +981,7 @@ mod tests {
             &UserMetadataKinds::default(),
         );
         stack_config.layers.remove(UPSTREAM_CREDENTIAL_KIND);
-        stack_config.root = Some("alias".into());
+        stack_config.root = Some(WATCH_LIMIT_KIND.into());
 
         let composed = unsafe {
             BrokerStackBuilder::new()
@@ -869,9 +1021,11 @@ mod tests {
             .inner_layer()
             .expect("shared inner stack roots at upstream_credential");
         assert_eq!(upstream.name(), UPSTREAM_CREDENTIAL_KIND);
-        let alias = upstream
+        let watch_limit = upstream
             .inner_layer()
-            .expect("upstream_credential wraps alias");
+            .expect("upstream_credential wraps watch_limit");
+        assert_eq!(watch_limit.name(), WATCH_LIMIT_KIND);
+        let alias = watch_limit.inner_layer().expect("watch_limit wraps alias");
         assert_eq!(alias.name(), "alias");
 
         let mut request = Request::new(AuthenticateRequest {
@@ -934,8 +1088,13 @@ mod tests {
         assert_eq!(config.root.as_deref(), Some(UPSTREAM_CREDENTIAL_KIND));
         assert_eq!(
             config.layers[UPSTREAM_CREDENTIAL_KIND].inner.as_deref(),
+            Some(WATCH_LIMIT_KIND),
+            "the credential boundary wraps the process-wide watch chokepoint"
+        );
+        assert_eq!(
+            config.layers[WATCH_LIMIT_KIND].inner.as_deref(),
             Some("alias"),
-            "the broker-owned boundary wraps the operator graph's alias root"
+            "watch admission wraps the operator graph's alias root"
         );
         assert!(
             !config
@@ -1166,5 +1325,179 @@ mod tests {
         };
         assert_eq!(error.code(), ErrorCode::InvalidArgument);
         assert!(error.message().contains("not-a-cidr"));
+    }
+}
+
+#[cfg(test)]
+mod watch_limit_tests {
+    use super::*;
+
+    fn router_only_config() -> StackConfig {
+        StackConfig {
+            root: Some("router".into()),
+            layers: HashMap::from([(
+                "router".into(),
+                LayerTable {
+                    kind: Some("router".into()),
+                    ..Default::default()
+                },
+            )]),
+            connections: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn broker_preparation_injects_watch_limit_inside_credential_boundary() {
+        let (config, factories) = prepare_broker_inner_stack(
+            router_only_config(),
+            Vec::new(),
+            AttributionStrategy::UserMetadata,
+            Vec::new(),
+            SharedWatchBudget::default(),
+        )
+        .unwrap();
+
+        assert_eq!(config.root.as_deref(), Some(UPSTREAM_CREDENTIAL_KIND));
+        assert_eq!(
+            config.layers[UPSTREAM_CREDENTIAL_KIND].inner.as_deref(),
+            Some(WATCH_LIMIT_KIND)
+        );
+        assert_eq!(
+            config.layers[WATCH_LIMIT_KIND].inner.as_deref(),
+            Some("router")
+        );
+        assert!(
+            factories
+                .iter()
+                .any(|factory| factory.descriptor().kind == WATCH_LIMIT_KIND),
+            "broker-native watch_limit factory must be registered"
+        );
+    }
+
+    #[test]
+    fn broker_preparation_preserves_declared_watch_limit_config() {
+        let mut config = router_only_config();
+        let mut watch_limit = ovstorage::host::wrapper_layer(WATCH_LIMIT_KIND, "router");
+        watch_limit
+            .config
+            .insert("max_watches_per_principal".into(), toml::Value::Integer(7));
+        config.layers.insert(WATCH_LIMIT_KIND.into(), watch_limit);
+        config.root = Some(WATCH_LIMIT_KIND.into());
+
+        let (prepared, _) = prepare_broker_inner_stack(
+            config,
+            Vec::new(),
+            AttributionStrategy::UserMetadata,
+            Vec::new(),
+            SharedWatchBudget::default(),
+        )
+        .unwrap();
+
+        assert_eq!(prepared.root.as_deref(), Some(UPSTREAM_CREDENTIAL_KIND));
+        assert_eq!(
+            prepared.layers[UPSTREAM_CREDENTIAL_KIND].inner.as_deref(),
+            Some(WATCH_LIMIT_KIND)
+        );
+        assert_eq!(
+            prepared.layers[WATCH_LIMIT_KIND]
+                .config
+                .get("max_watches_per_principal"),
+            Some(&toml::Value::Integer(7))
+        );
+        assert_eq!(prepared.layers.len(), 3, "no duplicate wrapper injected");
+    }
+
+    #[test]
+    fn broker_preparation_rejects_an_orphan_watch_limit() {
+        let mut config = router_only_config();
+        let mut orphan = ovstorage::host::wrapper_layer(WATCH_LIMIT_KIND, "router");
+        orphan
+            .config
+            .insert("max_watches_per_principal".into(), toml::Value::Integer(1));
+        config.layers.insert("orphan_limit".into(), orphan);
+
+        let error = match prepare_broker_inner_stack(
+            config,
+            Vec::new(),
+            AttributionStrategy::UserMetadata,
+            Vec::new(),
+            SharedWatchBudget::default(),
+        ) {
+            Ok(_) => panic!("an orphan watch_limit must not be relocated"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), ovstorage::ErrorCode::InvalidArgument);
+        assert!(error.message().contains("orphan_limit"));
+        assert!(error.message().contains("shared data-plane root"));
+        assert!(
+            error
+                .message()
+                .contains("current data-plane root is `router`")
+        );
+    }
+
+    #[test]
+    fn broker_preparation_rejects_a_branch_local_watch_limit() {
+        let mut config = router_only_config();
+        config.layers.get_mut("router").unwrap().children = vec!["branch_limit".into()];
+        config.layers.insert(
+            "backend".into(),
+            LayerTable {
+                kind: Some("test".into()),
+                ..Default::default()
+            },
+        );
+        config.layers.insert(
+            "branch_limit".into(),
+            ovstorage::host::wrapper_layer(WATCH_LIMIT_KIND, "backend"),
+        );
+
+        let error = match prepare_broker_inner_stack(
+            config,
+            Vec::new(),
+            AttributionStrategy::UserMetadata,
+            Vec::new(),
+            SharedWatchBudget::default(),
+        ) {
+            Ok(_) => panic!("a branch-local watch_limit must not be relocated"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), ovstorage::ErrorCode::InvalidArgument);
+        assert!(error.message().contains("branch_limit"));
+        assert!(error.message().contains("shared data-plane root"));
+        assert!(
+            error
+                .message()
+                .contains("current data-plane root is `router`")
+        );
+    }
+
+    #[test]
+    fn broker_preparation_rejects_multiple_watch_limit_budgets() {
+        let mut config = router_only_config();
+        config.layers.insert(
+            "first_limit".into(),
+            ovstorage::host::wrapper_layer(WATCH_LIMIT_KIND, "router"),
+        );
+        config.layers.insert(
+            "second_limit".into(),
+            ovstorage::host::wrapper_layer(WATCH_LIMIT_KIND, "router"),
+        );
+
+        let error = match prepare_broker_inner_stack(
+            config,
+            Vec::new(),
+            AttributionStrategy::UserMetadata,
+            Vec::new(),
+            SharedWatchBudget::default(),
+        ) {
+            Ok(_) => panic!("multiple independent watch budgets must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), ovstorage::ErrorCode::InvalidArgument);
+        assert!(error.message().contains("first_limit, second_limit"));
     }
 }

@@ -18,9 +18,11 @@ Persona: a Python developer importing the `ovstorage` wheel.
 
 - `ovstorage.Stack` is the composer. It accepts declarative layer
   declarations, `ConnectionRequest`s, and an optional `PluginRegistry`, then
-  builds one immutable runtime stack. There is no `load_config` and no
-  runtime connection or alias management on the Python surface: connections
-  are declared before the build.
+  builds one immutable runtime stack. `Stack.from_config(...)` loads an opaque,
+  terminal config graph; only `.with_registry(...)` may compose with it, not
+  `.layer()`, `.backend()`, `.wrapper()`, `.router()`, or `.connection()`.
+  There is no runtime connection or alias management on the Python surface:
+  connections are declared before the build.
 - `ovstorage.LayerBase` is the shared root for direct native-Python wrapper
   classes. The layer modules are `ovstorage.file`, `ovstorage.plugin`,
   `ovstorage.router`, `ovstorage.byte_cache`, `ovstorage.metadata_cache`,

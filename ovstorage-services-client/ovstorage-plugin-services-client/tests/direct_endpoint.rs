@@ -189,6 +189,7 @@ fn connection(id: &str) -> Connection {
         auth_state: ConnectionAuthState::Anonymous,
         last_probed: None,
         user_metadata: UserMetadata::new(),
+        owning_target: None,
     }
 }
 
@@ -1657,6 +1658,16 @@ fn a_locator_is_redacted_before_it_reaches_a_diagnostic() {
     );
 
     let events = captured_events(|| {
+        // Register the constructor's static callsite on the capture thread and
+        // re-enable it if parallel transport construction registered it first
+        // on a thread with no subscriber.
+        tracing::callsite::rebuild_interest_cache();
+        let _ = OmniverseStorageTransport::new(
+            ServiceLocation::Discovery("https://callsite-registration.invalid/".into()),
+            DiscoveryState::new("callsite-registration"),
+        );
+        tracing::callsite::rebuild_interest_cache();
+
         let transport = OmniverseStorageTransport::new(
             ServiceLocation::Discovery(raw.into()),
             DiscoveryState::new("default"),

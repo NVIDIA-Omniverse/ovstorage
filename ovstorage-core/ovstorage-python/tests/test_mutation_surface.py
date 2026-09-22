@@ -44,8 +44,11 @@ async def test_mutation_methods_and_stream_body_inputs(tmp_path: pathlib.Path) -
     copied_info = await stack.copy(source, copied)
     assert copied_info.address == copied
     await stack.rename(copied, renamed)
-    updated = await stack.update_metadata(renamed, user_metadata_set={"owner": "test"})
-    assert updated.user_metadata["owner"] == "test"
+    # The file backend stores no user metadata: a metadata update is refused
+    # and stat reports an empty map.
+    with pytest.raises(ovstorage.UnsupportedError):
+        await stack.update_metadata(renamed, user_metadata_set={"owner": "test"})
+    assert (await stack.stat(renamed)).user_metadata == {}
     created = await stack.create_directory(directory)
     assert created.address == directory
     await stack.delete_directory(directory)

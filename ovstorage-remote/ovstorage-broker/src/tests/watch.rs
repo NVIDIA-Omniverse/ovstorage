@@ -64,6 +64,44 @@ async fn broker_grpc_watch_delivers_brokered_events() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn in_process_transport_cancellation_stops_a_quiet_watch() {
+    let prefix = Url::parse("test://demo/").unwrap();
+    let broker = Broker::new(
+        BrokerStackFixture::new()
+            .test_backend(watch_test_cfg(0))
+            .build_stack()
+            .await,
+    );
+    let cancel = ovstorage::CancellationToken::new();
+    let mut stream = ovstorage_broker_protocol::BrokerClientTransport::watch_directory_with_cancel(
+        &broker,
+        prefix,
+        ovstorage::WatchDirectoryOptions::default(),
+        Some(cancel.clone()),
+    )
+    .await
+    .expect("quiet in-process watch opens");
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("ovs-test-quiet-watch".into())
+        .spawn(move || {
+            let _ = started_tx.send(());
+            let _ = done_tx.send(stream.next());
+        })
+        .expect("quiet watch consumer thread starts");
+    started_rx.await.expect("watch consumer entered");
+    cancel.cancel();
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(3), done_rx)
+        .await
+        .expect("transport cancellation unblocks a quiet iterator")
+        .expect("watch consumer reports completion");
+    assert!(next.is_none(), "cancelled quiet watch must end cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn broker_grpc_fans_out_to_multiple_watchers() {
     let prefix = Url::parse("test://demo/").unwrap();
     // Pace the plugin's emission so both subscribers register before

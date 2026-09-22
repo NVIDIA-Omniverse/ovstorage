@@ -26,23 +26,25 @@ pub(crate) mod layers {
 }
 
 pub(crate) mod routing {
-    use ovstorage_plugin::{ListOptions, StatOptions, Url, address};
+    use ovstorage_plugin::{ListOptions, Url, address};
 
+    /// Whether a listing under `options` has the one shape a cached page may
+    /// take: the whole first level, unpaged. The cost flags do not decide it;
+    /// they are recorded on the row and decide which later requests it answers.
     pub(crate) fn list_options_are_cacheable_for_stat(options: &ListOptions) -> bool {
-        !options.recursive
-            && options.max_results.is_none()
-            && options.page_token.is_none()
-            && !options.full_metadata
+        !options.recursive && options.max_results.is_none() && options.page_token.is_none()
     }
 
-    /// Whether a `stat` of `address` under `options` produces a cache entry.
+    /// Whether a `stat` of `address` produces a cache entry. Directory-form
+    /// stats never do; the cost flags do not decide it — they are recorded on
+    /// the row and decide which later requests the row may answer.
     ///
     /// One definition, because two layers read it: the metadata cache decides
     /// what to store with it, and the byte cache decides with it whether a
     /// forwarded read is worth a watch scope. A scope registered for a read
     /// that stores nothing spends a candidate slot on nothing.
-    pub(crate) fn stat_is_cacheable(address: &Url, options: &StatOptions) -> bool {
-        !address::is_directory(address) && !options.full_metadata
+    pub(crate) fn stat_is_cacheable(address: &Url) -> bool {
+        !address::is_directory(address)
     }
 
     /// Whether a `list` of `prefix` under `options` produces a cache entry.

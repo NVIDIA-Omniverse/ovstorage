@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine;
 use rmcp::ServiceExt;
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, ProtocolVersion,
+    CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation, ProtocolVersion,
 };
 use rmcp::service::RunningService;
 use rmcp::transport::TokioChildProcess;
@@ -249,15 +249,43 @@ async fn write_then_stat_then_read_roundtrip() {
     )
     .await;
     assert_eq!(result.is_error, Some(false));
+    let env = parse_envelope(&result);
+    assert_eq!(env["result"]["info"]["etag_strength"], "weak");
 
     let result = call_tool(
         &client,
         "ovstorage_stat",
-        Some(serde_json::json!({ "address": addr })),
+        Some(serde_json::json!({ "address": addr, "versioned_address": true })),
     )
     .await;
     let env = parse_envelope(&result);
     assert_eq!(env["result"]["size"], payload.len() as u64);
+    assert_eq!(env["result"]["etag_strength"], "weak");
+    // The file backend has no versions to pin, and the key is always present
+    // so `null` is a visible answer rather than an omission.
+    let stat_result = env["result"].as_object().unwrap();
+    assert!(stat_result["versioned_address"].is_null());
+    assert!(stat_result.contains_key("versioned_address"));
+
+    let result = call_tool(
+        &client,
+        "ovstorage_list",
+        Some(serde_json::json!({
+            "prefix": format!("file://{}/", tmp.path().display()),
+            "recursive": true,
+            "versioned_address": true
+        })),
+    )
+    .await;
+    let env = parse_envelope(&result);
+    let item = env["result"]["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["address"] == addr))
+        .expect("round-trip object is listed");
+    assert_eq!(item["etag_strength"], "weak");
+    let item = item.as_object().unwrap();
+    assert!(item["versioned_address"].is_null());
+    assert!(item.contains_key("versioned_address"));
 
     let result = call_tool(
         &client,
@@ -270,6 +298,7 @@ async fn write_then_stat_then_read_roundtrip() {
         .decode(env["result"]["data_base64"].as_str().unwrap())
         .unwrap();
     assert_eq!(data, payload);
+    assert_eq!(env["result"]["info"]["etag_strength"], "weak");
 }
 
 #[tokio::test]
@@ -487,7 +516,7 @@ async fn negotiated_version(requested: ProtocolVersion) -> ProtocolVersion {
     cmd.env("OVSTORAGE_MCP_NO_CONFIG", "1");
     cmd.env_remove("OVSTORAGE_CONFIG");
     let transport = TokioChildProcess::new(cmd).expect("spawn server");
-    let client = ClientInfo::new(
+    let client = ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::new("ovstorage-mcp-tests", env!("CARGO_PKG_VERSION")),
     )
@@ -531,13 +560,15 @@ async fn a_client_pinned_to_an_older_version_keeps_it() {
 }
 
 #[tokio::test]
-async fn a_client_ahead_of_the_default_still_negotiates_its_version() {
+async fn a_client_ahead_of_the_default_is_answered_with_the_newest_legacy_version() {
     // `KNOWN_VERSIONS` reaches past the default and the server does not narrow
-    // it, so the ceiling is not the default. Asserting this pins the
-    // distinction the notes draw between what is advertised and what is served.
+    // it, but 2026-07-28 replaces the `initialize` handshake with `discover`.
+    // A client that asks for it over `initialize` is therefore answered with
+    // the newest version that still has an `initialize` handshake, which is
+    // the advertised default, not a downgrade to some older floor.
     assert_eq!(
         negotiated_version(ProtocolVersion::V_2026_07_28).await,
-        ProtocolVersion::V_2026_07_28,
+        ProtocolVersion::V_2025_11_25,
     );
 }
 

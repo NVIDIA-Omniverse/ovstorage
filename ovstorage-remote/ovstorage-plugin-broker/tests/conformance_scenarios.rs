@@ -48,7 +48,7 @@ use ovstorage_plugin::{
     ResolvedTarget, Result, RouteSource, StatOptions, UpdateMetadataOptions, Url, UserMetadata,
     WatchDirectoryOptions, WriteOptions, WriteRedirectBatch, WriteResult, WriteStep, address,
 };
-use ovstorage_plugin_broker::BrokerClientBackend;
+use ovstorage_plugin_broker::{BrokerClientBackend, new_layer_for_tests};
 use ovstorage_plugin_test::{
     ConformanceReport, Scenario, ScenarioRegistry, ScenarioReport, ScenarioRunner,
 };
@@ -69,6 +69,7 @@ fn broker_published_capabilities() -> Capabilities {
     caps.supports_write_redirect = true;
     caps.supports_delete = true;
     caps.supports_list = true;
+    caps.supports_list_stream = true;
     caps.supports_recursive_list = true;
     caps.supports_create_directory = true;
     caps.supports_delete_directory = true;
@@ -85,6 +86,7 @@ fn broker_published_capabilities() -> Capabilities {
 
 fn canned_info(address: &Url, kind: ObjectKind, size: Option<u64>) -> ObjectInfo {
     ObjectInfo {
+        etag_strength: Default::default(),
         address: address.clone(),
         kind,
         etag: Some("etag-1".into()),
@@ -96,6 +98,7 @@ fn canned_info(address: &Url, kind: ObjectKind, size: Option<u64>) -> ObjectInfo
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
@@ -111,6 +114,7 @@ struct ScriptedTransport {
     write_options: Mutex<Option<WriteOptions>>,
     rename_options: Mutex<Option<RenameOptions>>,
     list_options: Mutex<Vec<ListOptions>>,
+    list_next_page_token: Mutex<Option<String>>,
 }
 
 impl ScriptedTransport {
@@ -145,6 +149,10 @@ impl ScriptedTransport {
 
     fn observed_list_options(&self) -> Vec<ListOptions> {
         self.list_options.lock().unwrap().clone()
+    }
+
+    fn set_list_next_page_token(&self, token: Option<&str>) {
+        *self.list_next_page_token.lock().unwrap() = token.map(str::to_owned);
     }
 }
 
@@ -249,7 +257,7 @@ impl BrokerClientTransport for ScriptedTransport {
                     item("team/", ObjectKind::DirectoryMarker),
                     item("a.txt", ObjectKind::File),
                 ],
-                next_page_token: Some("cursor-2".into()),
+                next_page_token: self.list_next_page_token.lock().unwrap().clone(),
             }
         })
     }
@@ -268,10 +276,11 @@ impl BrokerClientTransport for ScriptedTransport {
         Ok(canned_info(&address, ObjectKind::File, Some(0)))
     }
 
-    async fn watch_directory(
+    async fn watch_directory_with_cancel(
         &self,
         _prefix: Url,
         _opts: WatchDirectoryOptions,
+        _cancel: Option<ovstorage_plugin::CancellationToken>,
     ) -> Result<BrokerClientWatchDirectoryStream> {
         self.record("watch_directory")?;
         Ok(Box::new(std::iter::empty()))
@@ -337,6 +346,7 @@ impl BrokerClientTransport for ScriptedTransport {
 
 fn scripted_backend() -> (BrokerClientBackend, Arc<ScriptedTransport>) {
     let transport = Arc::new(ScriptedTransport::default());
+    transport.set_list_next_page_token(Some("cursor-2"));
     let backend = BrokerClientBackend::new_for_tests(
         "https://broker.example.com",
         transport.clone() as Arc<dyn BrokerClientTransport>,
@@ -371,6 +381,8 @@ fn capability_supported(caps: &Capabilities, name: &str) -> bool {
         "supports_atomic_rename" => caps.supports_atomic_rename,
         "supports_write_redirect" => caps.supports_write_redirect,
         "supports_watch_directory" => caps.supports_watch_directory,
+        "supports_list" => caps.supports_list,
+        "supports_list_stream" => caps.supports_list_stream,
         "has_real_directories" => caps.has_real_directories,
         _ => false,
     }
@@ -758,6 +770,20 @@ async fn drive_list_one_level_vs_recursive(scenario: &Scenario) -> ScenarioRepor
     pass(scenario)
 }
 
+async fn drive_list_stream_parity_and_cancel(scenario: &Scenario) -> ScenarioReport {
+    let transport = Arc::new(ScriptedTransport::default());
+    let layer = match new_layer_for_tests(transport as Arc<dyn BrokerClientTransport>).await {
+        Ok(layer) => layer,
+        Err(err) => return fail(scenario, format!("broker test layer setup failed: {err}")),
+    };
+    scenario
+        .drive_list_stream_parity_and_cancel(
+            layer.as_ref(),
+            address::parse("broker://host/dir/").unwrap(),
+        )
+        .await
+}
+
 // === Registry sweep ===
 
 #[tokio::test]
@@ -817,6 +843,10 @@ async fn conformance_scenarios_cover_the_registry() {
                 driven.push(scenario.name);
                 drive_list_one_level_vs_recursive(scenario).await
             }
+            "list-stream-parity-and-cancel" => {
+                driven.push(scenario.name);
+                drive_list_stream_parity_and_cancel(scenario).await
+            }
             "copy-to-self-preserves-content" => runner.skip(
                 scenario.name,
                 "same-key copy data preservation is enforced by whichever upstream backend \
@@ -856,7 +886,8 @@ async fn conformance_scenarios_cover_the_registry() {
             ),
             "write-redirect-commits-on-done"
             | "retry-never-replays-continue-write"
-            | "protocol-slots-pass-through" => runner.skip(
+            | "protocol-slots-pass-through"
+            | "materialize-unsupported-without-cache" => runner.skip(
                 scenario.name,
                 "host/wrapper-side protocol-slot contract; driven in ovstorage's \
                  conformance_protocol_slots.rs",
@@ -889,6 +920,7 @@ async fn conformance_scenarios_cover_the_registry() {
         vec![
             "delete-existing-object",
             "list-one-level-vs-recursive",
+            "list-stream-parity-and-cancel",
             "read-streamed-empty",
             "rename-no-overwrite-existing",
             "stat-basic-objectinfo",

@@ -22,6 +22,7 @@ use crate::handshake::{HandshakeOutput, NucleusSession, refresh_session};
 use crate::ops::NucleusOps;
 use tracing::debug;
 
+use super::ancestors::{CREATED_DIRS_CAP, CreatedDirectories};
 use super::convert::poisoned_state;
 
 /// Live per-connection session cell shared (via `Arc`) between the
@@ -43,6 +44,12 @@ pub(crate) struct NucleusShared {
     pub publication: std::sync::Mutex<()>,
     pub ops: Mutex<Option<Arc<dyn NucleusOps>>>,
     pub lft_client: Mutex<Option<Arc<LftClient>>>,
+    /// Directories this connection has already created, consulted before every
+    /// `PathAtBranch`-typed create. Directories are facts about the server, not
+    /// the identity, so installs and teardowns leave it alone. Leaf lock: held
+    /// only inside a block, never across an await, never inside another cell
+    /// lock, and outside the credential lock order.
+    pub created_dirs: Mutex<CreatedDirectories>,
     /// Bumped on every successful refresh; lets concurrent retriers observe
     /// that another task already re-established the session.
     pub cred_epoch: AtomicU64,
@@ -118,6 +125,7 @@ impl NucleusShared {
             publication: std::sync::Mutex::new(()),
             ops: Mutex::new(None),
             lft_client: Mutex::new(None),
+            created_dirs: Mutex::new(CreatedDirectories::with_capacity(CREATED_DIRS_CAP)),
             cred_epoch: AtomicU64::new(0),
             identity_gen: AtomicU64::new(0),
             session: Mutex::new(None),

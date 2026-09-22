@@ -16,6 +16,24 @@ pub struct Error {
     next_action: Option<String>,
 }
 
+/// The `next_action` a Layer sets when it REFUSED an add and could not undo it.
+///
+/// [`ErrorCode::CommitAmbiguous`] covers two facts that read alike and want
+/// opposite handling. A post-commit reconcile that failed leaves a connection
+/// that is registered, wanted, and simply not routed yet — a host must NOT
+/// pretend that succeeded, because with an `updates: false` child nothing will
+/// republish it and reads answer `NoRoute` forever. A refusal whose rollback
+/// failed leaves one that is registered and will NEVER route, because the
+/// refusing Layer withholds its roots; a host cannot repair that and must not
+/// die for it either.
+///
+/// The code alone cannot tell them apart, and only the producer knows which it
+/// is, so the producer says so here. Named rather than spelled inline at both
+/// ends: `Router::roll_back_conflicting_add` sets it and
+/// `StackBuilder::build_with_cancel` reads it, and a constant they share cannot
+/// drift the way two string literals would.
+pub const NEXT_ACTION_REFUSED_LEFTOVER: &str = "remove-refused-leftover";
+
 impl Error {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         let raw = message.into();

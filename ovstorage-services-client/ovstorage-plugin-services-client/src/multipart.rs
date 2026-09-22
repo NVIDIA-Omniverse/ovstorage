@@ -27,17 +27,18 @@ const TAG: &str = "ovstorage-plugin-services-client:write-redirect:1";
 pub struct Continuation {
     pub tag: String,
     /// The destination this continuation was minted for. Written to the encoded
-    /// form but never read back from it: on the broker's client-driven route the
-    /// blob is echoed back by the remote caller, so `finalize_write_redirect`
-    /// derives the destination from the authorized request address.
-    /// `skip_deserializing` is what makes a caller-supplied destination
-    /// unreachable rather than merely unused; it is still serialized so a
-    /// continuation minted here stays decodable by a peer replica running an
-    /// earlier build while an upload is in flight.
+    /// form but never read back from it. The broker's client-driven RPC
+    /// authenticates the blob and its address binding, but direct SPI callers,
+    /// follower routes, and unsealed hosts have no equivalent Layer guarantee,
+    /// so `finalize_write_redirect` derives the destination from the authorized
+    /// request address. `skip_deserializing` makes an unsealed caller's
+    /// destination unreachable rather than merely unused; it is still
+    /// serialized so a continuation minted here stays decodable by a peer
+    /// replica running an earlier build while an upload is in flight.
     #[serde(skip_deserializing)]
     pub destination_resource_address: String,
     // Carries opts.message across the redirect roundtrip so finalize can
-    // stash it under user_metadata key `x-ov-message` after success.
+    // stash it under user_metadata key `x_ov_message` after success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     // Carries opts.user_metadata across the redirect roundtrip so finalize can

@@ -72,6 +72,7 @@ use tonic::{Request, Response as GrpcResponse, Status};
 mod broker;
 mod client_transport;
 mod config;
+mod continuation_seal;
 mod discovery;
 mod grpc;
 mod lifecycle;
@@ -81,6 +82,7 @@ mod stack;
 mod trace;
 mod upstream_credential;
 mod watch;
+mod watch_limit;
 mod write_body;
 
 pub use broker::*;
@@ -180,7 +182,7 @@ pub fn build_zero_config_struct(bind: String, sandbox: &Path) -> BrokerConfig {
     );
 
     // Zero-config declares an EXPLICIT forward graph — the same
-    // `alias → … → router → attribution_file → file` chain the
+    // `alias → … → router → file` chain the
     // shipped `ovstorage-broker.toml`
     // declares — via the shared `broker_stack_config` builder, so it survives the
     // empty-stack refusal like any operator stack (the `broker:///` sandbox
@@ -320,7 +322,37 @@ pub async fn build_broker_from_config_file(path: impl AsRef<Path>) -> ovstorage:
 }
 
 pub async fn build_broker_from_config(config: &BrokerConfig) -> ovstorage::Result<Broker> {
-    build_broker_from_config_with_aliases(config, &[]).await
+    build_broker_with_context(config, BrokerBuildContext::default()).await
+}
+
+#[derive(Default)]
+pub(crate) struct BrokerBuildContext<'a> {
+    aliases: &'a [(Url, Url)],
+    watch_budget: Option<crate::watch_limit::SharedWatchBudget>,
+    continuation_seal_key: Option<crate::continuation_seal::ContinuationSealKey>,
+}
+
+impl<'a> BrokerBuildContext<'a> {
+    pub(crate) fn with_aliases(mut self, aliases: &'a [(Url, Url)]) -> Self {
+        self.aliases = aliases;
+        self
+    }
+
+    pub(crate) fn with_watch_budget(
+        mut self,
+        watch_budget: crate::watch_limit::SharedWatchBudget,
+    ) -> Self {
+        self.watch_budget = Some(watch_budget);
+        self
+    }
+
+    pub(crate) fn with_continuation_seal_key(
+        mut self,
+        key: crate::continuation_seal::ContinuationSealKey,
+    ) -> Self {
+        self.continuation_seal_key = Some(key);
+        self
+    }
 }
 
 /// Zero-config entry: composes `config`'s Stack plus the `broker:///` sandbox
@@ -330,14 +362,51 @@ pub async fn build_zero_config_broker(
     sandbox: &Path,
 ) -> ovstorage::Result<Broker> {
     let aliases = zero_config_aliases(sandbox)?;
-    build_broker_from_config_with_aliases(config, &aliases).await
+    build_broker_with_context(config, BrokerBuildContext::default().with_aliases(&aliases)).await
 }
 
-async fn build_broker_from_config_with_aliases(
+pub(crate) async fn build_broker_with_context(
     config: &BrokerConfig,
-    aliases: &[(Url, Url)],
+    context: BrokerBuildContext<'_>,
 ) -> ovstorage::Result<Broker> {
     validate_broker_config_for_startup(config)?;
+
+    let continuation_seal_key = if let Some(path) = config.continuation_seal.key_path.as_deref() {
+        let bytes = fs::read(path).map_err(|error| {
+            Error::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "failed to read continuation seal key '{}': {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        crate::continuation_seal::ContinuationSealKey::from_bytes(&bytes).map_err(|error| {
+            Error::new(
+                error.code(),
+                format!(
+                    "invalid continuation seal key '{}': {}",
+                    path.display(),
+                    error.message()
+                ),
+            )
+        })?
+    } else {
+        match context.continuation_seal_key {
+            Some(carried) => carried,
+            None => {
+                tracing::info!(
+                    target: "ovstorage.broker.continuation_seal",
+                    mode = "process_local_random",
+                    "no [continuation_seal] key_path configured: using a process-local random \
+                     key; write continuations issued by this process are refused by every other \
+                     broker process and after a restart; set `key_path` to share one key across \
+                     replicas or across restarts"
+                );
+                crate::continuation_seal::ContinuationSealKey::generate()
+            }
+        }
+    };
 
     // Built-in/anonymous auth is fully known before dlopen, so preserve the
     // original early empty-stack error. Plugin-shaped auth waits for the
@@ -351,7 +420,11 @@ async fn build_broker_from_config_with_aliases(
 
     // The shared inner graph is `[ovstorage]` config, built verbatim; caches +
     // follow policy are the operator's layer config, not host concerns.
-    let stack_config = with_alias_rules(config.ovstorage.clone(), aliases.to_vec(), Vec::new())?;
+    let stack_config = with_alias_rules(
+        config.ovstorage.clone(),
+        context.aliases.to_vec(),
+        Vec::new(),
+    )?;
     // Stamp the operator's disclosure policy onto every follower in the graph.
     // The operator sets one top-level key; the follower is where a read refusal
     // can still fetch the bytes, so the value has to reach it. An operator who
@@ -361,6 +434,12 @@ async fn build_broker_from_config_with_aliases(
         stack_config,
         config.redirect_credential_disclosure.discloses(),
     )?;
+    // Stamp the operator's anonymous fallback grant onto the backend layer of
+    // each granted scheme's kind. Same shape as the disclosure key: one
+    // top-level setting, carried to the layer that reads it, with a hand-set
+    // layer key or a grant nothing can carry refused at startup.
+    let stack_config =
+        ovstorage::host::stamp_anonymous_fallback(stack_config, &config.anonymous_fallback_set())?;
     let (registry, bindings) = build_oauth_providers_from_config(config)?;
     let listener = config.listener.as_ref();
     let listener_name = listener
@@ -385,6 +464,9 @@ async fn build_broker_from_config_with_aliases(
         // broker's own OAuth providers use the configured directory, so the
         // two halves of one broker's credentials land in different databases.
         .auth_dir(broker_auth_state_root(config.auth.state_root.as_deref()));
+    if let Some(watch_budget) = context.watch_budget {
+        builder = builder.watch_budget(watch_budget);
+    }
     if let Some(factory) = shared_byte_cache_factory(&config.ovstorage)? {
         builder = builder.extra_factory(factory);
     }
@@ -396,8 +478,10 @@ async fn build_broker_from_config_with_aliases(
     // BrokerStack: the exact Arcs shared with the immutable
     // `upstream_credential` wrapper, so the control-plane and the in-stack
     // wrapper can never disagree.
-    Ok(Broker::from_composed(broker_stack)
-        .with_redirect_disclosure(config.redirect_credential_disclosure.discloses()))
+    Ok(
+        Broker::from_composed_with_continuation_seal_key(broker_stack, continuation_seal_key)
+            .with_redirect_disclosure(config.redirect_credential_disclosure.discloses()),
+    )
 }
 
 #[derive(Clone, Debug)]

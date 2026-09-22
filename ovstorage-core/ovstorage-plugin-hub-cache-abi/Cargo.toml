@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ovstorage-plugin-hub-cache-abi"
+version.workspace = true
+edition = "2024"
+description = "ABI-v2 cdylib export of the ovstorage hub cache Layer factory."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+ovstorage-plugin = { workspace = true }
+ovstorage-plugin-hub-cache = { workspace = true }
+
+[lib]
+name = "ovstorage_plugin_hub_cache"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+doc = false
+
+[lints]
+workspace = true

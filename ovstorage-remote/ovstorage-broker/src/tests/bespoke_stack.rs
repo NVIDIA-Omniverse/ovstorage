@@ -20,10 +20,10 @@ use ovstorage::layers::{
     REDIRECT_FOLLOWER_KIND, RETRY_KIND, register_default_layer_factories,
 };
 use ovstorage::{
-    AuthEvent, AuthenticateRequest, ConnectionAuthState, ConnectionKey, InteractiveAuthCapability,
-    Layer, LayerConnectionRequest, LayerSpec, MetadataCache, MetadataCacheConfig, ReadOptions,
-    ReadRequest, ReadResult, Request, RootInfoChange, Stack, StatOptions, StatRequest,
-    WriteOptions, WriteRequest,
+    AddressVisibility, AuthEvent, AuthenticateRequest, ConnectionAuthState, ConnectionKey,
+    ErrorCode, InteractiveAuthCapability, Layer, LayerConnectionRequest, LayerSpec, MetadataCache,
+    MetadataCacheConfig, ReadOptions, ReadRequest, ReadResult, Request, RootInfoChange, Stack,
+    StatOptions, StatRequest, WriteOptions, WriteRequest,
 };
 use ovstorage_cache::{Cache, CacheConfig};
 use ovstorage_plugin_cache::{ByteCacheWrapperFactory, MetadataCacheWrapperFactory};
@@ -280,6 +280,126 @@ async fn bespoke_app_stack_round_trips_object_ops() {
     drop(stack);
     shutdown_test_server(server).await;
     remove_dir_all_retry(root).unwrap();
+}
+
+/// A broker-delivered `Hidden` root remains routable through the dlopen'd
+/// client while a `Suppressed` sibling is omitted from its route table.
+#[tokio::test(flavor = "multi_thread")]
+async fn bespoke_app_stack_routes_hidden_broker_root_and_drops_suppressed_root() {
+    let visible_root = unique_temp_dir();
+    let hidden_root = unique_temp_dir();
+    let suppressed_root = unique_temp_dir();
+    for root in [&visible_root, &hidden_root, &suppressed_root] {
+        std::fs::create_dir_all(root).unwrap();
+    }
+    let visible_prefix = address_for_path(&visible_root);
+    let hidden_prefix = address_for_path(&hidden_root);
+    let suppressed_prefix = address_for_path(&suppressed_root);
+    let broker = Arc::new(Broker::new(
+        BrokerStackFixture::new()
+            .file(&visible_root)
+            .file(&hidden_root)
+            .file(&suppressed_root)
+            .visibility(hidden_prefix.clone(), AddressVisibility::Hidden)
+            .visibility(suppressed_prefix.clone(), AddressVisibility::Suppressed)
+            .build_stack()
+            .await,
+    ));
+    let server = spawn_broker_grpc_tcp_listener(broker, "127.0.0.1:0".parse().unwrap()).unwrap();
+
+    let stack = bespoke_broker_stack(&server.endpoint_url(), SecretBundle::default()).await;
+
+    let (snapshot, updates) = stack
+        .list_address_roots(&ovstorage::Extensions::new(), None)
+        .await
+        .expect("list broker-delivered address roots");
+    drop(updates);
+    assert_eq!(
+        snapshot
+            .roots
+            .iter()
+            .find(|root| root.root == hidden_prefix)
+            .map(|root| (root.visibility, root.visible)),
+        Some((AddressVisibility::Hidden, false)),
+        "the client snapshot must retain the Hidden broker root: {:?}",
+        snapshot.roots
+    );
+    assert_eq!(
+        snapshot
+            .roots
+            .iter()
+            .find(|root| root.root == visible_prefix)
+            .map(|root| (root.visibility, root.visible)),
+        Some((AddressVisibility::Visible, true)),
+        "the visible broker root must remain unchanged: {:?}",
+        snapshot.roots
+    );
+    assert!(
+        snapshot
+            .roots
+            .iter()
+            .all(|root| root.root != suppressed_prefix),
+        "the client snapshot must omit the Suppressed broker root: {:?}",
+        snapshot.roots
+    );
+
+    let hidden_object = address::join_relative(&hidden_prefix, "hidden.txt").unwrap();
+    let hidden_payload = b"hidden broker root remains addressable".to_vec();
+    ovstorage::ext::LayerExt::write(
+        &stack,
+        hidden_object.clone(),
+        Body::Bytes(hidden_payload.clone()),
+        WriteOptions::default(),
+        None,
+    )
+    .await
+    .expect("write through the Hidden broker root");
+    let (hidden_bytes, hidden_info) = ovstorage::ext::LayerExt::read_bytes(
+        &stack,
+        hidden_object.clone(),
+        ReadOptions::default(),
+        None,
+    )
+    .await
+    .expect("read_bytes through the Hidden broker root");
+    assert_eq!(hidden_bytes, hidden_payload);
+    assert_eq!(hidden_info.size, Some(hidden_payload.len() as u64));
+    let hidden_stat =
+        ovstorage::ext::LayerExt::stat(&stack, hidden_object, StatOptions::default(), None)
+            .await
+            .expect("stat through the Hidden broker root");
+    assert_eq!(hidden_stat.size, Some(hidden_payload.len() as u64));
+
+    let visible_object = address::join_relative(&visible_prefix, "visible.txt").unwrap();
+    let visible_payload = b"visible broker root".to_vec();
+    ovstorage::ext::LayerExt::write(
+        &stack,
+        visible_object.clone(),
+        Body::Bytes(visible_payload.clone()),
+        WriteOptions::default(),
+        None,
+    )
+    .await
+    .expect("write through the Visible broker root");
+    let (visible_bytes, visible_info) =
+        ovstorage::ext::LayerExt::read_bytes(&stack, visible_object, ReadOptions::default(), None)
+            .await
+            .expect("read_bytes through the Visible broker root");
+    assert_eq!(visible_bytes, visible_payload);
+    assert_eq!(visible_info.size, Some(visible_payload.len() as u64));
+
+    let suppressed_object = address::join_relative(&suppressed_prefix, "suppressed.txt").unwrap();
+    let error =
+        ovstorage::ext::LayerExt::stat(&stack, suppressed_object, StatOptions::default(), None)
+            .await
+            .expect_err("the Suppressed broker root must not be routable");
+    assert_eq!(error.code(), ErrorCode::NoRoute);
+
+    drop(stack);
+    shutdown_test_server(server).await;
+    remove_dir_all_retry(visible_root).unwrap();
+    remove_dir_all_retry(hidden_root).unwrap();
+    remove_dir_all_retry(suppressed_root).unwrap();
 }
 
 /// Tier-1 interactive sign-in on the bespoke Stack: a credential-less broker

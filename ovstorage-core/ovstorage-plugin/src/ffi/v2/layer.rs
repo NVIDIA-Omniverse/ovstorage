@@ -367,6 +367,19 @@ pub type LayerWatchDirectoryFn = unsafe extern "C" fn(
     user_data: *mut core::ffi::c_void,
 );
 
+/// `list_stream` (`result`: [`ListEntryStream`]).
+///
+/// The `CancelTokenFFI` passed when opening the stream stays live for the
+/// stream's whole lifetime. `ListEntryStream::next_fn` takes no separate
+/// cancel argument and polls that open-time token.
+pub type LayerListStreamFn = unsafe extern "C" fn(
+    state: *mut core::ffi::c_void,
+    request: *const ListRequest,
+    cancel: *const CancelTokenFFI,
+    on_complete: OnComplete,
+    user_data: *mut core::ffi::c_void,
+);
+
 /// `create_directory` (`result`: [`BackendItemInfo`]).
 pub type LayerCreateDirectoryFn = unsafe extern "C" fn(
     state: *mut core::ffi::c_void,
@@ -435,12 +448,13 @@ pub type LayerAuthenticateFn = unsafe extern "C" fn(
 // ---------------------------------------------------------------------
 
 /// The operational Layer vtable. **Slot order is the freeze**: it
-/// mirrors the `ovstorage_layer::Layer` trait method order exactly
-/// (`{drop}` is the only C-only lifecycle slot, ahead of the 31 trait
-/// slots), enforced by the `slot_order` test. Every slot is always
+/// mirrors the original `ovstorage_layer::Layer` trait method order
+/// (`{drop}` is the only C-only lifecycle slot, ahead of the 32 trait
+/// slots), enforced by the `slot_order` test. Existing slots retain their
+/// frozen order and additive methods are appended. Every slot is always
 /// populated — pure wrappers install `OVSTORAGE_PASSTHROUGH_VTABLE`
 /// thunks and backends install `OVSTORAGE_UNSUPPORTED_VTABLE` thunks
-/// rather than leaving NULLs (see `thunks_v2`). The trailing 16
+/// rather than leaving NULLs (see `thunks_v2`). The trailing 15
 /// `_reserved` slots grow the ABI additively pre-2.0.
 #[repr(C)]
 pub struct LayerVTableV1 {
@@ -489,8 +503,11 @@ pub struct LayerVTableV1 {
     pub update_connection_attributes: LayerUpdateAttributesFn,
     pub authenticate_connection: LayerAuthenticateFn,
 
+    /// Additive operational slots retain append-only ABI order.
+    pub list_stream: LayerListStreamFn,
+
     /// Reserved padding for additive growth pre-2.0.
-    pub _reserved: [Option<unsafe extern "C" fn(*mut core::ffi::c_void) -> *mut Error>; 16],
+    pub _reserved: [Option<unsafe extern "C" fn(*mut core::ffi::c_void) -> *mut Error>; 15],
 }
 
 unsafe impl Sync for LayerVTableV1 {}
@@ -503,10 +520,10 @@ unsafe impl Sync for LayerVTableV1 {}
 
 #[cfg(test)]
 mod slot_order {
-    /// The 31 operational slots, in the exact order they must appear in
-    /// `LayerVTableV1` (after the C-only `drop` lifecycle slot) and in
-    /// the `Layer` trait. Kept as data so the test below can diff it
-    /// against the live trait source.
+    /// The 32 operational slots, in the exact order they must appear in
+    /// `LayerVTableV1` after the C-only `drop` lifecycle slot. Kept as data
+    /// so the test below can diff it against the live trait source while
+    /// preserving the frozen order of older slots.
     pub(super) const OPERATIONAL_SLOTS: &[&str] = &[
         "name",
         "descriptor",
@@ -539,6 +556,7 @@ mod slot_order {
         "update_connection_credentials",
         "update_connection_attributes",
         "authenticate_connection",
+        "list_stream",
     ];
 
     /// Extract the method names of `pub trait Layer` from the
@@ -639,10 +657,19 @@ mod slot_order {
 
     #[test]
     fn vtable_slot_order_matches_layer_trait() {
-        let methods: Vec<String> = layer_trait_methods()
+        let mut methods: Vec<String> = layer_trait_methods()
             .into_iter()
             .filter(|method| !NON_SLOT_METHODS.contains(&method.as_str()))
             .collect();
+        // New ABI slots append rather than moving older slots to follow the
+        // trait's semantic grouping. Keep this relocation explicit so a
+        // future trait method cannot silently reorder the frozen vtable.
+        let list_stream = methods
+            .iter()
+            .position(|method| method == "list_stream")
+            .map(|index| methods.remove(index))
+            .expect("`list_stream` not found in Layer trait");
+        methods.push(list_stream);
         assert_eq!(
             methods, OPERATIONAL_SLOTS,
             "OvStorage_LayerVTable slot list drifted from the Rust `Layer` \

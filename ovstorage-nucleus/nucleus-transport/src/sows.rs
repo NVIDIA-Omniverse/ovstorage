@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::error::TransportError;
-use crate::redact::{message_kind, message_len, redact_url};
+use crate::redact::{message_kind, message_len, redact_server_text, redact_url};
 use crate::runtime::io_runtime;
 use crate::transport::{RawResponse, Subscription, Transport, TransportDescriptor};
 
@@ -32,6 +32,15 @@ static CONN_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn next_conn_id() -> String {
     CONN_COUNTER.fetch_add(1, Ordering::Relaxed).to_string()
+}
+
+/// Build the typed error for server-chosen SOWS error prose.
+///
+/// Keeping the sanitization at construction means every later rendering and
+/// rewrap of this error sees the same redacted, bounded text.
+fn remote_error(code: u16, message: &str) -> TransportError {
+    let message = redact_server_text(message);
+    TransportError::ConnectionFailed(format!("sows remote error {code}: {message}"))
 }
 
 struct PendingEntry {
@@ -167,18 +176,21 @@ impl SowsTransport {
 
                     match resp_type {
                         RESPONSE_ERROR => {
-                            let (code, msg) = if payload.len() >= 2 {
+                            let (code, err) = if payload.len() >= 2 {
                                 let code = u16::from_le_bytes([payload[0], payload[1]]);
                                 let message =
                                     std::str::from_utf8(&payload[2..]).unwrap_or("unknown error");
-                                let msg = format!("sows remote error {code}: {message}");
-                                (code, msg)
+                                (code, remote_error(code, message))
                             } else {
-                                (0u16, "sows remote error (no details)".into())
+                                (
+                                    0u16,
+                                    TransportError::ConnectionFailed(
+                                        "sows remote error (no details)".into(),
+                                    ),
+                                )
                             };
                             debug!(conn_id = %conn_id, id, code, "received remote error for request");
-                            let err: Result<RawResponse> =
-                                Err(TransportError::ConnectionFailed(msg).into());
+                            let err: Result<RawResponse> = Err(err.into());
                             let entry = pending.lock().await.remove(&id);
                             if let Some(entry) = entry {
                                 entry.finished.store(true, Ordering::Relaxed);
@@ -275,7 +287,7 @@ impl SowsTransport {
                     return;
                 }
                 Some(Err(e)) => {
-                    let msg = e.to_string();
+                    let msg = redact_server_text(&e.to_string());
                     warn!(conn_id = %conn_id, err = %msg, "websocket error");
                     cancel.cancel();
                     Self::notify_pending_error(&conn_id, &pending, || {
@@ -470,10 +482,10 @@ impl Transport for SowsTransport {
         interface: &str,
         method: &str,
         params: serde_json::Value,
-        binary: Option<Vec<u8>>,
+        binary: Option<&[u8]>,
     ) -> impl std::future::Future<Output = Result<Subscription>> + Send {
         let id = self.next_id();
-        let frame_res = self.build_request_frame(id, interface, method, &params, binary.as_deref());
+        let frame_res = self.build_request_frame(id, interface, method, &params, binary);
 
         let (tx, rx) = mpsc::channel(256);
         let finished = Arc::new(AtomicBool::new(false));
@@ -503,5 +515,39 @@ impl Transport for SowsTransport {
             }
             Ok(Subscription::new(rx, id as u64, stop_tx, finished))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_error_redacts_credentials_before_display() {
+        let err = remote_error(
+            403,
+            "denied https://alice:password@nucleus.example/path?api_token=secret",
+        );
+
+        assert!(matches!(&err, TransportError::ConnectionFailed(_)));
+        let displayed = err.to_string();
+        assert_eq!(
+            displayed,
+            "connection failed: sows remote error 403: denied https://alice:REDACTED@nucleus.example/path?api_token=REDACTED"
+        );
+        assert!(!displayed.contains("password"));
+        assert!(!displayed.contains("secret"));
+    }
+
+    #[test]
+    fn remote_error_bounds_oversized_prose_before_display() {
+        let err = remote_error(500, &"x".repeat(4096));
+        let displayed = err.to_string();
+
+        assert!(
+            displayed.len() < 600,
+            "display was not bounded: {displayed}"
+        );
+        assert!(displayed.contains("[truncated; original length: 4096 bytes]"));
     }
 }

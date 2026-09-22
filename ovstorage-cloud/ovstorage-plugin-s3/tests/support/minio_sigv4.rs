@@ -104,6 +104,16 @@ pub struct FakeMinio {
 impl FakeMinio {
     /// Bind an ephemeral loopback port and start serving.
     pub fn spawn() -> Self {
+        Self::spawn_configured(false)
+    }
+
+    /// Start a fake that closes every verified UploadPart error response before
+    /// its declared body length is satisfied.
+    pub fn spawn_truncating_upload_part_error() -> Self {
+        Self::spawn_configured(true)
+    }
+
+    fn spawn_configured(truncate_upload_part_error: bool) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
         let addr = listener.local_addr().expect("local_addr");
         let state = Arc::new(Mutex::new(FakeState::default()));
@@ -124,7 +134,7 @@ impl FakeMinio {
                     let state = Arc::clone(&state_for_thread);
                     let spawned = thread::Builder::new()
                         .name("ovs-fake-minio-conn".into())
-                        .spawn(move || serve_connection(stream, state));
+                        .spawn(move || serve_connection(stream, state, truncate_upload_part_error));
                     if spawned.is_err() {
                         return;
                     }
@@ -186,7 +196,11 @@ struct WireRequest {
     close: bool,
 }
 
-fn serve_connection(mut stream: TcpStream, state: Arc<Mutex<FakeState>>) {
+fn serve_connection(
+    mut stream: TcpStream,
+    state: Arc<Mutex<FakeState>>,
+    truncate_upload_part_error: bool,
+) {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("set read timeout");
@@ -196,14 +210,14 @@ fn serve_connection(mut stream: TcpStream, state: Arc<Mutex<FakeState>>) {
             return;
         };
         let close = request.close;
-        let response = handle_request(request, &state);
+        let (response, force_close) = handle_request(request, &state, truncate_upload_part_error);
         if stream.write_all(&response).is_err() || stream.flush().is_err() {
             return;
         }
         // Honor `Connection: close`. A client that asks for it may block on
         // read-to-EOF rather than on the response framing, so holding the
         // socket open would hang it instead of answering it.
-        if close {
+        if close || force_close {
             let _ = stream.shutdown(std::net::Shutdown::Both);
             return;
         }
@@ -269,7 +283,11 @@ fn header_of<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str>
 // Routing
 // ---------------------------------------------------------------------------
 
-fn handle_request(request: WireRequest, state: &Arc<Mutex<FakeState>>) -> Vec<u8> {
+fn handle_request(
+    request: WireRequest,
+    state: &Arc<Mutex<FakeState>>,
+    truncate_upload_part_error: bool,
+) -> (Vec<u8>, bool) {
     let (path, query) = match request.target.split_once('?') {
         Some((path, query)) => (path.to_string(), query.to_string()),
         None => (request.target.clone(), String::new()),
@@ -277,15 +295,34 @@ fn handle_request(request: WireRequest, state: &Arc<Mutex<FakeState>>) -> Vec<u8
     let pairs = query_pairs(&query);
     let presigned = pairs.iter().any(|(name, _)| name == "X-Amz-Signature");
 
-    let (status, body, extra_headers) = if presigned {
+    let is_upload_part = request.method == "PUT"
+        && pairs.iter().any(|(name, _)| name == "uploadId")
+        && pairs.iter().any(|(name, _)| name == "partNumber");
+    let (status, body, extra_headers, declared_body_len, force_close) = if presigned {
         match verify_presigned(&request, &path, &pairs) {
-            Ok(()) => dispatch(&request, &path, &pairs, state),
+            Ok(()) if truncate_upload_part_error && is_upload_part => {
+                let body = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error>\
+                    <Code>SignatureDoesNotMatch</Code><Message>truncated";
+                (
+                    403,
+                    body.to_vec(),
+                    vec![("Connection".into(), "close".into())],
+                    Some(body.len() + 100),
+                    true,
+                )
+            }
+            Ok(()) => {
+                let (status, body, extra_headers) = dispatch(&request, &path, &pairs, state);
+                (status, body, extra_headers, None, false)
+            }
             Err(reason) => {
                 state.lock().unwrap().rejections.push(reason.clone());
                 (
                     403,
                     error_xml("SignatureDoesNotMatch", &reason).into_bytes(),
                     Vec::new(),
+                    None,
+                    false,
                 )
             }
         }
@@ -293,7 +330,8 @@ fn handle_request(request: WireRequest, state: &Arc<Mutex<FakeState>>) -> Vec<u8
         // An ordinary SDK call (SigV4 in the `Authorization` header): the
         // verify probe and the multipart control-plane. Answered canned; the
         // redirect replay is what this fixture exists to check.
-        dispatch(&request, &path, &pairs, state)
+        let (status, body, extra_headers) = dispatch(&request, &path, &pairs, state);
+        (status, body, extra_headers, None, false)
     };
 
     state.lock().unwrap().requests.push(RecordedRequest {
@@ -305,7 +343,10 @@ fn handle_request(request: WireRequest, state: &Arc<Mutex<FakeState>>) -> Vec<u8
         status,
         presigned,
     });
-    http_response(status, &body, &extra_headers)
+    (
+        http_response(status, &body, &extra_headers, declared_body_len),
+        force_close,
+    )
 }
 
 /// Route a request that has already passed verification (or did not need it).
@@ -581,7 +622,12 @@ fn decode(value: &str) -> String {
 // Responses
 // ---------------------------------------------------------------------------
 
-fn http_response(status: u16, body: &[u8], extra: &[(String, String)]) -> Vec<u8> {
+fn http_response(
+    status: u16,
+    body: &[u8],
+    extra: &[(String, String)],
+    declared_body_len: Option<usize>,
+) -> Vec<u8> {
     let reason = match status {
         200 => "OK",
         204 => "No Content",
@@ -591,7 +637,7 @@ fn http_response(status: u16, body: &[u8], extra: &[(String, String)]) -> Vec<u8
     };
     let mut head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n",
-        body.len()
+        declared_body_len.unwrap_or(body.len())
     );
     for (name, value) in extra {
         head.push_str(&format!("{name}: {value}\r\n"));

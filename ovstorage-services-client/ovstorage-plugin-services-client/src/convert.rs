@@ -9,7 +9,8 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ovstorage_plugin::{
-    BackendItemInfo, ChecksumSet, Error, ErrorCode, ObjectInfo, ObjectKind, Result, Url,
+    BackendItemInfo, ChecksumSet, Error, ErrorCode, EtagStrength, ObjectInfo, ObjectKind, Result,
+    Url,
 };
 use ovstorage_services_protos::nvidia::omniverse::storage::fileobject::v1alpha as fo;
 use tonic::Status;
@@ -47,22 +48,37 @@ pub fn map_status(status: Status) -> Error {
 /// raw values once, then spread them into the parent struct alongside
 /// kind / checksums / per-call extras.
 pub struct ObjectFields {
+    pub etag_strength: EtagStrength,
     pub etag: Option<String>,
     pub size: Option<u64>,
     pub mtime: Option<SystemTime>,
 }
 
-/// Extract the (etag, size, mtime) trio from a proto `Metadata` and an
-/// optional precomputed etag (passed in when the caller already knows
-/// the server-issued ResourceIdentity, e.g. on the Read RPC where the
-/// identity is implicit from the request).
+/// Extract etag strength, etag, size, and mtime from a proto `Metadata` and an
+/// optional precomputed etag (passed in when the caller already knows the
+/// server-issued ResourceIdentity, e.g. on the Read RPC where the identity is
+/// implicit from the request).
 pub fn fields_from_metadata(meta: Option<&fo::Metadata>, etag: Option<String>) -> ObjectFields {
     ObjectFields {
+        etag_strength: etag_strength(etag.as_deref()),
         etag,
         size: meta.and_then(|m| m.data_object_size),
         mtime: meta
             .and_then(|m| m.last_modified_timestamp.as_ref())
             .and_then(timestamp_to_system_time),
+    }
+}
+
+/// The Storage API contract explicitly marks a `ResourceIdentity` as suitable
+/// for use as a cache key. In Layer terms, that is the one-way promise needed
+/// for `Strong`: one encoded identity is not rebound to different bytes, even
+/// though different identities may identify the same immutable content.
+/// Strength follows that contract, not the opaque token's spelling.
+pub fn etag_strength(etag: Option<&str>) -> EtagStrength {
+    if etag.is_some() {
+        EtagStrength::Strong
+    } else {
+        EtagStrength::Unspecified
     }
 }
 
@@ -82,6 +98,7 @@ pub fn object_info_from(address: Url, info: &fo::ResourceInfo) -> ObjectInfo {
         .filter(|s| !s.is_empty());
     let fields = fields_from_metadata(info.metadata.as_ref(), etag);
     ObjectInfo {
+        etag_strength: fields.etag_strength,
         address,
         kind: ObjectKind::File,
         etag: fields.etag,
@@ -93,6 +110,7 @@ pub fn object_info_from(address: Url, info: &fo::ResourceInfo) -> ObjectInfo {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
@@ -104,6 +122,7 @@ pub fn item_info_from(info: &fo::ResourceInfo) -> BackendItemInfo {
         .filter(|s| !s.is_empty());
     let fields = fields_from_metadata(info.metadata.as_ref(), etag);
     BackendItemInfo {
+        etag_strength: fields.etag_strength,
         kind: ObjectKind::File,
         etag: fields.etag,
         version: None,
@@ -114,6 +133,7 @@ pub fn item_info_from(info: &fo::ResourceInfo) -> BackendItemInfo {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 
@@ -197,5 +217,32 @@ mod tests {
     #[test]
     fn require_etag_only_accepts_some_etag() {
         require_etag_only_if_match(Some("v1")).expect("any string is accepted");
+    }
+
+    #[test]
+    fn resource_identity_strength_tracks_nonempty_tokens() {
+        let address = Url::parse("omniverse-storage://project/object.bin").unwrap();
+        let resource = fo::ResourceInfo {
+            resource_identity: Some(fo::ResourceIdentity {
+                encoded_identity: "server-token".into(),
+            }),
+            metadata: None,
+        };
+        let info = object_info_from(address.clone(), &resource);
+        let item = item_info_from(&resource);
+        assert_eq!(info.etag.as_deref(), Some("server-token"));
+        assert_eq!(info.etag_strength, EtagStrength::Strong);
+        assert_eq!(item.etag_strength, EtagStrength::Strong);
+
+        let empty = fo::ResourceInfo {
+            resource_identity: Some(fo::ResourceIdentity::default()),
+            metadata: None,
+        };
+        let info = object_info_from(address, &empty);
+        let item = item_info_from(&empty);
+        assert_eq!(info.etag, None);
+        assert_eq!(info.etag_strength, EtagStrength::Unspecified);
+        assert_eq!(item.etag, None);
+        assert_eq!(item.etag_strength, EtagStrength::Unspecified);
     }
 }

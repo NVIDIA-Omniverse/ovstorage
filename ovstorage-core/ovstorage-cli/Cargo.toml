@@ -35,6 +35,9 @@ ovstorage-cache = { workspace = true }
 ovstorage-envelope = { workspace = true }
 
 [dev-dependencies]
+# Implementing `Layer` for a test stub needs the same attribute the trait is
+# declared with; the CLI itself only ever consumes Layers.
+async-trait = "0.1.89"
 tempfile = "3.27.0"
 ovstorage-plugin-core = { workspace = true }
 ovstorage-plugin-cache = { workspace = true }

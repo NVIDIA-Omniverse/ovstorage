@@ -35,11 +35,13 @@ std::size_t ovstorage_c_source_new_ops_watch_since_len(void);
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <thread>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 #include <utility>
 
@@ -58,6 +60,10 @@ std::size_t ovstorage_c_source_new_ops_watch_since_len(void);
 #endif
 
 namespace {
+
+static_assert(std::is_same_v<
+    decltype(std::declval<const ovstorage::Error&>().code_name()),
+    std::optional<std::string>>);
 
 // The `file://` address for a temp root.
 //
@@ -584,6 +590,65 @@ ovstorage::task<bool> exercise_new_operations(
     co_return ovstorage::Result<bool>::success(true);
 }
 
+bool owned_error_code_names_remain_distinct(
+    const ovstorage::Error& not_found)
+{
+    char not_configured_name[] = "NotConfigured";
+    // This synthetic error tests wrapper ownership, not C-side status folding.
+    OvStorage_Error raw_not_configured{};
+    raw_not_configured.code = OvStorage_Status_NotFound;
+    raw_not_configured.code_name = not_configured_name;
+
+    ovstorage::Error not_configured(raw_not_configured);
+    std::memset(not_configured_name, 'x', sizeof(not_configured_name) - 1);
+
+    ovstorage::Error copied = not_configured;
+    ovstorage::Error moved = std::move(copied);
+    ovstorage::Error copy_assigned;
+    copy_assigned = not_configured;
+    ovstorage::Error move_assigned;
+    move_assigned = std::move(copy_assigned);
+    const ovstorage::Error status_only(
+        OvStorage_Status_NotFound, "synthesized from a coarse status");
+
+    if (not_found.code() != OvStorage_Status_NotFound ||
+        !not_found.code_name().has_value() ||
+        *not_found.code_name() != "NotFound" ||
+        !not_configured.code_name().has_value() ||
+        *not_configured.code_name() != "NotConfigured" ||
+        !moved.code_name().has_value() ||
+        *moved.code_name() != "NotConfigured" ||
+        !move_assigned.code_name().has_value() ||
+        *move_assigned.code_name() != "NotConfigured" ||
+        status_only.code_name().has_value()) {
+        std::cerr << "C++ Error did not preserve distinct owned code names "
+                     "over the shared NotFound status\n";
+        return false;
+    }
+    return true;
+}
+
+bool error_code_name_outlives_temporary_result()
+{
+    char code_name[] = "AuthorizationLeaseExpired";
+    OvStorage_Error raw{};
+    raw.code = OvStorage_Status_PermissionDenied;
+    raw.code_name = code_name;
+
+    const auto owned_name =
+        ovstorage::Result<void>::failure(ovstorage::Error(raw))
+            .error()
+            .code_name();
+    std::memset(code_name, 'x', sizeof(code_name) - 1);
+
+    if (!owned_name.has_value() ||
+        *owned_name != "AuthorizationLeaseExpired") {
+        std::cerr << "C++ Error code name did not outlive a temporary Result\n";
+        return false;
+    }
+    return true;
+}
+
 // Every object-I/O op below is reached with `co_await` on the coroutine
 // `sync_wait` drives, so the awaiter handshake runs once per op.
 ovstorage::task<bool> exercise_layer(const ovstorage::LayerHandle& layer,
@@ -607,6 +672,16 @@ ovstorage::task<bool> exercise_layer(const ovstorage::LayerHandle& layer,
     }
     if (!stated.value().has_size() || stated.value().size() != payload.size()) {
         std::cerr << "stat returned unexpected object metadata\n";
+        co_return ovstorage::Result<bool>::success(false);
+    }
+    if (stated.value().etag_strength() !=
+        OVSTORAGE_ETAG_STRENGTH_WEAK) {
+        std::cerr << "the pure-C file backend did not declare its etag weak\n";
+        co_return ovstorage::Result<bool>::success(false);
+    }
+    if (stated.value().has_versioned_address()) {
+        std::cerr << "the pure-C file backend versions nothing, yet reported a "
+                     "versioned address\n";
         co_return ovstorage::Result<bool>::success(false);
     }
 
@@ -673,12 +748,41 @@ ovstorage::task<bool> exercise_layer(const ovstorage::LayerHandle& layer,
     // proves the option reached the backend: an unranged materialize of the
     // same object succeeds, so a wrapper that dropped the range would answer
     // with a local path here instead of an error.
-    auto materialized = co_await layer.read_local_file(object_address);
-    if (!succeeded("LayerHandle::read_local_file", materialized)) {
-        co_return ovstorage::Result<bool>::success(false);
+    ovstorage::Info materialized_snapshot;
+    {
+        auto materialized = co_await layer.read_local_file(object_address);
+        if (!succeeded("LayerHandle::read_local_file", materialized)) {
+            co_return ovstorage::Result<bool>::success(false);
+        }
+        if (materialized.value().path().empty()) {
+            std::cerr << "read_local_file returned no local path\n";
+            co_return ovstorage::Result<bool>::success(false);
+        }
+        const ovstorage::InfoView materialized_info = materialized.value().info();
+        if (materialized_info.get() == nullptr ||
+            !materialized_info.has_size() ||
+            materialized_info.size() != payload.size()) {
+            std::cerr << "read_local_file returned no usable metadata snapshot\n";
+            co_return ovstorage::Result<bool>::success(false);
+        }
+        materialized_snapshot = materialized_info.clone();
+        if (materialized_snapshot.get() == nullptr) {
+            std::cerr << "LocalDelegate metadata clone failed\n";
+            co_return ovstorage::Result<bool>::success(false);
+        }
+
+        ovstorage::LocalDelegate moved = std::move(materialized.value());
+        if (!materialized.value().path().empty() ||
+            materialized.value().info().get() != nullptr ||
+            moved.path().empty() ||
+            materialized_info.size() != payload.size()) {
+            std::cerr << "LocalDelegate move did not transfer view ownership\n";
+            co_return ovstorage::Result<bool>::success(false);
+        }
     }
-    if (materialized.value().path().empty()) {
-        std::cerr << "read_local_file returned no local path\n";
+    if (!materialized_snapshot.has_size() ||
+        materialized_snapshot.size() != payload.size()) {
+        std::cerr << "cloned LocalDelegate metadata did not outlive its owner\n";
         co_return ovstorage::Result<bool>::success(false);
     }
     auto materialized_window =
@@ -714,6 +818,12 @@ ovstorage::task<bool> exercise_layer(const ovstorage::LayerHandle& layer,
         co_await layer.read_local_file(object_address, end_without_start);
     if (!rejected_by_input_guard("read_local_file with a range end and no start",
                                  bad_local, range_reason)) {
+        co_return ovstorage::Result<bool>::success(false);
+    }
+    if (bad_bytes.error().code_name().has_value() ||
+        bad_stream.error().code_name().has_value() ||
+        bad_local.error().code_name().has_value()) {
+        std::cerr << "wrapper range rejection unexpectedly supplied a code name\n";
         co_return ovstorage::Result<bool>::success(false);
     }
 
@@ -762,6 +872,20 @@ ovstorage::task<bool> exercise_layer(const ovstorage::LayerHandle& layer,
     const OvStorage_RootInfo* root_info = roots.value().item_at(0);
     if (root_info == nullptr) {
         std::cerr << "list_address_roots returned no root to inspect\n";
+        co_return ovstorage::Result<bool>::success(false);
+    }
+    auto routed_root = co_await layer.root_info_for(object_address);
+    if (!succeeded("LayerHandle::root_info_for", routed_root)) {
+        co_return ovstorage::Result<bool>::success(false);
+    }
+    const auto expected_owning_target =
+        root_info->owning_target == nullptr
+        ? std::nullopt
+        : std::optional<std::string>(root_info->owning_target);
+    if (routed_root.value().root() != root_info->root ||
+        routed_root.value().layer_kind() != root_info->layer_kind ||
+        routed_root.value().owning_target() != expected_owning_target) {
+        std::cerr << "root_info_for disagreed with the routed root snapshot\n";
         co_return ovstorage::Result<bool>::success(false);
     }
     ovstorage::Capabilities caps;
@@ -947,7 +1071,9 @@ ovstorage::task<bool> exercise_layer(const ovstorage::LayerHandle& layer,
     // (detail::*_awaiter::on_complete), which the happy path never hits.
     auto missing = co_await layer.stat(root_address + "never-written.bin");
     if (!failed_with("stat of a missing address", missing,
-                     OvStorage_Status_NotFound)) {
+                     OvStorage_Status_NotFound) ||
+        !owned_error_code_names_remain_distinct(missing.error()) ||
+        !error_code_name_outlives_temporary_result()) {
         co_return ovstorage::Result<bool>::success(false);
     }
 
@@ -1261,6 +1387,7 @@ bool every_string_verb_is_guarded(const ovstorage::LayerHandle& layer)
         for (const auto& [bad, reason] : bad_inputs) {
             const ovstorage::Error error = invoke(layer, bad);
             if (error.code() != OvStorage_Status_InvalidArgument ||
+                error.code_name().has_value() ||
                 error.message().find(reason) == std::string::npos) {
                 std::cerr << name << " did not reject a " << reason
                           << " input through the wrapper's guard: status "
@@ -1462,49 +1589,59 @@ bool null_handle_short_circuits()
     ovstorage::LayerHandle empty;
     auto outcome = ovstorage::sync_wait(empty.stat("file:///nowhere.bin"));
     return failed_with("stat through a null LayerHandle", outcome,
-                       OvStorage_Status_InvalidArgument);
+                       OvStorage_Status_InvalidArgument) &&
+        !outcome.error().code_name().has_value();
+}
+
+bool host_setup_error_keeps_coarse_name(const std::string& directory)
+{
+    const auto malformed_config = ovstorage::StackConfig::from_toml_str("[ovstorage");
+    if (!failed_with("parsing malformed configuration", malformed_config,
+                     OvStorage_Status_InvalidArgument) ||
+        malformed_config.error().code_name() != "InvalidArgument") {
+        std::cerr << "C-side invalid argument did not carry its coarse name\n";
+        return false;
+    }
+    const auto missing_config = ovstorage::StackConfig::from_toml_path(
+        directory + "/absent-ovstorage.toml");
+    if (!failed_with("loading an absent configuration file", missing_config,
+                     OvStorage_Status_NotFound)) {
+        return false;
+    }
+    if (missing_config.error().code_name() != "NotFound") {
+        std::cerr << "host setup failure did not retain its coarse code name\n";
+        return false;
+    }
+    return true;
 }
 
 bool run_roundtrip(const std::string& root_address,
                    const std::string& object_address)
 {
     ovstorage::Registry registry;
-    ovstorage::Stack stack;
-    if (registry.get() == nullptr || stack.get() == nullptr) {
-        std::cerr << "failed to create the registry or Stack builder\n";
+    if (registry.get() == nullptr) {
+        std::cerr << "failed to create the registry\n";
         return false;
     }
 
-    // No Plugin exists or is registered. Resolving "file" here proves that
-    // Registry seeded the built-in file factory.
-    auto added_layer = stack.add_layer(registry, "files", "file");
-    if (!succeeded("seeded file resolution with zero plugins loaded",
-                   added_layer)) {
+    const std::string config_toml =
+        "[ovstorage]\n"
+        "root = \"files\"\n"
+        "[ovstorage.layers.files]\n"
+        "kind = \"file\"\n"
+        "[[ovstorage.connections]]\n"
+        "target = \"files\"\n"
+        "backend_kind = \"file\"\n"
+        "config = { root = \"" + root_address + "\" }\n";
+    auto parsed = ovstorage::StackConfig::from_toml_str(config_toml);
+    if (!succeeded("StackConfig::from_toml_str", parsed)) {
         return false;
     }
-    auto selected_root = stack.set_root("files");
-    if (!succeeded("Stack::set_root", selected_root)) {
-        return false;
-    }
-
-    ovstorage::ConnectionRequest request("file");
-    auto root_value = ovstorage::ConfigValue::string_(root_address);
-    if (root_value.raw() == nullptr ||
-        !request.add_config("root", std::move(root_value))) {
-        std::cerr << "failed to create the file connection config\n";
-        return false;
-    }
-
-    auto added_connection =
-        stack.add_connection("files", std::move(request));
-    if (!succeeded("Stack::add_connection", added_connection)) {
-        return false;
-    }
-
-    // `Stack::build` is itself a coroutine; the local `stack` outlives the
-    // await because sync_wait returns only once the build has resolved.
-    auto built = ovstorage::sync_wait(stack.build());
-    if (!succeeded("Stack::build", built)) {
+    ovstorage::StackConfig config = std::move(parsed).value();
+    // No Plugin exists or is registered. Config-driven success proves that a
+    // fresh Registry resolves the seeded built-in file factory.
+    auto built = ovstorage::sync_wait(config.build(registry));
+    if (!succeeded("StackConfig::build", built)) {
         return false;
     }
     ovstorage::LayerHandle layer = std::move(built).value();
@@ -1565,7 +1702,8 @@ extern "C" int ovstorage_c_source_roundtrip_cpp20(void)
                      "needs a local-drive TMP/TEMP\n",
                      directory);
     } else {
-        roundtrip_ok = run_roundtrip(root_address, object_address);
+        roundtrip_ok = host_setup_error_keeps_coarse_name(directory) &&
+            run_roundtrip(root_address, object_address);
     }
     bool cleanup_ok = true;
     // The round trip deletes the object through LayerHandle::delete_object;
@@ -1582,4 +1720,16 @@ extern "C" int ovstorage_c_source_roundtrip_cpp20(void)
     }
 
     return roundtrip_ok && cleanup_ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+extern "C" int ovstorage_c_source_plugin_log_cpp20_contract(void)
+{
+    ovstorage::PluginLogOptions options;
+    options.level = OvStorage_PluginLogLevel_Info;
+    auto configured = ovstorage::set_plugin_log_options(options);
+    if (!configured) {
+        return EXIT_FAILURE;
+    }
+    auto reset = ovstorage::reset_plugin_log_options();
+    return reset ? EXIT_SUCCESS : EXIT_FAILURE;
 }

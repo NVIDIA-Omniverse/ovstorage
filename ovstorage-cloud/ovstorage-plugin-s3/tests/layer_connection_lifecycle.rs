@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use futures::TryStreamExt;
 use ovstorage_plugin::{
     AccessOps, AuthenticateRequest, BackendFactory, Body, CheckAccessRequest, ConfigValue,
     ConnectionAuthState, ConnectionKey, ConnectionRequest, ErrorCode, InteractiveAuthCapability,
@@ -980,6 +981,70 @@ async fn list_folds_markers_and_paginates() {
     assert!(page2.next_page_token.is_none());
 }
 
+/// The native stream preserves the concatenated buffered-page sequence while
+/// applying marker folding incrementally instead of materializing the prefix.
+#[tokio::test]
+async fn list_stream_matches_all_buffered_pages() {
+    let server = spawn_scripted_server("200 OK", LIST_BODY);
+    let layer = empty_layer().await;
+    add(
+        &layer,
+        connection_request(
+            "bkt",
+            server.endpoint(),
+            credentials_bundle("AKIATESTFIXTURE"),
+        ),
+    )
+    .await;
+
+    let prefix = address::parse("s3://bkt/").unwrap();
+    let root = layer
+        .root_info_for(&prefix, &ovstorage_plugin::Extensions::new(), None)
+        .await
+        .unwrap();
+    assert!(root.capabilities.supports_list_stream);
+
+    let mut buffered = Vec::new();
+    let mut page_token = None;
+    loop {
+        let page = layer
+            .list(
+                Request::new(ListRequest {
+                    prefix: prefix.clone(),
+                    options: ListOptions {
+                        max_results: Some(2),
+                        page_token,
+                        ..ListOptions::default()
+                    },
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        buffered.extend(page.items);
+        match page.next_page_token {
+            Some(token) => page_token = Some(token),
+            None => break,
+        }
+    }
+
+    let streamed = layer
+        .list_stream(
+            Request::new(ListRequest {
+                prefix,
+                options: ListOptions::default(),
+            }),
+            None,
+        )
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+    assert_eq!(streamed, buffered);
+}
+
 // === parked connections that are, in fact, working ===
 //
 // `S3Driver::verify` proves a credential with one bucket-scope `ListObjectsV2`;
@@ -1810,4 +1875,639 @@ async fn add_time_park_leaves_the_data_path_unable_to_sign() {
         matches!(state, ConnectionAuthState::AwaitingAuth { .. }),
         "nothing reached the backend, so nothing may promote, got {state:?}"
     );
+}
+
+// === Anonymous s3:// fallback ===
+//
+// `anonymous_fallback = ["s3"]` on the layer publishes one hidden scheme root,
+// `s3:///`, and routes an `s3://` address no connection serves to a per-bucket
+// anonymous backend built on first touch. The tests here drive the layer's
+// factory and routing: what the grant publishes, what it refuses, and how it
+// ranks against a configured connection. The wire-level properties (unsigned
+// requests, refused mutations) live in `anonymous_public_bucket.rs`.
+
+/// The grant as the host produces it: the array reserialized under its key.
+fn grant(schemes: &[&str]) -> ConfigValue {
+    let list = schemes
+        .iter()
+        .map(|scheme| format!("\"{scheme}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    ConfigValue::Toml(format!("anonymous_fallback = [{list}]\n"))
+}
+
+/// A layer table granting the `s3://` fallback and pointing every fallback
+/// bucket at `endpoint`, path-style, so the loopback fixtures can answer.
+fn fallback_policy(endpoint: &str) -> LayerConfig {
+    let mut config = LayerConfig::new();
+    config.insert("anonymous_fallback".into(), grant(&["s3"]));
+    config.insert(
+        "anonymous_fallback_endpoint".into(),
+        ConfigValue::String(endpoint.into()),
+    );
+    config.insert(
+        "anonymous_fallback_force_path_style".into(),
+        ConfigValue::Bool(true),
+    );
+    config
+}
+
+async fn create_layer(config: &LayerConfig) -> ovstorage_plugin::Result<LayerHandle> {
+    S3LayerFactory::default()
+        .create_backend("s3", config, None)
+        .await
+}
+
+async fn fallback_layer(config: &LayerConfig) -> LayerHandle {
+    create_layer(config)
+        .await
+        .expect("the granted layer builds")
+}
+
+async fn roots_of(layer: &LayerHandle) -> Vec<ovstorage_plugin::RootInfo> {
+    layer
+        .list_address_roots(&ovstorage_plugin::Extensions::new(), None)
+        .await
+        .unwrap()
+        .0
+        .roots
+}
+
+async fn root_for(
+    layer: &LayerHandle,
+    address: &str,
+) -> ovstorage_plugin::Result<ovstorage_plugin::RootInfo> {
+    layer
+        .root_info_for(
+            &address::parse(address).unwrap(),
+            &ovstorage_plugin::Extensions::new(),
+            None,
+        )
+        .await
+}
+
+/// Without a grant nothing changes: an unconfigured bucket is `NoRoute` with
+/// the message every host already pins, and no scheme root is published.
+#[tokio::test]
+async fn fallback_is_off_by_default() {
+    let layer = empty_layer().await;
+    let err = stat_at(&layer, "s3://unconfigured/object.txt")
+        .await
+        .expect_err("no connection serves the bucket");
+    assert_eq!(err.code(), ErrorCode::NoRoute);
+    assert_eq!(err.message(), "no route matches address");
+    assert!(roots_of(&layer).await.is_empty(), "no root of any kind");
+    let err = root_for(&layer, "s3://unconfigured/object.txt")
+        .await
+        .expect_err("no root either");
+    assert_eq!(err.code(), ErrorCode::NoRoute);
+}
+
+/// The fallback keys are split off before the static-connection seed, so a
+/// layer holding only the grant seeds no connection and publishes exactly the
+/// hidden, marked, read-only scheme root.
+#[tokio::test]
+async fn a_layer_holding_only_the_fallback_key_seeds_no_static_connection() {
+    let mut config = LayerConfig::new();
+    config.insert("anonymous_fallback".into(), grant(&["s3"]));
+    let layer = fallback_layer(&config).await;
+
+    let (snapshot, _) = layer
+        .list_connections(&ovstorage_plugin::Extensions::new(), None)
+        .await
+        .unwrap();
+    assert!(
+        snapshot.connections.is_empty(),
+        "the grant is not a connection: {:?}",
+        snapshot.connections
+    );
+
+    let roots = roots_of(&layer).await;
+    assert_eq!(roots.len(), 1, "exactly the scheme root: {roots:?}");
+    let root = &roots[0];
+    assert_eq!(root.root.as_str(), "s3:///");
+    assert_eq!(root.layer_kind, "s3");
+    assert_eq!(root.connection_id, None);
+    assert_eq!(root.owning_target, None);
+    assert!(!root.visible);
+    assert_eq!(root.visibility, ovstorage_plugin::AddressVisibility::Hidden);
+    assert_eq!(
+        root.user_metadata
+            .get(ovstorage_plugin::fallback::SCHEME_FALLBACK_METADATA_KEY)
+            .map(String::as_str),
+        Some(ovstorage_plugin::fallback::SCHEME_FALLBACK_ANONYMOUS)
+    );
+    assert!(ovstorage_plugin::fallback::is_scheme_fallback_root(root));
+    // The same client, the same ranged reads: the strategy the connection
+    // roots advertise, so a consumer reading it off a fallback-served address
+    // sees no less capable an answer than for a configured bucket.
+    assert_eq!(
+        root.range_read_strategy,
+        ovstorage_plugin::RangeReadStrategy::Native
+    );
+    // Read-only: the read side of an anonymous connection, and nothing else.
+    let caps = &root.capabilities;
+    assert!(caps.supports_list && caps.supports_list_stream && caps.supports_recursive_list);
+    assert!(caps.supports_version_listing && caps.supports_access_check);
+    assert!(!caps.supports_write && !caps.supports_write_stream && !caps.supports_write_redirect);
+    assert!(!caps.supports_delete && !caps.supports_copy && !caps.supports_rename);
+    assert!(!caps.supports_create_directory && !caps.supports_delete_directory);
+    assert!(!caps.supports_native_metadata_patch && !caps.supports_metadata_rewrite_emulation);
+    assert!(!caps.supports_watch_directory);
+
+    // An unconfigured address resolves to the scheme root verbatim — never a
+    // synthesized per-bucket root.
+    let resolved = root_for(&layer, "s3://unconfigured/object.txt")
+        .await
+        .expect("the fallback routes it");
+    assert_eq!(resolved.root.as_str(), "s3:///");
+    assert_eq!(resolved.connection_id, None);
+    assert_eq!(
+        resolved.range_read_strategy,
+        ovstorage_plugin::RangeReadStrategy::Native
+    );
+}
+
+/// A grant naming a scheme this kind does not serve is a configuration error,
+/// not a silently inert key.
+#[tokio::test]
+async fn a_fallback_key_naming_a_scheme_this_layer_does_not_serve_is_refused() {
+    for schemes in [&["gs"][..], &["s3", "azure"][..]] {
+        let mut config = LayerConfig::new();
+        config.insert("anonymous_fallback".into(), grant(schemes));
+        let err = create_layer(&config)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{schemes:?} must be refused"));
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{schemes:?}: {err}");
+        assert!(
+            err.message().contains("does not serve") && err.message().contains("it serves s3"),
+            "{schemes:?}: {}",
+            err.message()
+        );
+    }
+}
+
+/// The grant must be a TOML array of scheme strings; a bare string is refused
+/// rather than read as a one-element array.
+#[tokio::test]
+async fn a_non_array_fallback_key_is_refused_at_create_backend() {
+    let mut config = LayerConfig::new();
+    config.insert(
+        "anonymous_fallback".into(),
+        ConfigValue::String("s3".into()),
+    );
+    let err = create_layer(&config)
+        .await
+        .err()
+        .expect("a bare string is refused");
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    assert!(
+        err.message().contains("must be a TOML array"),
+        "{}",
+        err.message()
+    );
+}
+
+/// A misspelt or unknown tunable is refused by name, and the tunables are
+/// validated even when no grant is present, so the mistake surfaces where the
+/// operator wrote it.
+#[tokio::test]
+async fn an_unknown_or_ill_typed_fallback_tunable_is_refused_at_create_backend() {
+    let mut config = LayerConfig::new();
+    config.insert(
+        "anonymous_fallback_regoin".into(),
+        ConfigValue::String("us-east-1".into()),
+    );
+    let err = create_layer(&config)
+        .await
+        .err()
+        .expect("an unknown key is refused");
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    assert!(
+        err.message().contains("anonymous_fallback_regoin"),
+        "the message names the key: {}",
+        err.message()
+    );
+
+    let mut config = LayerConfig::new();
+    config.insert("anonymous_fallback".into(), grant(&["s3"]));
+    config.insert(
+        "anonymous_fallback_region".into(),
+        ConfigValue::String("EU-WEST-1".into()),
+    );
+    let err = create_layer(&config)
+        .await
+        .err()
+        .expect("a region that is not a region identifier is refused");
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    assert!(
+        err.message().contains("anonymous_fallback_region"),
+        "{}",
+        err.message()
+    );
+
+    let mut config = LayerConfig::new();
+    config.insert("anonymous_fallback".into(), grant(&["s3"]));
+    config.insert(
+        "anonymous_fallback_max_backends".into(),
+        ConfigValue::Int(0),
+    );
+    let err = create_layer(&config)
+        .await
+        .err()
+        .expect("a zero bound is refused");
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    assert!(
+        err.message().contains("anonymous_fallback_max_backends"),
+        "{}",
+        err.message()
+    );
+}
+
+/// A fallback endpoint that embeds a credential, or carries a query, fragment
+/// or path, is refused at `create_backend` — granted or not — before any
+/// client is built: the string is what every fallback host is derived from
+/// and what an anonymous read's redirect is built from, so a credential in it
+/// would ride a tier whose promise is that none is sent. The refusal names the
+/// key and the layer, never the value.
+#[tokio::test]
+async fn a_credential_bearing_fallback_endpoint_is_refused_at_create_backend() {
+    let server = spawn_scripted_server("200 OK", EMPTY_LIST_BODY);
+    let authority = server
+        .endpoint()
+        .strip_prefix("http://")
+        .expect("the fixture is plain http")
+        .trim_end_matches('/')
+        .to_string();
+    for (spelling, complaint) in [
+        (format!("http://reader:hunter2@{authority}"), "credentials"),
+        (format!("http://{authority}/?x-id=GetObject"), "query"),
+        (format!("http://{authority}/#anchor"), "fragment"),
+        (format!("http://{authority}/prefix"), "path"),
+    ] {
+        for granted in [true, false] {
+            let mut config = LayerConfig::new();
+            if granted {
+                config.insert("anonymous_fallback".into(), grant(&["s3"]));
+            }
+            config.insert(
+                "anonymous_fallback_endpoint".into(),
+                ConfigValue::String(spelling.clone()),
+            );
+            let err = create_layer(&config)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{spelling} (granted: {granted}) was accepted"));
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{spelling}");
+            assert!(
+                err.message()
+                    .contains("`anonymous_fallback_endpoint` on layer `s3`")
+                    && err.message().contains(complaint),
+                "{spelling}: {}",
+                err.message()
+            );
+            assert!(
+                !err.message().contains("hunter2") && !err.message().contains("reader"),
+                "the refusal never echoes the credential: {}",
+                err.message()
+            );
+        }
+    }
+    assert_eq!(server.hits(), 0, "nothing reached the wire");
+}
+
+/// A fallback key on a connection request is refused with a pointer to where
+/// it belongs, on both `probe` and `add_connection`, and no RPC is sent.
+#[tokio::test]
+async fn a_connection_request_carrying_a_fallback_key_is_refused() {
+    let server = spawn_scripted_server("200 OK", EMPTY_LIST_BODY);
+    let layer = empty_layer().await;
+    for key in ["anonymous_fallback", "anonymous_fallback_region"] {
+        let mut request = connection_request(
+            "bkt",
+            server.endpoint(),
+            credentials_bundle("AKIATESTFIXTURE"),
+        );
+        request
+            .config
+            .insert(key.into(), ConfigValue::String("us-east-1".into()));
+        for (slot, result) in [
+            (
+                "probe",
+                layer
+                    .probe(
+                        Request::new(LayerConnectionRequest {
+                            target: "s3".into(),
+                            connection: request.clone(),
+                        }),
+                        None,
+                    )
+                    .await,
+            ),
+            (
+                "add_connection",
+                layer
+                    .add_connection(
+                        Request::new(LayerConnectionRequest {
+                            target: "s3".into(),
+                            connection: request.clone(),
+                        }),
+                        None,
+                    )
+                    .await,
+            ),
+        ] {
+            let err = result.expect_err("a layer key on a connection is refused");
+            assert_eq!(
+                err.code(),
+                ErrorCode::InvalidArgument,
+                "{slot} {key}: {err}"
+            );
+            assert!(
+                err.message().contains(key)
+                    && err.message().contains("layer key")
+                    && err.message().contains("[ovstorage.layers.s3]"),
+                "{slot} {key}: {}",
+                err.message()
+            );
+        }
+    }
+    assert_eq!(server.hits(), 0, "refused before any verify RPC");
+    let (snapshot, _) = layer
+        .list_connections(&ovstorage_plugin::Extensions::new(), None)
+        .await
+        .unwrap();
+    assert!(snapshot.connections.is_empty());
+}
+
+/// The first tier outranks the second: once a connection for a bucket
+/// installs, its root serves the bucket and the fallback's cached backend for
+/// it is evicted. Eviction is observed through the mint budget — a budget of
+/// two lets the bucket be built twice (before the connection and after its
+/// removal) and then refuses a third build, which a stale cache entry would
+/// have made unnecessary.
+#[tokio::test]
+async fn a_configured_root_outranks_the_fallback_and_install_evicts_the_cached_backend() {
+    let fallback_store = spawn_scripted_server("200 OK", EMPTY_LIST_BODY);
+    let configured_store = spawn_scripted_server("200 OK", EMPTY_LIST_BODY);
+    let mut config = fallback_policy(fallback_store.endpoint());
+    config.insert(
+        "anonymous_fallback_mints_per_minute".into(),
+        ConfigValue::Int(2),
+    );
+    let layer = fallback_layer(&config).await;
+
+    // (1) The fallback serves the bucket: build one.
+    stat_at(&layer, "s3://bkt/object.txt")
+        .await
+        .expect("the fallback serves an unconfigured bucket");
+    assert_eq!(fallback_store.hits(), 1);
+    assert_eq!(
+        root_for(&layer, "s3://bkt/object.txt")
+            .await
+            .unwrap()
+            .root
+            .as_str(),
+        "s3:///"
+    );
+
+    // (2) A connection for the bucket installs and outranks the fallback.
+    let connection = add(
+        &layer,
+        connection_request("bkt", configured_store.endpoint(), SecretBundle::default()),
+    )
+    .await;
+    stat_at(&layer, "s3://bkt/object.txt")
+        .await
+        .expect("the configured connection serves the bucket");
+    assert_eq!(
+        configured_store.hits(),
+        1,
+        "the connection's store answered"
+    );
+    assert_eq!(fallback_store.hits(), 1, "the fallback's store did not");
+    let root = root_for(&layer, "s3://bkt/object.txt").await.unwrap();
+    assert_eq!(root.root.as_str(), "s3://bkt/");
+    assert_eq!(root.connection_id.as_ref(), Some(&connection.id));
+    // Another bucket still falls through to the scheme root.
+    assert_eq!(
+        root_for(&layer, "s3://other/object.txt")
+            .await
+            .unwrap()
+            .root
+            .as_str(),
+        "s3:///"
+    );
+
+    // (3) Removing the connection hands the bucket back to the fallback, which
+    // builds it again (build two) because install evicted its cached backend.
+    layer
+        .remove_connection(
+            Request::new(ConnectionKey {
+                target: "s3".into(),
+                id: connection.id.clone(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    stat_at(&layer, "s3://bkt/object.txt")
+        .await
+        .expect("the fallback serves the bucket again");
+    assert_eq!(fallback_store.hits(), 2);
+
+    // (4) A third build is refused by the budget — proof that (3) was a build
+    // and not a hit on a stale entry.
+    let err = stat_at(&layer, "s3://other/object.txt")
+        .await
+        .expect_err("the two-build budget is spent");
+    assert_eq!(err.code(), ErrorCode::ResourceExhausted, "{err}");
+}
+
+/// The bare scheme root and a hostless address both reach the fallback as
+/// first-tier hits under its own root, and neither names a bucket: refused
+/// as `InvalidArgument`, on the read side and the mutating side alike, with
+/// nothing sent.
+#[tokio::test]
+async fn the_scheme_root_itself_is_invalid_argument() {
+    let store = spawn_scripted_server("200 OK", EMPTY_LIST_BODY);
+    let layer = fallback_layer(&fallback_policy(store.endpoint())).await;
+
+    for spelling in ["s3:///", "s3:///k", "s3:///dir/"] {
+        let err = stat_at(&layer, spelling)
+            .await
+            .expect_err("a hostless address names no bucket");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{spelling}: {err}");
+        assert_eq!(
+            err.message(),
+            "an s3:// address names no bucket",
+            "{spelling}"
+        );
+
+        let err = layer
+            .list(
+                Request::new(ListRequest {
+                    prefix: address::parse(spelling).unwrap(),
+                    options: ListOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .expect_err("nor can it be listed");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{spelling}: {err}");
+
+        let err = layer
+            .write(
+                Request::new(WriteRequest {
+                    address: address::parse(spelling).unwrap(),
+                    body: Body::Bytes(b"bytes".to_vec()),
+                    options: WriteOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .expect_err("nor written to");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{spelling}: {err}");
+    }
+    assert_eq!(store.hits(), 0, "nothing reached the wire");
+    // The root itself is still introspectable: it is a first-tier hit.
+    let root = root_for(&layer, "s3:///").await.unwrap();
+    assert_eq!(root.root.as_str(), "s3:///");
+}
+
+/// An address that authenticates itself through its query never takes the
+/// fallback: an anonymous attempt would discard the authority the caller
+/// presented. The version pin, which carries no authority, still routes.
+#[tokio::test]
+async fn a_presigned_or_sas_query_falls_through_to_no_route() {
+    let store = spawn_scripted_server("200 OK", EMPTY_LIST_BODY);
+    let layer = fallback_layer(&fallback_policy(store.endpoint())).await;
+
+    for presigned in [
+        "s3://unconfigured/object.txt?X-Amz-Signature=abc",
+        "s3://unconfigured/object.txt?X-Amz-Credential=AKIA%2F20260101%2Fus-east-1%2Fs3%2Faws4_request",
+        "s3://unconfigured/object.txt?sig=abc",
+    ] {
+        let err = stat_at(&layer, presigned)
+            .await
+            .expect_err("a credential-bearing query never takes the fallback");
+        assert_eq!(err.code(), ErrorCode::NoRoute, "{presigned}: {err}");
+        assert_eq!(err.message(), "no route matches address", "{presigned}");
+        let err = root_for(&layer, presigned)
+            .await
+            .expect_err("no root either");
+        assert_eq!(err.code(), ErrorCode::NoRoute, "{presigned}: {err}");
+    }
+    assert_eq!(store.hits(), 0);
+
+    stat_at(&layer, "s3://unconfigured/object.txt?versionId=7")
+        .await
+        .expect("a version pin carries no authority and routes");
+    assert_eq!(store.hits(), 1);
+    assert!(
+        store.requests()[0].contains("versionId=7"),
+        "the pin reaches the store: {}",
+        store.requests()[0]
+    );
+}
+
+/// At most `anonymous_fallback_max_backends` anonymous backends stay
+/// resident, evicted least-recently-used. Observed through the mint budget: a
+/// bound of one and a budget of three make the sequence a, b, a build three
+/// times and then refuse b, where an unbounded cache would have built twice
+/// and answered b from the cache.
+#[tokio::test]
+async fn cached_backends_are_bounded() {
+    let store = spawn_scripted_server("200 OK", EMPTY_LIST_BODY);
+    let mut config = fallback_policy(store.endpoint());
+    config.insert(
+        "anonymous_fallback_max_backends".into(),
+        ConfigValue::Int(1),
+    );
+    config.insert(
+        "anonymous_fallback_mints_per_minute".into(),
+        ConfigValue::Int(3),
+    );
+    let layer = fallback_layer(&config).await;
+
+    for address in [
+        "s3://bucket-a/object.txt",
+        "s3://bucket-b/object.txt",
+        "s3://bucket-a/object.txt",
+    ] {
+        stat_at(&layer, address)
+            .await
+            .unwrap_or_else(|err| panic!("{address}: {err}"));
+    }
+    assert_eq!(store.hits(), 3, "every stat reached the store");
+    let err = stat_at(&layer, "s3://bucket-b/object.txt")
+        .await
+        .expect_err("bucket-b was evicted by bucket-a's rebuild, and the budget is spent");
+    assert_eq!(err.code(), ErrorCode::ResourceExhausted, "{err}");
+    assert_eq!(store.hits(), 3, "the refusal sent nothing");
+}
+
+/// Past `anonymous_fallback_mints_per_minute` builds in a sliding minute, a
+/// miss answers a retryable `ResourceExhausted`; hits keep answering.
+#[tokio::test]
+async fn the_mint_budget_answers_resource_exhausted() {
+    let store = spawn_scripted_server("200 OK", EMPTY_LIST_BODY);
+    let mut config = fallback_policy(store.endpoint());
+    config.insert(
+        "anonymous_fallback_mints_per_minute".into(),
+        ConfigValue::Int(1),
+    );
+    let layer = fallback_layer(&config).await;
+
+    stat_at(&layer, "s3://bucket-a/object.txt")
+        .await
+        .expect("the first build is within budget");
+    let err = stat_at(&layer, "s3://bucket-b/object.txt")
+        .await
+        .expect_err("the second build is over budget");
+    assert_eq!(err.code(), ErrorCode::ResourceExhausted, "{err}");
+    assert_eq!(
+        err.message(),
+        "anonymous fallback mint budget exhausted; retry later"
+    );
+    assert!(err.code().retryable(), "a budget clears with time");
+    assert!(err.next_action().is_some(), "and says so");
+    assert_eq!(store.hits(), 1, "the refusal sent nothing");
+
+    stat_at(&layer, "s3://bucket-a/object.txt")
+        .await
+        .expect("a hit is not charged");
+    assert_eq!(store.hits(), 2);
+}
+
+/// A fallback endpoint naming a cloud instance-metadata host is refused at
+/// `create_backend`, with or without the grant, before any client exists.
+#[tokio::test]
+async fn a_link_local_fallback_endpoint_is_refused_at_create_backend() {
+    for granted in [true, false] {
+        let mut config = LayerConfig::new();
+        if granted {
+            config.insert("anonymous_fallback".into(), grant(&["s3"]));
+        }
+        config.insert(
+            "anonymous_fallback_endpoint".into(),
+            ConfigValue::String("http://169.254.169.254/".into()),
+        );
+        let err = create_layer(&config)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("granted={granted}: the endpoint must be refused"));
+        assert_eq!(
+            err.code(),
+            ErrorCode::PermissionDenied,
+            "granted={granted}: {err}"
+        );
+        assert!(
+            err.message().contains("instance-metadata")
+                && err.message().contains("169.254.169.254"),
+            "granted={granted}: {}",
+            err.message()
+        );
+    }
 }

@@ -29,7 +29,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use url::Url;
 
-use crate::file::metadata;
 use crate::{
     CancellationToken, ChangeEvent, ChangeKind, Result, WatchDirectoryCursor,
     WatchDirectoryOptions, address,
@@ -42,15 +41,14 @@ use ovstorage_layer::io_error;
 const MIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Per-entry identity captured on each scan. Change detection compares
-/// successive snapshots: an object is `Modified` when `(size, mtime)` differs
-/// and `MetadataChanged` when only its sidecar's mtime differs.
+/// successive snapshots: an object is `Modified` when `(size, mtime)` differs.
+/// The backend stores no user metadata, so it has no `MetadataChanged` to
+/// emit; `WatchDirectoryOptions.include_metadata_changes` is accepted and
+/// changes nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WatchSnapshotEntry {
     size: u64,
     mtime: Option<SystemTime>,
-    /// mtime of the object's user-metadata sidecar, if present. Drives
-    /// `MetadataChanged` when `include_metadata_changes` is set.
-    metadata_mtime: Option<SystemTime>,
 }
 
 /// Blocking, polling directory watcher. Holds the watched directory, the
@@ -60,7 +58,6 @@ pub(crate) struct FileChangeStream {
     root: PathBuf,
     base_address: Url,
     recursive: bool,
-    include_metadata_changes: bool,
     poll_interval: Duration,
     /// `Some(canonical_root)` when the matched root armed `confine_to_root`, in
     /// which case each snapshot re-jails every descended directory so the walk
@@ -99,7 +96,6 @@ impl FileChangeStream {
             root,
             base_address,
             recursive: opts.recursive,
-            include_metadata_changes: opts.include_metadata_changes,
             poll_interval: opts.poll_interval.max(MIN_POLL_INTERVAL),
             confine_root,
             snapshot,
@@ -136,18 +132,16 @@ impl Iterator for FileChangeStream {
                 self.recursive,
                 self.confine_root.as_deref(),
             ) {
-                Ok(next) => match diff_watch_directory_snapshots(
-                    &self.snapshot,
-                    &next,
-                    &self.base_address,
-                    self.include_metadata_changes,
-                ) {
-                    Ok(pending) => {
-                        self.pending = pending;
-                        self.snapshot = next;
+                Ok(next) => {
+                    match diff_watch_directory_snapshots(&self.snapshot, &next, &self.base_address)
+                    {
+                        Ok(pending) => {
+                            self.pending = pending;
+                            self.snapshot = next;
+                        }
+                        Err(error) => return Some(Err(error)),
                     }
-                    Err(error) => return Some(Err(error)),
-                },
+                }
                 Err(error) => return Some(Err(error)),
             }
         }
@@ -174,7 +168,7 @@ fn scan_watch_directory_dir(
     for entry in fs::read_dir(current).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         let path = entry.path();
-        if metadata::is_internal_entry(&path) {
+        if super::is_atomic_write_temp_sibling(&path) {
             continue;
         }
         // In `confine_to_root` mode re-jail every entry so the poll snapshot
@@ -199,14 +193,9 @@ fn scan_watch_directory_dir(
 
 fn watch_snapshot_entry(path: &Path) -> Result<WatchSnapshotEntry> {
     let metadata = fs::metadata(path).map_err(io_error)?;
-    let metadata_mtime = metadata::metadata_path(path)
-        .ok()
-        .and_then(|sidecar| fs::metadata(sidecar).ok())
-        .and_then(|sidecar| sidecar.modified().ok());
     Ok(WatchSnapshotEntry {
         size: metadata.len(),
         mtime: metadata.modified().ok(),
-        metadata_mtime,
     })
 }
 
@@ -214,7 +203,6 @@ fn diff_watch_directory_snapshots(
     old: &BTreeMap<Vec<u8>, WatchSnapshotEntry>,
     new: &BTreeMap<Vec<u8>, WatchSnapshotEntry>,
     base_address: &Url,
-    include_metadata_changes: bool,
 ) -> Result<VecDeque<ChangeEvent>> {
     let keys = old
         .keys()
@@ -240,17 +228,6 @@ fn diff_watch_directory_snapshots(
                     base_address,
                     key,
                     ChangeKind::Modified,
-                    Some(current),
-                )?);
-            }
-            (Some(previous), Some(current))
-                if include_metadata_changes
-                    && previous.metadata_mtime != current.metadata_mtime =>
-            {
-                out.push_back(change_event(
-                    base_address,
-                    key,
-                    ChangeKind::MetadataChanged,
                     Some(current),
                 )?);
             }
@@ -353,6 +330,7 @@ fn relative_path(base: &Path, path: &Path) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
     /// A file the backend can open must be a file the watcher can report.

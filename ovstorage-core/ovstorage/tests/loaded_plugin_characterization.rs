@@ -29,13 +29,12 @@ use ovstorage::{
     ConfigValue, ConnectionId, ConnectionKey, ConnectionRequest, CopyOptions, CopyRequest,
     CreateDirectoryOptions, CreateDirectoryRequest, DeleteDirectoryOptions, DeleteDirectoryRequest,
     DeleteOptions, DeleteRequest, ErrorCode, InteractiveAuthCapability, Layer, LayerConfig,
-    LayerConnectionRequest, LayerKindDescriptor, LayerSpec, LayerType, ListOptions, ListRequest,
-    ListVersionsOptions, ListVersionsRequest, LoadedLayerFactory, ObjectKind, ReadOptions,
-    ReadRequest, RedirectResultBatch, RenameOptions, RenameRequest, Request, RouterFactory,
-    SecretBundle, Stack, UpdateConnectionAttributesRequest, UpdateConnectionCredentialsRequest,
-    UpdateMetadataOptions, UpdateMetadataRequest, Url, WatchDirectoryOptions,
-    WatchDirectoryRequest, WrapperFactory, WriteOptions, WriteRedirectBatch, WriteRequest,
-    WriteStep,
+    LayerConnectionRequest, LayerKindDescriptor, LayerSpec, LayerType, ListVersionsOptions,
+    ListVersionsRequest, LoadedLayerFactory, ObjectKind, ReadOptions, ReadRequest,
+    RedirectResultBatch, RenameOptions, RenameRequest, Request, RouterFactory, SecretBundle, Stack,
+    UpdateConnectionAttributesRequest, UpdateConnectionCredentialsRequest, UpdateMetadataOptions,
+    UpdateMetadataRequest, Url, WatchDirectoryOptions, WatchDirectoryRequest, WrapperFactory,
+    WriteOptions, WriteRedirectBatch, WriteRequest, WriteStep,
 };
 use ovstorage_plugin::consume_v2::{ForeignVtableLayer, KindsFallback};
 use ovstorage_plugin::ffi;
@@ -165,7 +164,11 @@ async fn loaded_v2_forwards_operational_slots() {
         .expect("write_stream");
 
     // materialize → a real local path the host reads.
-    let delegate = layer
+    let wrapper = find_wrapper(&load_mini_v2().expect("cdylib present"))
+        .create_wrapper("v2-wrapper", &LayerConfig::new(), layer.clone(), None)
+        .await
+        .expect("create mini wrapper");
+    let delegate = wrapper
         .materialize(
             Request::new(ReadRequest {
                 address: Url::parse("mini://slots/obj.bin").unwrap(),
@@ -458,20 +461,9 @@ async fn loaded_v2_unimplemented_slots_surface_unsupported() {
             .code(),
         ErrorCode::Unsupported,
     );
-    assert_eq!(
-        layer
-            .list(
-                Request::new(ListRequest {
-                    prefix: url(),
-                    options: ListOptions::default(),
-                }),
-                None,
-            )
-            .await
-            .unwrap_err()
-            .code(),
-        ErrorCode::Unsupported,
-    );
+    // `mini-v2` implements list and list_stream for the loaded-plugin
+    // conformance scenarios; only the slots asserted here retain the trait's
+    // Unsupported default.
     // `watch_directory` yields a `ChangeStream` (not `Debug`), so match rather
     // than `unwrap_err`.
     let watch = layer

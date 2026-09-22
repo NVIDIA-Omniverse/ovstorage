@@ -4,16 +4,23 @@
 //! GCS credential discovery and bearer-token caching.
 //!
 //! Credentials come from the `SecretBundle` only: either an explicit
-//! `service_account_key` (service-account or `authorized_user` JSON), or
-//! an empty bundle which yields `CredentialSource::Anonymous` (no token,
+//! `service_account_key` (`service_account`, `authorized_user`,
+//! `external_account`, or `impersonated_service_account` JSON), or an
+//! empty bundle which yields `CredentialSource::Anonymous` (no token,
 //! unsigned requests). Users who want gcloud-ADC-file or env-var auth wire
 //! them in via the library's `SecretRef::File` / `SecretRef::FileJson`
 //! TOML mechanism.
 //!
 //! Service-account creds sign a JWT-bearer assertion and exchange it for
 //! an OAuth2 access token at `token_uri`. Authorized-user creds post a
-//! `refresh_token` grant. Bearers are cached behind a `Mutex` until
-//! `REFRESH_LEEWAY` before `expires_in`.
+//! `refresh_token` grant. External-account (workload identity federation)
+//! creds read a subject token from a file or URL — re-fetched on EVERY
+//! exchange, because federation platforms rotate it out from under a
+//! running process — exchange it at the STS endpoint, and optionally hop
+//! through `iamcredentials.googleapis.com` to impersonate a service
+//! account. Impersonated creds mint their source credential's bearer
+//! first and make the same impersonation hop. Bearers are cached behind
+//! a `Mutex` until `REFRESH_LEEWAY` before `expires_in`.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +40,14 @@ const SCOPE: &str = "https://www.googleapis.com/auth/devstorage.full_control htt
 const REFRESH_LEEWAY: Duration = Duration::from_secs(300);
 const JWT_LIFETIME_SECS: u64 = 3600;
 const USER_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
+const STS_TOKEN_URL: &str = "https://sts.googleapis.com/v1/token";
+/// Scope requested on the federated (pre-impersonation) leg. The federated
+/// token's only job is to call `generateAccessToken`, and IAM Credentials
+/// requires `cloud-platform`; the storage scopes are requested on the
+/// impersonated token instead.
+const CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+const STS_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+const STS_REQUESTED_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 
 /// Whether an auth-tagged error reason is the IdP REFUSING the grant, rather
 /// than failing to answer it.
@@ -50,18 +65,35 @@ const USER_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 /// reported. A body that fails to parse at all is NOT in this set — that is a
 /// truncated response or a proxy error page, which is a transport failure.
 ///
-/// One function because there is one judgment, and both consumers want it:
-/// `GcsDriver::verify`, which parks a connection on it, and
-/// [`Authenticator::credential_refused`], which withholds a promotion on it.
-/// **A reason left off this list does not fail closed.** `verify` reaches it
-/// through `GcsDriver`'s `reason_is_credential_rejection`, whose other arm is a
-/// lenient pass — so an unlisted definitive failure commits `Authenticated`
-/// instead of parking, and with `refresh` unsupported and
-/// `update_connection_credentials` refused, nothing can undo that.
+/// The impersonation hop (`impersonation_http_{status}` /
+/// `impersonation_empty`, see [`decode_impersonation_response`]) joins with
+/// the same status judgment — EXCEPT its 403, which is deliberately absent
+/// here: on `iamcredentials` a 403 is a verdict on the principal-to-SA
+/// *binding* (often IAM propagation lag minutes after setup), not on the
+/// credential, so it must not latch. It still parks `verify` through the
+/// driver's wider rejection set, which is why the hop needs its own tag: a
+/// `token_exchange_http_403` would be indistinguishable from one served by
+/// an IdP proxy on the primary grant, where this taxonomy keeps 403 fully
+/// lenient.
+///
+/// One function because there is one LATCH judgment; the two consumers are
+/// [`Authenticator::credential_refused`], which withholds a promotion on it,
+/// and `GcsDriver`'s `reason_is_credential_rejection`, whose park set is a
+/// superset (it adds `gcs_unauthorized`, `impersonation_http_403`, and every
+/// `CredentialUnavailable`). **A reason left off both sets does not fail
+/// closed.** `verify` reaches it through the driver's lenient arm — so an
+/// unlisted definitive failure commits `Authenticated` instead of parking,
+/// and with `refresh` unsupported and `update_connection_credentials`
+/// refused, nothing can undo that.
 pub(crate) fn reason_is_grant_refusal(reason: &str) -> bool {
     matches!(
         reason,
-        "token_exchange_http_400" | "token_exchange_http_401" | "token_exchange_empty"
+        "token_exchange_http_400"
+            | "token_exchange_http_401"
+            | "token_exchange_empty"
+            | "impersonation_http_400"
+            | "impersonation_http_401"
+            | "impersonation_empty"
     )
 }
 
@@ -80,6 +112,14 @@ fn error_is_grant_refusal(err: &Error) -> bool {
 pub enum CredentialSource {
     ServiceAccount(ServiceAccountKey),
     User(UserCredentials),
+    /// Workload identity federation (`external_account` ADC JSON): a
+    /// platform-issued subject token exchanged at the STS endpoint,
+    /// optionally followed by a service-account impersonation hop.
+    ExternalAccount(ExternalAccountCredentials),
+    /// `impersonated_service_account` ADC JSON: a source credential's
+    /// bearer spent on `iamcredentials.googleapis.com` to mint an
+    /// access token for the named service account.
+    Impersonated(ImpersonatedCredentials),
     /// No credentials provided — requests go out without an `Authorization`
     /// header. The server decides whether the bucket / object is publicly
     /// accessible.
@@ -93,6 +133,12 @@ impl fmt::Debug for CredentialSource {
                 f.debug_tuple("ServiceAccount").field(key).finish()
             }
             CredentialSource::User(user) => f.debug_tuple("User").field(user).finish(),
+            CredentialSource::ExternalAccount(ea) => {
+                f.debug_tuple("ExternalAccount").field(ea).finish()
+            }
+            CredentialSource::Impersonated(imp) => {
+                f.debug_tuple("Impersonated").field(imp).finish()
+            }
             CredentialSource::Anonymous => f.write_str("Anonymous"),
         }
     }
@@ -100,6 +146,9 @@ impl fmt::Debug for CredentialSource {
 
 impl CredentialSource {
     /// True only for credentials capable of producing a V4 RSA signature.
+    /// External-account and impersonated credentials hold no private key,
+    /// so their reads take the plugin-proxied arm instead of a signed
+    /// redirect.
     #[allow(dead_code)]
     pub fn can_sign_urls(&self) -> bool {
         matches!(self, CredentialSource::ServiceAccount(_))
@@ -145,6 +194,115 @@ impl fmt::Debug for UserCredentials {
             .field("client_secret", &"<redacted>")
             .field("refresh_token", &"<redacted>")
             .field("token_uri", &self.token_uri)
+            .finish()
+    }
+}
+
+/// `external_account` ADC JSON, the shape written by
+/// `gcloud iam workload-identity-pools create-cred-config` and by CI
+/// integrations that assemble it by hand.
+#[derive(Clone)]
+pub struct ExternalAccountCredentials {
+    /// Full workload-identity-pool provider resource, e.g.
+    /// `//iam.googleapis.com/projects/N/locations/global/workloadIdentityPools/P/providers/V`.
+    pub audience: String,
+    /// RFC 8693 type of the subject token, e.g.
+    /// `urn:ietf:params:oauth:token-type:jwt` for an OIDC id token.
+    pub subject_token_type: String,
+    pub token_url: String,
+    pub subject_source: SubjectTokenSource,
+    /// `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/
+    /// {email}:generateAccessToken`. Absent means the federated STS token is
+    /// itself the bearer (the federated principal holds the bucket grants).
+    pub impersonation_url: Option<String>,
+    /// Requested impersonated-token lifetime, from the JSON's optional
+    /// `service_account_impersonation.token_lifetime_seconds`.
+    pub token_lifetime_seconds: Option<u64>,
+}
+
+/// Where the platform-issued subject token comes from. Re-fetched on every
+/// exchange: federation platforms rotate the token out from under a running
+/// process (a projected volume on GKE, a per-request endpoint on GitHub
+/// Actions), so caching a read would strand refresh on a stale token.
+#[derive(Clone)]
+pub enum SubjectTokenSource {
+    File {
+        path: String,
+        format: SubjectTokenFormat,
+    },
+    Url {
+        url: String,
+        /// Sent verbatim on the fetch. May carry an authorization header —
+        /// treated as secret in every rendering.
+        headers: Vec<(String, String)>,
+        format: SubjectTokenFormat,
+    },
+}
+
+#[derive(Clone)]
+pub enum SubjectTokenFormat {
+    Text,
+    /// The source yields a JSON document; the subject token is the named
+    /// top-level string field.
+    Json {
+        field: String,
+    },
+}
+
+impl fmt::Debug for ExternalAccountCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExternalAccountCredentials")
+            .field("audience", &self.audience)
+            .field("subject_token_type", &self.subject_token_type)
+            .field("token_url", &self.token_url)
+            .field("subject_source", &self.subject_source)
+            .field("impersonation_url", &self.impersonation_url)
+            .finish()
+    }
+}
+
+impl fmt::Debug for SubjectTokenSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SubjectTokenSource::File { path, .. } => f.debug_tuple("File").field(path).finish(),
+            SubjectTokenSource::Url { url, headers, .. } => {
+                // The URL's query string is operator-controlled and may carry
+                // a token; keep everything up to it. Header VALUES are secret
+                // (GitHub's fetch authenticates via one); names are not.
+                let visible = url.split_once('?').map_or(url.as_str(), |(base, _)| base);
+                f.debug_struct("Url")
+                    .field("url", &visible)
+                    .field(
+                        "headers",
+                        &headers
+                            .iter()
+                            .map(|(name, _)| name.as_str())
+                            .collect::<Vec<_>>(),
+                    )
+                    .finish()
+            }
+        }
+    }
+}
+
+/// `impersonated_service_account` ADC JSON, the shape written by
+/// `gcloud auth application-default login --impersonate-service-account`.
+#[derive(Clone)]
+pub struct ImpersonatedCredentials {
+    pub impersonation_url: String,
+    /// The credential that pays for the `generateAccessToken` call. Parsed
+    /// recursively from the JSON's `source_credentials`; nesting another
+    /// impersonation inside is rejected at parse time.
+    pub source: Box<CredentialSource>,
+    pub delegates: Vec<String>,
+}
+
+impl fmt::Debug for ImpersonatedCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImpersonatedCredentials")
+            .field("impersonation_url", &self.impersonation_url)
+            .field("source", &self.source)
+            .field("delegates", &self.delegates)
             .finish()
     }
 }
@@ -375,6 +533,8 @@ impl Authenticator {
         let outcome = match &source {
             CredentialSource::ServiceAccount(sa) => self.exchange_jwt(sa).await,
             CredentialSource::User(user) => self.exchange_refresh_token(user).await,
+            CredentialSource::ExternalAccount(ea) => self.exchange_external_account(ea).await,
+            CredentialSource::Impersonated(imp) => self.exchange_impersonated(imp).await,
             CredentialSource::Anonymous => unreachable!("checked above"),
         };
         let response = match outcome {
@@ -461,7 +621,18 @@ impl Authenticator {
     }
 
     async fn exchange_jwt(&self, sa: &ServiceAccountKey) -> Result<GrantedToken> {
-        let assertion = build_service_account_jwt(sa)?;
+        self.exchange_jwt_scoped(sa, SCOPE).await
+    }
+
+    /// JWT-bearer exchange with a caller-chosen scope. The storage scopes
+    /// are the norm; an impersonation SOURCE instead needs `cloud-platform`
+    /// to be allowed onto `iamcredentials.googleapis.com`.
+    async fn exchange_jwt_scoped(
+        &self,
+        sa: &ServiceAccountKey,
+        scope: &str,
+    ) -> Result<GrantedToken> {
+        let assertion = build_service_account_jwt_scoped(sa, scope)?;
         let form = [
             ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
             ("assertion", assertion.as_str()),
@@ -491,6 +662,222 @@ impl Authenticator {
             .await
             .map_err(map_token_transport)?;
         decode_token_response(response).await
+    }
+
+    /// Workload-identity-federation exchange: subject token → STS federated
+    /// token → (optionally) impersonated service-account token.
+    async fn exchange_external_account(
+        &self,
+        ea: &ExternalAccountCredentials,
+    ) -> Result<GrantedToken> {
+        // With an impersonation hop the federated token only has to reach
+        // IAM Credentials; without one it IS the storage bearer and needs
+        // the storage scopes directly.
+        let scope = if ea.impersonation_url.is_some() {
+            CLOUD_PLATFORM_SCOPE
+        } else {
+            SCOPE
+        };
+        self.exchange_external_account_scoped(ea, scope).await
+    }
+
+    /// [`Self::exchange_external_account`] with a caller-chosen STS scope.
+    /// The impersonated-credential path forces `cloud-platform` here: its
+    /// external-account SOURCE never impersonates (parse rejects that), so
+    /// the natural scope choice above would pick the storage scopes — and a
+    /// storage-scoped bearer is refused by `generateAccessToken`.
+    async fn exchange_external_account_scoped(
+        &self,
+        ea: &ExternalAccountCredentials,
+        scope: &str,
+    ) -> Result<GrantedToken> {
+        let subject_token = self.fetch_subject_token(&ea.subject_source).await?;
+        let form = [
+            ("grant_type", STS_GRANT_TYPE),
+            ("audience", ea.audience.as_str()),
+            ("scope", scope),
+            ("requested_token_type", STS_REQUESTED_TOKEN_TYPE),
+            ("subject_token", subject_token.as_str()),
+            ("subject_token_type", ea.subject_token_type.as_str()),
+        ];
+        let response = self
+            .http
+            .post(&ea.token_url)
+            .form(&form)
+            .send()
+            .await
+            .map_err(map_token_transport)?;
+        let federated = decode_token_response(response).await?;
+        let Some(impersonation_url) = ea.impersonation_url.as_deref() else {
+            return Ok(federated);
+        };
+        self.generate_access_token(
+            impersonation_url,
+            &federated.access_token,
+            ea.token_lifetime_seconds.unwrap_or(JWT_LIFETIME_SECS),
+        )
+        .await
+    }
+
+    /// `impersonated_service_account` exchange: mint the source credential's
+    /// bearer, then spend it on the impersonation hop.
+    async fn exchange_impersonated(&self, imp: &ImpersonatedCredentials) -> Result<GrantedToken> {
+        let source = match imp.source.as_ref() {
+            CredentialSource::ServiceAccount(sa) => {
+                self.exchange_jwt_scoped(sa, CLOUD_PLATFORM_SCOPE).await?
+            }
+            CredentialSource::User(user) => self.exchange_refresh_token(user).await?,
+            // Forced to cloud-platform: this bearer's only job is the
+            // generateAccessToken call below, which refuses storage-scoped
+            // callers.
+            CredentialSource::ExternalAccount(ea) => {
+                self.exchange_external_account_scoped(ea, CLOUD_PLATFORM_SCOPE)
+                    .await?
+            }
+            // parse_credentials_json rejects nested impersonation and an
+            // anonymous source cannot be spelled in ADC JSON.
+            CredentialSource::Impersonated(_) | CredentialSource::Anonymous => {
+                return Err(Error::new(
+                    ErrorCode::InvalidArgument,
+                    "GCS impersonated credentials carry an unsupported source",
+                ));
+            }
+        };
+        self.generate_access_token_with_delegates(
+            &imp.impersonation_url,
+            &source.access_token,
+            JWT_LIFETIME_SECS,
+            &imp.delegates,
+        )
+        .await
+    }
+
+    /// Fetch the platform-issued subject token, fresh on every call.
+    /// Failures here are the PLATFORM being unavailable, not the IdP
+    /// refusing a grant, so they carry no auth reason and never latch.
+    async fn fetch_subject_token(&self, source: &SubjectTokenSource) -> Result<String> {
+        let (raw, format, origin) = match source {
+            SubjectTokenSource::File { path, format } => {
+                let expanded = expand_tilde(path);
+                let contents = std::fs::read(&expanded).map_err(|err| {
+                    Error::new(
+                        ErrorCode::CredentialUnavailable,
+                        format!("failed to read GCS subject-token file '{expanded}': {err}"),
+                    )
+                })?;
+                (contents, format, format!("file '{expanded}'"))
+            }
+            SubjectTokenSource::Url {
+                url,
+                headers,
+                format,
+            } => {
+                let mut request = self.http.get(url);
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
+                // `without_url()`: reqwest embeds the full request URL in its
+                // transport errors, and this URL's query string is
+                // operator-controlled and may carry a token (the same reason
+                // the Debug impl truncates it at `?`).
+                let response = request.send().await.map_err(|err| {
+                    Error::new(
+                        ErrorCode::CredentialUnavailable,
+                        format!(
+                            "GCS subject-token endpoint transport error: {}",
+                            err.without_url()
+                        ),
+                    )
+                })?;
+                let status = response.status();
+                let body = response.bytes().await.unwrap_or_default();
+                if !status.is_success() {
+                    // The endpoint is not the IdP; its body gets the same
+                    // suppression as every other provider body.
+                    return Err(Error::new(
+                        ErrorCode::CredentialUnavailable,
+                        format!(
+                            "GCS subject-token endpoint answered HTTP {status}; {} byte body suppressed",
+                            body.len()
+                        ),
+                    ));
+                }
+                (body.to_vec(), format, "endpoint response".to_string())
+            }
+        };
+        let token = match format {
+            SubjectTokenFormat::Text => String::from_utf8(raw)
+                .map_err(|_| {
+                    Error::new(
+                        ErrorCode::CredentialUnavailable,
+                        format!("GCS subject token from {origin} is not UTF-8"),
+                    )
+                })?
+                .trim()
+                .to_string(),
+            SubjectTokenFormat::Json { field } => {
+                let value: serde_json::Value = serde_json::from_slice(&raw).map_err(|err| {
+                    Error::new(
+                        ErrorCode::CredentialUnavailable,
+                        format!(
+                            "GCS subject token from {origin} is not JSON: {}",
+                            crate::error_body::decode_failure(&err, raw.len())
+                        ),
+                    )
+                })?;
+                value
+                    .get(field)
+                    .and_then(|token| token.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            }
+        };
+        if token.is_empty() {
+            return Err(Error::new(
+                ErrorCode::CredentialUnavailable,
+                format!("GCS subject token from {origin} is empty"),
+            ));
+        }
+        Ok(token)
+    }
+
+    async fn generate_access_token(
+        &self,
+        impersonation_url: &str,
+        bearer: &str,
+        lifetime_seconds: u64,
+    ) -> Result<GrantedToken> {
+        self.generate_access_token_with_delegates(impersonation_url, bearer, lifetime_seconds, &[])
+            .await
+    }
+
+    /// The `iamcredentials.googleapis.com` … `:generateAccessToken` hop
+    /// shared by external-account impersonation and
+    /// `impersonated_service_account` credentials.
+    async fn generate_access_token_with_delegates(
+        &self,
+        impersonation_url: &str,
+        bearer: &str,
+        lifetime_seconds: u64,
+        delegates: &[String],
+    ) -> Result<GrantedToken> {
+        let mut body = serde_json::json!({
+            "scope": SCOPE.split(' ').collect::<Vec<_>>(),
+            "lifetime": format!("{lifetime_seconds}s"),
+        });
+        if !delegates.is_empty() {
+            body["delegates"] = serde_json::json!(delegates);
+        }
+        let response = self
+            .http
+            .post(impersonation_url)
+            .bearer_auth(bearer)
+            .json(&body)
+            .send()
+            .await
+            .map_err(map_token_transport)?;
+        decode_impersonation_response(response).await
     }
 }
 
@@ -703,10 +1090,114 @@ async fn decode_token_response(response: reqwest::Response) -> Result<GrantedTok
     })
 }
 
+/// Decode a `generateAccessToken` response. The success shape differs from
+/// OAuth (`accessToken` + RFC 3339 `expireTime` instead of `access_token` +
+/// `expires_in`), and the reason tags are the hop's own
+/// (`impersonation_http_{status}` / `impersonation_empty`): 400/401/empty
+/// join [`reason_is_grant_refusal`]'s latch set, while the 403 arm — a
+/// verdict on the principal-to-SA binding rather than the credential — must
+/// park `verify` without latching, which a shared `token_exchange_*` tag
+/// could not express. Body suppression follows the same rules as the OAuth
+/// path, because an IAM error `message` echoes the caller's request the way
+/// `error_description` echoes an assertion.
+async fn decode_impersonation_response(response: reqwest::Response) -> Result<GrantedToken> {
+    let status = response.status();
+    let body = response.bytes().await.unwrap_or_default();
+    if !status.is_success() {
+        // IAM errors nest the code (`{"error": {"status": "..."}}`); a
+        // front-door proxy may still answer in the flat OAuth shape.
+        let detail = ovstorage_plugin::provider_error::json_code(&body, "/error/status")
+            .or_else(|| ovstorage_plugin::provider_error::json_code(&body, "/error"))
+            .unwrap_or_else(|| {
+                format!(
+                    "no provider error code; {} byte body suppressed",
+                    body.len()
+                )
+            });
+        return Err(Error::new(
+            ErrorCode::AuthRequired,
+            format!("GCS service-account impersonation failed with HTTP {status}: {detail}"),
+        )
+        .with_context(ErrorContext::Auth {
+            connection_id: ConnectionId(String::new()),
+            reason: Some(format!("impersonation_http_{}", status.as_u16())),
+            expired_at: None,
+        }));
+    }
+    let parsed: ImpersonationResponse = serde_json::from_slice(&body).map_err(|err| {
+        Error::new(
+            ErrorCode::Internal,
+            format!(
+                "GCS impersonation response was not JSON: {}",
+                crate::error_body::decode_failure(&err, body.len())
+            ),
+        )
+    })?;
+    let access_token = parsed
+        .access_token
+        .as_ref()
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if access_token.is_empty() {
+        return Err(Error::new(
+            ErrorCode::AuthRequired,
+            "GCS service-account impersonation returned no usable accessToken",
+        )
+        .with_context(ErrorContext::Auth {
+            connection_id: ConnectionId(String::new()),
+            reason: Some("impersonation_empty".into()),
+            expired_at: None,
+        }));
+    }
+    // An absent or unparseable expireTime must not condemn a working bearer
+    // (the same rule a string expires_in follows): fall back to the
+    // requested lifetime's documented default and let the leeway logic cope.
+    // A PARSEABLE expireTime is honored even when it is already in the past
+    // (clock skew, a stale front-door answer): it clamps to zero rather than
+    // riding the fallback, so the caching window stays the leeway minimum
+    // instead of an hour of a bearer the server said is dead.
+    let expires_in = match parsed.expire_time.as_deref().and_then(|text| {
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()
+    }) {
+        Some(expiry) => {
+            let now = time::OffsetDateTime::now_utc();
+            u64::try_from((expiry - now).whole_seconds()).unwrap_or(0)
+        }
+        None => JWT_LIFETIME_SECS,
+    };
+    Ok(GrantedToken {
+        access_token,
+        expires_in,
+    })
+}
+
+#[derive(Deserialize)]
+struct ImpersonationResponse {
+    #[serde(default, rename = "accessToken")]
+    access_token: Option<serde_json::Value>,
+    #[serde(default, rename = "expireTime")]
+    expire_time: Option<String>,
+}
+
+impl fmt::Debug for ImpersonationResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImpersonationResponse")
+            .field("access_token", &"<redacted>")
+            .field("expire_time", &self.expire_time)
+            .finish()
+    }
+}
+
 fn map_token_transport(err: reqwest::Error) -> Error {
+    // `without_url()`: reqwest embeds the full request URL in transport
+    // errors, and every endpoint that reaches this mapper is
+    // operator-controlled (token_uri, token_url, the impersonation URL) —
+    // a query string there may carry a secret.
     Error::new(
         ErrorCode::AuthRequired,
-        format!("GCS token exchange transport error: {err}"),
+        format!("GCS token exchange transport error: {}", err.without_url()),
     )
     .with_context(ErrorContext::Auth {
         connection_id: ConnectionId(String::new()),
@@ -717,14 +1208,14 @@ fn map_token_transport(err: reqwest::Error) -> Error {
 
 /// Mint the JWT bearer assertion per
 /// <https://developers.google.com/identity/protocols/oauth2/service-account#jwt-auth>.
-pub fn build_service_account_jwt(sa: &ServiceAccountKey) -> Result<String> {
+fn build_service_account_jwt_scoped(sa: &ServiceAccountKey, scope: &str) -> Result<String> {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?
         .as_secs();
     let claims = JwtClaims {
         iss: sa.client_email.clone(),
-        scope: SCOPE.to_string(),
+        scope: scope.to_string(),
         aud: sa.token_uri.clone(),
         iat: now,
         exp: now + JWT_LIFETIME_SECS,
@@ -830,7 +1321,8 @@ fn home_dir() -> Option<std::path::PathBuf> {
     Some(out)
 }
 
-/// Parse a service-account or `authorized_user` ADC JSON blob.
+/// Parse an ADC JSON blob: `service_account`, `authorized_user`,
+/// `external_account`, or `impersonated_service_account`.
 pub fn parse_credentials_json(bytes: &[u8]) -> Result<CredentialSource> {
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|err| {
         Error::new(
@@ -838,6 +1330,10 @@ pub fn parse_credentials_json(bytes: &[u8]) -> Result<CredentialSource> {
             format!("GCS credentials JSON is not valid JSON: {err}"),
         )
     })?;
+    parse_credentials_value(value, false)
+}
+
+fn parse_credentials_value(value: serde_json::Value, nested: bool) -> Result<CredentialSource> {
     let key_type = value
         .get("type")
         .and_then(|t| t.as_str())
@@ -861,11 +1357,322 @@ pub fn parse_credentials_json(bytes: &[u8]) -> Result<CredentialSource> {
             })?;
             Ok(CredentialSource::User(user))
         }
+        "external_account" => Ok(CredentialSource::ExternalAccount(parse_external_account(
+            value,
+        )?)),
+        "impersonated_service_account" => {
+            if nested {
+                return Err(Error::new(
+                    ErrorCode::InvalidArgument,
+                    "GCS impersonated credentials cannot nest another impersonation",
+                ));
+            }
+            let object = value.as_object().ok_or_else(|| {
+                Error::new(
+                    ErrorCode::InvalidArgument,
+                    "GCS impersonated credentials JSON must be an object",
+                )
+            })?;
+            let impersonation_url =
+                required_string_field(object, "service_account_impersonation_url")?;
+            require_google_endpoint(&impersonation_url, "service_account_impersonation_url")?;
+            let source_value = object.get("source_credentials").cloned().ok_or_else(|| {
+                Error::new(
+                    ErrorCode::InvalidArgument,
+                    "GCS impersonated credentials JSON is missing source_credentials",
+                )
+            })?;
+            let source = parse_credentials_value(source_value, true)?;
+            // An external-account source that itself impersonates would put
+            // two impersonation hops in one credential — the same cycle risk
+            // the `nested` guard exists for, spelled differently. Its exchange
+            // would also hand this hop a storage-scoped bearer.
+            if let CredentialSource::ExternalAccount(ea) = &source
+                && ea.impersonation_url.is_some()
+            {
+                return Err(Error::new(
+                    ErrorCode::InvalidArgument,
+                    "GCS impersonated credentials cannot nest an external_account that itself impersonates",
+                ));
+            }
+            // Fail closed like every other credential field: a silently
+            // filtered delegate chain is a DIFFERENT generateAccessToken
+            // request — potentially direct impersonation without the
+            // intended chain — not a tolerable reading of a malformed file.
+            let delegates = match object.get("delegates") {
+                None => Vec::new(),
+                Some(serde_json::Value::Array(list)) => {
+                    let mut delegates = Vec::with_capacity(list.len());
+                    for entry in list {
+                        let delegate = entry
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|text| !text.is_empty())
+                            .ok_or_else(|| {
+                                Error::new(
+                                    ErrorCode::InvalidArgument,
+                                    "GCS impersonated credentials 'delegates' entries must be non-empty strings",
+                                )
+                            })?;
+                        delegates.push(delegate.to_string());
+                    }
+                    delegates
+                }
+                Some(_) => {
+                    return Err(Error::new(
+                        ErrorCode::InvalidArgument,
+                        "GCS impersonated credentials 'delegates' must be an array of non-empty strings when present",
+                    ));
+                }
+            };
+            Ok(CredentialSource::Impersonated(ImpersonatedCredentials {
+                impersonation_url,
+                source: Box::new(source),
+                delegates,
+            }))
+        }
         other => Err(Error::new(
             ErrorCode::InvalidArgument,
             format!("unsupported GCS credentials type '{other}'"),
         )),
     }
+}
+
+/// Loopback endpoints pass every gate below: unit tests and local emulators
+/// speak plain HTTP on 127.0.0.1, and nothing reachable there is an
+/// exfiltration target.
+fn url_is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+/// `token_url` and the impersonation URLs must be Google's own endpoints (or
+/// loopback). Unlike a `service_account` private key, an `external_account`
+/// JSON is *configuration* in the wider Google ecosystem — documented as
+/// non-secret and routinely copied around — and `token_url` is where the
+/// locally-read subject token gets POSTed, so accepting an arbitrary host
+/// there turns a shared config file into a local-file-read-plus-exfiltrate
+/// primitive. Google's own auth libraries validate these fields the same way.
+fn require_google_endpoint(url_text: &str, field: &str) -> Result<()> {
+    let parsed = url::Url::parse(url_text).map_err(|_| {
+        Error::new(
+            ErrorCode::InvalidArgument,
+            format!("GCS external-account '{field}' is not a valid URL"),
+        )
+    })?;
+    if url_is_loopback(&parsed) {
+        return Ok(());
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    if parsed.scheme() == "https" && (host == "googleapis.com" || host.ends_with(".googleapis.com"))
+    {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorCode::InvalidArgument,
+        format!("GCS external-account '{field}' must be an https *.googleapis.com endpoint"),
+    ))
+}
+
+/// `credential_source.url` cannot be pinned to Google (GitHub's token
+/// endpoint lives on `*.actions.githubusercontent.com`), but it must be
+/// https or loopback: the GCE metadata server — plain http on a link-local
+/// address — must not become reachable through a credential file, with or
+/// without the caller-chosen headers this field carries.
+fn require_https_or_loopback(url_text: &str, field: &str) -> Result<()> {
+    let parsed = url::Url::parse(url_text).map_err(|_| {
+        Error::new(
+            ErrorCode::InvalidArgument,
+            format!("GCS external-account '{field}' is not a valid URL"),
+        )
+    })?;
+    if url_is_loopback(&parsed) || parsed.scheme() == "https" {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorCode::InvalidArgument,
+        format!("GCS external-account '{field}' must be https (or loopback)"),
+    ))
+}
+
+/// A field that must be a non-empty string WHEN PRESENT. Absence is the
+/// caller's business; a present null / non-string / blank value fails closed
+/// instead of silently reading as absent — for `service_account_impersonation_url`
+/// that silent reading would return the federated token under the wrong
+/// identity rather than reject the malformed credential.
+fn optional_string_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<&'a str>> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(Some)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "GCS credentials field '{key}' must be a non-empty string when present"
+                    ),
+                )
+            }),
+    }
+}
+
+fn parse_external_account(value: serde_json::Value) -> Result<ExternalAccountCredentials> {
+    let object = value.as_object().ok_or_else(|| {
+        Error::new(
+            ErrorCode::InvalidArgument,
+            "GCS external-account credentials JSON must be an object",
+        )
+    })?;
+    let audience = required_string_field(object, "audience")?;
+    // Workforce (user-identity) federation exchanges carry an extra
+    // `options={"userProject":...}` STS parameter this client does not send,
+    // so a workforce config would parse fine and then fail every refresh.
+    // Reject it up front instead of advertising support.
+    if audience.contains("/workforcePools/") || object.contains_key("workforce_pool_user_project") {
+        return Err(Error::new(
+            ErrorCode::InvalidArgument,
+            "GCS external-account workforce identity federation is not supported; only workload identity pools are",
+        ));
+    }
+    let subject_token_type = required_string_field(object, "subject_token_type")?;
+    let token_url = optional_string_field(object, "token_url")?
+        .map(str::to_string)
+        .unwrap_or_else(|| STS_TOKEN_URL.to_string());
+    require_google_endpoint(&token_url, "token_url")?;
+    let source_object = object
+        .get("credential_source")
+        .and_then(|source| source.as_object())
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCode::InvalidArgument,
+                "GCS external-account credentials JSON is missing credential_source",
+            )
+        })?;
+    // The AWS flavor identifies itself with environment_id rather than a
+    // distinct type; name it so the operator learns which flavor was
+    // rejected rather than just that a file/url was missing.
+    if source_object.contains_key("environment_id") {
+        return Err(Error::new(
+            ErrorCode::InvalidArgument,
+            "GCS external-account AWS credential_source is not supported; only file- and url-sourced subject tokens are",
+        ));
+    }
+    if source_object.contains_key("executable") {
+        return Err(Error::new(
+            ErrorCode::InvalidArgument,
+            "GCS external-account executable credential_source is not supported; only file- and url-sourced subject tokens are",
+        ));
+    }
+    let format = parse_subject_token_format(source_object)?;
+    let subject_source = if let Some(path) = source_object.get("file").and_then(|f| f.as_str()) {
+        SubjectTokenSource::File {
+            path: path.to_string(),
+            format,
+        }
+    } else if let Some(url) = source_object.get("url").and_then(|u| u.as_str()) {
+        require_https_or_loopback(url, "credential_source.url")?;
+        let headers = source_object
+            .get("headers")
+            .and_then(|headers| headers.as_object())
+            .map(|headers| {
+                headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value.as_str().map(|text| (name.clone(), text.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        SubjectTokenSource::Url {
+            url: url.to_string(),
+            headers,
+            format,
+        }
+    } else {
+        return Err(Error::new(
+            ErrorCode::InvalidArgument,
+            "GCS external-account credential_source must name a file or a url",
+        ));
+    };
+    let token_lifetime_seconds = object
+        .get("service_account_impersonation")
+        .and_then(|options| options.get("token_lifetime_seconds"))
+        .and_then(|lifetime| lifetime.as_u64());
+    let impersonation_url =
+        match optional_string_field(object, "service_account_impersonation_url")? {
+            None => None,
+            Some(url) => {
+                require_google_endpoint(url, "service_account_impersonation_url")?;
+                Some(url.to_string())
+            }
+        };
+    Ok(ExternalAccountCredentials {
+        audience,
+        subject_token_type,
+        token_url,
+        subject_source,
+        impersonation_url,
+        token_lifetime_seconds,
+    })
+}
+
+fn parse_subject_token_format(
+    source_object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<SubjectTokenFormat> {
+    let Some(format) = source_object.get("format") else {
+        return Ok(SubjectTokenFormat::Text);
+    };
+    let format_type = format
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("text");
+    match format_type {
+        "text" => Ok(SubjectTokenFormat::Text),
+        "json" => {
+            let field = format
+                .get("subject_token_field_name")
+                .and_then(|name| name.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::InvalidArgument,
+                        "GCS external-account json credential_source format requires subject_token_field_name",
+                    )
+                })?;
+            Ok(SubjectTokenFormat::Json { field })
+        }
+        other => Err(Error::new(
+            ErrorCode::InvalidArgument,
+            format!("unsupported GCS external-account credential_source format '{other}'"),
+        )),
+    }
+}
+
+fn required_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<String> {
+    object
+        .get(key)
+        .and_then(|value| value.as_str())
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCode::InvalidArgument,
+                format!("GCS credentials JSON is missing required field '{key}'"),
+            )
+        })
 }
 
 #[cfg(test)]
@@ -887,7 +1694,7 @@ mod tests {
     #[test]
     fn jwt_header_and_claims_match_google_documented_shape() {
         let sa = test_service_account();
-        let token = build_service_account_jwt(&sa).expect("jwt");
+        let token = build_service_account_jwt_scoped(&sa, SCOPE).expect("jwt");
         let mut parts = token.split('.');
         let header_b64 = parts.next().expect("header part");
         let payload_b64 = parts.next().expect("payload part");
@@ -981,9 +1788,329 @@ mod tests {
 
     #[test]
     fn parse_credentials_json_rejects_unknown_type() {
-        let unknown = serde_json::json!({"type": "external_account"}).to_string();
+        let unknown = serde_json::json!({"type": "gcp_magic_beans"}).to_string();
         let err = parse_credentials_json(unknown.as_bytes()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert!(
+            err.message().contains("gcp_magic_beans"),
+            "the rejected type is the diagnostic: {}",
+            err.message()
+        );
+    }
+
+    fn external_account_json(source: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "external_account",
+            "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/v",
+            "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+            "token_url": "https://sts.googleapis.com/v1/token",
+            "credential_source": source,
+        })
+    }
+
+    #[test]
+    fn parse_external_account_file_and_url_sources() {
+        let file = external_account_json(serde_json::json!({"file": "/var/run/token"})).to_string();
+        let source = parse_credentials_json(file.as_bytes()).expect("file-sourced");
+        assert!(!source.can_sign_urls(), "no RSA key to sign with");
+        match source {
+            CredentialSource::ExternalAccount(ea) => {
+                assert_eq!(ea.token_url, "https://sts.googleapis.com/v1/token");
+                assert!(ea.impersonation_url.is_none());
+                assert!(matches!(
+                    ea.subject_source,
+                    SubjectTokenSource::File { ref path, format: SubjectTokenFormat::Text } if path == "/var/run/token"
+                ));
+            }
+            other => panic!("expected ExternalAccount, got {other:?}"),
+        }
+
+        let url = external_account_json(serde_json::json!({
+            "url": "https://issuer.example/token?audience=x",
+            "headers": {"Authorization": "Bearer runner-secret"},
+            "format": {"type": "json", "subject_token_field_name": "value"},
+        }))
+        .to_string();
+        match parse_credentials_json(url.as_bytes()).expect("url-sourced") {
+            CredentialSource::ExternalAccount(ea) => match ea.subject_source {
+                SubjectTokenSource::Url {
+                    ref url,
+                    ref headers,
+                    format: SubjectTokenFormat::Json { ref field },
+                } => {
+                    assert_eq!(url, "https://issuer.example/token?audience=x");
+                    assert_eq!(headers.len(), 1);
+                    assert_eq!(field, "value");
+                }
+                other => panic!("expected Url source, got {other:?}"),
+            },
+            other => panic!("expected ExternalAccount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_external_account_defaults_the_sts_endpoint() {
+        let mut json = external_account_json(serde_json::json!({"file": "/var/run/token"}));
+        json.as_object_mut().unwrap().remove("token_url");
+        match parse_credentials_json(json.to_string().as_bytes()).expect("parses") {
+            CredentialSource::ExternalAccount(ea) => assert_eq!(ea.token_url, STS_TOKEN_URL),
+            other => panic!("expected ExternalAccount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_external_account_rejects_unsupported_source_flavors() {
+        for (source, named) in [
+            (
+                serde_json::json!({"environment_id": "aws1", "regional_cred_verification_url": "https://sts.aws.example"}),
+                "AWS",
+            ),
+            (
+                serde_json::json!({"executable": {"command": "/bin/mint-token"}}),
+                "executable",
+            ),
+            (serde_json::json!({}), "file or a url"),
+        ] {
+            let json = external_account_json(source).to_string();
+            let err = parse_credentials_json(json.as_bytes()).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+            assert!(
+                err.message().contains(named),
+                "'{named}' missing from: {}",
+                err.message()
+            );
+        }
+    }
+
+    #[test]
+    fn parse_external_account_json_format_requires_a_field_name() {
+        let json = external_account_json(serde_json::json!({
+            "file": "/var/run/token",
+            "format": {"type": "json"},
+        }))
+        .to_string();
+        let err = parse_credentials_json(json.as_bytes()).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert!(
+            err.message().contains("subject_token_field_name"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn parse_impersonated_service_account_with_a_user_source() {
+        let json = serde_json::json!({
+            "type": "impersonated_service_account",
+            "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken",
+            "delegates": ["chain@p.iam.gserviceaccount.com"],
+            "source_credentials": {
+                "type": "authorized_user",
+                "client_id": "abc",
+                "client_secret": "shh",
+                "refresh_token": "rt",
+            },
+        })
+        .to_string();
+        let source = parse_credentials_json(json.as_bytes()).expect("impersonated");
+        assert!(!source.can_sign_urls());
+        match source {
+            CredentialSource::Impersonated(imp) => {
+                assert_eq!(imp.delegates.len(), 1);
+                assert!(matches!(*imp.source, CredentialSource::User(_)));
+            }
+            other => panic!("expected Impersonated, got {other:?}"),
+        }
+    }
+
+    /// A silently filtered delegate chain is a DIFFERENT impersonation
+    /// request; malformed `delegates` must fail closed like every other
+    /// credential field.
+    #[test]
+    fn parse_impersonated_service_account_fails_closed_on_malformed_delegates() {
+        for delegates in [
+            serde_json::json!("chain@p.iam.gserviceaccount.com"),
+            serde_json::Value::Null,
+            serde_json::json!(["chain@p.iam.gserviceaccount.com", 42]),
+            serde_json::json!(["chain@p.iam.gserviceaccount.com", "  "]),
+            serde_json::json!([null]),
+        ] {
+            let json = serde_json::json!({
+                "type": "impersonated_service_account",
+                "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/x:generateAccessToken",
+                "delegates": delegates,
+                "source_credentials": {
+                    "type": "authorized_user",
+                    "client_id": "abc",
+                    "client_secret": "shh",
+                    "refresh_token": "rt",
+                },
+            })
+            .to_string();
+            let err = parse_credentials_json(json.as_bytes()).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{delegates:?}");
+            assert!(
+                err.message().contains("delegates"),
+                "{delegates:?}: {}",
+                err.message()
+            );
+        }
+        // Absent stays fine, and a well-formed chain survives intact.
+        let json = serde_json::json!({
+            "type": "impersonated_service_account",
+            "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/x:generateAccessToken",
+            "source_credentials": {
+                "type": "authorized_user", "client_id": "a", "client_secret": "b", "refresh_token": "c",
+            },
+        })
+        .to_string();
+        parse_credentials_json(json.as_bytes()).expect("absent delegates is valid");
+    }
+
+    #[test]
+    fn parse_impersonated_service_account_rejects_nested_impersonation() {
+        let json = serde_json::json!({
+            "type": "impersonated_service_account",
+            "service_account_impersonation_url": "https://iamcredentials.googleapis.com/outer",
+            "source_credentials": {
+                "type": "impersonated_service_account",
+                "service_account_impersonation_url": "https://iamcredentials.googleapis.com/inner",
+                "source_credentials": {"type": "authorized_user", "client_id": "a", "client_secret": "b", "refresh_token": "c"},
+            },
+        })
+        .to_string();
+        let err = parse_credentials_json(json.as_bytes()).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert!(err.message().contains("nest"), "{}", err.message());
+    }
+
+    /// An external_account JSON is treated as shareable configuration in the
+    /// wider Google ecosystem, and its `token_url` is where the locally-read
+    /// subject token gets POSTed — so a non-Google (and non-loopback) host
+    /// there is a file-exfiltration primitive and must be rejected at parse.
+    #[test]
+    fn parse_external_account_pins_token_and_impersonation_urls_to_google() {
+        for (field, json) in [
+            ("token_url", {
+                let mut j = external_account_json(serde_json::json!({"file": "/var/run/token"}));
+                j["token_url"] = serde_json::json!("https://attacker.example/collect");
+                j
+            }),
+            ("token_url http even on googleapis", {
+                let mut j = external_account_json(serde_json::json!({"file": "/var/run/token"}));
+                j["token_url"] = serde_json::json!("http://sts.googleapis.com/v1/token");
+                j
+            }),
+            ("service_account_impersonation_url", {
+                let mut j = external_account_json(serde_json::json!({"file": "/var/run/token"}));
+                j["service_account_impersonation_url"] =
+                    serde_json::json!("https://attacker.example/impersonate");
+                j
+            }),
+            ("token_url lookalike suffix", {
+                let mut j = external_account_json(serde_json::json!({"file": "/var/run/token"}));
+                j["token_url"] = serde_json::json!("https://evilgoogleapis.com/v1/token");
+                j
+            }),
+        ] {
+            let err = parse_credentials_json(json.to_string().as_bytes()).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{field}");
+            assert!(
+                err.message().contains("googleapis.com"),
+                "{field}: {}",
+                err.message()
+            );
+        }
+        // Loopback stays allowed — that is what the exchange tests and local
+        // emulators run against.
+        let mut j = external_account_json(serde_json::json!({"file": "/var/run/token"}));
+        j["token_url"] = serde_json::json!("http://127.0.0.1:4443/token");
+        parse_credentials_json(j.to_string().as_bytes()).expect("loopback token_url is fine");
+    }
+
+    /// `credential_source.url` cannot be pinned to Google (GitHub's endpoint
+    /// is elsewhere), but the GCE metadata server — plain http on a
+    /// link-local address — must not become reachable through a credential
+    /// file. https or loopback only.
+    #[test]
+    fn parse_external_account_rejects_a_plain_http_subject_source() {
+        let json = external_account_json(serde_json::json!({
+            "url": "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/identity",
+            "headers": {"Metadata-Flavor": "Google"},
+        }))
+        .to_string();
+        let err = parse_credentials_json(json.as_bytes()).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert!(err.message().contains("https"), "{}", err.message());
+    }
+
+    /// Workforce (user-identity) federation needs an STS `options` parameter
+    /// this client does not send; accepting the config and failing every
+    /// refresh would be worse than naming the limitation at parse.
+    #[test]
+    fn parse_external_account_rejects_workforce_credentials() {
+        let mut by_audience = external_account_json(serde_json::json!({"file": "/var/run/token"}));
+        by_audience["audience"] = serde_json::json!(
+            "//iam.googleapis.com/locations/global/workforcePools/pool/providers/v"
+        );
+        let mut by_field = external_account_json(serde_json::json!({"file": "/var/run/token"}));
+        by_field["workforce_pool_user_project"] = serde_json::json!("proj-1");
+        for json in [by_audience, by_field] {
+            let err = parse_credentials_json(json.to_string().as_bytes()).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+            assert!(err.message().contains("workforce"), "{}", err.message());
+        }
+    }
+
+    /// A present-but-malformed field must fail closed, not read as absent:
+    /// for `service_account_impersonation_url` the absent reading silently
+    /// returns the federated token under the WRONG identity instead of
+    /// rejecting the credential.
+    #[test]
+    fn parse_external_account_fails_closed_on_malformed_optional_fields() {
+        for (field, value) in [
+            ("service_account_impersonation_url", serde_json::json!(42)),
+            ("service_account_impersonation_url", serde_json::Value::Null),
+            (
+                "service_account_impersonation_url",
+                serde_json::json!("   "),
+            ),
+            (
+                "token_url",
+                serde_json::json!(["https://sts.googleapis.com"]),
+            ),
+        ] {
+            let mut json = external_account_json(serde_json::json!({"file": "/var/run/token"}));
+            json[field] = value.clone();
+            let err = parse_credentials_json(json.to_string().as_bytes()).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{field}={value}");
+            assert!(
+                err.message().contains(field),
+                "{field}={value}: {}",
+                err.message()
+            );
+        }
+    }
+
+    /// The subject-token fetch may authenticate with a header value, and the
+    /// source URL's query string is operator-controlled; neither may survive
+    /// into a `{:?}` rendering.
+    #[test]
+    fn debug_redacts_subject_token_source_secrets() {
+        let json = external_account_json(serde_json::json!({
+            "url": "https://issuer.example/token?bearer=REQUEST-SECRET",
+            "headers": {"Authorization": "Bearer HEADER-SECRET"},
+            "format": {"type": "json", "subject_token_field_name": "value"},
+        }))
+        .to_string();
+        let source = parse_credentials_json(json.as_bytes()).expect("parses");
+        let rendered = format!("{source:?}");
+        assert!(!rendered.contains("REQUEST-SECRET"), "{rendered}");
+        assert!(!rendered.contains("HEADER-SECRET"), "{rendered}");
+        assert!(
+            rendered.contains("https://issuer.example/token"),
+            "the origin+path stays diagnostic: {rendered}"
+        );
     }
 
     #[tokio::test]
@@ -1560,7 +2687,9 @@ mod promotion_latch_tests {
     }
 
     /// The storage epoch is what a promotion witness compares, so it must move
-    /// on a refusal and stay still otherwise.
+    /// on a refusal and stay still otherwise (external-account note: the same
+    /// witness protocol covers WIF connections because the epoch lives on the
+    /// authenticator, not the credential shape).
     ///
     /// Driven through `note_promotion_evidence` rather than by calling
     /// `note_refusal` by hand: the latter would assert `fetch_add`
@@ -1597,6 +2726,514 @@ mod promotion_latch_tests {
             auth.refusal_epoch(),
             before + 1,
             "a 401 is the service refusing this credential"
+        );
+    }
+}
+
+#[cfg(test)]
+mod external_account_exchange_tests {
+    use super::*;
+    use ovstorage_plugin::{SecretBytes, SecretValue};
+    use ovstorage_plugin_test::{CannedHttpResponse, ScriptedHttpServer};
+
+    const STS_OK_BODY: &str = "{\"access_token\": \"sts-federated-token\", \"token_type\": \"Bearer\", \"expires_in\": 3599}";
+
+    fn impersonation_ok_body(lifetime_seconds: i64) -> String {
+        let expire_time = (time::OffsetDateTime::now_utc()
+            + time::Duration::seconds(lifetime_seconds))
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("rfc3339");
+        format!("{{\"accessToken\": \"impersonated-token\", \"expireTime\": \"{expire_time}\"}}")
+    }
+
+    fn bundle_with_json(json: &serde_json::Value) -> SecretBundle {
+        let mut bundle = SecretBundle::default();
+        bundle.fields.insert(
+            "service_account_key".into(),
+            SecretValue::Bytes(SecretBytes(json.to_string().into_bytes())),
+        );
+        bundle
+    }
+
+    fn external_account_bundle(
+        token_url: &str,
+        source: serde_json::Value,
+        impersonation_url: Option<&str>,
+    ) -> SecretBundle {
+        let mut json = serde_json::json!({
+            "type": "external_account",
+            "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/v",
+            "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+            "token_url": token_url,
+            "credential_source": source,
+        });
+        if let Some(url) = impersonation_url {
+            json["service_account_impersonation_url"] = serde_json::json!(url);
+        }
+        bundle_with_json(&json)
+    }
+
+    fn subject_token_file(contents: &str) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().expect("temp subject-token file");
+        std::fs::write(file.path(), contents).expect("write subject token");
+        file
+    }
+
+    /// The direct (no-impersonation) exchange: the STS answer IS the bearer,
+    /// and the request carries the token-exchange grant, the subject token
+    /// read from the file, and the STORAGE scopes (nothing narrows them —
+    /// there is no second hop to carry them instead).
+    #[tokio::test]
+    async fn a_file_sourced_subject_token_exchanges_at_sts() {
+        let file = subject_token_file("github-oidc-jwt");
+        let sts = ScriptedHttpServer::spawn(CannedHttpResponse::json("200 OK", STS_OK_BODY));
+        let bundle = external_account_bundle(
+            sts.endpoint(),
+            serde_json::json!({"file": file.path().to_str().unwrap()}),
+            None,
+        );
+        let auth = Authenticator::new(&bundle, reqwest::Client::new()).expect("build");
+        let (token, _ttl) = auth.refresh_now().await.expect("exchange");
+        assert_eq!(token, "sts-federated-token");
+        assert!(!auth.credential_refused());
+
+        let requests = sts.requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(
+            request.contains("urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange"),
+            "token-exchange grant missing: {request}"
+        );
+        assert!(
+            request.contains("github-oidc-jwt"),
+            "subject token missing: {request}"
+        );
+        assert!(
+            request.contains("devstorage.full_control"),
+            "storage scope missing on the direct exchange: {request}"
+        );
+    }
+
+    /// With an impersonation URL the STS leg asks only for cloud-platform,
+    /// the hop spends the federated bearer, and the final token/TTL come
+    /// from the `generateAccessToken` answer.
+    #[tokio::test]
+    async fn an_impersonation_hop_spends_the_federated_token() {
+        let file = subject_token_file("github-oidc-jwt");
+        let sts = ScriptedHttpServer::spawn(CannedHttpResponse::json("200 OK", STS_OK_BODY));
+        let iam = ScriptedHttpServer::spawn(CannedHttpResponse::json(
+            "200 OK",
+            impersonation_ok_body(1800),
+        ));
+        let bundle = external_account_bundle(
+            sts.endpoint(),
+            serde_json::json!({"file": file.path().to_str().unwrap()}),
+            Some(iam.endpoint()),
+        );
+        let auth = Authenticator::new(&bundle, reqwest::Client::new()).expect("build");
+        let (token, ttl) = auth.refresh_now().await.expect("exchange");
+        assert_eq!(token, "impersonated-token");
+        assert!(
+            ttl >= Duration::from_secs(1700) && ttl <= Duration::from_secs(1900),
+            "expireTime must translate into a ~1800s ttl, got {ttl:?}"
+        );
+
+        let sts_request = &sts.requests()[0];
+        assert!(
+            sts_request.contains("cloud-platform"),
+            "the federated leg only needs to reach IAM Credentials: {sts_request}"
+        );
+        assert!(
+            !sts_request.contains("devstorage.full_control"),
+            "storage scopes belong to the impersonated token: {sts_request}"
+        );
+        let iam_request = &iam.requests()[0];
+        assert!(
+            iam_request.contains("authorization: Bearer sts-federated-token")
+                || iam_request.contains("Authorization: Bearer sts-federated-token"),
+            "the hop must spend the federated bearer: {iam_request}"
+        );
+        assert!(
+            iam_request.contains("devstorage.full_control"),
+            "the impersonated token carries the storage scopes: {iam_request}"
+        );
+    }
+
+    /// Federation platforms rotate the subject token out from under a running
+    /// process; caching the first read would strand every later refresh on a
+    /// stale token. Each exchange must carry the file's CURRENT contents.
+    #[tokio::test]
+    async fn the_subject_token_is_reread_on_every_exchange() {
+        let file = subject_token_file("first-token");
+        let sts = ScriptedHttpServer::spawn_sequence(vec![
+            Some(CannedHttpResponse::json("200 OK", STS_OK_BODY)),
+            Some(CannedHttpResponse::json("200 OK", STS_OK_BODY)),
+        ]);
+        let bundle = external_account_bundle(
+            sts.endpoint(),
+            serde_json::json!({"file": file.path().to_str().unwrap()}),
+            None,
+        );
+        let auth = Authenticator::new(&bundle, reqwest::Client::new()).expect("build");
+        auth.refresh_now().await.expect("first exchange");
+        std::fs::write(file.path(), "second-token").expect("rotate subject token");
+        auth.refresh_now().await.expect("second exchange");
+
+        let requests = sts.requests();
+        assert!(requests[0].contains("first-token"), "{}", requests[0]);
+        assert!(
+            requests[1].contains("second-token"),
+            "the rotated token must be picked up: {}",
+            requests[1]
+        );
+    }
+
+    /// The url-sourced flavor (GitHub Actions): the fetch sends the
+    /// configured headers, the subject token is plucked out of the JSON
+    /// answer by field name, and the exchange proceeds as usual.
+    #[tokio::test]
+    async fn a_url_sourced_subject_token_is_fetched_with_headers() {
+        let issuer = ScriptedHttpServer::spawn(CannedHttpResponse::json(
+            "200 OK",
+            "{\"value\": \"issued-oidc-jwt\", \"count\": 1}",
+        ));
+        let sts = ScriptedHttpServer::spawn(CannedHttpResponse::json("200 OK", STS_OK_BODY));
+        let bundle = external_account_bundle(
+            sts.endpoint(),
+            serde_json::json!({
+                "url": issuer.endpoint(),
+                "headers": {"Authorization": "Bearer runner-request-token"},
+                "format": {"type": "json", "subject_token_field_name": "value"},
+            }),
+            None,
+        );
+        let auth = Authenticator::new(&bundle, reqwest::Client::new()).expect("build");
+        let (token, _ttl) = auth.refresh_now().await.expect("exchange");
+        assert_eq!(token, "sts-federated-token");
+
+        let issuer_request = &issuer.requests()[0];
+        assert!(
+            issuer_request.contains("runner-request-token"),
+            "the configured header must reach the issuer: {issuer_request}"
+        );
+        assert!(
+            sts.requests()[0].contains("issued-oidc-jwt"),
+            "the extracted field is the subject token: {}",
+            sts.requests()[0]
+        );
+    }
+
+    /// A missing subject-token file is the PLATFORM being unavailable, not
+    /// the IdP refusing a grant: `CredentialUnavailable`, and no latch —
+    /// latching would withhold promotions from a credential nobody refused.
+    #[tokio::test]
+    async fn a_missing_subject_token_file_does_not_latch() {
+        let sts = ScriptedHttpServer::spawn(CannedHttpResponse::json("200 OK", STS_OK_BODY));
+        let bundle = external_account_bundle(
+            sts.endpoint(),
+            serde_json::json!({"file": "/nonexistent/subject-token"}),
+            None,
+        );
+        let auth = Authenticator::new(&bundle, reqwest::Client::new()).expect("build");
+        let err = auth.refresh_now().await.expect_err("no file to read");
+        assert_eq!(err.code(), ErrorCode::CredentialUnavailable);
+        assert!(!auth.credential_refused());
+        assert_eq!(sts.hits(), 0, "nothing to exchange, so STS is never asked");
+    }
+
+    /// An STS 400 is the IdP refusing the grant — the same latch a refused
+    /// refresh-token grant earns.
+    #[tokio::test]
+    async fn an_sts_refusal_latches() {
+        let file = subject_token_file("expired-oidc-jwt");
+        let sts = ScriptedHttpServer::spawn(CannedHttpResponse::json(
+            "400 Bad Request",
+            "{\"error\": \"invalid_grant\"}",
+        ));
+        let bundle = external_account_bundle(
+            sts.endpoint(),
+            serde_json::json!({"file": file.path().to_str().unwrap()}),
+            None,
+        );
+        let auth = Authenticator::new(&bundle, reqwest::Client::new()).expect("build");
+        let err = auth.refresh_now().await.expect_err("scripted refusal");
+        assert_eq!(err.code(), ErrorCode::AuthRequired);
+        assert!(auth.credential_refused());
+    }
+
+    /// The impersonation hop follows the established status judgment: 401
+    /// refuses the credential and latches; 403 is a PERMISSION verdict on the
+    /// principal-to-SA binding — often IAM propagation lag minutes after
+    /// setup — and parking permanently on it would strand a binding that is
+    /// about to work. The error still surfaces; only the latch is withheld.
+    #[tokio::test]
+    async fn impersonation_statuses_follow_the_grant_refusal_vocabulary() {
+        for (status, body, expect_latch, expect_reason) in [
+            (
+                "401 Unauthorized",
+                "{\"error\": {\"status\": \"UNAUTHENTICATED\"}}",
+                true,
+                "impersonation_http_401",
+            ),
+            (
+                "403 Forbidden",
+                "{\"error\": {\"status\": \"PERMISSION_DENIED\"}}",
+                false,
+                "impersonation_http_403",
+            ),
+        ] {
+            let file = subject_token_file("github-oidc-jwt");
+            let sts = ScriptedHttpServer::spawn(CannedHttpResponse::json("200 OK", STS_OK_BODY));
+            let iam = ScriptedHttpServer::spawn(CannedHttpResponse::json(status, body));
+            let bundle = external_account_bundle(
+                sts.endpoint(),
+                serde_json::json!({"file": file.path().to_str().unwrap()}),
+                Some(iam.endpoint()),
+            );
+            let auth = Authenticator::new(&bundle, reqwest::Client::new()).expect("build");
+            let err = auth.refresh_now().await.expect_err(status);
+            assert_eq!(err.code(), ErrorCode::AuthRequired, "{status}");
+            assert_eq!(auth.credential_refused(), expect_latch, "{status}");
+            // The hop's own tag, not token_exchange_*: the driver parks on
+            // the 403 while the latch stays clear, a split a shared tag
+            // could not express.
+            match err.context() {
+                Some(ovstorage_plugin::ErrorContext::Auth { reason, .. }) => {
+                    assert_eq!(reason.as_deref(), Some(expect_reason), "{status}");
+                }
+                other => panic!("expected Auth context for {status}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Transport errors on the STS / impersonation endpoints must not leak
+    /// the endpoint URL: reqwest embeds the full request URL — query string
+    /// included — in its error Display, and these URLs are
+    /// operator-controlled.
+    #[tokio::test]
+    async fn a_token_transport_error_does_not_leak_the_endpoint_url() {
+        let file = subject_token_file("github-oidc-jwt");
+        // Port 1 refuses immediately; the query value plays the secret.
+        // Loopback, so the parse-time endpoint gate admits it.
+        let bundle = external_account_bundle(
+            "http://127.0.0.1:1/token?api_key=STS-QUERY-SECRET",
+            serde_json::json!({"file": file.path().to_str().unwrap()}),
+            None,
+        );
+        let auth = Authenticator::new(&bundle, reqwest::Client::new()).expect("build");
+        let err = auth.refresh_now().await.expect_err("nothing listens on :1");
+        assert_eq!(err.code(), ErrorCode::AuthRequired);
+        assert!(
+            !err.message().contains("STS-QUERY-SECRET"),
+            "the token_url query survived into the message: {}",
+            err.message()
+        );
+    }
+
+    /// The IAM error body gets the same suppression as every provider body:
+    /// the nested status code escapes, the message (which echoes the request)
+    /// does not.
+    #[tokio::test]
+    async fn an_impersonation_error_body_is_reported_by_code_alone() {
+        let file = subject_token_file("github-oidc-jwt");
+        let sts = ScriptedHttpServer::spawn(CannedHttpResponse::json("200 OK", STS_OK_BODY));
+        let iam = ScriptedHttpServer::spawn(CannedHttpResponse::json(
+            "403 Forbidden",
+            "{\"error\": {\"status\": \"PERMISSION_DENIED\", \"message\": \"Permission denied on sa-with-SECRET-name\"}}",
+        ));
+        let bundle = external_account_bundle(
+            sts.endpoint(),
+            serde_json::json!({"file": file.path().to_str().unwrap()}),
+            Some(iam.endpoint()),
+        );
+        let auth = Authenticator::new(&bundle, reqwest::Client::new()).expect("build");
+        let err = auth.refresh_now().await.expect_err("scripted 403");
+        assert!(
+            err.message().contains("PERMISSION_DENIED"),
+            "{}",
+            err.message()
+        );
+        assert!(
+            !err.message().contains("SECRET-name"),
+            "the IAM message echoes the request and must not escape: {}",
+            err.message()
+        );
+    }
+
+    /// A 200 impersonation answer with no usable accessToken produced no
+    /// credential — the same one-condition rule the OAuth path pins.
+    #[tokio::test]
+    async fn an_impersonation_grant_without_a_bearer_is_definitive() {
+        let file = subject_token_file("github-oidc-jwt");
+        let sts = ScriptedHttpServer::spawn(CannedHttpResponse::json("200 OK", STS_OK_BODY));
+        let iam = ScriptedHttpServer::spawn(CannedHttpResponse::json(
+            "200 OK",
+            "{\"expireTime\": \"2099-01-01T00:00:00Z\"}",
+        ));
+        let bundle = external_account_bundle(
+            sts.endpoint(),
+            serde_json::json!({"file": file.path().to_str().unwrap()}),
+            Some(iam.endpoint()),
+        );
+        let auth = Authenticator::new(&bundle, reqwest::Client::new()).expect("build");
+        let err = auth.refresh_now().await.expect_err("no bearer");
+        assert_eq!(err.code(), ErrorCode::AuthRequired);
+        assert!(auth.credential_refused());
+    }
+
+    /// An external-account SOURCE inside an impersonated credential must ask
+    /// STS for cloud-platform, never the storage scopes: its bearer's only
+    /// job is the `generateAccessToken` call, which refuses storage-scoped
+    /// callers. (The natural no-impersonation scope choice would pick the
+    /// storage scopes here — the regression this pins.)
+    #[tokio::test]
+    async fn an_external_account_source_is_exchanged_with_cloud_platform_scope() {
+        let file = subject_token_file("gke-projected-jwt");
+        let sts = ScriptedHttpServer::spawn(CannedHttpResponse::json("200 OK", STS_OK_BODY));
+        let iam = ScriptedHttpServer::spawn(CannedHttpResponse::json(
+            "200 OK",
+            impersonation_ok_body(3600),
+        ));
+        let json = serde_json::json!({
+            "type": "impersonated_service_account",
+            "service_account_impersonation_url": iam.endpoint(),
+            "source_credentials": {
+                "type": "external_account",
+                "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/v",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "token_url": sts.endpoint(),
+                "credential_source": {"file": file.path().to_str().unwrap()},
+            },
+        });
+        let auth =
+            Authenticator::new(&bundle_with_json(&json), reqwest::Client::new()).expect("build");
+        let (token, _ttl) = auth.refresh_now().await.expect("exchange");
+        assert_eq!(token, "impersonated-token");
+        let sts_request = &sts.requests()[0];
+        assert!(
+            sts_request.contains("cloud-platform"),
+            "the source bearer must be allowed onto IAM Credentials: {sts_request}"
+        );
+        assert!(
+            !sts_request.contains("devstorage.full_control"),
+            "a storage-scoped bearer is refused by generateAccessToken: {sts_request}"
+        );
+        assert!(
+            iam.requests()[0].contains("sts-federated-token"),
+            "the federated bearer pays for the hop: {}",
+            iam.requests()[0]
+        );
+    }
+
+    /// The double-impersonation spelling — an external-account source that
+    /// itself names an impersonation URL — is rejected at parse, like nested
+    /// `impersonated_service_account`.
+    #[tokio::test]
+    async fn an_impersonating_external_account_source_is_rejected_at_parse() {
+        let json = serde_json::json!({
+            "type": "impersonated_service_account",
+            "service_account_impersonation_url": "https://iamcredentials.googleapis.com/outer",
+            "source_credentials": {
+                "type": "external_account",
+                "audience": "//iam.googleapis.com/x",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "credential_source": {"file": "/var/run/token"},
+                "service_account_impersonation_url": "https://iamcredentials.googleapis.com/inner",
+            },
+        })
+        .to_string();
+        let err = parse_credentials_json(json.as_bytes()).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert!(err.message().contains("nest"), "{}", err.message());
+    }
+
+    /// A PARSEABLE expireTime already in the past clamps the TTL to zero
+    /// (the leeway floor takes over) instead of riding the 3600s
+    /// absent-field fallback — an hour of caching for a bearer the server
+    /// said is dead.
+    #[tokio::test]
+    async fn a_past_expire_time_does_not_ride_the_default_lifetime() {
+        let file = subject_token_file("github-oidc-jwt");
+        let sts = ScriptedHttpServer::spawn(CannedHttpResponse::json("200 OK", STS_OK_BODY));
+        let iam = ScriptedHttpServer::spawn(CannedHttpResponse::json(
+            "200 OK",
+            impersonation_ok_body(-600),
+        ));
+        let bundle = external_account_bundle(
+            sts.endpoint(),
+            serde_json::json!({"file": file.path().to_str().unwrap()}),
+            Some(iam.endpoint()),
+        );
+        let auth = Authenticator::new(&bundle, reqwest::Client::new()).expect("build");
+        let (_token, ttl) = auth.refresh_now().await.expect("exchange");
+        assert!(
+            ttl <= REFRESH_LEEWAY + Duration::from_secs(1),
+            "a dead bearer must get the minimum caching window, got {ttl:?}"
+        );
+    }
+
+    /// A transport failure on the subject-token fetch must not leak the
+    /// endpoint URL: its query string is operator-controlled and may carry a
+    /// token (reqwest embeds the full URL in its error Display by default).
+    #[tokio::test]
+    async fn a_subject_token_transport_error_does_not_leak_the_url() {
+        let sts = ScriptedHttpServer::spawn(CannedHttpResponse::json("200 OK", STS_OK_BODY));
+        let bundle = external_account_bundle(
+            sts.endpoint(),
+            serde_json::json!({
+                // Port 1 refuses immediately; the query value plays the secret.
+                "url": "http://127.0.0.1:1/token?bearer=URL-QUERY-SECRET",
+                "format": {"type": "json", "subject_token_field_name": "value"},
+            }),
+            None,
+        );
+        let auth = Authenticator::new(&bundle, reqwest::Client::new()).expect("build");
+        let err = auth.refresh_now().await.expect_err("nothing listens on :1");
+        assert_eq!(err.code(), ErrorCode::CredentialUnavailable);
+        assert!(
+            !err.message().contains("URL-QUERY-SECRET"),
+            "the operator-controlled query survived into the message: {}",
+            err.message()
+        );
+    }
+
+    /// `impersonated_service_account` ADC: the source credential's grant runs
+    /// first, its bearer pays for the hop, and the delegates ride along.
+    #[tokio::test]
+    async fn impersonated_credentials_mint_the_source_bearer_first() {
+        let idp = ScriptedHttpServer::spawn(CannedHttpResponse::json(
+            "200 OK",
+            "{\"access_token\": \"source-user-token\", \"expires_in\": 3600}",
+        ));
+        let iam = ScriptedHttpServer::spawn(CannedHttpResponse::json(
+            "200 OK",
+            impersonation_ok_body(3600),
+        ));
+        let json = serde_json::json!({
+            "type": "impersonated_service_account",
+            "service_account_impersonation_url": iam.endpoint(),
+            "delegates": ["chain@p.iam.gserviceaccount.com"],
+            "source_credentials": {
+                "type": "authorized_user",
+                "client_id": "abc",
+                "client_secret": "shh",
+                "refresh_token": "rt",
+                "token_uri": idp.endpoint(),
+            },
+        });
+        let auth =
+            Authenticator::new(&bundle_with_json(&json), reqwest::Client::new()).expect("build");
+        let (token, _ttl) = auth.refresh_now().await.expect("exchange");
+        assert_eq!(token, "impersonated-token");
+        assert_eq!(idp.hits(), 1, "the source grant runs first");
+        let iam_request = &iam.requests()[0];
+        assert!(
+            iam_request.contains("source-user-token"),
+            "the source bearer pays for the hop: {iam_request}"
+        );
+        assert!(
+            iam_request.contains("chain@p.iam.gserviceaccount.com"),
+            "delegates must ride along: {iam_request}"
         );
     }
 }

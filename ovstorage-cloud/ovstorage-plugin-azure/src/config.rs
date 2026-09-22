@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use ovstorage_plugin::{
     ConfigField, ConfigFieldKind, ConfigValue, ConnectionRequest, CredentialField,
-    CredentialMethod, Error, ErrorCode, Result, SecretBundle, Url, address,
+    CredentialMethod, Error, ErrorCode, LayerConfig, Result, SecretBundle, Url, address,
 };
 
 pub(crate) const BACKEND_KIND: &str = "azure";
@@ -321,6 +321,46 @@ impl AzureConnectionConfig {
         })
     }
 
+    /// The config the anonymous scheme fallback synthesizes for one
+    /// `azure://{account}/{container}/` node it derives from an address.
+    ///
+    /// It is an ordinary per-container config — the same shape a connection
+    /// would carry — so `validate_target` keeps pinning every operation to
+    /// the node the backend was built for. The fallback has no operator
+    /// telling it about the account, so it assumes the public blob tier: a
+    /// flat namespace (there is no HNS probe to run anonymously), no change
+    /// feed (`watch_directory` is refused by the fallback regardless), and no
+    /// per-tier endpoint override beyond the loopback-only test hook.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorCode::InvalidArgument`] — the account, container or suffix
+    ///   fails the same validation `from_request` applies.
+    pub(crate) fn anonymous_for(
+        account: &str,
+        container: &str,
+        endpoint_suffix: &str,
+        test_endpoint: Option<AzureEndpoint>,
+    ) -> Result<Self> {
+        validate_account_name(account)?;
+        validate_container_name(container)?;
+        validate_endpoint_suffix(endpoint_suffix)?;
+        Ok(Self {
+            account: account.to_string(),
+            container: container.to_string(),
+            endpoint_suffix: endpoint_suffix.to_string(),
+            blob_endpoint: None,
+            dfs_endpoint: None,
+            hierarchical_namespace: false,
+            change_feed_enabled: false,
+            change_feed_segment_lag_seconds: DEFAULT_CHANGE_FEED_SEGMENT_LAG_SECONDS,
+            change_feed_poll_interval_seconds: DEFAULT_CHANGE_FEED_POLL_INTERVAL_SECONDS,
+            test_change_feed_endpoint: None,
+            test_endpoint_override: test_endpoint,
+            address_root: azure_address_root(account, container)?,
+        })
+    }
+
     pub(crate) fn blob_host(&self) -> String {
         format!("{}.blob.{}", self.account, self.endpoint_suffix)
     }
@@ -460,6 +500,57 @@ impl AzureConnectionConfig {
         .into_iter()
         .flatten()
         .find(|endpoint| !endpoint.is_https() && !endpoint.is_loopback())
+    }
+
+    /// The alternate URL prefixes this connection accepts as spellings of its
+    /// `azure://{account}/{container}/` root — the value the layer stamps
+    /// under [`ovstorage_plugin::ACCEPTED_URL_SPELLINGS_METADATA_KEY`] so an
+    /// alias wrapper above can auto-generate hidden alias rules.
+    ///
+    /// Generated from [`Self::effective_blob_endpoint`] /
+    /// [`Self::effective_dfs_endpoint`] — the one place each tier's endpoint
+    /// is derived — rather than from a host template, so sovereign clouds
+    /// (`endpoint_suffix`), privatelink and custom endpoints, and path-style
+    /// Azurite (`http://127.0.0.1:10000/devstoreaccount1/{container}/`) come
+    /// out right by construction.
+    ///
+    /// The DFS (`dfs.core.windows.net`) spelling is included exactly when
+    /// `hierarchical_namespace` is set: only then does this connection
+    /// address the DFS tier at all, and under HNS the two tiers expose the
+    /// same storage account — a genuine alternate spelling of the same data.
+    /// A flat-namespace connection never issues an ADLS Gen2 request, so a
+    /// DFS URL is not a spelling of anything it serves.
+    /// **An endpoint path prefix is withheld unless the endpoint is
+    /// loopback.** This value is published in connection metadata, which
+    /// `list_connections` and `list_address_roots` return to any principal
+    /// holding the addressless introspection operation — a weaker grant than
+    /// reading the data. An endpoint path can be a capability token
+    /// (`https://gateway.example/<token>`), and connection configuration is
+    /// otherwise never returned, so generating that spelling would disclose
+    /// the token to a caller that cannot read a byte of the container. The
+    /// loopback carve-out is what keeps path-style Azurite working: its path
+    /// is the well-known `devstoreaccount1`, on an address that leaves no
+    /// host. The cost is that a remote path-bearing endpoint gets no
+    /// generated spelling — the operator can author the alias rule by hand,
+    /// which is a decision to publish that prefix rather than a default.
+    pub(crate) fn alternate_url_prefixes(&self) -> Vec<Url> {
+        let mut endpoints = vec![self.effective_blob_endpoint()];
+        if self.hierarchical_namespace {
+            endpoints.push(self.effective_dfs_endpoint());
+        }
+        // The bases carry no trailing slash by [`AzureEndpoint`] invariant and
+        // the container name is a validated DNS-safe label, so plain
+        // concatenation is exact. `address::parse` so the prefixes normalize
+        // exactly as the alias layer parses its rule config; these shapes
+        // cannot fail it, but one that somehow does is dropped rather than
+        // poisoning its neighbours.
+        endpoints
+            .iter()
+            .filter(|endpoint| endpoint.path_prefix().is_empty() || endpoint.is_loopback())
+            .filter_map(|endpoint| {
+                address::parse(&format!("{}/{}/", endpoint.base(), self.container)).ok()
+            })
+            .collect()
     }
 
     /// Short label identifying where this connection points, for
@@ -737,6 +828,10 @@ fn text_field(
 }
 
 pub(crate) fn reject_unknown_config_keys(config: &HashMap<String, ConfigValue>) -> Result<()> {
+    // A fallback key on a connection is refused by the layer first, with a
+    // message naming the layer table it belongs on; here it is one more
+    // unknown field, so it cannot sit inert on a request that reaches the
+    // parser without a layer.
     let mut unknown = config
         .keys()
         .filter(|key| {
@@ -789,7 +884,7 @@ fn required_text(config: &HashMap<String, ConfigValue>, key: &str) -> Result<Str
     }
 }
 
-fn optional_text(
+pub(crate) fn optional_text(
     config: &HashMap<String, ConfigValue>,
     key: &str,
     default: &str,
@@ -839,7 +934,11 @@ fn optional_bool(config: &HashMap<String, ConfigValue>, key: &str) -> Result<boo
     }
 }
 
-fn optional_u64(config: &HashMap<String, ConfigValue>, key: &str, default: u64) -> Result<u64> {
+pub(crate) fn optional_u64(
+    config: &HashMap<String, ConfigValue>,
+    key: &str,
+    default: u64,
+) -> Result<u64> {
     match config.get(key) {
         Some(ConfigValue::Int(value)) if *value >= 0 => Ok(*value as u64),
         Some(ConfigValue::Int(_)) => Err(Error::new(
@@ -913,6 +1012,14 @@ fn optional_test_data_endpoint(
         ));
     };
     require_loopback_endpoint(value, key)
+}
+
+/// The loopback-only `__test_endpoint` hook read off a LAYER table, for the
+/// anonymous scheme fallback: the same key, the same parser and the same
+/// loopback guard as the connection-level hook, judged with an empty
+/// credential bundle because the fallback never holds one.
+pub(crate) fn layer_test_endpoint(config: &LayerConfig) -> Result<Option<AzureEndpoint>> {
+    optional_test_data_endpoint(config, &SecretBundle::default(), "__test_endpoint")
 }
 
 /// Shared tail of both `__test_*` endpoint hooks: normalize through the same
@@ -1481,6 +1588,139 @@ mod tests {
         );
     }
 
+    fn prefixes(config: &AzureConnectionConfig) -> Vec<String> {
+        config
+            .alternate_url_prefixes()
+            .iter()
+            .map(|url| url.as_str().to_string())
+            .collect()
+    }
+
+    /// An endpoint path prefix can be a capability token, and this value is
+    /// returned by `list_connections` / `list_address_roots` to a principal
+    /// holding only the addressless introspection operation — so a remote
+    /// path-bearing endpoint generates no spelling at all, rather than
+    /// publishing its path to a caller that cannot read the container.
+    #[test]
+    fn a_remote_endpoint_path_prefix_is_never_published_as_a_spelling() {
+        let config = config_with(&[(
+            "blob_endpoint",
+            ConfigValue::String("https://gateway.example/sas-capability-token".into()),
+        )]);
+        assert!(
+            prefixes(&config).is_empty(),
+            "a path-bearing remote endpoint must generate nothing: {:?}",
+            prefixes(&config)
+        );
+
+        // The HNS twin is filtered on its own endpoint, so a path-bearing DFS
+        // endpoint is withheld even when the blob endpoint is clean.
+        let split = config_with(&[
+            (
+                "blob_endpoint",
+                ConfigValue::String("https://acct123.blob.core.windows.net".into()),
+            ),
+            (
+                "dfs_endpoint",
+                ConfigValue::String("https://gateway.example/sas-capability-token".into()),
+            ),
+            ("hierarchical_namespace", ConfigValue::Bool(true)),
+        ]);
+        assert_eq!(
+            prefixes(&split),
+            vec!["https://acct123.blob.core.windows.net/assets/"],
+            "the clean tier still generates; the path-bearing one does not"
+        );
+    }
+
+    /// The loopback carve-out: path-style Azurite keeps its spelling. Its
+    /// path is the well-known emulator account, on an address that never
+    /// leaves the host.
+    #[test]
+    fn a_loopback_endpoint_path_prefix_is_still_published() {
+        assert_eq!(
+            prefixes(&config_with(&[(
+                "blob_endpoint",
+                ConfigValue::String("http://127.0.0.1:10000/devstoreaccount1".into()),
+            )])),
+            vec!["http://127.0.0.1:10000/devstoreaccount1/assets/"]
+        );
+    }
+
+    /// The generated spellings come from the effective endpoints — the same
+    /// derivation the request signer uses — so the natural host, a sovereign
+    /// suffix, a custom endpoint, and path-style Azurite are each exact by
+    /// construction.
+    #[test]
+    fn alternate_spellings_follow_the_effective_blob_endpoint() {
+        assert_eq!(
+            prefixes(&config_with(&[])),
+            vec!["https://acct123.blob.core.windows.net/assets/"]
+        );
+        assert_eq!(
+            prefixes(&config_with(&[(
+                "endpoint_suffix",
+                ConfigValue::String("core.chinacloudapi.cn".into()),
+            )])),
+            vec!["https://acct123.blob.core.chinacloudapi.cn/assets/"]
+        );
+        assert_eq!(
+            prefixes(&config_with(&[(
+                "blob_endpoint",
+                ConfigValue::String("https://myaccount.privatelink.blob.core.windows.net".into()),
+            )])),
+            vec!["https://myaccount.privatelink.blob.core.windows.net/assets/"]
+        );
+        // Path-style Azurite: the account path prefix precedes the container.
+        assert_eq!(
+            prefixes(&config_with(&[(
+                "blob_endpoint",
+                ConfigValue::String("http://127.0.0.1:10000/devstoreaccount1".into()),
+            )])),
+            vec!["http://127.0.0.1:10000/devstoreaccount1/assets/"]
+        );
+    }
+
+    /// The DFS spelling exists exactly when the connection addresses the DFS
+    /// tier: under `hierarchical_namespace` the same account answers on both
+    /// hosts, and without it a DFS URL names nothing this connection serves.
+    #[test]
+    fn the_dfs_spelling_is_generated_only_under_hns() {
+        assert_eq!(
+            prefixes(&config_with(&[(
+                "hierarchical_namespace",
+                ConfigValue::Bool(true),
+            )])),
+            vec![
+                "https://acct123.blob.core.windows.net/assets/",
+                "https://acct123.dfs.core.windows.net/assets/",
+            ]
+        );
+        // Flat namespace: blob tier only, even with a dfs_endpoint configured
+        // (a lone dfs_endpoint is inert without HNS).
+        assert_eq!(
+            prefixes(&config_with(&[(
+                "dfs_endpoint",
+                ConfigValue::String("http://azurite:10001/devstoreaccount1".into()),
+            )])),
+            vec!["https://acct123.blob.core.windows.net/assets/"]
+        );
+        // HNS with a custom DFS endpoint follows that endpoint.
+        assert_eq!(
+            prefixes(&config_with(&[
+                ("hierarchical_namespace", ConfigValue::Bool(true)),
+                (
+                    "dfs_endpoint",
+                    ConfigValue::String("https://private.dfs.example.com".into()),
+                ),
+            ])),
+            vec![
+                "https://acct123.blob.core.windows.net/assets/",
+                "https://private.dfs.example.com/assets/",
+            ]
+        );
+    }
+
     #[test]
     fn endpoint_keys_are_accepted_and_published() {
         assert!(CONFIG_KEYS.contains(&"blob_endpoint"));
@@ -1495,5 +1735,146 @@ mod tests {
             .expect("endpoint_suffix is in the schema");
         assert_eq!(keys[suffix + 1], "blob_endpoint");
         assert_eq!(keys[suffix + 2], "dfs_endpoint");
+    }
+
+    /// The fallback's synthesized config is an ordinary flat-namespace,
+    /// public-tier config for the node, so every pin `validate_target`
+    /// applies to a connection applies to a fallback backend too.
+    #[test]
+    fn an_anonymous_config_is_a_flat_public_tier_config_for_the_node() {
+        let config = AzureConnectionConfig::anonymous_for(
+            "acct123",
+            "assets",
+            DEFAULT_ENDPOINT_SUFFIX,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.account, "acct123");
+        assert_eq!(config.container, "assets");
+        assert_eq!(config.address_root.as_str(), "azure://acct123/assets/");
+        assert_eq!(
+            config.blob_url_base(),
+            "https://acct123.blob.core.windows.net"
+        );
+        assert!(!config.hierarchical_namespace);
+        assert!(!config.change_feed_enabled);
+        assert_eq!(config.blob_endpoint, None);
+        assert_eq!(config.dfs_endpoint, None);
+
+        let sovereign = AzureConnectionConfig::anonymous_for(
+            "acct123",
+            "assets",
+            "core.chinacloudapi.cn",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            sovereign.blob_url_base(),
+            "https://acct123.blob.core.chinacloudapi.cn"
+        );
+
+        let test_endpoint =
+            AzureEndpoint::parse("http://127.0.0.1:10000", "__test_endpoint").unwrap();
+        let repointed = AzureConnectionConfig::anonymous_for(
+            "acct123",
+            "assets",
+            DEFAULT_ENDPOINT_SUFFIX,
+            Some(test_endpoint),
+        )
+        .unwrap();
+        assert_eq!(repointed.blob_url_base(), "http://127.0.0.1:10000");
+
+        for (account, container, suffix) in [
+            ("Upper", "assets", DEFAULT_ENDPOINT_SUFFIX),
+            ("acct123", "a", DEFAULT_ENDPOINT_SUFFIX),
+            ("acct123", "assets", "https://core.windows.net"),
+        ] {
+            let err = AzureConnectionConfig::anonymous_for(account, container, suffix, None)
+                .expect_err("the connection validators apply to the fallback too");
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        }
+    }
+
+    /// A fallback key belongs on the layer table. The layer refuses it on a
+    /// connection request with a message naming that table; the parser, which
+    /// has no layer name in scope, still refuses it by name as an unknown
+    /// field, so the key cannot sit inert on a request that reaches the
+    /// parser directly.
+    #[test]
+    fn a_fallback_key_on_a_connection_request_is_not_connection_config() {
+        for key in [
+            "anonymous_fallback",
+            "anonymous_fallback_endpoint_suffix",
+            "anonymous_fallback_max_backends",
+        ] {
+            let err = AzureConnectionConfig::from_request(&request_with(&[(
+                key,
+                ConfigValue::String("azure".into()),
+            )]))
+            .expect_err("a fallback key is not connection config");
+            assert_eq!(err.code(), ErrorCode::InvalidArgument);
+            assert!(
+                err.message().contains(key),
+                "the refusal names the key: {}",
+                err.message()
+            );
+        }
+    }
+
+    /// The layer-level test hook is the connection-level one judged with no
+    /// credential: the same loopback guard, the same shape refusals.
+    #[test]
+    fn the_layer_test_endpoint_hook_is_loopback_only() {
+        let mut layer = LayerConfig::new();
+        assert_eq!(layer_test_endpoint(&layer).unwrap(), None);
+
+        layer.insert(
+            "__test_endpoint".into(),
+            ConfigValue::String("http://127.0.0.1:10000".into()),
+        );
+        let endpoint = layer_test_endpoint(&layer).unwrap().unwrap();
+        assert_eq!(endpoint.base(), "http://127.0.0.1:10000");
+
+        layer.insert(
+            "__test_endpoint".into(),
+            ConfigValue::String("https://storage.invalid.example".into()),
+        );
+        let err = layer_test_endpoint(&layer).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert!(err.message().contains("loopback"), "{}", err.message());
+    }
+
+    /// The fallback's hook is the only endpoint text the fallback takes
+    /// whole, and reqwest turns URL userinfo into a Basic `Authorization`
+    /// header on every request built from it — which would put a credential
+    /// on a wire the fallback promises carries none. The shapes are pinned on
+    /// a LOOPBACK authority so the loopback guard is not what refuses them:
+    /// userinfo, a query and a fragment each fail in the parser that rebuilds
+    /// the base from scheme, host, port and path, and the refusal names the
+    /// shape without echoing the value.
+    #[test]
+    fn the_layer_test_endpoint_hook_refuses_userinfo_a_query_and_a_fragment_on_loopback() {
+        for (raw, shape) in [
+            ("http://user:s3cret@127.0.0.1:10000", "credentials"),
+            ("http://s3cret@127.0.0.1:10000", "credentials"),
+            ("http://127.0.0.1:10000?sig=s3cret", "query string"),
+            ("http://127.0.0.1:10000#s3cret", "fragment"),
+        ] {
+            let mut layer = LayerConfig::new();
+            layer.insert("__test_endpoint".into(), ConfigValue::String(raw.into()));
+            let err = layer_test_endpoint(&layer).expect_err(raw);
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{raw}");
+            assert!(err.message().contains(shape), "{raw}: {}", err.message());
+            assert!(
+                !err.message().contains("loopback"),
+                "{raw}: refused on shape, not on host: {}",
+                err.message()
+            );
+            assert!(
+                !err.message().contains("s3cret"),
+                "{raw}: the refusal echoes the value: {}",
+                err.message()
+            );
+        }
     }
 }

@@ -81,6 +81,51 @@ pub(crate) enum InteractiveOutcome {
     TransportError(anyhow::Error),
 }
 
+/// Maximum size of a rendered polling transport error exposed to logs or the host.
+const TRANSPORT_ERROR_MAX_BYTES: usize = 512;
+
+/// Redact and bound a transport error before exposing it outside the handshake.
+///
+/// `redact_message` deliberately returns arbitrary prose unchanged unless it
+/// contains `://` or `bearer`, and its parser-based URL pass preserves a URL
+/// span it cannot parse. The transport redactor supplies the total lexical
+/// fallback for those malformed spans and bounds its own synchronous scan.
+/// Its bounded output is all the shared scanner receives, so a serde diagnostic
+/// containing a multi-megabyte server-chosen value cannot turn this error path
+/// into an avoidable denial-of-service surface.
+///
+/// Redaction is followed by a byte bound because arbitrary prose remains
+/// arbitrary prose. The truncation marker is included in the cap, reports the
+/// complete rendered input length, and the retained prefix ends at a UTF-8
+/// character boundary.
+pub(crate) fn sanitized_transport_error(err: &anyhow::Error) -> String {
+    let rendered = format!("{err:#}");
+    let original_len = rendered.len();
+
+    // The standalone transport redactor is lexical and total, so malformed
+    // credential-bearing URL spans do not inherit `redact_message`'s
+    // parse-failure fallback of copying the original span. Keep the shared
+    // redactor as the richer pass for valid signed cloud URLs. Passing the full
+    // rendering also lets the transport redactor's marker report the true
+    // input length; it owns the bounded working prefix internally.
+    let lexically_redacted = nucleus_transport::redact::redact_server_text(&rendered);
+    let redacted = ovstorage_plugin::redact::redact_message(&lexically_redacted);
+    if redacted.len() <= TRANSPORT_ERROR_MAX_BYTES {
+        return redacted.into_owned();
+    }
+
+    let marker = format!(" [truncated; original length: {original_len} bytes]");
+    let mut prefix_len = redacted.len().min(TRANSPORT_ERROR_MAX_BYTES - marker.len());
+    while !redacted.is_char_boundary(prefix_len) {
+        prefix_len -= 1;
+    }
+
+    let mut bounded = String::with_capacity(prefix_len + marker.len());
+    bounded.push_str(&redacted[..prefix_len]);
+    bounded.push_str(&marker);
+    bounded
+}
+
 /// Drive the Nucleus URL+nonce-poll handshake.
 ///
 /// Discovers `Credentials` + `Tokens`, calls `start_interactive` for
@@ -265,11 +310,16 @@ pub(crate) async fn establish_interactive_auth(
             None
         }
         InteractiveOutcome::TransportError(err) => {
-            tracing::warn!(err = %err, "nucleus interactive auth transport error during polling");
+            // Keep this plugin-side pass even when transports sanitize errors at
+            // their source: `Subscription::recv` can return a serde error whose
+            // Display text includes server-controlled frame content that the
+            // transport cannot rewrite before it reaches this boundary.
+            let sanitized = sanitized_transport_error(&err);
+            tracing::warn!(err = %sanitized, "nucleus interactive auth transport error during polling");
             push(Ok(AuthEvent::Failed {
                 error: Error::new(
                     ErrorCode::Transient,
-                    format!("Nucleus subscription error during polling: {err:#}"),
+                    format!("Nucleus subscription error during polling: {sanitized}"),
                 )
                 .with_context(ErrorContext::Auth {
                     connection_id: connection.id,
@@ -1123,6 +1173,124 @@ mod tests {
         let (stop_tx, _stop_rx) = mpsc::channel(1);
         let finished = StdArc::new(AtomicBool::new(false));
         (Subscription::new(rx, 1, stop_tx, finished), tx)
+    }
+
+    #[test]
+    fn sanitized_transport_error_redacts_signed_url_in_rendered_chain() {
+        let err = anyhow::anyhow!(
+            "server rejected https://bucket.example/key?X-Amz-Signature=super-secret&versionId=7"
+        )
+        .context("subscription receive failed");
+
+        let sanitized = sanitized_transport_error(&err);
+
+        assert!(sanitized.starts_with("subscription receive failed: server rejected"));
+        assert!(
+            sanitized.contains("X-Amz-Signature=REDACTED"),
+            "{sanitized}"
+        );
+        assert!(sanitized.contains("versionId=7"), "{sanitized}");
+        assert!(!sanitized.contains("super-secret"), "{sanitized}");
+    }
+
+    #[test]
+    fn sanitized_transport_error_bounds_oversized_message_at_char_boundary() {
+        let oversized = "é".repeat(400);
+        let err = anyhow::anyhow!(oversized);
+
+        let sanitized = sanitized_transport_error(&err);
+
+        assert_eq!(sanitized.len(), TRANSPORT_ERROR_MAX_BYTES);
+        assert!(
+            sanitized.ends_with(" [truncated; original length: 800 bytes]"),
+            "{sanitized}"
+        );
+    }
+
+    #[test]
+    fn sanitized_transport_error_bounds_work_before_scanning_server_diagnostic() {
+        // A long scheme-shaped ASCII run is the adversarial case for a scanner
+        // that retries URL detection at every byte. The server can place one
+        // verbatim in serde's Display text, so keep this substantially larger
+        // than the working-prefix cap without making a regression test itself
+        // expensive to allocate.
+        let oversized = format!(
+            "invalid type: string \"://{}\", expected TokensAuth",
+            "a".repeat(2 * 1024 * 1024)
+        );
+        let original_len = oversized.len();
+        let err = anyhow::anyhow!(oversized);
+
+        let sanitized = sanitized_transport_error(&err);
+
+        assert!(sanitized.len() <= TRANSPORT_ERROR_MAX_BYTES, "{sanitized}");
+        assert!(
+            sanitized.ends_with(&format!(
+                " [truncated; original length: {original_len} bytes]"
+            )),
+            "{sanitized}"
+        );
+    }
+
+    #[test]
+    fn sanitized_transport_error_keeps_one_marker_when_redaction_shrinks_input() {
+        let oversized = format!(
+            "server rejected wss://h/p?access_token={}",
+            "x".repeat(2 * 1024 * 1024)
+        );
+        let original_len = oversized.len();
+        let err = anyhow::anyhow!(oversized);
+
+        let sanitized = sanitized_transport_error(&err);
+
+        assert!(sanitized.len() <= TRANSPORT_ERROR_MAX_BYTES, "{sanitized}");
+        assert!(sanitized.contains("access_token=REDACTED"), "{sanitized}");
+        assert_eq!(
+            sanitized.matches("[truncated; original length:").count(),
+            1,
+            "{sanitized}"
+        );
+        assert!(
+            sanitized.ends_with(&format!("original length: {original_len} bytes]")),
+            "{sanitized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sanitized_transport_error_redacts_malformed_url_from_auth_frame() {
+        let credential = "malformed-password-sentinel";
+        let (subscription, tx) = fake_subscription();
+        let expires_at = SystemTime::now() + Duration::from_secs(60);
+        let task = tokio::spawn(async move {
+            poll_interactive_outcome(subscription, expires_at, Duration::from_millis(50), None)
+                .await
+        });
+        tx.send(Ok(RawResponse {
+            json: format!(r#"{{"status":"https://alice:{credential}@","version":1}}"#).into_bytes(),
+            blob: None,
+        }))
+        .await
+        .unwrap();
+        let outcome = task.await.unwrap();
+        let InteractiveOutcome::TransportError(err) = outcome else {
+            panic!("expected malformed auth frame to produce a transport error");
+        };
+        assert!(
+            format!("{err:#}").contains(credential),
+            "test input must reach serde's diagnostic before sanitization"
+        );
+
+        let sanitized = sanitized_transport_error(&err);
+
+        assert!(sanitized.contains("https://alice:REDACTED@"), "{sanitized}");
+        assert!(!sanitized.contains(credential), "{sanitized}");
+    }
+
+    #[test]
+    fn sanitized_transport_error_preserves_short_benign_text() {
+        let err = anyhow::anyhow!("websocket dropped");
+
+        assert_eq!(sanitized_transport_error(&err), "websocket dropped");
     }
 
     #[tokio::test]

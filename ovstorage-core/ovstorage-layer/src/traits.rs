@@ -133,18 +133,40 @@ pub fn bail_if_cancelled(cancel: &Option<CancellationToken>) -> Result<()> {
     }
 }
 
-/// The [`ConnectionKey::target`](crate::ConnectionKey) a connection op routes
-/// to for a host-side leaf that owns a root: its sole `owned_targets` entry when
-/// it declares exactly one (the connection-owning name a loaded plugin reports
-/// across the ABI, not its outer host name), else its own `name`. THE single
-/// home for the leaf-ownership rule — shared by [`Layer::owning_target_for`]'s
-/// default and the loaded-plugin host-fill in `ovstorage-plugin`'s
-/// `root_info_for`, so the two cannot drift.
-pub fn leaf_owning_target(owned_targets: &[String], name: &str) -> String {
+/// The [`ConnectionKey::target`](crate::ConnectionKey) attributable to a layer
+/// from its `owned_targets` ALONE: its sole entry when it declares exactly one
+/// — the connection-owning name a loaded plugin reports across the ABI, not its
+/// outer host name — and `None` otherwise.
+///
+/// `None` is the honest answer for a layer owning several targets, because no
+/// name it has is a routable one: a Router's target table is built from exactly
+/// these entries, so a composite's outer host name is not in it and a key built
+/// on it answers `NotFound` at `route_target` against a graph that holds the
+/// connection.
+///
+/// THE single home for the rule. [`leaf_owning_target`] is this plus a fallback,
+/// so the two cannot drift.
+pub fn sole_owning_target(owned_targets: &[String]) -> Option<String> {
     match owned_targets {
-        [only] => only.clone(),
-        _ => name.to_string(),
+        [only] => Some(only.clone()),
+        _ => None,
     }
+}
+
+/// The [`ConnectionKey::target`](crate::ConnectionKey) a connection op routes
+/// to for a host-side leaf that owns a root: [`sole_owning_target`], else its
+/// own `name`. Shared by [`Layer::owning_target_for`]'s default and the
+/// loaded-plugin host-fill in `ovstorage-plugin`'s `root_info_for`.
+///
+/// The `name` fallback belongs to a **root**, not to a connection. A
+/// [`RootInfo`] carries the address it is about, so a caller
+/// handed an unroutable name still has [`Layer::owning_target_for`] to fall back
+/// on. A [`Connection`] carries no such recourse — one parked
+/// in `AwaitingAuth` publishes no address at all — so connection attribution
+/// takes [`sole_owning_target`] and reports `None` rather than a name that fails
+/// at use.
+pub fn leaf_owning_target(owned_targets: &[String], name: &str) -> String {
+    sole_owning_target(owned_targets).unwrap_or_else(|| name.to_string())
 }
 
 /// The uniform operation surface every layer in a chain implements.
@@ -723,6 +745,21 @@ pub trait Layer: Send + Sync {
         }
     }
 
+    /// # Ownership
+    ///
+    /// `materialize` is a host-owned slot. In a composed [`Stack`],
+    /// `ByteCacheWrapper` and `RedirectFollowerWrapper` produce the local file,
+    /// and `FileBackend` returns the path it already owns. A backend
+    /// plugin MUST NOT implement this slot: it leaves the trait default in
+    /// place and the composed `Stack` supplies the behavior.
+    ///
+    /// Ownership follows a layer's position in the composed `Stack`: host
+    /// wrapper or built-in `file` backend versus backend-plugin leaf. Local
+    /// availability is a property of the composed `Stack`, not a backend
+    /// capability, so there is no capability bit for it and none may be added.
+    /// [`docs/public/plugin-storage/OWNERSHIP.md`](../../../docs/public/plugin-storage/OWNERSHIP.md)
+    /// is the registry of record.
+    ///
     /// # Errors
     ///
     /// - [`ErrorCode::NotFound`] — no object exists at the address.
@@ -774,6 +811,62 @@ pub trait Layer: Send + Sync {
             Some(inner) => inner.list(request, cancel).await,
             None => Err(unsupported("list")),
         }
+    }
+
+    /// Stream the objects below a prefix without a page window.
+    ///
+    /// Entry ordering is backend-defined and is not contractual on this
+    /// surface. Cancellation uses the token supplied when the stream is
+    /// opened: firing it ends the stream, while dropping the stream releases
+    /// its resources. Stopping a stream makes no promise that the listing can
+    /// be resumed.
+    ///
+    /// The default is a compatibility adapter for layers that only implement
+    /// [`Layer::list`]. It deliberately calls `self.list` so wrappers that
+    /// filter or transform buffered listings are not bypassed. The adapter
+    /// buffers one full listing before yielding its entries. If `list`
+    /// returns a continuation token, the adapter fails closed because it
+    /// cannot expose that token or prove the returned page is complete.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorCode::NotFound`] — the prefix does not exist.
+    /// - [`ErrorCode::InvalidArgument`] — the prefix is an object rather
+    ///   than a directory, or `max_results` / `page_token` requests a page
+    ///   window that this streaming surface does not provide.
+    /// - [`ErrorCode::NoRoute`] — no configured root matches the prefix.
+    /// - [`ErrorCode::PermissionDenied`] — the caller may not enumerate
+    ///   the prefix.
+    /// - [`ErrorCode::Unsupported`] — the leaf default reached through the
+    ///   buffered compatibility adapter.
+    /// - [`ErrorCode::Cancelled`] — `cancel` fired while opening or consuming
+    ///   the stream.
+    /// - [`ErrorCode::Transient`] — retryable backend I/O failure.
+    /// - [`ErrorCode::Internal`] — the buffered compatibility adapter received
+    ///   a continuation token and cannot safely expose a partial listing.
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        if request.input.options.max_results.is_some() || request.input.options.page_token.is_some()
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+
+        let stream_cancel = cancel.clone();
+        let page = self.list(request, cancel).await?;
+        if page.next_page_token.is_some() {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                "list returned a continuation token the buffered list_stream adapter cannot follow; implement list_stream natively",
+            ));
+        }
+        let stream = Box::pin(futures::stream::iter(page.items.into_iter().map(Ok)));
+        Ok(cancel_list_stream(stream, stream_cancel))
     }
 
     /// # Errors
@@ -902,7 +995,8 @@ pub trait Layer: Send + Sync {
     /// - [`ErrorCode::DirectoryNotEmpty`] — the directory still holds
     ///   entries.
     /// - [`ErrorCode::InvalidArgument`] — the target is an object (use
-    ///   [`delete`](Layer::delete)).
+    ///   [`delete`](Layer::delete)) or a symlink, which `delete_directory`
+    ///   does not remove or follow.
     /// - [`ErrorCode::NotFound`] — the directory does not exist.
     /// - [`ErrorCode::NoRoute`] — no configured root matches the address.
     /// - [`ErrorCode::PermissionDenied`] — the caller may not remove the
@@ -1441,6 +1535,15 @@ impl Layer for Stack {
         self.root.list(request, cancel).await
     }
 
+    async fn list_stream(
+        &self,
+        mut request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        request.input.prefix = canonicalize(request.input.prefix);
+        self.root.list_stream(request, cancel).await
+    }
+
     async fn list_versions(
         &self,
         mut request: Request<ListVersionsRequest>,
@@ -1645,11 +1748,27 @@ impl StackBuilder {
                 // are independently routable under longest-prefix lookup —
                 // and its connection would be dropped rather than shadowed.
                 //
-                // It is also NOT a graph-wide exclusivity guarantee. Two
-                // sibling Layers can each accept a connection on one root
-                // without either raising anything, because neither sees the
-                // other's roots; the route table logs an overlap warning and
-                // keeps both. That case never reaches this arm.
+                // The CROSS-Layer collision reaches this arm too, and satisfies
+                // the same requirement. Two sibling Layers each see only their
+                // own roots, so neither can refuse the other's; the Router
+                // refuses it for them, at the aggregation boundary where both
+                // are visible (`Router::cross_child_conflict`). It refuses on
+                // node equality and never on containment, and it rolls the
+                // newcomer back off its child before returning.
+                //
+                // Crucially it refuses only when EVERY address the newcomer
+                // publishes collides. That is what makes the requirement above
+                // hold rather than merely resemble it: this arm's licence to
+                // skip comes from the newcomer's addresses resolving to the
+                // incumbent whatever the host does, and for a connection
+                // publishing five roots of which one collides, four of them
+                // resolve to nothing once it is skipped. Those partial cases
+                // are shadowed by the Router and never reach here, so the
+                // connections this arm drops are exactly the ones that had
+                // nothing left to serve. Skipping is therefore right here as
+                // well: without the refusal that connection would be
+                // registered, probed with its own credential, and then
+                // permanently unroutable.
                 //
                 // Do not widen this arm. A broader catch would swallow
                 // refusals that mean something else — the alias layer's
@@ -1671,6 +1790,73 @@ impl StackBuilder {
                         reason = %crate::redact::redact_message(err.message()),
                         "skipping a declared connection whose route is already served; \
                          the rest of the stack is unaffected"
+                    );
+                }
+                // `CommitAmbiguous` reaches here for two different facts, and
+                // only ONE of them is survivable.
+                //
+                // A refusal whose rollback failed — a Router turning down a
+                // sibling's root, on a backend that leaves `remove_connection`
+                // to the trait default, which `file` does, so two `file` layers
+                // over one root is a copy-pasted `[[ovstorage.connections]]`
+                // entry away — leaves a connection that is registered and will
+                // NEVER route, because the refusing Layer withholds its roots.
+                // Nothing a host does changes that, so dying for it costs every
+                // unrelated backend in the graph and loops an auto-restarting
+                // host for nothing.
+                //
+                // A post-commit CATCH-UP that failed is the opposite: the
+                // connection is registered, wanted, and merely unpublished. With
+                // an `updates: false` child no watcher republishes it and no
+                // rebuild is scheduled, so tolerating it would hand back a Stack
+                // that answers `NoRoute` for a declared connection, forever,
+                // while reporting success — exactly what `Router::route_catch_up`
+                // makes its `?` load-bearing to prevent. That one propagates.
+                //
+                // The code cannot tell them apart and only the producer knows,
+                // so the producer says which via
+                // [`NEXT_ACTION_REFUSED_LEFTOVER`]; an unmarked
+                // `CommitAmbiguous` is treated as the reconcile failure it most
+                // likely is.
+                //
+                // It is tolerated for the same reason `RouteConflict` is, and
+                // the reason is the stronger of the two here: aborting buys that
+                // connection nothing — it is registered whatever the host does,
+                // and where the Router refused it, it is quarantined out of the
+                // route table so it cannot serve — while costing every unrelated
+                // backend in the graph, and a host that auto-restarts loops on
+                // it. A config mistake in one connection must not be able to
+                // stop a host from starting when the graph itself is fine.
+                //
+                // This is NOT the widening warned against above: that is about
+                // codes meaning some OTHER failure, where skipping would drop a
+                // rule the operator declared. This code says the opposite — the
+                // mutation happened — so the declared connection is present, not
+                // silently discarded, and the warning says which and why. The
+                // runtime paths still see the code untouched: `ovstorage connect`
+                // reports it, exits 20, and tells the operator not to retry.
+                //
+                // **Unless the caller asked to stop.** A fired token is not a
+                // config mistake to be survived: the caller is leaving, the
+                // connection committed anyway, and answering `Ok` would hand
+                // back a Stack whose remaining connections were never applied
+                // while claiming everything landed. What the token buys is an
+                // exit, not a different outcome, so the ambiguity travels — and
+                // the loop stops rather than applying the rest into a context
+                // that has been cancelled.
+                Err(err)
+                    if err.code() == ErrorCode::CommitAmbiguous
+                        && err.next_action() == Some(crate::NEXT_ACTION_REFUSED_LEFTOVER)
+                        && !cancel.as_ref().is_some_and(|token| token.is_cancelled()) =>
+                {
+                    tracing::warn!(
+                        target: "ovstorage.stack",
+                        layer = %target,
+                        reason = %crate::redact::redact_message(err.message()),
+                        "a declared connection was registered but this graph could not confirm \
+                         it; continuing so the rest of the stack starts. It may not route until \
+                         a later rebuild, and where it was refused for another layer's root it \
+                         will not route at all — the message says which"
                     );
                 }
                 Err(err) => return Err(err),
@@ -1911,7 +2097,211 @@ fn unsupported(slot: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BufferedListLayer {
+        items: Vec<ObjectInfo>,
+        next_page_token: Option<String>,
+        list_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Layer for BufferedListLayer {
+        fn name(&self) -> &str {
+            "buffered-list"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            descriptor("buffered-list", LayerType::Backend, false)
+        }
+
+        async fn list(
+            &self,
+            _request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ListPage> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ListPage {
+                items: self.items.clone(),
+                next_page_token: self.next_page_token.clone(),
+            })
+        }
+    }
+
+    struct StreamRecordingLayer {
+        observed_prefix: std::sync::Mutex<Option<Url>>,
+    }
+
+    #[async_trait]
+    impl Layer for StreamRecordingLayer {
+        fn name(&self) -> &str {
+            "stream-recorder"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            descriptor("stream-recorder", LayerType::Backend, false)
+        }
+
+        async fn list_stream(
+            &self,
+            request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ListStream> {
+            *self.observed_prefix.lock().unwrap() = Some(request.input.prefix);
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    fn listed_object(address: &str) -> ObjectInfo {
+        ObjectInfo::from((Url::parse(address).unwrap(), BackendItemInfo::default()))
+    }
+
+    #[tokio::test]
+    async fn list_stream_default_adapts_buffered_list() {
+        let expected = vec![
+            listed_object("test://root/first"),
+            listed_object("test://root/second"),
+        ];
+        let layer = BufferedListLayer {
+            items: expected.clone(),
+            next_page_token: None,
+            list_calls: AtomicUsize::new(0),
+        };
+        let request = Request::new(ListRequest {
+            prefix: Url::parse("test://root/").unwrap(),
+            options: ListOptions::default(),
+        });
+
+        let stream = layer.list_stream(request, None).await.unwrap();
+        let actual = stream
+            .map(|entry| entry.expect("buffered list entries remain successful"))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(actual, expected);
+        assert_eq!(layer.list_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn list_stream_default_rejects_page_window_options() {
+        let layer = BufferedListLayer {
+            items: Vec::new(),
+            next_page_token: None,
+            list_calls: AtomicUsize::new(0),
+        };
+
+        for options in [
+            ListOptions {
+                max_results: Some(1),
+                ..ListOptions::default()
+            },
+            ListOptions {
+                page_token: Some("resume-here".into()),
+                ..ListOptions::default()
+            },
+        ] {
+            let result = layer
+                .list_stream(
+                    Request::new(ListRequest {
+                        prefix: Url::parse("test://root/").unwrap(),
+                        options,
+                    }),
+                    None,
+                )
+                .await;
+            let error = match result {
+                Ok(_) => panic!("page window unexpectedly accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        }
+
+        assert_eq!(layer.list_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn list_stream_default_rejects_a_partial_buffered_listing() {
+        let layer = BufferedListLayer {
+            items: vec![listed_object("test://root/first")],
+            next_page_token: Some("buffered-token".into()),
+            list_calls: AtomicUsize::new(0),
+        };
+
+        let result = layer
+            .list_stream(
+                Request::new(ListRequest {
+                    prefix: Url::parse("test://root/").unwrap(),
+                    options: ListOptions::default(),
+                }),
+                None,
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("partial buffered listing unexpectedly became a stream"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert!(error.to_string().contains("continuation token"));
+        assert_eq!(layer.list_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stack_list_stream_canonicalizes_prefix_before_delegating() {
+        let recorder = Arc::new(StreamRecordingLayer {
+            observed_prefix: std::sync::Mutex::new(None),
+        });
+        let stack = Stack {
+            spec: StackSpec::new("stream-recorder"),
+            root: recorder.clone(),
+        };
+        let uncanonical = Url::parse("test://ROOT/a%2F..%2Fb#client-only").unwrap();
+        let expected = canonicalize(uncanonical.clone());
+        assert_ne!(uncanonical, expected);
+
+        let mut stream = stack
+            .list_stream(
+                Request::new(ListRequest {
+                    prefix: uncanonical,
+                    options: ListOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(stream.next().await.is_none());
+        assert_eq!(*recorder.observed_prefix.lock().unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn leaf_owning_target_is_sole_owning_target_plus_the_name_fallback() {
+        // The two rules are one function and a fallback, so they cannot drift.
+        // Asserted directly, because the drift this prevents is silent: a
+        // connection attributed by the leaf rule would carry a layer name that
+        // no `route_target` can find.
+        let sole = vec!["inner-a".to_string()];
+        let several = vec!["inner-a".to_string(), "inner-b".to_string()];
+        let none: Vec<String> = Vec::new();
+
+        assert_eq!(sole_owning_target(&sole), Some("inner-a".to_string()));
+        assert_eq!(sole_owning_target(&several), None);
+        assert_eq!(sole_owning_target(&none), None);
+
+        for targets in [&sole, &several, &none] {
+            assert_eq!(
+                leaf_owning_target(targets, "outer"),
+                sole_owning_target(targets).unwrap_or_else(|| "outer".to_string()),
+            );
+        }
+        // The divergence that matters, spelled out: where a composite has no
+        // sole target, the leaf rule answers with a name and the connection
+        // rule declines. `Some("outer")` is the answer a connection must NOT
+        // get, because `outer` is not one of the targets the graph routes.
+        assert_eq!(leaf_owning_target(&several, "outer"), "outer".to_string());
+        assert_eq!(sole_owning_target(&several), None);
+    }
 
     #[test]
     fn extensions_clone_local_values_without_serializing_them() {
@@ -2712,6 +3102,7 @@ mod tests {
                 auth_state: ConnectionAuthState::Anonymous,
                 last_probed: None,
                 user_metadata: UserMetadata::new(),
+                owning_target: None,
             };
             self.connections.lock().unwrap().push(connection.clone());
             Ok(connection)

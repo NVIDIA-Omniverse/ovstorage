@@ -17,7 +17,8 @@ pub struct RequestContext {
 pub struct Broker {
     /// The per-listener auth Stack the daemon dispatches every data op through:
     /// the built-in **auth layer** (`builtin-auth`) `attach`ed over the shared
-    /// auth-free inner (`upstream_credential → alias → copy_rename_fallback →
+    /// auth-free inner (`upstream_credential → watch_limit → alias →
+    /// copy_rename_fallback →
     /// [byte_cache] → [metadata_cache] → redirect_follower → retry → router →
     /// [attribution_<kind> →] backend-per-kind`, the attribution overlay sitting
     /// per-branch below the router). The auth layer
@@ -46,6 +47,13 @@ pub struct Broker {
     pub(crate) watch_directory_state: Arc<WatchDirectoryState>,
     pub(crate) oauth_providers: Arc<crate::OAuthProviderRegistry>,
     pub(crate) oauth_route_bindings: Arc<crate::BrokerOAuthRouteBindings>,
+    /// Process-lifetime watch counters carried into replacement Stacks during
+    /// lifecycle reloads.
+    pub(crate) watch_budget: crate::watch_limit::SharedWatchBudget,
+    /// Process-lifetime key authenticating client-driven write continuations.
+    /// Lifecycle reloads carry this into the replacement broker so in-flight
+    /// uploads remain continuable.
+    continuation_seal_key: crate::continuation_seal::ContinuationSealKey,
     /// Whether a redirect carrying a credential broader than the redirected
     /// request may leave this process.
     ///
@@ -138,6 +146,8 @@ impl Broker {
             watch_directory_state: Arc::new(WatchDirectoryState::default()),
             oauth_providers: Arc::new(crate::OAuthProviderRegistry::new()),
             oauth_route_bindings: Arc::new(crate::BrokerOAuthRouteBindings::new()),
+            watch_budget: crate::watch_limit::SharedWatchBudget::default(),
+            continuation_seal_key: crate::continuation_seal::ContinuationSealKey::generate(),
             // Refuse by default. A broker built without operator config must
             // not disclose more than one built with it.
             disclose_redirect_credentials: false,
@@ -146,8 +156,19 @@ impl Broker {
 
     /// Wrap a fully composed [`BrokerStack`] — the per-listener auth Stack plus
     /// the concrete auth-layer handle (for reload) and the discovered backend
-    /// kinds. The production construction path.
+    /// kinds. Generates a process seal key for programmatic and fixture callers.
     pub fn from_composed(composed: crate::BrokerStack) -> Self {
+        Self::from_composed_with_continuation_seal_key(
+            composed,
+            crate::continuation_seal::ContinuationSealKey::generate(),
+        )
+    }
+
+    /// Wrap a composed Stack with an already-resolved process seal key.
+    pub(crate) fn from_composed_with_continuation_seal_key(
+        composed: crate::BrokerStack,
+        continuation_seal_key: crate::continuation_seal::ContinuationSealKey,
+    ) -> Self {
         Self {
             stack: composed.stack,
             health_stack: composed.health_stack,
@@ -156,6 +177,8 @@ impl Broker {
             watch_directory_state: Arc::new(WatchDirectoryState::default()),
             oauth_providers: composed.oauth_providers,
             oauth_route_bindings: composed.oauth_bindings,
+            watch_budget: composed.watch_budget,
+            continuation_seal_key,
             // Refuse by default. A broker built without operator config must
             // not disclose more than one built with it.
             disclose_redirect_credentials: false,
@@ -173,6 +196,16 @@ impl Broker {
     /// (`redirect_credential_disclosure`).
     pub fn with_redirect_disclosure(mut self, disclose: bool) -> Self {
         self.disclose_redirect_credentials = disclose;
+        self
+    }
+
+    /// Give a test-built broker the key from another broker instance.
+    #[cfg(test)]
+    pub(crate) fn with_continuation_seal_key(
+        mut self,
+        key: crate::continuation_seal::ContinuationSealKey,
+    ) -> Self {
+        self.continuation_seal_key = key;
         self
     }
 
@@ -233,6 +266,14 @@ impl Broker {
 
     pub fn oauth_route_bindings(&self) -> &crate::BrokerOAuthRouteBindings {
         &self.oauth_route_bindings
+    }
+
+    pub(crate) fn watch_budget(&self) -> crate::watch_limit::SharedWatchBudget {
+        self.watch_budget.clone()
+    }
+
+    pub(crate) fn continuation_seal_key(&self) -> crate::continuation_seal::ContinuationSealKey {
+        self.continuation_seal_key.clone()
     }
 
     /// Stamp the caller's gathered credential material onto a **fresh**
@@ -533,11 +574,13 @@ impl Broker {
             //
             // `BrokerWriteOutcome::Redirects` has no producer anywhere. If one
             // is ever added — a `write` that surfaces the batch rather than
-            // driving it — **it must go through `write_batch_is_delegable`
-            // first**, as `write_redirect` does. Both consumers of that variant
-            // (the gRPC `Write` response and the client transport) put the batch
-            // straight in front of a remote caller without checking it, so a
-            // producer added here would disclose whatever the backend declared.
+            // driving it — **it must go through `write_batch_is_delegable` and
+            // then seal the batch**, as `write_redirect` does. Both consumers
+            // of that variant (the gRPC `Write` response and the client
+            // transport) put the batch straight in front of a remote caller
+            // without checking it, so a producer added here would otherwise
+            // disclose whatever the backend declared or issue an unauthenticated
+            // continuation.
             Ok(BrokerWriteOutcome::Done(result))
         }
         .instrument(span)
@@ -559,7 +602,7 @@ impl Broker {
                 self.credential_req(
                     context,
                     WriteRequest {
-                        address,
+                        address: address.clone(),
                         body: Body::Bytes(Vec::new()),
                         options,
                     },
@@ -589,7 +632,11 @@ impl Broker {
             ));
         }
         metrics::counter!(crate::observability::REDIRECT_EMISSIONS, "kind" => "write").increment(1);
-        Ok(batch)
+        Ok(crate::continuation_seal::seal_batch(
+            &self.continuation_seal_key,
+            &address,
+            batch,
+        ))
     }
 
     pub async fn continue_write(
@@ -599,6 +646,28 @@ impl Broker {
         redirects: WriteRedirectBatch,
         results: RedirectResultBatch,
     ) -> ovstorage::Result<ovstorage::WriteStep> {
+        let redirects = match crate::continuation_seal::unseal_batch_with_reason(
+            &self.continuation_seal_key,
+            &address,
+            redirects,
+        ) {
+            Ok(redirects) => redirects,
+            Err(refusal) => {
+                let reason = refusal.reason();
+                tracing::warn!(
+                    target: "ovstorage.broker.continuation_seal",
+                    address = %crate::trace::RedactedUrl(&address),
+                    reason,
+                    "refused an invalid write continuation seal"
+                );
+                metrics::counter!(
+                    crate::observability::CONTINUATION_SEAL_REFUSALS,
+                    "reason" => reason
+                )
+                .increment(1);
+                return Err(refusal.into());
+            }
+        };
         ovstorage::validate_redirect_results(&redirects, &results)?;
         if let Some(result) = results
             .results
@@ -619,7 +688,7 @@ impl Broker {
                 self.credential_req(
                     context,
                     ContinueWriteRequest {
-                        address,
+                        address: address.clone(),
                         redirects,
                         results,
                     },
@@ -645,17 +714,26 @@ impl Broker {
         // connection's auth mode, so a batch that starts delegable stays
         // delegable and this never fires. It guards a plugin that changes
         // mechanism between rounds.
-        if let ovstorage::WriteStep::Redirects(batch) = &step
-            && !self.write_batch_is_delegable(batch)
-        {
-            return Err(Error::new(
-                ErrorCode::PermissionDenied,
-                "a later round of this redirected write carries a credential that authorizes \
-                 more than the redirected request, and `redirect_credential_disclosure` is \
-                 `refuse`",
-            ));
+        match step {
+            ovstorage::WriteStep::Redirects(batch) => {
+                if !self.write_batch_is_delegable(&batch) {
+                    return Err(Error::new(
+                        ErrorCode::PermissionDenied,
+                        "a later round of this redirected write carries a credential that \
+                         authorizes more than the redirected request, and \
+                         `redirect_credential_disclosure` is `refuse`",
+                    ));
+                }
+                Ok(ovstorage::WriteStep::Redirects(
+                    crate::continuation_seal::seal_batch(
+                        &self.continuation_seal_key,
+                        &address,
+                        batch,
+                    ),
+                ))
+            }
+            ovstorage::WriteStep::Done(result) => Ok(ovstorage::WriteStep::Done(result)),
         }
-        Ok(step)
     }
 
     pub async fn delete(
@@ -879,6 +957,22 @@ impl Broker {
         prefix: Url,
         opts: ovstorage::WatchDirectoryOptions,
     ) -> ovstorage::Result<BrokerClientWatchDirectoryStream> {
+        let (stream, _rpc_cancel) = self
+            .watch_directory_with_cancel(context, prefix, opts, None)
+            .await?;
+        Ok(stream)
+    }
+
+    pub(crate) async fn watch_directory_with_cancel(
+        &self,
+        context: &RequestContext,
+        prefix: Url,
+        opts: ovstorage::WatchDirectoryOptions,
+        cancel: Option<ovstorage::CancellationToken>,
+    ) -> ovstorage::Result<(
+        BrokerClientWatchDirectoryStream,
+        ovstorage::CancellationToken,
+    )> {
         // Pass the RAW `prefix` + the caller's request context into
         // `watch_directory_state`, which threads it into `stack.watch_directory`.
         // The in-stack auth Layer runs the WatchDirectory pre-check AND
@@ -887,8 +981,10 @@ impl Broker {
         // watch. Per-subscriber security and
         // visibility filtering is the auth Layer's job: the backend coalescer is
         // principal-blind (it keys physical subscriptions by connection/prefix,
-        // never by principal, and enforces no per-principal watcher cap). The
-        // broker performs no host-side per-event authz.
+        // never by principal). Admission is enforced centrally by the
+        // broker-native `watch_limit` Layer at the shared data-plane root,
+        // immediately inside `upstream_credential`. The broker performs no
+        // host-side per-event authz.
         let stream = self
             .watch_directory_state
             .watch_directory(
@@ -896,6 +992,7 @@ impl Broker {
                 prefix,
                 opts,
                 self.credential_cx(context),
+                cancel,
             )
             .await?;
         Ok(stream)
@@ -1075,10 +1172,12 @@ mod upstream_dispatch_tests {
     use ovstorage::wrappers::ext;
     use ovstorage::{
         AddressVisibility, AuthEventStream, AuthenticateRequest, CancellationToken, Capabilities,
-        ConfigLayer, Connection, ConnectionAuthState, ConnectionId, ConnectionSource, Error,
-        ErrorCode, Extensions, InteractiveAuthCapability, Layer, LayerHandle, LayerKindDescriptor,
-        LayerType, RangeReadStrategy, Request, RootInfo, RouteSource, Stack,
-        UpdateConnectionCredentialsRequest, Url, UserMetadata,
+        ConfigLayer, Connection, ConnectionAuthState, ConnectionId, ConnectionSource,
+        ContinueWriteRequest, Error, ErrorCode, Extensions, InteractiveAuthCapability, Layer,
+        LayerHandle, LayerKindDescriptor, LayerType, RangeReadStrategy, RedirectResult,
+        RedirectResultBatch, Request, RootInfo, RouteSource, Stack,
+        UpdateConnectionCredentialsRequest, Url, UserMetadata, WriteOptions, WriteRedirectBatch,
+        WriteRequest, WriteStep,
     };
 
     use super::{Broker, RequestContext};
@@ -1090,6 +1189,9 @@ mod upstream_dispatch_tests {
         root_extensions: Mutex<Vec<Extensions>>,
         auth_request: Mutex<Option<Request<AuthenticateRequest>>>,
         update_request: Mutex<Option<Request<UpdateConnectionCredentialsRequest>>>,
+        write_redirect_batch: Mutex<Option<WriteRedirectBatch>>,
+        continue_request: Mutex<Option<Request<ContinueWriteRequest>>>,
+        continue_step: Mutex<Option<WriteStep>>,
     }
 
     impl DispatchProbe {
@@ -1101,6 +1203,17 @@ mod upstream_dispatch_tests {
                 root_extensions: Mutex::new(Vec::new()),
                 auth_request: Mutex::new(None),
                 update_request: Mutex::new(None),
+                write_redirect_batch: Mutex::new(None),
+                continue_request: Mutex::new(None),
+                continue_step: Mutex::new(None),
+            }
+        }
+
+        fn redirect_protocol(first: &[u8], next: &[u8]) -> Self {
+            Self {
+                write_redirect_batch: Mutex::new(Some(redirect_batch(first))),
+                continue_step: Mutex::new(Some(WriteStep::Redirects(redirect_batch(next)))),
+                ..Self::routable()
             }
         }
 
@@ -1170,6 +1283,7 @@ mod upstream_dispatch_tests {
             auth_state: ConnectionAuthState::Anonymous,
             last_probed: None,
             user_metadata: UserMetadata::default(),
+            owning_target: None,
         }
     }
 
@@ -1221,6 +1335,38 @@ mod upstream_dispatch_tests {
             *self.update_request.lock().unwrap() = Some(request);
             Ok(result)
         }
+
+        async fn write_redirect(
+            &self,
+            _request: Request<WriteRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> ovstorage::Result<WriteRedirectBatch> {
+            self.write_redirect_batch
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| Error::new(ErrorCode::Unsupported, "no redirect batch configured"))
+        }
+
+        async fn continue_write(
+            &self,
+            request: Request<ContinueWriteRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> ovstorage::Result<WriteStep> {
+            *self.continue_request.lock().unwrap() = Some(request);
+            self.continue_step
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| Error::new(ErrorCode::Unsupported, "no write step configured"))
+        }
+    }
+
+    fn redirect_batch(continuation: &[u8]) -> WriteRedirectBatch {
+        WriteRedirectBatch {
+            continuation: continuation.to_vec(),
+            redirects: Vec::new(),
+        }
     }
 
     async fn broker_for(probe: Arc<DispatchProbe>) -> Broker {
@@ -1269,6 +1415,120 @@ mod upstream_dispatch_tests {
             }),
             audit_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn write_redirect_and_later_round_are_sealed_while_the_stack_sees_inner_bytes() {
+        let probe = Arc::new(DispatchProbe::redirect_protocol(
+            b"first-inner",
+            b"next-inner",
+        ));
+        let broker = broker_for(probe.clone()).await;
+        let address = Url::parse("s3://bucket/object").unwrap();
+
+        let first = broker
+            .write_redirect(
+                &RequestContext::default(),
+                address.clone(),
+                WriteOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(first.continuation.as_slice(), b"first-inner");
+        let first_inner = crate::continuation_seal::unseal_batch(
+            &broker.continuation_seal_key(),
+            &address,
+            first.clone(),
+        )
+        .unwrap();
+        assert_eq!(first_inner.continuation.as_slice(), b"first-inner");
+
+        let step = broker
+            .continue_write(
+                &RequestContext::default(),
+                address.clone(),
+                first,
+                RedirectResultBatch {
+                    results: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let dispatched = probe.continue_request.lock().unwrap().take().unwrap();
+        assert_eq!(
+            dispatched.input.redirects.continuation.as_slice(),
+            b"first-inner"
+        );
+        let WriteStep::Redirects(next) = step else {
+            panic!("the configured continuation returns a further redirect batch");
+        };
+        assert_ne!(next.continuation.as_slice(), b"next-inner");
+        let next_inner =
+            crate::continuation_seal::unseal_batch(&broker.continuation_seal_key(), &address, next)
+                .unwrap();
+        assert_eq!(next_inner.continuation.as_slice(), b"next-inner");
+    }
+
+    #[tokio::test]
+    async fn unsigned_continuation_is_refused_before_cardinality_checks_or_stack_dispatch() {
+        let probe = Arc::new(DispatchProbe::routable());
+        let broker = broker_for(probe.clone()).await;
+        let address = Url::parse("s3://bucket/object").unwrap();
+
+        let error = broker
+            .continue_write(
+                &RequestContext::default(),
+                address,
+                redirect_batch(b"caller-chosen"),
+                RedirectResultBatch {
+                    // This deliberately mismatches the empty redirect batch.
+                    // Seal verification must win before cardinality validation.
+                    results: vec![RedirectResult {
+                        status_code: 503,
+                        captured_headers: Vec::new(),
+                        captured_body: Vec::new(),
+                    }],
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(error.message(), "continuation seal is invalid");
+        assert!(probe.continue_request.lock().unwrap().is_none());
+        assert!(probe.root_extensions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuation_sealed_for_another_address_is_refused_before_stack_dispatch() {
+        let probe = Arc::new(DispatchProbe::redirect_protocol(b"inner", b"unused"));
+        let broker = broker_for(probe.clone()).await;
+        let issued_for = Url::parse("s3://bucket/authorized").unwrap();
+        let presented = Url::parse("s3://bucket/substituted").unwrap();
+        let batch = broker
+            .write_redirect(
+                &RequestContext::default(),
+                issued_for,
+                WriteOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let error = broker
+            .continue_write(
+                &RequestContext::default(),
+                presented,
+                batch,
+                RedirectResultBatch {
+                    results: Vec::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(error.message(), "continuation seal is invalid");
+        assert!(probe.continue_request.lock().unwrap().is_none());
     }
 
     #[tokio::test]

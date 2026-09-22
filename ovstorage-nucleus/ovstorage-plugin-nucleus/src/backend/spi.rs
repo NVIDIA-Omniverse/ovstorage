@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use nucleus_client::LftClient;
-use nucleus_client::types::{PathAtBranch, PathAtVersion, PathsToCopy, PathsToRename};
+use nucleus_client::types::{PathAtBranch, PathAtVersion, PathsToCopy, PathsToRename, StatusType};
 use ovstorage_plugin::{
     AccessDecision, AccessOps, BodyStream, CancellationToken, Capabilities, ChangeKindSet,
     CopyOptions, CreateDirectoryOptions, DeleteDirectoryOptions, DeleteOptions,
@@ -30,6 +30,7 @@ use crate::convert::require_etag_only_if_match;
 use crate::ops::{NucleusOps, acl_to_effective_permissions, status_to_result};
 use crate::trace::RedactedUrl;
 
+use super::ancestors::Ensured;
 use super::convert::{
     create_asset_to_object_info, list_entry_to_item, path_at_version, poisoned_state,
     read_result_to_object_info, stat2_to_object_info, update_asset_to_object_info,
@@ -57,12 +58,23 @@ pub struct NucleusBackend {
 /// contents of a sibling named `docsx` as well.
 ///
 /// The root is already `/` and is left alone; appending would make `//`.
-fn directory_path(path: &str) -> String {
+pub(super) fn directory_path(path: &str) -> String {
     if path.is_empty() || path.ends_with('/') {
         path.to_string()
     } else {
         format!("{path}/")
     }
+}
+
+/// Fold a batched omni1 mutation's top-level status and its first per-path
+/// status into one `Result`, so a `NotFound` from either drives the same
+/// ancestor retry.
+fn batch_status(status: StatusType, responses: &[StatusType], op: &str) -> Result<()> {
+    status_to_result(status, op)?;
+    if let Some(per_path) = responses.first() {
+        status_to_result(*per_path, &format!("{op} entry"))?;
+    }
+    Ok(())
 }
 
 impl NucleusBackend {
@@ -79,6 +91,11 @@ impl NucleusBackend {
     /// reach past the data-path surface (the failed-rotation session clear).
     pub(crate) fn shared(&self) -> &Arc<NucleusShared> {
         &self.shared
+    }
+
+    /// The connection's route prefix; ancestor creation never climbs above it.
+    pub(super) fn prefix(&self) -> &str {
+        &self.prefix
     }
 
     fn target(&self, target: &ResolvedTarget) -> Result<NucleusTarget> {
@@ -181,7 +198,7 @@ impl NucleusBackend {
                         path,
                         Some(etag.clone()),
                         None,
-                        Some(bytes),
+                        Some(bytes.as_slice()),
                         None,
                         None,
                         message,
@@ -192,10 +209,45 @@ impl NucleusBackend {
             }
             IfDestExists::Overwrite | IfDestExists::Fail => {
                 let overwrite = matches!(opts.if_dest, IfDestExists::Overwrite);
+                // A write creates its path: the folder is ensured before the body travels.
+                let ensured = self.ensure_parent_for_write(&ops, &parsed).await?;
+                // The body is borrowed by the wire call, so the one retry re-sends it
+                // without ever holding a second copy.
                 let result = ops
-                    .create_asset(path, Some(bytes), None, Some(overwrite), message)
+                    .create_asset(
+                        path.clone(),
+                        Some(bytes.as_slice()),
+                        None,
+                        Some(overwrite),
+                        message.clone(),
+                    )
                     .await?;
-                status_to_result(result.status, "create_asset")?;
+                let result = match status_to_result(result.status, "create_asset") {
+                    Ok(()) => result,
+                    // A set-answered parent may be stale: re-ensure it live and
+                    // re-send once. The body goes out twice only on this path.
+                    Err(err)
+                        if err.code() == ErrorCode::NotFound && ensured.retry_after_not_found() =>
+                    {
+                        if let Err(recovery) = self.recreate_parent(&ops, &parsed).await {
+                            Self::note_recovery_failure(&recovery);
+                            return Err(err);
+                        }
+                        let result = ops
+                            .create_asset(
+                                path,
+                                Some(bytes.as_slice()),
+                                None,
+                                Some(overwrite),
+                                message,
+                            )
+                            .await?;
+                        status_to_result(result.status, "create_asset")?;
+                        result
+                    }
+                    Err(err) => return Err(err),
+                };
+                self.remember_parent(&parsed)?;
                 create_asset_to_object_info(address.clone(), result)
             }
         };
@@ -235,10 +287,34 @@ impl NucleusBackend {
             }
             IfDestExists::Overwrite | IfDestExists::Fail => {
                 let overwrite = matches!(opts.if_dest, IfDestExists::Overwrite);
+                let ensured = self.ensure_parent_for_write(&ops, &parsed).await?;
                 let response = ops
-                    .create_asset(path, None, Some(content_id), Some(overwrite), message)
+                    .create_asset(
+                        path.clone(),
+                        None,
+                        Some(content_id),
+                        Some(overwrite),
+                        message.clone(),
+                    )
                     .await?;
-                status_to_result(response.status, "create_asset")?;
+                let response = match status_to_result(response.status, "create_asset") {
+                    Ok(()) => response,
+                    Err(err)
+                        if err.code() == ErrorCode::NotFound && ensured.retry_after_not_found() =>
+                    {
+                        if let Err(recovery) = self.recreate_parent(&ops, &parsed).await {
+                            Self::note_recovery_failure(&recovery);
+                            return Err(err);
+                        }
+                        let response = ops
+                            .create_asset(path, None, Some(content_id), Some(overwrite), message)
+                            .await?;
+                        status_to_result(response.status, "create_asset")?;
+                        response
+                    }
+                    Err(err) => return Err(err),
+                };
+                self.remember_parent(&parsed)?;
                 create_asset_to_object_info(address.clone(), response)
             }
         };
@@ -346,14 +422,14 @@ pub(crate) struct NucleusContinuation {
     /// The path and branch this continuation was minted for. (`branch` is
     /// always `None` in practice: the only address spelling that yields one is
     /// `?branch&N`, which also yields a checkpoint, and every mutating verb
-    /// refuses a checkpoint.) Written to the
-    /// encoded form but never read back from it: on the broker's client-driven
-    /// route the blob is echoed back by the remote caller, so `continue_write`
-    /// re-derives both from the authorized request address.
-    /// `skip_deserializing` is what makes a caller-supplied path unreachable
-    /// rather than merely unused; both are still serialized so a continuation
-    /// minted here stays decodable by a peer replica running an earlier build
-    /// while an upload is in flight.
+    /// refuses a checkpoint.) Written to the encoded form but never read back
+    /// from it. The broker's client-driven RPC authenticates the blob and its
+    /// address binding, but direct SPI callers, follower routes, and unsealed
+    /// hosts have no equivalent Layer guarantee, so `continue_write` re-derives
+    /// both from the authorized request address. `skip_deserializing` makes an
+    /// unsealed caller's path unreachable rather than merely unused; both are
+    /// still serialized so a continuation minted here stays decodable by a
+    /// peer replica running an earlier build while an upload is in flight.
     #[serde(skip_deserializing)]
     pub path: String,
     #[serde(skip_deserializing)]
@@ -385,10 +461,19 @@ pub(super) fn decode_nucleus_continuation(raw: &[u8]) -> Result<NucleusContinuat
 /// (`ConnectionSet::with_recovery` + `NucleusDriver::refresh`) owns
 /// refresh-and-retry-once at the layer.
 impl NucleusBackend {
+    /// `versioned_address` on a file costs one `get_checkpoints` plus one
+    /// `stat2` at the chosen checkpoint on top of the stat2 probes. The facts
+    /// returned (etag, size, mtime, ...) are that checkpoint's own rather than
+    /// the head's, so a save landing between the two calls cannot leave the
+    /// pin naming newer bytes than the facts describe; the address stays the
+    /// requested one. When the address already carries a `?branch&checkpoint`
+    /// pin, that pin names one checkpoint and is echoed without a lookup.
+    /// Folders and files without checkpoints carry `None` and keep their head
+    /// facts.
     pub async fn stat(
         &self,
         target: ResolvedTarget,
-        _opts: StatOptions,
+        opts: StatOptions,
         cancel: Option<CancellationToken>,
     ) -> Result<ObjectInfo> {
         let parsed = self.target(&target)?;
@@ -403,38 +488,54 @@ impl NucleusBackend {
             let address = address.clone();
             async move {
                 let ops = self.ops()?;
-                if !needs_dual_probe {
+                let mut info = if !needs_dual_probe {
                     let result = ops.stat2(path_at_version(&parsed)).await?;
                     status_to_result(result.status, "stat2")?;
-                    return Ok(stat2_to_object_info(address, result));
-                }
+                    stat2_to_object_info(address.clone(), result)
+                } else {
+                    let file_target = parsed.clone();
+                    let mut folder_target = parsed.clone();
+                    folder_target.path = format!("{}/", folder_target.path);
 
-                let file_target = parsed.clone();
-                let mut folder_target = parsed.clone();
-                folder_target.path = format!("{}/", folder_target.path);
+                    let file_fut = async {
+                        let r = ops.stat2(path_at_version(&file_target)).await?;
+                        status_to_result(r.status, "stat2")?;
+                        Ok::<_, Error>(r)
+                    };
+                    let folder_fut = async {
+                        let r = ops.stat2(path_at_version(&folder_target)).await?;
+                        status_to_result(r.status, "stat2")?;
+                        Ok::<_, Error>(r)
+                    };
+                    let (file_res, folder_res) = tokio::join!(file_fut, folder_fut);
 
-                let file_fut = async {
-                    let r = ops.stat2(path_at_version(&file_target)).await?;
-                    status_to_result(r.status, "stat2")?;
-                    Ok::<_, Error>(r)
-                };
-                let folder_fut = async {
-                    let r = ops.stat2(path_at_version(&folder_target)).await?;
-                    status_to_result(r.status, "stat2")?;
-                    Ok::<_, Error>(r)
-                };
-                let (file_res, folder_res) = tokio::join!(file_fut, folder_fut);
-
-                match (file_res, folder_res) {
-                    (Ok(file_result), _) => Ok(stat2_to_object_info(address, file_result)),
-                    (Err(_), Ok(folder_result)) => {
-                        let mut folder_address = address.clone();
-                        let new_path = format!("{}/", folder_address.path());
-                        folder_address.set_path(&new_path);
-                        Ok(stat2_to_object_info(folder_address, folder_result))
+                    match (file_res, folder_res) {
+                        (Ok(file_result), _) => stat2_to_object_info(address.clone(), file_result),
+                        (Err(_), Ok(folder_result)) => {
+                            let mut folder_address = address.clone();
+                            let new_path = format!("{}/", folder_address.path());
+                            folder_address.set_path(&new_path);
+                            stat2_to_object_info(folder_address, folder_result)
+                        }
+                        (Err(file_err), Err(_)) => return Err(file_err),
                     }
-                    (Err(file_err), Err(_)) => Err(file_err),
+                };
+                if info.kind == ObjectKind::File {
+                    match parsed.checkpoint {
+                        Some(checkpoint) => {
+                            info.versioned_address =
+                                Some(checkpoint_address(&address, &parsed, checkpoint));
+                        }
+                        None if opts.versioned_address => {
+                            if let Some(checkpoint) = latest_checkpoint_id(&*ops, &parsed).await? {
+                                info = checkpoint_pinned_info(&*ops, &address, &parsed, checkpoint)
+                                    .await?;
+                            }
+                        }
+                        None => {}
+                    }
                 }
+                Ok(info)
             }
         })
         .instrument(span)
@@ -686,7 +787,17 @@ impl NucleusBackend {
         })?;
         let path = parsed.path.clone();
         let lft_for_generate = Arc::clone(&lft);
+        let ops = self.ops()?;
+        let parsed_for_ensure = parsed.clone();
+        let opts_for_ensure = opts.clone();
         let lft_info = race_cancel(cancel.as_ref(), async move {
+            // The mint names the asset path, so its folder is ensured here and the
+            // later finalize finds it in the set. An etag precondition asserts the
+            // target exists, so its folder does too: no ancestor call for it.
+            if !matches!(opts_for_ensure.if_dest, IfDestExists::MatchEtag(_)) {
+                self.ensure_parent_for_write(&ops, &parsed_for_ensure)
+                    .await?;
+            }
             lft_for_generate
                 .generate_upload(&path)
                 .await
@@ -726,7 +837,9 @@ impl NucleusBackend {
         let cont = decode_nucleus_continuation(&redirects.continuation)?;
         // Derive the asset from the authorized request address — the same
         // expression `write_redirect` used at mint — rather than reading the
-        // path back out of a blob the remote caller echoes.
+        // path back out of the blob. The broker seals this binding on its
+        // client-driven RPC, while the Layer rule keeps direct SPI callers,
+        // follower routes, and unsealed hosts safe too.
         let parsed = self.target(&target)?;
         // `write_redirect` refuses a `?checkpoint=N` address, and
         // `finalize_with_content_id` would silently commit to the branch head,
@@ -803,6 +916,14 @@ impl NucleusBackend {
         .await
     }
 
+    /// One level of a folder as omni1 `list2` reports it.
+    ///
+    /// `versioned_address` costs one `get_checkpoints` plus one `stat2` per
+    /// file entry on top of the single `list2` call: omni1 keeps checkpoints
+    /// per path and `list2` does not report them, and the entry's facts are
+    /// re-read at the chosen checkpoint so they describe the same bytes the
+    /// pin names. A failed lookup fails the page; folders and files without
+    /// checkpoints carry `None` and keep their `list2` facts.
     pub async fn list(
         &self,
         prefix: ResolvedTarget,
@@ -828,6 +949,7 @@ impl NucleusBackend {
         let prefix_address = prefix.resolved_address.clone();
         let recursive = opts.recursive;
         let max_results = opts.max_results.map(|n| n as usize);
+        let versioned_address = opts.versioned_address;
         race_cancel(cancel.as_ref(), {
             let parsed = parsed.clone();
             let prefix_address = prefix_address.clone();
@@ -842,11 +964,23 @@ impl NucleusBackend {
                 // loop deliberately accepts.
                 'outer: for response in responses {
                     for entry in response.entries.into_iter().flatten() {
-                        let Some(item) =
+                        let Some(mut item) =
                             list_entry_to_item(&prefix_address, &path, entry, recursive)?
                         else {
                             continue;
                         };
+                        if versioned_address && item.kind == ObjectKind::File {
+                            let child = parse_nucleus_address(&item.address)?;
+                            if let Some(checkpoint) = latest_checkpoint_id(&*ops, &child).await? {
+                                item = checkpoint_pinned_info(
+                                    &*ops,
+                                    &item.address,
+                                    &child,
+                                    checkpoint,
+                                )
+                                .await?;
+                            }
+                        }
                         items.push(item);
                         if let Some(cap) = max_results
                             && items.len() >= cap
@@ -909,7 +1043,8 @@ impl NucleusBackend {
                     };
                     let address = checkpoint_address(&base_address, &parsed, id);
                     let info = ObjectInfo {
-                        address,
+                        etag_strength: Default::default(),
+                        address: address.clone(),
                         kind: ObjectKind::File,
                         etag: None,
                         version: Some(id.to_string()),
@@ -920,6 +1055,7 @@ impl NucleusBackend {
                         system_metadata: None,
                         user_metadata: None,
                         modified_by: None,
+                        versioned_address: Some(address),
                     };
                     items.push(info);
                 }
@@ -950,39 +1086,18 @@ impl NucleusBackend {
                 let address = address.clone();
                 async move {
                     let ops = self.ops()?;
-                    if let Some(checkpoint) = parsed.checkpoint {
-                        let result = ops.stat2(path_at_version(&parsed)).await?;
-                        status_to_result(result.status, "stat2")?;
-                        let version_address = checkpoint_address(&address, &parsed, checkpoint);
-                        let info = stat2_to_object_info(version_address, result);
-                        return Ok(info);
-                    }
-                    let path = PathAtBranch {
-                        path: parsed.path.clone(),
-                        branch: parsed.branch.clone(),
-                    };
-                    let response = ops.get_checkpoints(path).await?;
-                    status_to_result(response.status, "get_checkpoints")?;
-                    // omni1 doesn't document checkpoint ordering; checkpoint_id is monotonic,
-                    // so max() is the head regardless of how the server sorts the list.
-                    let latest_id = response
-                        .checkpoints
-                        .into_iter()
-                        .filter_map(|c| c.checkpoint_id)
-                        .max()
-                        .ok_or_else(|| {
+                    let checkpoint = match parsed.checkpoint {
+                        Some(checkpoint) => checkpoint,
+                        None => latest_checkpoint_id(&*ops, &parsed).await?.ok_or_else(|| {
                             Error::new(
                                 ErrorCode::Unsupported,
                                 "Nucleus path has no checkpoints; create one before requesting the latest version",
                             )
-                        })?;
-                    let mut at_checkpoint = parsed.clone();
-                    at_checkpoint.checkpoint = Some(latest_id);
-                    let result = ops.stat2(path_at_version(&at_checkpoint)).await?;
-                    status_to_result(result.status, "stat2")?;
-                    let version_address = checkpoint_address(&address, &parsed, latest_id);
-                    let info = stat2_to_object_info(version_address, result);
-                    Ok(info)
+                        })?,
+                    };
+                    // A version's own address is already its pin.
+                    let version_address = checkpoint_address(&address, &parsed, checkpoint);
+                    checkpoint_pinned_info(&*ops, &version_address, &parsed, checkpoint).await
                 }
             },
         )
@@ -1037,12 +1152,22 @@ impl NucleusBackend {
             let parsed = parsed.clone();
             async move {
                 let ops = self.ops()?;
-                let path = PathAtBranch {
-                    path: directory_path(&parsed.path),
-                    branch: parsed.branch.clone(),
-                };
-                let response = ops.create_directory(path).await?;
-                status_to_result(response.status, "create_directory")?;
+                // The root always exists and is never created.
+                if directory_path(&parsed.path) == "/" {
+                    return Ok(BackendItemInfo::default());
+                }
+                // The requested target is always sent (a set hit would report
+                // success on a folder deleted since); its ancestors come from
+                // the set. Recursive and idempotent, as the slot contract asks.
+                let ensured = self
+                    .ensure_directory(&ops, &parsed.branch, &parsed.path, true)
+                    .await?;
+                // `ALREADY_EXISTS` names a node of any type; idempotent success
+                // is for an existing directory only.
+                if ensured == Ensured::AlreadyExisted {
+                    self.confirm_directory(&ops, &parsed.branch, &parsed.path)
+                        .await?;
+                }
                 Ok(BackendItemInfo::default())
             }
         })
@@ -1065,7 +1190,7 @@ impl NucleusBackend {
                 let ops = self.ops()?;
                 let path = PathAtVersion {
                     path: directory_path(&parsed.path),
-                    branch: parsed.branch,
+                    branch: parsed.branch.clone(),
                     checkpoint: parsed.checkpoint,
                 };
                 let response = ops.delete2(vec![path]).await?;
@@ -1073,6 +1198,8 @@ impl NucleusBackend {
                 if let Some(per_path) = response.responses.first() {
                     status_to_result(*per_path, "delete2 directory entry")?;
                 }
+                // A folder this connection removed must not be asserted afterwards.
+                self.forget_subtree(&parsed.branch, &parsed.path)?;
                 Ok(())
             }
         })
@@ -1121,21 +1248,39 @@ impl NucleusBackend {
             let message = message.clone();
             async move {
                 let ops = self.ops()?;
-                let response = ops
-                    .copy2(vec![PathsToCopy {
+                let request = || {
+                    vec![PathsToCopy {
                         src: path_at_version(&src_parsed),
                         dst: PathAtBranch {
-                            path: dst_parsed.path,
-                            branch: dst_parsed.branch,
+                            path: dst_parsed.path.clone(),
+                            branch: dst_parsed.branch.clone(),
                         },
-                        message: Some(message),
-                    }])
-                    .await?;
-                status_to_result(response.status, "copy2")?;
-                if let Some(per_path) = response.responses.first() {
-                    status_to_result(*per_path, "copy2 entry")?;
+                        message: Some(message.clone()),
+                    }]
+                };
+                // No body travels with copy2, so the destination folder is
+                // created only after the server reports something missing, and
+                // only once the source is known to exist: a copy that fails for
+                // another reason leaves no folder behind.
+                let response = ops.copy2(request()).await?;
+                match batch_status(response.status, &response.responses, "copy2") {
+                    Ok(()) => {}
+                    Err(err)
+                        if err.code() == ErrorCode::NotFound
+                            && self.source_exists(&ops, &src_parsed).await =>
+                    {
+                        if let Err(recovery) = self.recreate_parent(&ops, &dst_parsed).await {
+                            Self::note_recovery_failure(&recovery);
+                            return Err(err);
+                        }
+                        let response = ops.copy2(request()).await?;
+                        batch_status(response.status, &response.responses, "copy2")?;
+                    }
+                    Err(err) => return Err(err),
                 }
+                self.remember_parent(&dst_parsed)?;
                 let info = ObjectInfo {
+                    etag_strength: Default::default(),
                     address: dest_address,
                     kind: ObjectKind::File,
                     etag: None,
@@ -1147,6 +1292,7 @@ impl NucleusBackend {
                     system_metadata: None,
                     user_metadata: None,
                     modified_by: None,
+                    versioned_address: None,
                 };
                 Ok(WriteStep::Done(WriteResult { info }))
             }
@@ -1194,23 +1340,42 @@ impl NucleusBackend {
             let message = message.clone();
             async move {
                 let ops = self.ops()?;
-                let response = ops
-                    .rename2(vec![PathsToRename {
+                let request = || {
+                    vec![PathsToRename {
                         src: PathAtBranch {
-                            path: src_parsed.path,
-                            branch: src_parsed.branch,
+                            path: src_parsed.path.clone(),
+                            branch: src_parsed.branch.clone(),
                         },
                         dst: PathAtBranch {
-                            path: dst_parsed.path,
-                            branch: dst_parsed.branch,
+                            path: dst_parsed.path.clone(),
+                            branch: dst_parsed.branch.clone(),
                         },
-                        message: Some(message),
-                    }])
-                    .await?;
-                status_to_result(response.status, "rename2")?;
-                if let Some(per_path) = response.responses.first() {
-                    status_to_result(*per_path, "rename2 entry")?;
+                        message: Some(message.clone()),
+                    }]
+                };
+                // Same lazy shape as copy: the destination folder is created
+                // only after the server reports something missing and the
+                // source is known to exist.
+                let response = ops.rename2(request()).await?;
+                match batch_status(response.status, &response.responses, "rename2") {
+                    Ok(()) => {}
+                    Err(err)
+                        if err.code() == ErrorCode::NotFound
+                            && self.source_exists(&ops, &src_parsed).await =>
+                    {
+                        if let Err(recovery) = self.recreate_parent(&ops, &dst_parsed).await {
+                            Self::note_recovery_failure(&recovery);
+                            return Err(err);
+                        }
+                        let response = ops.rename2(request()).await?;
+                        batch_status(response.status, &response.responses, "rename2")?;
+                    }
+                    Err(err) => return Err(err),
                 }
+                // The source tree moved: nothing beneath its old name is a
+                // folder this connection may assert any more.
+                self.forget_subtree(&src_parsed.branch, &src_parsed.path)?;
+                self.remember_parent(&dst_parsed)?;
                 Ok(())
             }
         })
@@ -1309,6 +1474,48 @@ impl NucleusBackend {
     }
 }
 
+/// The newest checkpoint id on `target`'s path and branch, or `None` when the
+/// path has none. One `get_checkpoints` round-trip.
+async fn latest_checkpoint_id(ops: &dyn NucleusOps, target: &NucleusTarget) -> Result<Option<u64>> {
+    let response = ops
+        .get_checkpoints(PathAtBranch {
+            path: target.path.clone(),
+            branch: target.branch.clone(),
+        })
+        .await?;
+    status_to_result(response.status, "get_checkpoints")?;
+    // omni1 doesn't document checkpoint ordering; checkpoint_id is monotonic,
+    // so max() is the head regardless of how the server sorts the list.
+    Ok(response
+        .checkpoints
+        .into_iter()
+        .filter_map(|checkpoint| checkpoint.checkpoint_id)
+        .max())
+}
+
+/// `address` described by the facts of `target` at `checkpoint`, with the
+/// pin beside them as `versioned_address`. One `stat2` round-trip, pinned to
+/// the checkpoint rather than the head: reading the facts there keeps them
+/// and the pin naming the same bytes even when a save lands between the
+/// lookup that chose the checkpoint and this call.
+async fn checkpoint_pinned_info(
+    ops: &dyn NucleusOps,
+    address: &Url,
+    target: &NucleusTarget,
+    checkpoint: u64,
+) -> Result<ObjectInfo> {
+    let mut pinned = target.clone();
+    pinned.checkpoint = Some(checkpoint);
+    let result = ops.stat2(path_at_version(&pinned)).await?;
+    status_to_result(result.status, "stat2")?;
+    let mut info = stat2_to_object_info(address.clone(), result);
+    info.versioned_address = Some(checkpoint_address(address, target, checkpoint));
+    Ok(info)
+}
+
+/// `base` pinned to one checkpoint, spelled `?&N` (default branch) or
+/// `?branch&N`; both spellings parse back through
+/// `crate::address::parse_nucleus_address`.
 fn checkpoint_address(base: &Url, target: &NucleusTarget, checkpoint: u64) -> Url {
     let mut address = base.clone();
     address.set_query(None);
@@ -1357,6 +1564,7 @@ pub(crate) fn native_capabilities() -> Capabilities {
         supports_atomic_rename: false,
         has_real_directories: true,
         supports_list: true,
+        supports_list_stream: false,
         wants_list_backed_stat: true,
         // omni1 list2 returns a single directory level; recursive walks are host-driven.
         supports_recursive_list: false,

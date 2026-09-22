@@ -11,7 +11,8 @@ Everything is in one tree, `ovstorage-c-source/`. There is no
 source.
 
 - **C++ wrapper:** `include/ovstorage.hpp` — header-only, hand-written,
-  async-only.
+  async-only. `StackConfig` is the declarative TOML-to-Stack path; `Stack` is
+  the imperative builder.
 - **C API it sits on:** `include/ovstorage.h`, implemented by `src/*.c`.
   The wrapper surface mirrors the C API, so any new C++ method needs a
   corresponding C entry point. Both are hand-maintained and edited
@@ -51,10 +52,13 @@ C++20 with `<coroutine>`, `<span>`, `<concepts>`. Targets:
 - Clang 17+
 - MSVC 19.40+ (Visual Studio 2022 17.10+)
 
-GCC 15.x is *within* the floor version range but has a known compiler defect
-that causes a ThreadSanitizer data race on coroutine frames resumed on another
-thread before the ramp returns (callback-driven awaiters); see
+GCC 15.2 and later, including GCC 16, are *within* the floor version range but
+have a known compiler defect that causes a ThreadSanitizer data race on
+coroutine frames resumed on another thread before the ramp returns
+(callback-driven awaiters); see
 [Known toolchain defects](README.md#known-toolchain-defects) in the README.
+Affected local hosts can set `OVSTORAGE_ACKNOWLEDGE_UNSUPPORTED_TOOLCHAIN=1`
+for that diagnosed race, while the relevant Linux CI jobs pin `g++-13`.
 
 Both example build files probe the floor by compiling `ovstorage.hpp`
 itself and report it if the compiler cannot — a narrower coroutine probe
@@ -74,18 +78,26 @@ compiler / STL combination.
 |---|---|
 | Is method X exposed in C++? | Search `ovstorage.hpp` for `task<...> X(`; if absent, check `ovstorage.h` first (C API gap, not just C++ gap). |
 | Does this need a new C API entry point? | Yes if the method isn't in `ovstorage.h`. Adding one means declaring it there AND implementing it in `src/`; the link-completeness gate fails otherwise. |
+| Should an app translate `[ovstorage]` TOML itself? | No. Use `StackConfig::from_toml_path` and build through the app-owned `Registry`; use imperative `Stack` only for programmatically generated topology. |
 | Does a string argument need a NUL check? | No — `detail::embedded_nul` is the single chokepoint every entry point routes through. Add the guard line, don't write a new check. |
 | Streaming reads — per-chunk? | Not provided; aggregates to `std::vector<std::byte>`. Punt to C ABI multi-fire callback. |
 | Cancellation across multiple ops? | One `CancelToken` shared by reference; see README § *Cancellation*. |
+| Which route owns one address? | `LayerHandle::root_info_for()`; do not raw-prefix-match a `list_address_roots()` snapshot. |
 | STL mismatch concern? | Route to [README.md § STL mismatch posture](README.md#stl-mismatch-posture) — already-decided posture. |
 | Plugin author wants to use C++ internally? | `-static-libstdc++` (GCC) or `-stdlib=libc++ -lc++abi --whole-archive` (Clang); manifest types stay POD C. |
 
 ## Hard rules
 
-- **No exceptions across the library boundary.** Wrapper itself never
-  throws; errors come back as `ovstorage::Result<T>`. Plugins that
+- **No exceptions across the C library boundary.** Storage failures come
+  back as `ovstorage::Result<T>`; allocating C++ operations, including an owned
+  `Error::code_name()` copy, can throw locally. Plugins that
   use C++ internally must catch internally and translate to the C
   error shape before returning.
+- **Error names preserve origin data, not guaranteed precision.** Plugin
+  errors retain finer names; C-host errors carry coarse names; wrapper
+  preflight errors constructed from status/message carry no name. Use status
+  for portable policy, and operation context plus diagnostics where the name
+  is ambiguous. A setup `NotFound` is not evidence of a missing asset.
 - **Move-only handles.** Every wrapper type is move-only; a moved-from
   handle is null and methods on it return failed `Result` rather than
   hanging.

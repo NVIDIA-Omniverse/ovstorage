@@ -78,6 +78,12 @@ pub struct BrokerDriver {
     /// republish routes after a deferred sign-in. `Weak` because the layer owns
     /// (via its `ConnectionSet`) this driver — an `Arc` would leak the cycle.
     layer: Weak<BrokerClientLayer>,
+    /// Hermetic acceptance probe for integration tests. Grant parsing, token-file
+    /// reads, identity replacement, and the authenticated hook still use the
+    /// production paths; only the normally remote verification RPC is injected.
+    #[cfg(feature = "_test_support")]
+    test_verify_transport:
+        Option<std::sync::Arc<dyn ovstorage_broker_protocol::BrokerClientTransport>>,
 }
 
 impl BrokerDriver {
@@ -102,7 +108,18 @@ impl BrokerDriver {
             stable,
             claim: std::sync::OnceLock::new(),
             layer,
+            #[cfg(feature = "_test_support")]
+            test_verify_transport: None,
         }
+    }
+
+    #[cfg(feature = "_test_support")]
+    pub(crate) fn with_test_verify_transport(
+        mut self,
+        transport: std::sync::Arc<dyn ovstorage_broker_protocol::BrokerClientTransport>,
+    ) -> Self {
+        self.test_verify_transport = Some(transport);
+        self
     }
 
     /// Scope this connection's durable key by its account discriminator.
@@ -553,6 +570,14 @@ impl ConnectionAuthDriver for BrokerDriver {
         credentials: &SecretBundle,
         cancel: Option<CancellationToken>,
     ) -> Result<()> {
+        #[cfg(feature = "_test_support")]
+        if let Some(transport) = &self.test_verify_transport {
+            return race_cancel(cancel.as_ref(), async {
+                transport.list_address_roots().await.map(|_| ())
+            })
+            .await;
+        }
+
         // Prove the backend accepts the bearer with ONE read-only RPC over an
         // EPHEMERAL transport whose interceptor reads a fresh private state
         // seeded with only `credentials`' bearer — never the live cell. An empty
@@ -1206,6 +1231,7 @@ mod tests {
             },
             last_probed: None,
             user_metadata: UserMetadata::new(),
+            owning_target: None,
         }
     }
 

@@ -66,10 +66,10 @@ by construction.
 | Method + path | `Layer` operation | Notes |
 |---|---|---|
 | `GET /v1/objects?address=...` | `Stack::read` | `200` with body for `Bytes` / `Stream` / `LocalDelegate`; `307 Temporary Redirect` with `Location` + `X-OV-Audit-Id` for `Redirect` (the REST stack's follower runs `follow_reads=false`, so a backend `Redirect` surfaces unfollowed). Range reads via `Range:` header. |
-| `GET /v1/objects:stat?address=...&full_metadata=true` | `stat` | Input-guided directory handling: `.../foo` stats exact object first, then `.../foo/` on `NotFound`; `.../foo/` stats only the directory spelling. |
+| `GET /v1/objects:stat?address=...&full_metadata=true&versioned_address=true` | `stat` | Input-guided directory handling: `.../foo` stats exact object first, then `.../foo/` on `NotFound`; `.../foo/` stats only the directory spelling. `versioned_address=true` asks for the pinned address; the response field is omitted when absent. |
 | `PUT /v1/objects?dest=...` | `write` | Request body propagates as `Body::Stream` chunk-by-chunk (no host-side `Vec<u8>` drain) through a 16-slot bounded mpsc. |
 | `DELETE /v1/objects?address=...` | `delete` | |
-| `GET /v1/objects:list?prefix=...&recursive=true&full_metadata=true` | `list` | Per-item authz filtering via `filter_list_batch`. |
+| `GET /v1/objects:list?prefix=...&recursive=true&full_metadata=true&versioned_address=true` | `list` | Per-item authz filtering via `filter_list_batch`. `versioned_address=true` asks for the pinned address on every file item. |
 | `GET /v1/objects:versions?address=...` | `list_versions` | |
 | `GET /v1/objects:latest-version?address=...` | `get_latest_version` | |
 | `POST /v1/objects:copy` | `copy` | Decomposes server-side into `Read(src) + Write(dst)` for authz. |
@@ -117,12 +117,25 @@ the standard loader at startup — not mutated through REST (see
 `ObjectInfo`, `Capabilities`, `WriteResult`, page envelopes, and error
 envelopes are JSON. `list`, `list_versions`, and
 `get_latest_version` surface `ObjectInfo` values directly; version
-history items carry version-pinned addresses in `ObjectInfo.address`.
+history items carry version-pinned addresses in `ObjectInfo.address`, and
+every `ObjectInfo` may carry `versioned_address`, the address that serves
+this exact version (a pin, not an identity), omitted from the JSON when
+absent; `list_versions` and `get_latest_version` items return it equal to
+`address`.
 Object bodies are raw bytes with chunked
 transfer encoding when the upstream `ReadResult` is `Stream` or
 `LocalDelegate`. Query parameters are parsed strictly: booleans accept
 exactly `true`/`false`/`1`/`0`; integers reject non-integer values
 with `400 InvalidArgument`.
+
+`full_metadata` and `versioned_address` are cost knobs, not inclusion lists.
+Leaving one clear says "spend no extra round-trips on this"; setting it says
+"I will pay". A backend that already has the value in hand returns it either
+way, so an absent field means "the backend has none" only when you asked, and
+a present field does not mean you asked. With `versioned_address` set, a
+versioning backend returns the pinned address for every object it versions;
+an absent `versioned_address` under the flag means the backend does not
+version this object.
 
 ## Authentication
 

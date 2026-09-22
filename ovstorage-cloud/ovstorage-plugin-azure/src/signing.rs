@@ -179,6 +179,17 @@ impl SasPermission {
             Self::Delete => 'd',
         }
     }
+
+    fn canonical_order(self) -> usize {
+        // Exhaustive on purpose: adding a permission cannot compile until its
+        // documented Azure position is selected here.
+        match self {
+            Self::Read => 0,
+            Self::Create => 2,
+            Self::Write => 3,
+            Self::Delete => 4,
+        }
+    }
 }
 
 /// Inputs for a Service SAS over a single blob path.
@@ -193,12 +204,29 @@ pub(crate) struct ServiceSasRequest<'a> {
     pub version: &'a str,
 }
 
+/// Azure's canonical SAS permission order. Not alphabetical, and not
+/// negotiable: a permission string in any other order is rejected with
+/// `AuthenticationFailed` / "Signature fields not well formed".
+///
+/// <https://learn.microsoft.com/rest/api/storageservices/create-service-sas#permissions-for-a-blob>
+#[cfg(test)]
+const SAS_PERMISSION_ORDER: &str = "racwdxltmeop";
+
 impl<'a> ServiceSasRequest<'a> {
     pub fn permission_string(&self) -> String {
-        let mut chars: Vec<char> = self.permissions.iter().map(|p| p.as_char()).collect();
-        chars.sort();
-        chars.dedup();
-        chars.into_iter().collect()
+        let mut permissions = self.permissions.to_vec();
+        // Sort into Azure's canonical order, not alphabetical. The two agree
+        // for every set this plugin mints today (`r`, and `cw` for
+        // write+create), which is why an alphabetical sort has never failed in
+        // the wild -- but they diverge the moment `d` or `r`+`c` is granted
+        // (alphabetical `cdrw` vs canonical `rcwd`), and that failure would
+        // surface only against live Azure.
+        permissions.sort_by_key(|permission| permission.canonical_order());
+        permissions.dedup();
+        permissions
+            .into_iter()
+            .map(SasPermission::as_char)
+            .collect()
     }
 }
 
@@ -282,6 +310,84 @@ pub(crate) fn decode_account_key(raw: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn req_with_permissions(permissions: &[SasPermission]) -> ServiceSasRequest<'_> {
+        ServiceSasRequest {
+            account: "a",
+            container: "c",
+            blob_path: "b",
+            permissions,
+            start: None,
+            expiry: "x",
+            protocol: None,
+            version: DEFAULT_SAS_VERSION,
+        }
+    }
+
+    /// The sets this plugin mints today. Both are order-identical under an
+    /// alphabetical sort, which is exactly why the wrong sort survived: these
+    /// pass either way, so they cannot catch a regression on their own.
+    #[test]
+    fn permission_string_covers_the_sets_minted_today() {
+        assert_eq!(
+            req_with_permissions(&[SasPermission::Read]).permission_string(),
+            "r"
+        );
+        assert_eq!(
+            req_with_permissions(&[SasPermission::Write, SasPermission::Create])
+                .permission_string(),
+            "cw"
+        );
+    }
+
+    /// The sets where canonical and alphabetical diverge. These are what
+    /// actually pin the ordering: alphabetical would yield "crw" and "cdrw",
+    /// both rejected by Azure with `AuthenticationFailed` /
+    /// "Signature fields not well formed".
+    #[test]
+    fn permission_string_uses_azure_canonical_order_not_alphabetical() {
+        assert_eq!(
+            req_with_permissions(&[
+                SasPermission::Write,
+                SasPermission::Read,
+                SasPermission::Read,
+                SasPermission::Create,
+            ])
+            .permission_string(),
+            "rcw",
+            "duplicates collapse and order is canonical, not alphabetical (\"crw\")"
+        );
+        assert_eq!(
+            req_with_permissions(&[
+                SasPermission::Read,
+                SasPermission::Write,
+                SasPermission::Create,
+                SasPermission::Delete,
+            ])
+            .permission_string(),
+            "rcwd",
+            "full grant is \"rcwd\", not alphabetical \"cdrw\""
+        );
+    }
+
+    #[test]
+    fn each_sas_permission_maps_to_its_documented_character_and_position() {
+        for permission in [
+            SasPermission::Read,
+            SasPermission::Write,
+            SasPermission::Create,
+            SasPermission::Delete,
+        ] {
+            assert_eq!(
+                SAS_PERMISSION_ORDER
+                    .chars()
+                    .nth(permission.canonical_order()),
+                Some(permission.as_char()),
+                "{permission:?} must map to its documented Azure position"
+            );
+        }
+        assert_eq!(SAS_PERMISSION_ORDER, "racwdxltmeop");
+    }
+
     /// Pins the documented Microsoft List Blobs Shared Key example.
     #[test]
     fn shared_key_string_to_sign_matches_microsoft_list_blobs_example() {
@@ -360,26 +466,6 @@ mod tests {
         let query = service_sas_query(&key_bytes, &req).unwrap();
         let expected = "sv=2021-12-02&sr=b&se=2030-01-01T00%3A00%3A00Z&sp=r&spr=https&sig=mNRhahQKl%2BTUsBbqjtJW95R3VQVHyRp%2Fwh40%2BFZSZvw%3D";
         assert_eq!(query, expected);
-    }
-
-    #[test]
-    fn permission_string_is_sorted_and_deduped() {
-        let req = ServiceSasRequest {
-            account: "a",
-            container: "c",
-            blob_path: "b",
-            permissions: &[
-                SasPermission::Write,
-                SasPermission::Read,
-                SasPermission::Read,
-                SasPermission::Create,
-            ],
-            start: None,
-            expiry: "x",
-            protocol: None,
-            version: DEFAULT_SAS_VERSION,
-        };
-        assert_eq!(req.permission_string(), "crw");
     }
 
     #[test]

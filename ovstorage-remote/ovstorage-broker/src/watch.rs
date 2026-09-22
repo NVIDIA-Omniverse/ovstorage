@@ -34,14 +34,29 @@ impl WatchDirectoryState {
         prefix: Url,
         opts: WatchDirectoryOptions,
         extensions: ovstorage::Extensions,
-    ) -> ovstorage::Result<ChangeStream> {
+        cancel: Option<CancellationToken>,
+    ) -> ovstorage::Result<(ChangeStream, CancellationToken)> {
         let span = tracing::info_span!(
             "broker.watch",
             op = "watch_directory",
             object.address = %crate::trace::RedactedUrl(&prefix),
         );
         let _guard = span.enter();
-        stack
+        let rpc_cancel = self.shutdown.child_token();
+        if let Some(caller_cancel) = cancel {
+            let bridge_cancel = rpc_cancel.clone();
+            let bridge_done = bridge_cancel.clone();
+            // Intentionally detached: it owns only token clones and exits as
+            // soon as either the caller or the RPC cancellation fires.
+            drop(tokio::spawn(async move {
+                tokio::select! {
+                    _ = caller_cancel.cancelled() => bridge_cancel.cancel(),
+                    _ = bridge_done.cancelled() => {}
+                }
+            }));
+        }
+
+        let stream = match stack
             .watch_directory(
                 ovstorage::Request {
                     extensions,
@@ -50,9 +65,24 @@ impl WatchDirectoryState {
                         options: opts,
                     },
                 },
-                Some(self.shutdown.child_token()),
+                Some(rpc_cancel.clone()),
             )
             .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                rpc_cancel.cancel();
+                return Err(error);
+            }
+        };
+
+        // Direct in-process callers do not have a tonic response body whose
+        // Drop can signal cancellation. Make every returned iterator own the
+        // per-RPC token so abandoning it also unblocks a quiet backend watch.
+        Ok((
+            Box::new(ovstorage::cancel_on_drop(stream, rpc_cancel.clone())),
+            rpc_cancel,
+        ))
     }
 }
 

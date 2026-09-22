@@ -34,14 +34,17 @@ is extended to it. Then pick one route from the table below.
 | Use or modify the Python binding | [`docs/public/library-python/AGENTS.md`](docs/public/library-python/AGENTS.md) |
 | Run or extend Python examples | [`docs/public/library-python/AGENTS.md`](docs/public/library-python/AGENTS.md) and [`ovstorage-core/examples/python/README.md`](ovstorage-core/examples/python/README.md) |
 | Use or modify the C++ binding | [`docs/public/library-cpp/AGENTS.md`](docs/public/library-cpp/AGENTS.md) |
-| Call ovstorage over HTTP/REST | [`docs/public/library-web/AGENTS.md`](docs/public/library-web/AGENTS.md) |
+| Call ovstorage over HTTP/REST | [`docs/public/library-web/AGENTS.md`](docs/public/library-web/AGENTS.md) (not recommended for new deployments) |
 | Work on storage plugin behavior | [`docs/public/plugin-storage/AGENTS.md`](docs/public/plugin-storage/AGENTS.md) and [`docs/public/plugin-development/AGENTS.md`](docs/public/plugin-development/AGENTS.md) |
+| Add a capability bit, implement a Layer slot, or move behavior between a backend and a wrapper | [`docs/public/plugin-storage/OWNERSHIP.md`](docs/public/plugin-storage/OWNERSHIP.md) first, then [`docs/public/plugin-storage/AGENTS.md`](docs/public/plugin-storage/AGENTS.md) |
 | Work on the Omniverse Storage Service client plugin | [`docs/public/plugin-storage/plugin-services-client.md`](docs/public/plugin-storage/plugin-services-client.md) |
-| Work on the broker-client plugin | [`docs/public/plugin-storage/plugin-broker.md`](docs/public/plugin-storage/plugin-broker.md) plus [`docs/public/plugin-storage/AGENTS.md`](docs/public/plugin-storage/AGENTS.md) |
+| Work on the broker-client plugin | [`docs/public/plugin-storage/plugin-broker.md`](docs/public/plugin-storage/plugin-broker.md) plus [`docs/public/plugin-storage/AGENTS.md`](docs/public/plugin-storage/AGENTS.md) (not recommended for new deployments) |
 | Configure or modify authorization policy | [`docs/public/authz-policy/AGENTS.md`](docs/public/authz-policy/AGENTS.md) |
-| Operate the broker daemon | [`docs/public/broker-operator/AGENTS.md`](docs/public/broker-operator/AGENTS.md) |
-| Operate the REST gateway | [`docs/public/library-web/AGENTS.md`](docs/public/library-web/AGENTS.md) |
+| Operate the broker daemon | [`docs/public/broker-operator/AGENTS.md`](docs/public/broker-operator/AGENTS.md) (not recommended for new deployments) |
+| Operate the REST gateway | [`docs/public/library-web/AGENTS.md`](docs/public/library-web/AGENTS.md) (not recommended for new deployments) |
 | Work on repository maintenance or CI | Source-developer skills under [`skills/`](skills/) |
+| Claim issues or review PRs as an AI harness | The maintainer guide's `CONTRIBUTING.md` (internal) |
+| Run or troubleshoot app-level integration tests | [`ovstorage-contributor-run-integration-tests`](skills/ovstorage-contributor-run-integration-tests/SKILL.md) |
 | Use the MCP tools or result-envelope contract | [`docs/public/agent/README.md`](docs/public/agent/README.md) |
 | Work on service/API specs, service-stack deployment, or service operations | [`ovstorage-services/AGENTS.md`](ovstorage-services/AGENTS.md) |
 
@@ -54,7 +57,7 @@ The five user-facing personas (one persona doc per audience):
 | [`library-rust`](docs/public/library-rust/README.md) | Rust applications linking the `ovstorage` crate |
 | [`library-python`](docs/public/library-python/README.md) | Python applications using the abi3-py310 wheel |
 | [`library-cpp`](docs/public/library-cpp/README.md) | C / C++ applications using the C ABI cdylib + C++20 header |
-| [`library-web`](docs/public/library-web/README.md) | HTTP callers using `ovstorage-rest` |
+| [`library-web`](docs/public/library-web/README.md) | HTTP callers using `ovstorage-rest` (not recommended for new deployments) |
 | [`agent`](docs/public/agent/README.md) | MCP / result-envelope consumers |
 
 Plus three plugin / operator personas:
@@ -63,7 +66,7 @@ Plus three plugin / operator personas:
 |---|---|
 | [`plugin-storage`](docs/public/plugin-storage/README.md) | Storage backend plugin authors |
 | [`authz-policy`](docs/public/authz-policy/README.md) | Authorization policy operators and contributors |
-| [`broker-operator`](docs/public/broker-operator/README.md) | `ovstorage-broker` deployment + policy management |
+| [`broker-operator`](docs/public/broker-operator/README.md) | `ovstorage-broker` deployment + policy management (not recommended for new deployments) |
 
 ## Invocable Skills
 
@@ -104,6 +107,7 @@ Source-developer skills:
 | [`ovstorage-contributor-author-storage-plugin`](skills/ovstorage-contributor-author-storage-plugin/SKILL.md) | Adding or reviewing a storage backend plugin |
 | [`ovstorage-contributor-modify-authz-layer`](skills/ovstorage-contributor-modify-authz-layer/SKILL.md) | Changing the built-in auth Layer or policy engine |
 | [`ovstorage-contributor-run-broker-locally`](skills/ovstorage-contributor-run-broker-locally/SKILL.md) | Standing up a local broker for development or integration testing |
+| [`ovstorage-contributor-run-integration-tests`](skills/ovstorage-contributor-run-integration-tests/SKILL.md) | Running the app-level suite hermetically or against live cloud fixtures |
 | [`ovstorage-contributor-regenerate-c-headers`](skills/ovstorage-contributor-regenerate-c-headers/SKILL.md) | Refreshing generated C/C++ headers |
 | [`ovstorage-contributor-verify-before-merge`](skills/ovstorage-contributor-verify-before-merge/SKILL.md) | Running checks before review or merge |
 | [`ovstorage-contributor-services-client-conformance`](skills/ovstorage-contributor-services-client-conformance/SKILL.md) | Checking the Storage API contract that the services-client plugin depends on |

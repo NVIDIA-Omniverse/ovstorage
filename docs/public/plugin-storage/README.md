@@ -9,8 +9,9 @@ type vocabulary, ownership, build, and loading rules.
 ## Architecture
 
 A storage plugin is an ABI-v2 Layer plugin — "v2" is the plugin ABI *family*,
-whose version number is 13 in ovstorage 0.2.1 with a floor of 5, and is
-unrelated to the ovstorage package version.
+whose version number is 19 in the current source tree and 15 in ovstorage
+0.2.1, with a family floor of 5. It is unrelated to the ovstorage package
+version.
 
 It implements:
 
@@ -65,6 +66,15 @@ Unimplemented optional slots return `Unsupported`. Advertise the corresponding
 capability only when the implementation honors the complete contract in
 [CONFORMANCE.md](CONFORMANCE.md).
 
+That list is exhaustive for a backend Layer. The vtable carries one further
+object slot, `materialize`, which a backend leaves at its trait default: local
+availability is produced by the host wrapper Layers composed above the backend
+— the redirect follower stages a `read` into a local file, and the byte cache
+serves and pins under a lease one it already holds, delegating downward on a
+miss — so it is a property of the composed Stack rather than of a backend, and
+there is no capability bit for it. [OWNERSHIP.md](OWNERSHIP.md) is the registry
+of which Layer owns which concern.
+
 ## Streaming
 
 Large reads return `ReadResult::Stream`; streaming writes consume
@@ -97,7 +107,30 @@ directory key** rather than assume a trailing slash is present. See
 Returned object addresses stay inside the resolved request prefix. The host
 projects them back into the caller namespace. Version-aware plugins return
 version-pinned addresses and never silently drop a caller-supplied pin on a
-mutation.
+mutation. Under the `versioned_address` cost flag they also report each
+object's pin as `ObjectInfo.versioned_address`; the per-backend table in
+[CONFORMANCE.md](CONFORMANCE.md) states what that costs on each store.
+
+An address that no connection serves is `NoRoute` — unless the operator granted
+the **anonymous fallback** for the address's scheme, with
+`anonymous_fallback = ["s3"]` (or `["gs"]`, `["azure"]`) on that kind's layer
+table, or `anonymous_fallback_schemes` on a broker or REST gateway, which
+stamps the same key. A granted backend publishes one hidden scheme root
+(`s3:///`, `gs:///`, `azure:///`); the shared route table consults it only
+after every prefix has missed and only for an address whose query carries no
+credential; and the backend attempts the address anonymously and read-only,
+refusing a cloud instance-metadata host before any socket opens. The placement
+follows the ownership registry's information test: the backend owns reaching
+the node anonymously — the scheme root, the per-bucket client, the read-only
+refusal and the instance-metadata refusal — and the host owns whether that is
+permitted, which is why the grant is layer configuration and authorization is
+evaluated before routing. The `anonymous_fallback` section of
+[configuration.md](../configuration.md) has the keys and the host rules; the
+`Router` routing row and the owning-backend row for the per-scheme anonymous
+fallback in [OWNERSHIP.md](OWNERSHIP.md) record the placement; and each cloud
+plugin's own **Anonymous fallback** section ([S3](plugin-s3.md),
+[GCS](plugin-gcs.md), [Azure](plugin-azure.md)) states what its fallback
+reaches and refuses.
 
 ## Credentials and secrets
 
@@ -127,10 +160,11 @@ Rust plugins build as `cdylib` and invoke:
 ovstorage_plugin::ovstorage_layer_plugin!(backend, MyLayerFactory::default);
 ```
 
-The loader requires an exact match on the Layer ABI version — 13 in ovstorage
-0.2.1 — rather than a compatible range. A cdylib declaring anything else is
-refused at load with `IncompatibleType`. `test_only` is available
-only for controlled conformance fixtures:
+The loader requires an exact match on the host's Layer ABI version rather than
+a compatible range. The current source tree expects 19; ovstorage 0.2.1
+expects 15. A cdylib declaring anything else is refused at load with
+`IncompatibleType`. `test_only` is available only for controlled conformance
+fixtures:
 
 ```rust,ignore
 ovstorage_plugin::ovstorage_layer_plugin!(backend, TestLayerFactory::default, test_only);
@@ -171,6 +205,8 @@ fixture, not a vendor-plugin template. Its export crate marks the cdylib
 - [S3](plugin-s3.md) — AWS S3 and compatible services.
 - [GCS](plugin-gcs.md) — Google Cloud Storage.
 - [Azure](plugin-azure.md) — Azure Blob Storage and ADLS Gen2.
+- [Hugging Face Hub](plugin-huggingface.md) — Hugging Face Hub repositories
+  (read-only).
 - [OpenDAL](plugin-opendal.md) — OpenDAL-backed services.
 - [Nucleus](plugin-nucleus.md) — Omniverse Nucleus.
 - [test plugin](plugin-test.md) — deterministic conformance fixture.
@@ -180,6 +216,8 @@ fixture, not a vendor-plugin template. Its export crate marks the cdylib
 - Keep capability declarations exact.
 - Preserve error codes across SDK/provider mappings.
 - Enforce write preconditions before publishing bytes.
+- A write creates its path: create missing ancestors on real-directory
+  backends; never make the caller do it.
 - Keep streams bounded and cancellation-aware.
 - Never hand-author the C vtable for a Rust plugin.
 - Treat plugins as trusted in-process code; there is no sandbox or hot reload.

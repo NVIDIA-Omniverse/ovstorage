@@ -8,10 +8,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ovstorage_plugin::{
     AccessDecision, AccessOps, AddressRoot, AddressVisibility, Body, ByteRange, ChecksumAlgorithm,
     ChecksumSet, ConnectionId, CopyOptions, CreateDirectoryOptions, DeleteDirectoryOptions,
-    DeleteOptions, EffectivePermissions, Error, ErrorCode, IfDestExists, InteractiveAuthCapability,
-    ListOptions, ListPage, ListVersionsOptions, ObjectInfo, ObjectKind, ReadOptions,
-    RedirectBodySource, RedirectResult, RedirectResultBatch, RedirectScope, RenameOptions,
-    RouteSource, StatOptions, UpdateMetadataOptions, Url, WatchDirectoryCursor,
+    DeleteOptions, EffectivePermissions, Error, ErrorCode, EtagStrength, IfDestExists,
+    InteractiveAuthCapability, ListOptions, ListPage, ListVersionsOptions, ObjectInfo, ObjectKind,
+    ReadOptions, RedirectBodySource, RedirectResult, RedirectResultBatch, RedirectScope,
+    RenameOptions, RouteSource, StatOptions, UpdateMetadataOptions, Url, WatchDirectoryCursor,
     WatchDirectoryOptions, WriteOptions, WriteRedirect, WriteRedirectBatch, WriteResult, address,
 };
 use prost::Message;
@@ -46,6 +46,12 @@ pub struct ProtocolVersion {
 }
 
 pub const PROTOCOL_V2: ProtocolVersion = ProtocolVersion { major: 2, minor: 0 };
+
+/// Shared inbound gRPC message ceiling for broker servers and official clients.
+///
+/// This retains a four-MiB plugin-continuation range while leaving room for the
+/// broker's fixed-size authentication envelope and protobuf framing overhead.
+pub const BROKER_GRPC_MAX_DECODING_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 
 /// gRPC metadata header carrying the host's [`InteractiveAuthCapability`]. Values:
 /// `"none" | "headless" | "browser"`; absent → `Browser`. Lowercase so HPACK indexes repeats.
@@ -107,6 +113,8 @@ pub fn object_info_to_proto(info: &ObjectInfo) -> pb::ObjectInfo {
             .map(effective_permissions_to_proto),
         user_metadata: info.user_metadata.clone().unwrap_or_default(),
         system_metadata: info.system_metadata.clone().unwrap_or_default(),
+        etag_strength: etag_strength_to_proto(info.etag_strength) as i32,
+        versioned_address: info.versioned_address.as_ref().map(object_address_to_proto),
     }
 }
 
@@ -115,6 +123,7 @@ pub fn object_info_from_proto(
 ) -> ovstorage_plugin::Result<ObjectInfo> {
     let info = info.ok_or_else(|| invalid_argument("missing object info"))?;
     Ok(ObjectInfo {
+        etag_strength: etag_strength_from_proto(info.etag_strength),
         address: object_address_from_proto(info.address)?,
         kind: object_kind_from_proto(info.kind),
         etag: info.etag,
@@ -128,7 +137,29 @@ pub fn object_info_from_proto(
         system_metadata: (!info.system_metadata.is_empty()).then_some(info.system_metadata),
         user_metadata: (!info.user_metadata.is_empty()).then_some(info.user_metadata),
         modified_by: info.modified_by,
+        // A pin that does not parse is as fatal as a malformed `address`;
+        // absence keeps its meaning and never absorbs garbage.
+        versioned_address: info
+            .versioned_address
+            .map(object_address_from_proto)
+            .transpose()?,
     })
+}
+
+fn etag_strength_to_proto(strength: EtagStrength) -> pb::EtagStrength {
+    match strength {
+        EtagStrength::Unspecified => pb::EtagStrength::Unspecified,
+        EtagStrength::Strong => pb::EtagStrength::Strong,
+        EtagStrength::Weak => pb::EtagStrength::Weak,
+    }
+}
+
+fn etag_strength_from_proto(value: i32) -> EtagStrength {
+    match pb::EtagStrength::try_from(value) {
+        Ok(pb::EtagStrength::Strong) => EtagStrength::Strong,
+        Ok(pb::EtagStrength::Weak) => EtagStrength::Weak,
+        Ok(pb::EtagStrength::Unspecified) | Err(_) => EtagStrength::Unspecified,
+    }
 }
 
 fn object_kind_to_proto(kind: ObjectKind) -> pb::ObjectKind {
@@ -241,6 +272,7 @@ fn effective_permissions_from_proto(permissions: pb::AccessOps) -> EffectivePerm
 pub fn stat_options_to_proto(options: &StatOptions) -> pb::StatOptions {
     pb::StatOptions {
         full_metadata: options.full_metadata,
+        versioned_address: options.versioned_address,
     }
 }
 
@@ -248,6 +280,7 @@ pub fn stat_options_from_proto(options: Option<pb::StatOptions>) -> StatOptions 
     let options = options.unwrap_or_default();
     StatOptions {
         full_metadata: options.full_metadata,
+        versioned_address: options.versioned_address,
     }
 }
 
@@ -313,6 +346,7 @@ pub fn list_options_to_proto(options: &ListOptions) -> pb::ListOptions {
         max_results: options.max_results,
         page_token: options.page_token.clone().unwrap_or_default(),
         full_metadata: options.full_metadata,
+        versioned_address: options.versioned_address,
     }
 }
 
@@ -323,6 +357,7 @@ pub fn list_options_from_proto(options: Option<pb::ListOptions>) -> ListOptions 
         max_results: options.max_results,
         page_token: nonempty(options.page_token),
         full_metadata: options.full_metadata,
+        versioned_address: options.versioned_address,
     }
 }
 
@@ -721,6 +756,9 @@ pub fn capabilities_from_proto(
         supports_atomic_rename: caps.supports_atomic_rename,
         has_real_directories: caps.has_real_directories,
         supports_list: caps.supports_list,
+        // Streaming is a client-side adaptation of this unchanged unary List
+        // protocol and therefore has no independent wire field.
+        supports_list_stream: false,
         wants_list_backed_stat: caps.wants_list_backed_stat,
         supports_recursive_list: caps.supports_recursive_list,
         populates_subdirectory_metadata: caps.populates_subdirectory_metadata,
@@ -1446,6 +1484,7 @@ fn response_parsing_to_proto(parsing: &ovstorage_plugin::ResponseParsing) -> pb:
                 header: header.clone(),
             })
             .collect(),
+        etag_strength: etag_strength_to_proto(parsing.etag_strength) as i32,
     }
 }
 
@@ -1471,6 +1510,7 @@ fn response_parsing_from_proto(
         content_checksum_header: parsing.content_checksum_header,
         content_checksum_algorithm,
         checksum_headers,
+        etag_strength: etag_strength_from_proto(parsing.etag_strength),
     })
 }
 
@@ -1772,23 +1812,55 @@ mod tests {
     #[test]
     fn object_info_round_trips_flat_fields() {
         let url = address::parse("file:///tmp/x").unwrap();
-        let info = ObjectInfo {
-            address: url,
-            kind: ObjectKind::File,
-            etag: Some("e1".into()),
-            version: None,
-            size: Some(7),
-            mtime: None,
-            checksums: ChecksumSet::default(),
-            effective_permissions: None,
-            system_metadata: None,
-            user_metadata: None,
-            modified_by: None,
-        };
-        let proto = object_info_to_proto(&info);
-        let back = object_info_from_proto(Some(proto)).unwrap();
-        assert_eq!(back.etag.as_deref(), Some("e1"));
-        assert_eq!(back.size, Some(7));
+        let pin = address::parse("s3://b/k?versionId=v1").unwrap();
+        for (etag_strength, proto_strength) in [
+            (EtagStrength::Unspecified, pb::EtagStrength::Unspecified),
+            (EtagStrength::Strong, pb::EtagStrength::Strong),
+            (EtagStrength::Weak, pb::EtagStrength::Weak),
+        ] {
+            let info = ObjectInfo {
+                etag_strength,
+                address: url.clone(),
+                kind: ObjectKind::File,
+                etag: Some("e1".into()),
+                version: None,
+                size: Some(7),
+                mtime: None,
+                checksums: ChecksumSet::default(),
+                effective_permissions: None,
+                system_metadata: None,
+                user_metadata: None,
+                modified_by: None,
+                versioned_address: Some(pin.clone()),
+            };
+            let proto = object_info_to_proto(&info);
+            assert_eq!(proto.etag_strength, proto_strength as i32);
+            assert_eq!(proto.versioned_address.as_deref(), Some(pin.as_str()));
+            let back = object_info_from_proto(Some(proto)).unwrap();
+            assert_eq!(back.etag.as_deref(), Some("e1"));
+            assert_eq!(back.etag_strength, etag_strength);
+            assert_eq!(back.size, Some(7));
+            assert_eq!(back.versioned_address, Some(pin.clone()));
+        }
+    }
+
+    #[test]
+    fn object_info_decodes_stable_etag_strength_wire_values() {
+        for (raw_strength, expected) in [
+            (0, EtagStrength::Unspecified),
+            (1, EtagStrength::Strong),
+            (2, EtagStrength::Weak),
+        ] {
+            let proto = pb::ObjectInfo {
+                address: "file:///tmp/x".into(),
+                etag: Some("e1".into()),
+                etag_strength: raw_strength,
+                ..Default::default()
+            };
+
+            let info = object_info_from_proto(Some(proto)).unwrap();
+            assert_eq!(info.etag_strength, expected);
+        }
     }
 
     #[test]
@@ -1837,6 +1909,7 @@ mod tests {
             ObjectKind::DirectoryInferred,
         ] {
             let info = ObjectInfo {
+                etag_strength: Default::default(),
                 address: url.clone(),
                 kind,
                 etag: None,
@@ -1848,6 +1921,7 @@ mod tests {
                 system_metadata: None,
                 user_metadata: None,
                 modified_by: None,
+                versioned_address: None,
             };
             let proto = object_info_to_proto(&info);
             let back = object_info_from_proto(Some(proto)).unwrap();
@@ -1856,14 +1930,72 @@ mod tests {
     }
 
     #[test]
-    fn object_kind_unspecified_proto_value_decodes_as_file() {
-        // Default-constructed proto carries `kind = 0` (File) — must decode File.
+    fn object_info_proto_defaults_decode_fail_safe() {
+        // A peer that omits `etag_strength` leaves prost's enum zero value. It
+        // must remain untrusted on decode, and an omitted `versioned_address`
+        // means "no pin" rather than an empty one.
         let proto = pb::ObjectInfo {
             address: "file:///tmp/x".into(),
             ..Default::default()
         };
         let info = object_info_from_proto(Some(proto)).unwrap();
         assert_eq!(info.kind, ObjectKind::File);
+        assert_eq!(info.etag_strength, EtagStrength::Unspecified);
+        assert_eq!(info.versioned_address, None);
+    }
+
+    #[test]
+    fn malformed_versioned_address_fails_decode() {
+        for malformed in ["", "not a url"] {
+            let proto = pb::ObjectInfo {
+                address: "file:///tmp/x".into(),
+                versioned_address: Some(malformed.into()),
+                ..Default::default()
+            };
+            assert!(
+                object_info_from_proto(Some(proto)).is_err(),
+                "pin {malformed:?} must fail the decode like a malformed address"
+            );
+        }
+    }
+
+    #[test]
+    fn stat_and_list_options_round_trip_versioned_address() {
+        assert!(!stat_options_from_proto(None).versioned_address);
+        assert!(!list_options_from_proto(None).versioned_address);
+        for full_metadata in [false, true] {
+            for versioned_address in [false, true] {
+                let stat = StatOptions {
+                    full_metadata,
+                    versioned_address,
+                };
+                let proto = stat_options_to_proto(&stat);
+                assert_eq!(proto.versioned_address, versioned_address);
+                assert_eq!(stat_options_from_proto(Some(proto)), stat);
+
+                let list = ListOptions {
+                    recursive: true,
+                    max_results: Some(3),
+                    page_token: Some("token".into()),
+                    full_metadata,
+                    versioned_address,
+                };
+                let proto = list_options_to_proto(&list);
+                assert_eq!(proto.versioned_address, versioned_address);
+                assert_eq!(list_options_from_proto(Some(proto)), list);
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_etag_strength_decodes_as_unspecified() {
+        let proto = pb::ObjectInfo {
+            address: "file:///tmp/x".into(),
+            etag_strength: 99,
+            ..Default::default()
+        };
+        let info = object_info_from_proto(Some(proto)).unwrap();
+        assert_eq!(info.etag_strength, EtagStrength::Unspecified);
     }
 
     #[test]
@@ -1968,6 +2100,7 @@ mod tests {
         );
         let parsing = ResponseParsing {
             etag_header: Some("x-amz-etag".into()),
+            etag_strength: EtagStrength::Strong,
             version_header: Some("x-amz-version-id".into()),
             size_header: Some("x-amz-size".into()),
             mtime_header: Some("x-amz-mtime".into()),
@@ -1997,6 +2130,17 @@ mod tests {
         let proto = read_redirect_to_proto(&redirect);
         let back = read_redirect_from_proto(proto).unwrap();
         assert_eq!(back.response_parsing, parsing);
+    }
+
+    #[test]
+    fn response_parsing_unknown_etag_strength_is_unspecified() {
+        let parsing = pb::ResponseParsing {
+            etag_strength: i32::MAX,
+            ..Default::default()
+        };
+
+        let parsing = response_parsing_from_proto(parsing).unwrap();
+        assert_eq!(parsing.etag_strength, EtagStrength::Unspecified);
     }
 
     #[test]
@@ -2469,6 +2613,7 @@ mod tests {
         let pre_epoch = UNIX_EPOCH - Duration::from_millis(12_345);
         let url = address::parse("file:///tmp/x").unwrap();
         let info = ObjectInfo {
+            etag_strength: Default::default(),
             address: url,
             kind: ObjectKind::File,
             etag: None,
@@ -2480,6 +2625,7 @@ mod tests {
             system_metadata: None,
             user_metadata: None,
             modified_by: None,
+            versioned_address: None,
         };
         let proto = object_info_to_proto(&info);
         assert_eq!(proto.mtime_unix_millis, Some(-12_345));

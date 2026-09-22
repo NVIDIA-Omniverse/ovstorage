@@ -419,6 +419,58 @@ pub unsafe extern "C" fn ovstorage_plugin_connection_change_stream_free(
 // Paged object results (`list`, `list_versions`)
 // ---------------------------------------------------------------------
 
+/// `next_fn` signature for [`ListEntryStream`].
+pub type ListEntryNextFn = unsafe extern "C" fn(
+    state: *mut core::ffi::c_void,
+    out_item: *mut ObjectInfo,
+    out_error: *mut Error,
+) -> StreamStep;
+
+/// Plugin-emitted iterator over `Result<ObjectInfo>` from `list_stream`.
+///
+/// **Cancellation contract:** `next_fn` takes no cancel argument by
+/// design — cancellation flows through the token the host passed to
+/// `list_stream` at open, which is guaranteed live for the stream's whole
+/// lifetime (the host retains its `CancelTokenHandle` and the plugin retains
+/// the matching `CancelTokenLocal` guard in the stream state, rather than
+/// dropping them when the open returns). A plugin list stream therefore MUST
+/// poll that open-time token between blocking waits so a host cancel can
+/// interrupt a parked `next()`; a `next()` that blocks without polling its
+/// token cannot be preempted (inherent to a pull iterator). Dropping the
+/// stream runs `drop_fn`, which tears down the listing walk.
+#[repr(C)]
+pub struct ListEntryStream {
+    pub state: *mut core::ffi::c_void,
+    pub next_fn: ListEntryNextFn,
+    pub drop_fn: StreamDropFn,
+}
+
+unsafe impl Send for ListEntryStream {}
+
+impl Drop for ListEntryStream {
+    fn drop(&mut self) {
+        // SAFETY: `drop_fn` is valid for the lifetime of `state`.
+        unsafe { (self.drop_fn)(self.state) }
+    }
+}
+
+/// Reclaim a heap-allocated [`ListEntryStream`]. Drives `drop_fn` exactly
+/// once before releasing the outer allocation. Safe with NULL.
+///
+/// # Safety
+///
+/// `value`, when non-null, must be a heap pointer produced by an ovstorage
+/// call. Passing a non-heap pointer is UB.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ovstorage_plugin_list_entry_stream_free(value: *mut ListEntryStream) {
+    unsafe {
+        if value.is_null() {
+            return;
+        }
+        crate::ffi::abi_alloc::abi_box_free(value);
+    }
+}
+
 /// One page of objects returned by `list`, including the in-band continuation
 /// token. Mirrors `ovstorage_layer::ListPage`.
 #[repr(C)]

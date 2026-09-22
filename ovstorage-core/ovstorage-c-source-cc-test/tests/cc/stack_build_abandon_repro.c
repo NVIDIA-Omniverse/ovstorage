@@ -1239,6 +1239,61 @@ static void park_register_builtin_kinds(OvStorage_Registry *registry)
     ovstorage_error_clear(&error);
 }
 
+/* A StackConfig translates synchronously into an owned builder before the
+ * asynchronous operation starts. Park that build inside a plugin call before
+ * releasing the config and registry borrows, then let the owned work finish. */
+static void run_config_borrows_end_while_parked(unsigned long generation)
+{
+    static const char source[] =
+        "[ovstorage]\n"
+        "root = \"connection\"\n"
+        "[ovstorage.layers.connection]\n"
+        "kind = \"cc-test-park\"\n"
+        "[[ovstorage.connections]]\n"
+        "backend_kind = \"cc-test-park\"\n"
+        "target = \"connection\"\n";
+    BuildCompletion completion;
+    OvStorage_StackConfig *config;
+    OvStorage_Registry *registry;
+    OvStorage_Error error = {0};
+
+    registry = ovstorage_registry_create();
+    if (registry == NULL) {
+        park_fail("failed to create the StackConfig registry");
+    }
+    park_register_builtin_kinds(registry);
+    config = NULL;
+    if (ovstorage_stack_config_from_toml_str(source, &config, &error) !=
+        OvStorage_Status_Ok) {
+        park_fail("failed to parse the parked StackConfig");
+    }
+    build_completion_init(&completion);
+    ovstorage_stack_build_from_config_async(config,
+                                            registry,
+                                            NULL,
+                                            NULL,
+                                            on_build,
+                                            &completion);
+    gate_wait(&g_arrived, generation);
+    if (build_completion_is_done(&completion)) {
+        park_fail("the StackConfig build completed before it was released");
+    }
+
+    ovstorage_stack_config_destroy(config);
+    ovstorage_registry_destroy(registry);
+    gate_signal(&g_released);
+    build_completion_wait(&completion);
+    gate_wait(&g_completed, generation);
+    if (completion.fire_count != 1 ||
+        completion.status != OvStorage_Status_Ok ||
+        completion.handle == NULL) {
+        park_fail("the parked StackConfig build did not complete successfully");
+    }
+    ovstorage_layer_handle_destroy(completion.handle);
+    build_completion_destroy(&completion);
+    ovstorage_error_clear(&error);
+}
+
 /*
  * Leg (f): abandon a build whose quarantined subtree spans two plugins.
  *
@@ -1351,6 +1406,9 @@ int main(int argc, char **argv)
     gate_init(&g_created);
     gate_init(&g_dropped);
 
+    generation = 0;
+    run_config_borrows_end_while_parked(++generation);
+
     registry = ovstorage_registry_create();
     if (registry == NULL) {
         park_fail("failed to create the registry");
@@ -1359,7 +1417,6 @@ int main(int argc, char **argv)
 
     /* Every abandonable slot and every outcome shape, repeated: the reference
      * counts are only interesting under repetition. */
-    generation = 0;
     for (iteration = 0; iteration < PARK_ITERATIONS; ++iteration) {
         for (at = 0; at < sizeof(parked) / sizeof(parked[0]); ++at) {
             run_abandon_while_parked(registry, parked[at], ++generation);

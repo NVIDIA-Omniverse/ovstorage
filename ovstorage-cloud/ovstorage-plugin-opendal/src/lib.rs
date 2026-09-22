@@ -9,6 +9,7 @@ mod layer;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures::StreamExt as _;
 use opendal::{EntryMode, ErrorKind as OpenDalErrorKind, Metadata, Metakey, Operator, Scheme};
 use tracing::{Instrument as _, debug_span};
 
@@ -30,12 +31,13 @@ use ovstorage_plugin::{
     AccessOps, ByteRange, CancellationToken, Capabilities, ChecksumSet, ConfigField,
     ConfigFieldKind, ConfigValue, ConnectionId, ConnectionRequest, CopyOptions,
     CreateDirectoryOptions, CredentialField, CredentialMethod, DeleteDirectoryOptions,
-    DeleteOptions, EnumSource, Error, ErrorCode, ErrorContext, HttpRequest, IfDestExists,
-    ListOptions, ObjectInfo, ObjectKind, ReadOptions, RedirectBodySource, RedirectCredential,
-    RedirectResultBatch, RedirectScope, RenameOptions, ResolvedTarget, Result, ResultCapture,
-    SecretValue, StatOptions, StorageBackendKindDescriptor, Url, WriteOptions, WriteRedirect,
-    WriteRedirectBatch, WriteResult, address, race_cancel, reject_pinned_for_mutation,
-    validate_redirect_results,
+    DeleteOptions, EnumSource, Error, ErrorCode, ErrorContext, EtagStrength, HttpRequest,
+    IfDestExists, ListOptions, ListStream, MESSAGE_METADATA_KEY, ObjectInfo, ObjectKind,
+    ReadOptions, RedirectBodySource, RedirectCredential, RedirectResultBatch, RedirectScope,
+    RenameOptions, ResolvedTarget, Result, ResultCapture, SecretValue, StatOptions,
+    StorageBackendKindDescriptor, Url, WriteOptions, WriteRedirect, WriteRedirectBatch,
+    WriteResult, address, normalize_optional_wire_etag, normalize_wire_etag, race_cancel,
+    reject_pinned_for_mutation, validate_redirect_results,
 };
 
 const PINNED_VERSION_KEYS: &[&str] = &[
@@ -48,10 +50,6 @@ const PINNED_VERSION_KEYS: &[&str] = &[
 use ovstorage_plugin::{BackendItemInfo, ReadResult, WriteStep};
 
 const PRESIGN_LIFETIME_SECS: u64 = 5 * 60;
-
-/// User-metadata key under which `WriteOptions::message` is persisted on
-/// drivers that support custom user metadata.
-const OV_MESSAGE_KEY: &str = "x-ov-message";
 
 // Including signed-query parameters in `RedirectScope.physical_url_prefix`
 // would make every prefix unique and defeat host-side scope checks.
@@ -139,6 +137,10 @@ fn driver_capabilities(spec: &DriverSpec) -> Capabilities {
     caps.supports_delete = true;
     caps.supports_create_directory = true;
     caps.supports_delete_directory = true;
+    // Every configured service exposes OpenDAL's pull-based Lister. The Layer
+    // preserves its provider order; the incremental fold rejects an ordering
+    // regression on recursive flat walks instead of returning wrong ancestors.
+    caps.supports_list_stream = true;
     match spec.profile {
         DriverCapabilityProfile::Fs => {
             caps.has_real_directories = true;
@@ -182,6 +184,7 @@ struct OpenDalConnectionConfig {
     prefix: Url,
 }
 
+#[derive(Clone)]
 pub struct OpenDalBackend {
     service: &'static str,
     operator: Operator,
@@ -420,8 +423,9 @@ impl OpenDalBackend {
                     }
                 };
                 if let Some(expected) = opts.if_match.as_deref() {
-                    let actual = metadata.etag().map(str::to_string);
-                    if actual.as_deref() != Some(expected) {
+                    let expected = normalize_wire_etag(expected).0;
+                    let (actual, _) = normalize_optional_wire_etag(metadata.etag());
+                    if actual.as_deref() != Some(expected.as_str()) {
                         return Err(Error::new(ErrorCode::ObjectModified, "object etag changed")
                             .with_context(ErrorContext::Identity { new_etag: actual }));
                     }
@@ -611,7 +615,7 @@ impl OpenDalBackend {
                 ));
             }
             // `opts.message` is discarded on this path rather than refused: a
-            // presigned PUT has nowhere to carry the `x-ov-message` stash, and
+            // presigned PUT has nowhere to carry the `x_ov_message` stash, and
             // the contract lets a backend drop a per-operation annotation. A
             // refusal would instead send every annotated write back through the
             // host, which is what the redirect exists to avoid.
@@ -717,10 +721,11 @@ impl OpenDalBackend {
             }
         }
         // Derive the object from the authorized request address, and never
-        // decode `redirects.continuation`. Under the broker's client-driven
-        // route the blob arrives from the remote caller, and this plugin's blob
-        // is the bare object key: any UTF-8 it sent would otherwise be the key
-        // this stat probes.
+        // decode `redirects.continuation`. The broker's client-driven RPC
+        // authenticates the blob and its address binding. A direct SPI caller
+        // or unsealed host can still supply any UTF-8 as this plugin's bare-key
+        // blob, so the Layer implementation cannot use it as the key this stat
+        // probes.
         let key = self.relative_key(&target.resolved_address)?;
         race_cancel(
             cancel.as_ref(),
@@ -890,73 +895,11 @@ impl OpenDalBackend {
                 };
                 let mut out = Vec::with_capacity(entries.len());
                 for entry in entries {
-                    let raw_entry_path = entry.path();
-                    let entry_path = raw_entry_path.trim_start_matches('/');
-                    let relative_key = entry_path
-                        .strip_prefix(listed_prefix.as_str())
-                        .ok_or_else(|| {
-                            Error::new(
-                                ErrorCode::Internal,
-                                format!(
-                                    "OpenDAL list entry '{raw_entry_path}' is outside requested prefix '{listed_prefix}'"
-                                ),
-                            )
-                        })?;
-                    if relative_key.is_empty() {
-                        // The entry is the prefix leaf itself. Some services
-                        // (fs included) "list" a file by returning the file
-                        // as its own single entry instead of erroring; on a
-                        // real-directories profile that means the caller
-                        // listed a file leaf — the wrong operation.
-                        if self.capabilities.has_real_directories
-                            && entry.metadata().mode() != EntryMode::DIR
-                            && let Some(mismatch) = self
-                                .leaf_type_mismatch(
-                                    &listed_prefix,
-                                    true,
-                                    "list prefix is a file, not a directory",
-                                )
-                                .await
-                        {
-                            return Err(mismatch);
-                        }
-                        continue;
-                    }
-                    let Ok(address) = address::join_relative(&prefix_address, relative_key)
+                    let Some(info) = self
+                        .list_entry_to_object_info(entry, &listed_prefix, &prefix_address)
+                        .await?
                     else {
-                        tracing::warn!(
-                            target: "ovstorage.opendal.backend",
-                            plugin = "opendal",
-                            key = %relative_key,
-                            "opendal: key is not addressable as a URI path; omitted from listing",
-                        );
                         continue;
-                    };
-                    let _ =
-                        address::relative_suffix(&address, &prefix_address).ok_or_else(|| {
-                            Error::new(
-                                ErrorCode::Internal,
-                                format!(
-                                    "OpenDAL list entry '{raw_entry_path}' could not be projected under '{}'",
-                                    prefix_address
-                                ),
-                            )
-                        })?;
-                    let mut info = object_info_from_metadata(address, entry.metadata());
-                    match entry.metadata().mode() {
-                        EntryMode::DIR if self.capabilities.has_real_directories => {
-                            info.kind = ObjectKind::Directory;
-                        }
-                        EntryMode::DIR => {
-                            info.kind = ObjectKind::DirectoryInferred;
-                            info.size = None;
-                        }
-                        EntryMode::FILE | EntryMode::Unknown => {
-                            if relative_key.ends_with('/') && info.size.unwrap_or(0) == 0 {
-                                info.kind = ObjectKind::DirectoryMarker;
-                                info.size = None;
-                            }
-                        }
                     };
                     out.push(info);
                     if let Some(max) = max_results
@@ -970,6 +913,166 @@ impl OpenDalBackend {
             .instrument(span),
         )
         .await
+    }
+
+    /// OpenDAL's [`opendal::Lister`] exposed as ovstorage's pull-based list
+    /// stream. The lister itself owns at most its current provider page (or
+    /// traversal frame); no prefix-sized collection is created here.
+    pub async fn list_stream(
+        &self,
+        prefix: ResolvedTarget,
+        opts: ListOptions,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        if opts.max_results.is_some() || opts.page_token.is_some() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+
+        let span = debug_span!(
+            "opendal.list_stream",
+            op = "list",
+            plugin = "opendal",
+            object.address = %RedactedUrl(&prefix.resolved_address),
+        );
+        let listed_prefix = address::directory_key(&self.relative_key(&prefix.resolved_address)?);
+        let prefix_address = prefix.resolved_address;
+        let recursive = opts.recursive;
+        let lister = race_cancel(
+            cancel.as_ref(),
+            async {
+                match self
+                    .operator
+                    .lister_with(&listed_prefix)
+                    .recursive(recursive)
+                    .metakey(Metakey::ContentLength | Metakey::LastModified | Metakey::Etag)
+                    .await
+                {
+                    Ok(lister) => Ok(lister),
+                    Err(err) => {
+                        // Match buffered `list`: only a real-directory prefix
+                        // gets the file-vs-directory diagnostic probe.
+                        if self.capabilities.has_real_directories
+                            && let Some(mismatch) = self
+                                .leaf_type_mismatch(
+                                    &listed_prefix,
+                                    true,
+                                    "list prefix is a file, not a directory",
+                                )
+                                .await
+                        {
+                            return Err(mismatch);
+                        }
+                        Err(map_opendal_error(err))
+                    }
+                }
+            }
+            .instrument(span),
+        )
+        .await?;
+
+        let backend = self.clone();
+        let stream = futures::stream::try_unfold(
+            (lister, backend, listed_prefix, prefix_address, cancel),
+            |(mut lister, backend, listed_prefix, prefix_address, cancel)| async move {
+                let next = race_cancel(cancel.as_ref(), async {
+                    loop {
+                        let Some(entry) = lister.next().await else {
+                            return Ok(None);
+                        };
+                        let entry = entry.map_err(map_opendal_error)?;
+                        if let Some(info) = backend
+                            .list_entry_to_object_info(entry, &listed_prefix, &prefix_address)
+                            .await?
+                        {
+                            return Ok(Some(info));
+                        }
+                    }
+                })
+                .await?;
+
+                Ok(next.map(|info| {
+                    (
+                        info,
+                        (lister, backend, listed_prefix, prefix_address, cancel),
+                    )
+                }))
+            },
+        );
+        Ok(Box::pin(stream))
+    }
+
+    /// Convert one native listing entry without changing the buffered list's
+    /// omission, projection, or directory-kind behavior.
+    async fn list_entry_to_object_info(
+        &self,
+        entry: opendal::Entry,
+        listed_prefix: &str,
+        prefix_address: &Url,
+    ) -> Result<Option<ObjectInfo>> {
+        let raw_entry_path = entry.path();
+        let entry_path = raw_entry_path.trim_start_matches('/');
+        let relative_key = entry_path.strip_prefix(listed_prefix).ok_or_else(|| {
+            Error::new(
+                ErrorCode::Internal,
+                format!(
+                    "OpenDAL list entry '{raw_entry_path}' is outside requested prefix '{listed_prefix}'"
+                ),
+            )
+        })?;
+        if relative_key.is_empty() {
+            // Some services (fs included) list a file as its own entry. On a
+            // real-directory profile that is a wrong-shaped list request.
+            if self.capabilities.has_real_directories
+                && entry.metadata().mode() != EntryMode::DIR
+                && let Some(mismatch) = self
+                    .leaf_type_mismatch(
+                        listed_prefix,
+                        true,
+                        "list prefix is a file, not a directory",
+                    )
+                    .await
+            {
+                return Err(mismatch);
+            }
+            return Ok(None);
+        }
+        let Ok(address) = address::join_relative(prefix_address, relative_key) else {
+            tracing::warn!(
+                target: "ovstorage.opendal.backend",
+                plugin = "opendal",
+                key = %relative_key,
+                "opendal: key is not addressable as a URI path; omitted from listing",
+            );
+            return Ok(None);
+        };
+        let _ = address::relative_suffix(&address, prefix_address).ok_or_else(|| {
+            Error::new(
+                ErrorCode::Internal,
+                format!(
+                    "OpenDAL list entry '{raw_entry_path}' could not be projected under '{prefix_address}'"
+                ),
+            )
+        })?;
+        let mut info = object_info_from_metadata(address, entry.metadata());
+        match entry.metadata().mode() {
+            EntryMode::DIR if self.capabilities.has_real_directories => {
+                info.kind = ObjectKind::Directory;
+            }
+            EntryMode::DIR => {
+                info.kind = ObjectKind::DirectoryInferred;
+                info.size = None;
+            }
+            EntryMode::FILE | EntryMode::Unknown => {
+                if relative_key.ends_with('/') && info.size.unwrap_or(0) == 0 {
+                    info.kind = ObjectKind::DirectoryMarker;
+                    info.size = None;
+                }
+            }
+        };
+        Ok(Some(info))
     }
 
     pub async fn create_directory(
@@ -1304,7 +1407,7 @@ fn has_user_metadata(opts: &WriteOptions) -> bool {
 ///
 /// `opts.message` is weaker by contract — a per-operation annotation a backend
 /// may drop when it has nowhere to put one — so it alone never fails a write.
-/// It is stashed under [`OV_MESSAGE_KEY`] where the driver can keep it, and
+/// It is stashed under [`MESSAGE_METADATA_KEY`] where the driver can keep it, and
 /// discarded here otherwise.
 fn resolve_user_metadata(
     supports_user_metadata: bool,
@@ -1767,23 +1870,53 @@ fn secret_string(credentials: &HashMap<String, SecretValue>, key: &str) -> Resul
     }
 }
 
-/// Map `if_none_match("*")` failures to `Conflict` so the no-overwrite race outcome is uniform across drivers.
-// Merge caller-supplied user_metadata with `opts.message` stashed under
-// `x-ov-message`; later entries win on key collision so a caller-supplied
-// `x-ov-message` overrides an opts.message of the same write call.
+/// Whether `value` can travel as an HTTP header value: visible ASCII, space,
+/// tab, or bytes above 0x7F. Metadata rides in `x-amz-meta-*` headers here, so a
+/// message outside that set cannot be stored as is, and the annotation is
+/// droppable by contract: the stash declines it rather than turning the call
+/// into a request-construction failure.
+fn is_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte == b'\t' || (0x20..0x7F).contains(&byte) || byte >= 0x80)
+}
+
+/// Merge caller-supplied `user_metadata` with `opts.message` stashed under
+/// [`MESSAGE_METADATA_KEY`].
+///
+/// The caller's map is never overwritten by the message, as on every other
+/// backend: `user_metadata` must be persisted while the per-operation
+/// annotation is droppable by contract. The caller's pairs come first, and a
+/// non-empty message is pushed last only when no caller pair carries the key,
+/// so the pairs hold exactly one entry under it. The key comparison folds
+/// ASCII case: the one driver that stores user metadata, `s3`, lowercases
+/// key names on the way in, so a caller's `X_OV_MESSAGE` and the annotation
+/// would land under one stored name and which survived would be an ordering
+/// accident. Without a message the caller's map passes through untouched.
 fn collect_user_metadata(opts: &WriteOptions) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
-    if let Some(message) = opts.message.as_deref().filter(|m| !m.is_empty()) {
-        out.push((OV_MESSAGE_KEY.to_string(), message.to_string()));
-    }
     if let Some(meta) = opts.user_metadata.as_ref() {
         for (k, v) in meta {
             out.push((k.clone(), v.clone()));
         }
     }
+    let caller_carries_key = out
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case(MESSAGE_METADATA_KEY));
+    if caller_carries_key {
+        return out;
+    }
+    if let Some(message) = opts
+        .message
+        .as_deref()
+        .filter(|m| !m.is_empty() && is_header_value(m))
+    {
+        out.push((MESSAGE_METADATA_KEY.to_string(), message.to_string()));
+    }
     out
 }
 
+/// Map `if_none_match("*")` failures to `Conflict` so the no-overwrite race outcome is uniform across drivers.
 fn map_no_overwrite_error(error: opendal::Error) -> Error {
     if matches!(
         error.kind(),
@@ -1887,6 +2020,7 @@ fn map_opendal_error(error: opendal::Error) -> Error {
 }
 
 struct OpenDalFields {
+    etag_strength: EtagStrength,
     etag: Option<String>,
     version: Option<String>,
     size: Option<u64>,
@@ -1894,8 +2028,10 @@ struct OpenDalFields {
 }
 
 fn fields_from_metadata(metadata: &Metadata) -> OpenDalFields {
+    let (etag, etag_strength) = normalize_optional_wire_etag(metadata.etag());
     OpenDalFields {
-        etag: metadata.etag().map(|value| value.to_string()),
+        etag_strength,
+        etag,
         version: metadata.version().map(|value| value.to_string()),
         // Directory sizes are `None` by contract. OpenDAL marks directory
         // metadata `Metakey::Complete` (with `content_length` at its zero
@@ -1923,6 +2059,7 @@ fn object_info_from_metadata(address: Url, metadata: &Metadata) -> ObjectInfo {
         ObjectKind::File
     };
     ObjectInfo {
+        etag_strength: fields.etag_strength,
         address,
         kind,
         etag: fields.etag,
@@ -1934,6 +2071,7 @@ fn object_info_from_metadata(address: Url, metadata: &Metadata) -> ObjectInfo {
         system_metadata: None,
         user_metadata: metadata.user_metadata().cloned(),
         modified_by: None,
+        versioned_address: None,
     }
 }
 
@@ -1945,6 +2083,7 @@ fn item_info_from_metadata(metadata: &Metadata) -> BackendItemInfo {
         ObjectKind::File
     };
     BackendItemInfo {
+        etag_strength: fields.etag_strength,
         kind,
         etag: fields.etag,
         version: fields.version,
@@ -1955,6 +2094,7 @@ fn item_info_from_metadata(metadata: &Metadata) -> BackendItemInfo {
         system_metadata: None,
         user_metadata: metadata.user_metadata().cloned(),
         modified_by: None,
+        versioned_address: None,
     }
 }
 
@@ -2105,6 +2245,7 @@ mod tests {
     fn allow_list_capabilities_match_per_driver_shape() {
         for driver in DRIVER_SPECS {
             let caps = driver_capabilities(driver);
+            assert!(caps.supports_list_stream);
             match driver.profile {
                 DriverCapabilityProfile::Fs => {
                     assert!(caps.has_real_directories);
@@ -3119,7 +3260,7 @@ mod tests {
     }
 
     /// The accept arm as a decision: a driver that CAN store metadata must
-    /// receive the caller's map and the `x-ov-message` stash. A resolver that
+    /// receive the caller's map and the `x_ov_message` stash. A resolver that
     /// refused nothing and returned nothing would satisfy every `fs` test in
     /// this module while dropping metadata on S3, which is the very defect
     /// being fixed. [`s3_backend_resolves_metadata_through_the_driver_capability`]
@@ -3138,10 +3279,110 @@ mod tests {
         assert_eq!(
             resolved,
             vec![
-                (OV_MESSAGE_KEY.to_string(), "commit note".to_string()),
                 ("project".to_string(), "ovstorage".to_string()),
+                (MESSAGE_METADATA_KEY.to_string(), "commit note".to_string()),
             ]
         );
+    }
+
+    /// A message that cannot travel as a header value is dropped rather than
+    /// stashed, so the `s3` driver's write proceeds without it; a header-legal
+    /// non-ASCII message is kept.
+    #[test]
+    fn collect_user_metadata_drops_a_message_that_cannot_travel_as_a_header() {
+        let unstorable = collect_user_metadata(&WriteOptions {
+            user_metadata: None,
+            message: Some("line one\r\nx-amz-meta-injected: yes".into()),
+            ..WriteOptions::default()
+        });
+        assert!(unstorable.is_empty(), "{unstorable:?}");
+        let kept = collect_user_metadata(&WriteOptions {
+            user_metadata: None,
+            message: Some("café ☕".into()),
+            ..WriteOptions::default()
+        });
+        assert_eq!(
+            kept,
+            vec![(MESSAGE_METADATA_KEY.to_string(), "café ☕".to_string())]
+        );
+    }
+
+    /// The guard folds ASCII case: the `s3` driver lowercases key names, so a
+    /// caller's upper-cased entry and the annotation would share one stored
+    /// name. The caller's pair is the only one under the key, in its own
+    /// spelling.
+    #[test]
+    fn collect_user_metadata_keeps_a_differently_cased_callers_entry_over_the_message() {
+        let mut meta = ovstorage_plugin::UserMetadata::new();
+        meta.insert(MESSAGE_METADATA_KEY.to_ascii_uppercase(), "caller".into());
+        let opts = WriteOptions {
+            user_metadata: Some(meta),
+            message: Some("real".into()),
+            ..WriteOptions::default()
+        };
+        let merged = collect_user_metadata(&opts);
+        assert_eq!(
+            merged,
+            vec![(
+                MESSAGE_METADATA_KEY.to_ascii_uppercase(),
+                "caller".to_string()
+            )],
+            "the caller's pair alone, in the caller's spelling: {merged:?}"
+        );
+    }
+
+    /// A caller-supplied entry under the message key stands and the message is
+    /// not written at all, as on every other backend: `user_metadata` must be
+    /// persisted while the annotation is droppable by contract. The merged
+    /// pairs carry exactly one `x_ov_message` and it is the caller's. A driver
+    /// collects these pairs into a map, so a duplicate key here would make the
+    /// stored value an ordering accident.
+    #[test]
+    fn collect_user_metadata_keeps_a_callers_entry_under_its_key_over_the_message() {
+        let mut meta = ovstorage_plugin::UserMetadata::new();
+        meta.insert(MESSAGE_METADATA_KEY.into(), "caller".into());
+        meta.insert("project".into(), "ovstorage".into());
+        let opts = WriteOptions {
+            user_metadata: Some(meta),
+            message: Some("real".into()),
+            ..WriteOptions::default()
+        };
+        let merged = collect_user_metadata(&opts);
+        let under_key: Vec<&str> = merged
+            .iter()
+            .filter(|(k, _)| k == MESSAGE_METADATA_KEY)
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(under_key, vec!["caller"]);
+        assert!(merged.contains(&("project".to_string(), "ovstorage".to_string())));
+        assert_eq!(
+            merged.len(),
+            2,
+            "the caller's two pairs and nothing else: {merged:?}"
+        );
+        assert!(
+            !merged.iter().any(|(_, v)| v == "real"),
+            "the message is absent when the caller's map carries its key: {merged:?}"
+        );
+    }
+
+    /// A caller's entry under the message key passes through when there is no
+    /// message, and an empty message is no message.
+    #[test]
+    fn collect_user_metadata_keeps_a_callers_entry_under_the_key_when_there_is_no_message() {
+        let mut meta = ovstorage_plugin::UserMetadata::new();
+        meta.insert(MESSAGE_METADATA_KEY.into(), "caller".into());
+        for message in [None, Some(String::new())] {
+            let opts = WriteOptions {
+                user_metadata: Some(meta.clone()),
+                message,
+                ..WriteOptions::default()
+            };
+            assert_eq!(
+                collect_user_metadata(&opts),
+                vec![(MESSAGE_METADATA_KEY.to_string(), "caller".to_string())]
+            );
+        }
     }
 
     /// The refuse arm and its boundary, as a decision rather than a round
@@ -3378,7 +3619,7 @@ mod tests {
 
     /// `opts.message` is a per-operation annotation the plugin contract lets a
     /// backend drop, and this adapter carries it only as a convenience — it is
-    /// stashed under the reserved `x-ov-message` key where the driver can keep
+    /// stashed under the `x_ov_message` key where the driver can keep
     /// it. So a write carrying a message and no caller metadata still succeeds
     /// on a driver that stores neither. This pins the rejected design: keying
     /// the refusal on the merged map `collect_user_metadata` produces would
@@ -3491,10 +3732,11 @@ mod tests {
     }
 
     /// Substitution, not modification: the OpenDAL continuation is the bare
-    /// object key with no tag and no structure, so under the broker's
-    /// client-driven route any UTF-8 the caller sends would be the key this
-    /// plugin probes. `continue_write` must derive the key from the authorized
-    /// request address instead.
+    /// object key with no tag and no structure. A direct SPI caller or an
+    /// unsealed host can make any UTF-8 the key this plugin probes; the broker's
+    /// client-driven RPC instead refuses a continuation whose authenticated
+    /// bytes or address binding changed. `continue_write` must still derive the
+    /// key from the authorized request address for every supported route.
     #[tokio::test(flavor = "multi_thread")]
     async fn continue_write_stats_the_authorized_key_not_the_continuations() {
         let temp = TempDir::new().unwrap();
@@ -3818,6 +4060,75 @@ mod tests {
             .await
             .expect_err("mismatched if_match etag must fail");
         assert_eq!(err.code(), ErrorCode::ObjectModified);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quoted_driver_etag_round_trips_through_stat_then_read_if_match() {
+        use futures::StreamExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let read = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let is_head = request.starts_with("HEAD ");
+                let body = if is_head { "" } else { "payload" };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: 7\r\netag: \"driver-etag\"\r\nconnection: close\r\n\r\n{body}"
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+
+        let operator =
+            Operator::via_iter(Scheme::Http, [("endpoint".to_string(), endpoint)]).unwrap();
+        let prefix = address::parse("opendal://http/").unwrap();
+        let backend = OpenDalBackend {
+            service: "http",
+            operator,
+            prefix: prefix.clone(),
+            capabilities: Capabilities::empty(),
+        };
+        let backend_id = ovstorage_plugin::BackendId("opendal:http:test".into());
+        let object = address::join_relative(&prefix, "object.bin").unwrap();
+
+        let stat = backend
+            .stat(
+                target_for(&backend_id, object.clone()),
+                StatOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stat.etag.as_deref(), Some("driver-etag"));
+        assert_eq!(stat.etag_strength, EtagStrength::Strong);
+
+        let read = backend
+            .read(
+                target_for(&backend_id, object),
+                ReadOptions {
+                    if_match: stat.etag,
+                    ..ReadOptions::default()
+                },
+                None,
+            )
+            .await
+            .expect("normalized stat etag must match the driver's quoted read metadata etag");
+        let ReadResult::Stream { mut stream, info } = read else {
+            panic!("expected streamed HTTP read");
+        };
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(bytes, b"payload");
+        assert_eq!(info.etag.as_deref(), Some("driver-etag"));
+        assert_eq!(info.etag_strength, EtagStrength::Strong);
     }
 
     // === Empty if_dest is no-op ===

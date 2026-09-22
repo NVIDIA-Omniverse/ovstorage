@@ -32,6 +32,7 @@ const ADDRESS: &str = "mem://data/object.bin";
 
 fn object_info(address: Url) -> ObjectInfo {
     ObjectInfo {
+        etag_strength: Default::default(),
         address,
         kind: ObjectKind::File,
         etag: None,
@@ -43,6 +44,7 @@ fn object_info(address: Url) -> ObjectInfo {
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
 }
 

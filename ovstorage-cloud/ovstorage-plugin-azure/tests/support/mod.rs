@@ -42,9 +42,10 @@ use std::time::Duration;
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use ovstorage_plugin::{
-    BackendId, ConfigValue, ResolvedTarget, SecretBundle, SecretBytes, SecretValue, address,
+    BackendFactory, BackendId, ConfigValue, LayerConfig, LayerHandle, ResolvedTarget, SecretBundle,
+    SecretBytes, SecretValue, address,
 };
-use ovstorage_plugin_azure::AzureBackend;
+use ovstorage_plugin_azure::{AzureBackend, AzureLayerFactory};
 use sha2::Sha256;
 
 // === Credentials ===
@@ -183,6 +184,153 @@ pub fn target(account: &str, container: &str, key: &str) -> ResolvedTarget {
     ResolvedTarget {
         backend_id: BackendId(format!("azure:{account}:{container}")),
         resolved_address: address::parse(&format!("azure://{account}/{container}/{key}")).unwrap(),
+    }
+}
+
+// === Anonymous scheme fallback ===
+//
+// The fallback is layer policy, not a connection, so these helpers build a
+// whole `Layer` through the factory the way a host does, with the grant on the
+// layer table and the loopback-only `__test_endpoint` hook pointing the
+// fallback at a fixture.
+
+/// The layer key carrying the operator's grant.
+pub const ANONYMOUS_FALLBACK_KEY: &str = "anonymous_fallback";
+
+/// The `anonymous_fallback` layer value a host writes for `schemes`: the
+/// array reserialized under its own key, which is the wrapper shape the
+/// decoder accepts.
+pub fn anonymous_fallback_grant(schemes: &[&str]) -> ConfigValue {
+    let quoted = schemes
+        .iter()
+        .map(|scheme| format!("\"{scheme}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    ConfigValue::Toml(format!("{ANONYMOUS_FALLBACK_KEY} = [{quoted}]\n"))
+}
+
+/// A layer table granting the `azure://` fallback, pointed at `endpoint`
+/// through the loopback-only test hook, plus `pairs`.
+pub fn fallback_layer_config(endpoint: &str, pairs: &[(&str, ConfigValue)]) -> LayerConfig {
+    let mut config = LayerConfig::new();
+    config.insert(
+        ANONYMOUS_FALLBACK_KEY.into(),
+        anonymous_fallback_grant(&["azure"]),
+    );
+    config.insert(
+        "__test_endpoint".into(),
+        ConfigValue::String(endpoint.into()),
+    );
+    for (key, value) in pairs {
+        config.insert((*key).into(), value.clone());
+    }
+    config
+}
+
+/// Build the layer from `config` through the factory, the way a host does.
+pub async fn create_layer(config: &LayerConfig) -> ovstorage_plugin::Result<LayerHandle> {
+    AzureLayerFactory::default()
+        .create_backend("azure", config, None)
+        .await
+}
+
+/// A layer whose only route is the granted fallback, pointed at `endpoint`.
+pub async fn fallback_layer(endpoint: &str, pairs: &[(&str, ConfigValue)]) -> LayerHandle {
+    create_layer(&fallback_layer_config(endpoint, pairs))
+        .await
+        .expect("a fallback-only layer builds")
+}
+
+// === Captured tracing events ===
+//
+// The fallback's first-touch `info!` is the operator-facing record of which
+// nodes were reached anonymously, so tests assert on the emitted event. The
+// subscriber is installed ONCE per test binary rather than per test with
+// `set_default`: `tracing` caches each callsite's `Interest` globally on
+// first hit, so a thread-local subscriber races other tests for whether the
+// callsite is ever evaluated again. Events are tagged with the emitting
+// thread so parallel tests read only their own; `#[tokio::test]` runs its
+// future on the test thread, so a test's events land under its own id.
+
+static EVENTS: Mutex<Vec<(thread::ThreadId, tracing::Level, String)>> = Mutex::new(Vec::new());
+static SUBSCRIBER: std::sync::Once = std::sync::Once::new();
+
+/// Start recording this thread's INFO-and-above events, discarding anything
+/// it logged earlier.
+pub fn capture_logs() -> LogCapture {
+    SUBSCRIBER.call_once(|| {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(CaptureLayer))
+            .expect("no other global subscriber in this test binary");
+    });
+    EVENTS
+        .lock()
+        .expect("capture poisoned")
+        .retain(|(thread, _, _)| *thread != thread::current().id());
+    LogCapture {
+        thread: thread::current().id(),
+    }
+}
+
+pub struct LogCapture {
+    thread: thread::ThreadId,
+}
+
+impl LogCapture {
+    /// Every rendered event this thread emitted since [`capture_logs`], at
+    /// `level` or above.
+    pub fn lines_at_least(&self, level: tracing::Level) -> Vec<String> {
+        EVENTS
+            .lock()
+            .expect("capture poisoned")
+            .iter()
+            .filter(|(thread, event_level, _)| *thread == self.thread && *event_level <= level)
+            .map(|(_, _, text)| text.clone())
+            .collect()
+    }
+
+    /// The captured lines whose rendering contains `needle`.
+    pub fn containing(&self, needle: &str) -> Vec<String> {
+        self.lines_at_least(tracing::Level::INFO)
+            .into_iter()
+            .filter(|line| line.contains(needle))
+            .collect()
+    }
+}
+
+struct CaptureLayer;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        // DEBUG and TRACE are not recorded: nothing here asserts on them and
+        // the fixture would otherwise accumulate every span-less event the
+        // whole binary emits.
+        if *event.metadata().level() > tracing::Level::INFO {
+            return;
+        }
+        let mut visitor = RenderVisitor(String::new());
+        event.record(&mut visitor);
+        EVENTS.lock().expect("capture poisoned").push((
+            thread::current().id(),
+            *event.metadata().level(),
+            visitor.0,
+        ));
+    }
+}
+
+struct RenderVisitor(String);
+
+impl tracing::field::Visit for RenderVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        let _ = write!(self.0, "{}={value:?}", field.name());
     }
 }
 

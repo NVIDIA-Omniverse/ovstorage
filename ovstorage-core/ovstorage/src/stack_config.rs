@@ -11,6 +11,7 @@
 //! to [`ovstorage_plugin::ConfigValue`] on conversion to a [`StackSpec`].
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::Path;
 
 use ovstorage_plugin::{Error, ErrorCode, Result};
@@ -190,7 +191,84 @@ fn toml_declares_ovstorage(s: &str) -> Result<bool> {
 /// process environment (a `set_var` that races another thread's `getenv` is UB
 /// on glibc).
 fn env_key_to_config_path(key: &str) -> String {
-    format!("ovstorage.{}", key.to_lowercase().replace("__", "."))
+    debug_assert!(key.is_ascii());
+    format!("ovstorage.{}", key.to_ascii_lowercase().replace("__", "."))
+}
+
+const OVSTORAGE_ENV_PREFIX: &str = "OVSTORAGE__";
+
+/// Match `Env::prefixed`, whose `UncasedStr` keys compare the ASCII prefix
+/// case-insensitively. This gate must not discard an overlay that Figment would
+/// otherwise accept when the file has no `[ovstorage]` table.
+fn env_key_has_ovstorage_prefix(key: &str) -> bool {
+    key.get(..OVSTORAGE_ENV_PREFIX.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(OVSTORAGE_ENV_PREFIX))
+}
+
+fn env_key_path_is_supported(key: &str) -> bool {
+    env_key_has_ovstorage_prefix(key) && key[OVSTORAGE_ENV_PREFIX.len()..].is_ascii()
+}
+
+fn os_env_key_has_ovstorage_prefix(key: &OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        let bytes = key.as_bytes();
+        bytes
+            .get(..OVSTORAGE_ENV_PREFIX.len())
+            .is_some_and(|candidate| {
+                candidate.eq_ignore_ascii_case(OVSTORAGE_ENV_PREFIX.as_bytes())
+            })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        let prefix: Vec<u16> = key.encode_wide().take(OVSTORAGE_ENV_PREFIX.len()).collect();
+        prefix.len() == OVSTORAGE_ENV_PREFIX.len()
+            && prefix
+                .iter()
+                .zip(OVSTORAGE_ENV_PREFIX.bytes())
+                .all(|(actual, expected)| {
+                    u8::try_from(*actual).is_ok_and(|actual| actual.eq_ignore_ascii_case(&expected))
+                })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        key.to_str().is_some_and(env_key_has_ovstorage_prefix)
+    }
+}
+
+fn validate_ovstorage_environment() -> Result<bool> {
+    let mut supplies_ovstorage = false;
+
+    for (key, value) in std::env::vars_os() {
+        if !os_env_key_has_ovstorage_prefix(&key) {
+            continue;
+        }
+        supplies_ovstorage = true;
+        let key = key.into_string().map_err(|_| {
+            Error::new(
+                ErrorCode::InvalidArgument,
+                "an OVSTORAGE__ environment key is not valid Unicode",
+            )
+        })?;
+        debug_assert!(env_key_has_ovstorage_prefix(&key));
+        if !env_key_path_is_supported(&key) {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                format!("environment key '{key}' uses a non-ASCII OVSTORAGE__ path"),
+            ));
+        }
+        if value.into_string().is_err() {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                format!("environment value for '{key}' is not valid Unicode"),
+            ));
+        }
+    }
+    Ok(supplies_ovstorage)
 }
 
 impl StackConfig {
@@ -265,9 +343,7 @@ impl StackConfig {
                 format!("could not read {}: {err}", path.display()),
             )
         })?;
-        let env_supplies_ovstorage = std::env::vars_os()
-            .filter_map(|(key, _)| key.into_string().ok())
-            .any(|key| key.starts_with("OVSTORAGE__"));
+        let env_supplies_ovstorage = validate_ovstorage_environment()?;
         if !toml_declares_ovstorage(&contents)? && !env_supplies_ovstorage {
             return Ok(Self::default());
         }
@@ -582,6 +658,28 @@ mod tests {
     }
 
     #[test]
+    fn from_toml_str_uses_the_effective_figment_grammar() {
+        for invalid in [
+            "[ovstorage]\nvalue = \"\\e\"\n",
+            "[ovstorage]\nvalue = \"\\x41\"\n",
+            "[ovstorage]\nvalue = { one = 1, }\n",
+            "[ovstorage]\nvalue = { one = 1,\n two = 2 }\n",
+            "[ovstorage]\nvalue = 07:32\n",
+            "[ovstorage]\ncafé = 1\n",
+        ] {
+            let error = StackConfig::from_toml_str(invalid).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidArgument, "{invalid:?}");
+        }
+
+        StackConfig::from_toml_str(
+            "[ovstorage]\n\
+             local = 07:32:00.123456789012345678901234567890\n\
+             stamp = 1979-05-27T07:32:00.123456789012345678901234567890Z\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn from_toml_path_missing_ovstorage_table_is_empty_stack() {
         let _env_guard = ENV_LOCK.lock().unwrap();
         let path = std::env::temp_dir().join(format!("ovstorage-noov-{}.toml", std::process::id()));
@@ -655,5 +753,24 @@ mod tests {
         // A double `__` only ever collapses to a `.` — no path picks up a second
         // `ovstorage.` segment, which is exactly the single-prefix guarantee.
         assert!(!env_key_to_config_path("ROOT").contains("ovstorage.ovstorage"));
+    }
+
+    #[test]
+    fn env_overlay_detection_matches_figment_uncased_prefix() {
+        assert!(env_key_has_ovstorage_prefix("OVSTORAGE__ROOT"));
+        assert!(env_key_has_ovstorage_prefix("ovstorage__root"));
+        assert!(env_key_has_ovstorage_prefix("OvStorage__Layers__File"));
+        assert!(!env_key_has_ovstorage_prefix("OVSTORAGE_ROOT"));
+        assert!(!env_key_has_ovstorage_prefix("OVSTOR"));
+    }
+
+    #[test]
+    fn env_overlay_paths_are_ascii_only() {
+        assert!(env_key_path_is_supported("OVSTORAGE__LAYERS__FILE__ROOT"));
+        assert!(!env_key_path_is_supported("OVSTORAGE__LÄYERS__FILE__ROOT"));
+        assert_eq!(
+            env_key_to_config_path("Layers__File__Root"),
+            "ovstorage.layers.file.root"
+        );
     }
 }

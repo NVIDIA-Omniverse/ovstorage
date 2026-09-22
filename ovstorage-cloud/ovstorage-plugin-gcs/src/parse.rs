@@ -11,7 +11,8 @@ use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use ovstorage_plugin::{
-    ChecksumAlgorithm, ChecksumSet, Error, ErrorCode, Result, SystemMetadata, UserMetadata,
+    ChecksumAlgorithm, ChecksumSet, Error, ErrorCode, EtagStrength, Result, SystemMetadata,
+    UserMetadata,
 };
 use serde::Deserialize;
 
@@ -36,6 +37,14 @@ pub struct GcsObject {
     pub content_type: Option<String>,
     #[serde(rename = "contentEncoding")]
     pub content_encoding: Option<String>,
+    #[serde(rename = "contentLanguage")]
+    pub content_language: Option<String>,
+    #[serde(rename = "contentDisposition")]
+    pub content_disposition: Option<String>,
+    #[serde(rename = "cacheControl")]
+    pub cache_control: Option<String>,
+    #[serde(rename = "customTime")]
+    pub custom_time: Option<String>,
     #[serde(rename = "temporaryHold")]
     pub temporary_hold: Option<bool>,
     #[serde(rename = "eventBasedHold")]
@@ -75,6 +84,7 @@ pub struct TestIamPermissionsResponse {
 /// metadata side-tables. Address is attached by the caller since the same
 /// resource feeds `stat`, `list`, and write-completion paths.
 pub struct ParsedObject {
+    pub etag_strength: EtagStrength,
     pub etag: Option<String>,
     pub version: Option<String>,
     pub size: Option<u64>,
@@ -92,6 +102,11 @@ pub fn parse_object(object: &GcsObject) -> Result<ParsedObject> {
     // etag from the response body is stashed in `system_metadata` for
     // diagnostics; it is not a precondition token under the new SPI.
     let etag = object.generation.clone();
+    let etag_strength = if etag.is_some() {
+        EtagStrength::Strong
+    } else {
+        EtagStrength::Unspecified
+    };
     let version = object.generation.clone();
     let size = parse_optional_u64(&object.size, "size")?;
     let mtime = parse_optional_rfc3339(object.updated.as_deref().or_else(|| {
@@ -154,6 +169,7 @@ pub fn parse_object(object: &GcsObject) -> Result<ParsedObject> {
     let user_metadata: UserMetadata = object.metadata.clone();
 
     Ok(ParsedObject {
+        etag_strength,
         etag,
         version,
         size,
@@ -228,6 +244,7 @@ mod tests {
         }"#;
         let object: GcsObject = serde_json::from_str(json).unwrap();
         let parsed = parse_object(&object).unwrap();
+        assert_eq!(parsed.etag_strength, EtagStrength::Strong);
         assert_eq!(parsed.etag.as_deref(), Some("1700000000000001"));
         assert_eq!(parsed.version.as_deref(), Some("1700000000000001"));
         assert_eq!(
@@ -303,5 +320,13 @@ mod tests {
         assert_eq!(listing.items[0].name.as_deref(), Some("dir/file.txt"));
         assert_eq!(listing.prefixes, vec!["dir/sub/", "dir/other/"]);
         assert_eq!(listing.next_page_token.as_deref(), Some("page-2"));
+    }
+
+    #[test]
+    fn missing_generation_has_unspecified_etag_strength() {
+        let object: GcsObject = serde_json::from_str(r#"{"name":"dir/file.txt"}"#).unwrap();
+        let parsed = parse_object(&object).unwrap();
+        assert_eq!(parsed.etag, None);
+        assert_eq!(parsed.etag_strength, EtagStrength::Unspecified);
     }
 }

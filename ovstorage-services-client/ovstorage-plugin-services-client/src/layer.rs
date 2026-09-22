@@ -214,6 +214,15 @@ impl OmniverseStorageLayer {
             },
             last_probed: None,
             user_metadata: UserMetadata::new(),
+            // This layer answers connection ops keyed on its own name, so that
+            // name is what reaches this row -- stamped whether or not
+            // `owned_targets` currently publishes it. Those two answer different
+            // questions: `owned_targets` is gated on `supports_runtime_add` and
+            // says which targets the graph will route to, while this says which
+            // target addresses this row. A row naming a target the Router does
+            // not route is a diagnosable condition, not a reason to report no
+            // owner at all.
+            owning_target: Some(self.name.clone()),
         };
         Ok(ConnectionScaffold {
             connection_id,
@@ -767,6 +776,28 @@ impl Layer for OmniverseStorageLayer {
             })
             .await?;
         paginate_list_items(items, max_results, page_token)
+    }
+
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        if request.input.options.max_results.is_some() || request.input.options.page_token.is_some()
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "list_stream does not accept max_results or page_token",
+            ));
+        }
+
+        let options = request.input.options;
+        self.recover(&request.input.prefix, move |instance, target| {
+            let options = options.clone();
+            let cancel = cancel.clone();
+            async move { instance.backend.list_stream(target, options, cancel).await }
+        })
+        .await
     }
 
     async fn list_versions(
@@ -1382,6 +1413,36 @@ mod tests {
             )
             .await;
         assert_eq!(stat.unwrap_err().code(), ErrorCode::NoRoute);
+    }
+
+    #[tokio::test]
+    async fn list_stream_rejects_paging_before_routing() {
+        let layer = test_layer();
+        for options in [
+            ListOptions {
+                max_results: Some(1),
+                ..ListOptions::default()
+            },
+            ListOptions {
+                page_token: Some("opaque".into()),
+                ..ListOptions::default()
+            },
+        ] {
+            let error = match layer
+                .list_stream(
+                    Request::new(ListRequest {
+                        prefix: Url::parse("omniverse://host/dir/").unwrap(),
+                        options,
+                    }),
+                    None,
+                )
+                .await
+            {
+                Ok(_) => panic!("list_stream must reject caller paging"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        }
     }
 
     /// A credential the CALLER spelled does not reach the wire.

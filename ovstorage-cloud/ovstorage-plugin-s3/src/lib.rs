@@ -16,6 +16,7 @@ mod convert;
 mod credentials;
 mod driver;
 mod errors;
+mod fallback;
 mod layer;
 mod multipart;
 mod subscription;
@@ -125,10 +126,43 @@ mod tests {
     #[tokio::test]
     async fn add_connection_returns_native_backend_with_aws_capabilities() {
         let request = request_with_credentials("assets");
-        let (layer, connection) = layer_with_connection(request).await;
+        let (layer, connection) = layer_with_connection(request.clone()).await;
 
         assert_eq!(connection.current_addresses.len(), 1);
         assert_eq!(connection.current_addresses[0].as_str(), "s3://assets/");
+        // The registered row carries the accepted-URL-spellings contract the
+        // alias wrapper consumes — this is the wire between the two tested
+        // halves (`alternate_url_prefixes` shapes, wrapper consumption), so a
+        // refactor that drops the stamping cannot ship a silently dead
+        // feature. The fixture is the custom path-style endpoint, whose one
+        // spelling is exact.
+        assert_eq!(
+            connection
+                .user_metadata
+                .get(ovstorage_plugin::ACCEPTED_URL_SPELLINGS_METADATA_KEY)
+                .map(String::as_str),
+            Some("http://127.0.0.1:1/assets/")
+        );
+        // The probe preview row carries the same contract, so a host can show
+        // "these URLs will also resolve" before the caller commits.
+        let preview = layer
+            .probe(
+                Request::new(LayerConnectionRequest {
+                    target: "s3".into(),
+                    connection: request,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            preview
+                .user_metadata
+                .get(ovstorage_plugin::ACCEPTED_URL_SPELLINGS_METADATA_KEY),
+            connection
+                .user_metadata
+                .get(ovstorage_plugin::ACCEPTED_URL_SPELLINGS_METADATA_KEY),
+        );
         // Credentials verify against an unroutable endpoint: the lenient
         // verify treats a transport failure as a pass.
         assert!(matches!(

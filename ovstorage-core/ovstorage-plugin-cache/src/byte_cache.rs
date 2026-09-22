@@ -28,7 +28,13 @@ use super::{READ_TO_BYTES_EXTENSION, buffer_read_stream, cache_config_field, con
 /// from the byte cache, and `etag` is the validator the hit was proven fresh
 /// against.
 fn cached_object_info(address: Url, size: u64, etag: Option<String>) -> ObjectInfo {
+    let etag_strength = if etag.as_deref().is_some_and(|etag| !etag.is_empty()) {
+        EtagStrength::Strong
+    } else {
+        EtagStrength::Unspecified
+    };
     ObjectInfo {
+        etag_strength,
         address,
         kind: ObjectKind::File,
         etag,
@@ -40,7 +46,35 @@ fn cached_object_info(address: Url, size: u64, etag: Option<String>) -> ObjectIn
         system_metadata: None,
         user_metadata: None,
         modified_by: None,
+        versioned_address: None,
     }
+}
+
+/// Drop `mtime` from an `ObjectInfo` that is about to be paired with the CAS
+/// copy `put_path_and_lease` just wrote, rather than with the path the info
+/// was originally stat'd against. `put_path_and_lease` copies the delegate's
+/// bytes into a fresh staging file and publishes that file's own path; the
+/// mtime on `info` still names the *source* object's last-modified time, so
+/// pairing it unmodified with the CAS path claims a filesystem fact about a
+/// file that was never stat'd. Downstream identity checks that compare a
+/// `LocalDelegate`'s `info` against its `path`'s own fstat (e.g. the C ABI's
+/// materialize-time delegate guard) treat an absent field as unverifiable
+/// rather than mismatched, which is the correct reading here: `size` still
+/// describes the CAS copy, since the copy is byte-for-byte identical to the
+/// source, but `mtime` does not.
+fn without_backing_mtime(info: ObjectInfo) -> ObjectInfo {
+    ObjectInfo {
+        mtime: None,
+        ..info
+    }
+}
+
+/// Whether `info` reports a present etag that cannot identify trusted bytes.
+/// An absent etag carries no version evidence and deliberately returns false.
+fn disproves_cached_validator(info: &ObjectInfo) -> bool {
+    info.etag
+        .as_deref()
+        .is_some_and(|etag| etag.is_empty() || info.etag_strength != EtagStrength::Strong)
 }
 
 fn require_path(config: &LayerConfig, key: &str) -> Result<PathBuf> {
@@ -272,10 +306,10 @@ impl WrapperFactory for ByteCacheWrapperFactory {
         };
         let watch_invalidation = parse_watch_invalidation(config)?;
         let watch_inner = inner.clone();
-        // Reclaim the availability rows of the abandoned key namespaces before
-        // serving: they are unreachable under the current key, so nothing else
-        // will ever remove them.
-        sweep_legacy_availability_rows(&cache, &partition);
+        // Reclaim rows from the abandoned cache namespaces before serving:
+        // they are unreachable under the current keys, so nothing else will
+        // ever remove them.
+        sweep_legacy_cache_rows(&cache, &partition);
         // Read once: `status()` is a query, and the budget is fixed for the
         // cache's lifetime. A failure here is fatal to the build rather than
         // silently unbudgeted -- swallowing it would disable the coexistence
@@ -342,18 +376,18 @@ impl WrapperFactory for ByteCacheWrapperFactory {
     }
 }
 
-/// Caches object bytes, keyed by the object's **validator**: the cache
-/// key is `partition\0canonical_address\0etag`, so an entry is tied to the
+/// Caches object bytes, keyed by the object's **strong validator**: the cache
+/// key is `partition\u{3}canonical_address\0etag`, so an entry is tied to the
 /// object version it was read from. Composes **above**
 /// `RedirectFollowerWrapper` so it caches *post-redirect* bytes.
 ///
 /// **Lookups validate first**: a cacheable read/materialize obtains the
-/// object's current `etag` via an inner `stat` (served by the
+/// object's current strong `etag` via an inner `stat` (served by the
 /// `MetadataCacheWrapper` composed below in the default chain, so repeats are
 /// cheap) and looks up under that validator — a changed object is never
 /// served older bytes than the validator source knows about, and a request
-/// whose current validator is unknown (the stat answered without an `etag`)
-/// bypasses the cache.
+/// whose current validator is absent, empty, weak, or unspecified bypasses the
+/// cache.
 ///
 /// **Consistency bound.** Composed above a metadata cache, the validating stat
 /// may be served from a TTL-fresh metadata
@@ -363,8 +397,9 @@ impl WrapperFactory for ByteCacheWrapperFactory {
 /// an operator already tunes. A byte cache composed WITHOUT a metadata cache
 /// validates against the backend on every lookup: absolute freshness, at one
 /// stat round-trip per read.
-/// **Fills require a validator**: content is inserted only under the `etag`
-/// the result itself reports; unversioned content is never cached. A
+/// **Fills require a strong validator**: content is inserted only under the
+/// strong `etag` the result itself reports; weak, unspecified, and unversioned
+/// content is never cached. A
 /// superseded validator's entry is unreachable by construction on the strict
 /// path, and its content row is best-effort reclaimed — the availability
 /// index names the exact predecessor, so each new fill prunes the row it
@@ -473,6 +508,23 @@ struct ValidatorProbe {
     /// masks refusals as absences keeps that capability, and closing it belongs
     /// where the masking happens.
     registers: bool,
+    /// Whether the read may snapshot (and, on a cold address, seed) the
+    /// availability row before fetching bytes.
+    ///
+    /// A successful stat with a present untrusted validator sets this false:
+    /// the observation rules out a cache lookup and any live fallback for this
+    /// operation, and seeding a tombstone would turn every weak-validator read
+    /// into cache I/O. A later strong read result may still fill the strict
+    /// content row, but cannot publish the availability row without this
+    /// read-start fence. An absent stat validator leaves it true because a
+    /// redirect response may still carry a strong validator that needs the
+    /// fence.
+    snapshot_fence: bool,
+    /// Whether this operation's successful stat already settled a fallback
+    /// disproved by an untrusted validator. Completion must not settle it a
+    /// second time: a strong publisher landing after the stat-side settlement
+    /// is newer evidence and keeps its row.
+    untrusted_stat_settled: bool,
 }
 
 impl ValidatorProbe {
@@ -481,12 +533,14 @@ impl ValidatorProbe {
         Self {
             validator: None,
             registers: false,
+            snapshot_fence: false,
+            untrusted_stat_settled: false,
         }
     }
 }
 
 impl ByteCacheWrapper {
-    /// `partition\0canonical_address\0etag`. The `etag` dimension ties
+    /// `partition\u{3}canonical_address\0etag`. The `etag` dimension ties
     /// the entry to the object version it was read from. Backend instance IDs
     /// deliberately do not participate: the validator, not a resolved route
     /// identity, is the
@@ -496,10 +550,10 @@ impl ByteCacheWrapper {
     }
 
     /// The validator to look up under. Preferred source: the object's
-    /// current `etag` via an inner `stat` carrying the caller's request
+    /// current strong `etag` via an inner `stat` carrying the caller's request
     /// extensions (so principal scoping and tracing flow); a backend that
-    /// answers without an `etag` means bypass (`None`) — unversioned content
-    /// is never served.
+    /// answers without a strong, nonempty `etag` means bypass (`None`) — only
+    /// strongly validated content is served.
     ///
     /// A stat **error** is discriminated by shape:
     ///
@@ -551,15 +605,24 @@ impl ByteCacheWrapper {
             )
             .await
         {
-            // An empty etag is no validator: it cannot distinguish two
-            // versions, so a lookup keyed on it would serve the first fill
-            // through every later change the backend reports the same way.
+            // An empty or non-strong etag is not a trusted content identity.
             // [`ProvenValidator`] refuses to publish one; this refuses to look
             // one up, so neither end of the strict path can key on it.
-            Ok(info) => Ok(ValidatorProbe {
-                validator: info.etag.filter(|etag| !etag.is_empty()),
-                registers: true,
-            }),
+            Ok(info) => {
+                let disproves_fallback = disproves_cached_validator(&info);
+                self.settle_without_validator(address, Some(&info), None)
+                    .await;
+                let validator = (info.etag_strength == EtagStrength::Strong)
+                    .then_some(info.etag)
+                    .flatten()
+                    .filter(|etag| !etag.is_empty());
+                Ok(ValidatorProbe {
+                    validator,
+                    registers: true,
+                    snapshot_fence: !disproves_fallback,
+                    untrusted_stat_settled: disproves_fallback,
+                })
+            }
             Err(error) => match error.code() {
                 ErrorCode::Cancelled => Err(error),
                 // An outage, not a verdict on the address. `registers` stays
@@ -580,6 +643,8 @@ impl ByteCacheWrapper {
                 | ErrorCode::RedirectExpired => Ok(ValidatorProbe {
                     validator: self.last_known_validator(address).await,
                     registers: true,
+                    snapshot_fence: true,
+                    untrusted_stat_settled: false,
                 }),
                 // `NotFound` registers on both arms — the same rule the `stat`
                 // pass-through applies, and for the same reason: the metadata
@@ -588,10 +653,14 @@ impl ByteCacheWrapper {
                 ErrorCode::NotFound if self.lost_backing_fallback => Ok(ValidatorProbe {
                     validator: self.last_known_validator(address).await,
                     registers: true,
+                    snapshot_fence: true,
+                    untrusted_stat_settled: false,
                 }),
                 ErrorCode::NotFound => Ok(ValidatorProbe {
                     validator: None,
                     registers: true,
+                    snapshot_fence: true,
+                    untrusted_stat_settled: false,
                 }),
                 // A stat-less backend gets no silent staleness: an
                 // explicit arm so a future code addition can't reclassify it
@@ -601,6 +670,8 @@ impl ByteCacheWrapper {
                 ErrorCode::Unsupported => Ok(ValidatorProbe {
                     validator: None,
                     registers: true,
+                    snapshot_fence: true,
+                    untrusted_stat_settled: false,
                 }),
                 // The one bucket that does not register: `PermissionDenied`, the
                 // auth/credential family and `InvalidArgument` — the codes this
@@ -696,6 +767,14 @@ impl ByteCacheWrapper {
         clear_latest_impl(&self.cache, &self.partition, &self.generations, address).await
     }
 
+    /// Clear a live fallback after an untrusted validator observation, without
+    /// manufacturing or rotating a tombstone when the row already names
+    /// nothing. Unlike mutation invalidation, this is conditional on the exact
+    /// live row observed: a later strong publisher wins the race.
+    async fn clear_live_fallback(&self, address: &Url) -> Result<()> {
+        clear_live_fallback_impl(&self.cache, &self.partition, &self.generations, address).await
+    }
+
     /// Whether an object of `len` bytes is within the per-object fill cap. A
     /// `None` cap is unbounded. Gates every byte-path fill so an object served
     /// as `Bytes` cannot bypass the cap the stream tee already enforces.
@@ -735,18 +814,19 @@ impl ByteCacheWrapper {
     /// post-delete `NotFound` is the steady state, not an outage) — and
     /// best-effort reclaim the children's content rows, mirroring
     /// `clear_latest`'s single-object reclamation. The appended `/` keeps a
-    /// sibling prefix (`dir` vs `dir2`) out of the sweep; the `\u{2}` / `\0`
+    /// sibling prefix (`dir` vs `dir2`) out of the sweep; the `\u{4}` / `\u{3}`
     /// separators keep the two namespaces disjoint.
     fn clear_subtree(&self, address: &Url) -> Result<()> {
         clear_subtree_impl(&self.cache, &self.partition, &self.generations, address)
     }
 
-    /// Settle the availability row for a completed read-family op that proved
-    /// no usable validator.
+    /// Settle the availability row after a successful validator observation.
+    /// A usable strong validator requires no settlement here; every other
+    /// observation takes the evidence-sensitive path below.
     ///
-    /// The two ways to have none are not the same evidence, and both `read` and
-    /// `materialize` owe the distinction -- so it lives here rather than being
-    /// written out twice.
+    /// The three ways to have none are not the same evidence, and `stat`,
+    /// `read`, and `materialize` owe the distinction -- so it lives here rather
+    /// than being written out at every observation point.
     ///
     /// A backend that reports NO etag has said nothing about versions, so a row
     /// an earlier fill established still stands and only this op's own seed is
@@ -755,19 +835,26 @@ impl ByteCacheWrapper {
     /// named it with a string that cannot be told from any other. A row naming
     /// an older, real validator no longer describes the object, so leaving it
     /// is the one outcome that serves bytes this op disproved, once a stat
-    /// outage engages the fallback. Note `discard_unused_seed` cannot cover
-    /// that case by construction: it deliberately keeps a row that names a real
+    /// outage engages the fallback. A backend that reports a present, nonempty
+    /// etag but does not declare it strong has likewise proved that the row's
+    /// named validator cannot be trusted as a content identity, so it takes the
+    /// same clearing path. Note `discard_unused_seed` cannot cover either case
+    /// by construction: it deliberately keeps a row that names a real
     /// validator, which is exactly the row that is now wrong.
     async fn settle_without_validator(
         &self,
         address: &Url,
-        reported_etag: Option<&str>,
+        reported_info: Option<&ObjectInfo>,
         snapshot: Option<&[u8]>,
     ) {
-        if reported_etag == Some("") {
+        if reported_info.is_some_and(disproves_cached_validator) {
             // Best-effort: the op holds a good answer, and an unwritable index
-            // must not fail it.
-            let _ = self.clear_latest(address).await;
+            // must not fail it. A cold/settled untrusted backend has no live
+            // fallback to clear, so this performs no cache write. If this op
+            // seeded a fence before learning the result was untrusted, take
+            // that exact seed back as well.
+            let _ = self.clear_live_fallback(address).await;
+            self.discard_unused_seed(address, snapshot).await;
         } else {
             self.discard_unused_seed(address, snapshot).await;
         }
@@ -901,7 +988,7 @@ impl ByteCacheWrapper {
                     self.watch_state.note_cached(address);
                     Ok(ReadResult::LocalDelegate(LocalDelegate {
                         path: put.entry.path,
-                        info: local.info,
+                        info: without_backing_mtime(local.info),
                         guard: Some(Arc::new(lease) as Arc<dyn Send + Sync>),
                     }))
                 }
@@ -916,22 +1003,22 @@ impl ByteCacheWrapper {
 
     /// Streamed write-through: tee the request's `Body::Stream` into the cache
     /// as the inner write drains it, committing the teed body under the write
-    /// result's new validator on clean completion. `use_write_stream` selects
-    /// the inner slot (`write_stream` vs `write`).
+    /// result's new strong validator on clean completion. `use_write_stream`
+    /// selects the inner slot (`write_stream` vs `write`).
     ///
     /// Mirrors the read stream tee: the body spools chunk-by-chunk into a cache
     /// staging file capped by `max_object_bytes` (never held whole in memory); a
     /// cap breach or a body error abandons the fill (the write's body streams on
     /// intact), and a commit lands only when the whole body flowed through
-    /// (`reached_eof`), the write result carried a validator, the staged length
-    /// matched the result's declared size, and the address was not mutated
-    /// since the tee started (the write registers against the generations
-    /// map exactly as the read tee and other mutation paths do). A write the tee
-    /// could not fully observe — cache unavailable, backend that did not drain
-    /// the body, cap breach, or missing validator — invalidates the address
-    /// instead, so the availability index never keeps naming the pre-write
-    /// validator. The commit is off-runtime (`sync_all` + CAS publication + SQLite
-    /// publish), matching the read tee.
+    /// (`reached_eof`), the write result carried a strong validator, the staged
+    /// length matched the result's declared size, and the address was not
+    /// mutated since the tee started (the write registers against the
+    /// generations map exactly as the read tee and other mutation paths do). A
+    /// write the tee could not fully observe — cache unavailable, backend that
+    /// did not drain the body, cap breach, or missing/untrusted validator —
+    /// invalidates the address instead, so the availability index never keeps
+    /// naming the pre-write validator. The commit is off-runtime (`sync_all` +
+    /// CAS publication + SQLite publish), matching the read tee.
     async fn streamed_write_through(
         &self,
         mut request: Request<WriteRequest>,
@@ -1006,7 +1093,7 @@ impl ByteCacheWrapper {
                 return Err(error);
             }
         };
-        // Commit only a fully-observed, still-current, validator-carrying fill
+        // Commit only a fully-observed, still-current, strong-validator fill
         // (commit-only-on-complete). `registration.current()` is read BEFORE the
         // commit-time bump below, so the write's own mutation bump never fails
         // its own check.
@@ -1207,35 +1294,47 @@ async fn delegate_size(local: &LocalDelegate) -> u64 {
     }
 }
 
-/// Content cache key `partition\0canonical_address\0etag`. Shared by the
+/// Content cache key `partition\u{3}canonical_address\0etag`. Shared by the
 /// wrapper's [`ByteCacheWrapper::cache_key`] and the stream tee so the row a
 /// tee commits is looked up under exactly the same key.
+///
+/// The `\u{3}` namespace is the strength-gated content-key version. The
+/// pre-gating `\0` namespace is never read: a weak and a strong HTTP etag can
+/// normalize to the same opaque token, so a row written before strength was
+/// part of the cache admission contract cannot safely answer a current strong
+/// lookup.
 fn content_cache_key(partition: &str, address: &Url, etag: &str) -> String {
-    format!("{partition}\0{address}\0{etag}")
+    format!("{}{address}\0{etag}", content_prefix(partition))
 }
 
-/// Availability-index key `partition\u{2}canonical_address` — a `\u{2}`
-/// namespace disjoint from every `\0` content key.
+/// Availability-index key `partition\u{4}canonical_address` — a `\u{4}`
+/// namespace disjoint from the current `\u{3}` content keys and every legacy
+/// namespace.
 ///
-/// The `\u{1}` namespace is abandoned and never read. It holds rows in two
-/// encodings that cannot be told apart from each other or from
+/// The `\u{1}` and `\u{2}` namespaces are abandoned and never read. `\u{1}`
+/// holds rows in two encodings that cannot be told apart from each other or from
 /// [`encode_avail`]'s shape with acceptable confidence — a bare UTF-8 etag, and
 /// `epoch (u64 LE) || etag`, whose leading NUL bytes decode as valid UTF-8 and
 /// whose tombstone reads as a live validator. A row that cannot be identified
-/// must not be interpreted, so the whole namespace is unreachable rather than
-/// misread, and [`sweep_legacy_availability_rows`] reclaims it at construction
-/// so it does not wait on eviction.
+/// must not be interpreted. `\u{2}` holds version-1 strength-gating rows, while
+/// current version-2 rows occupy `\u{4}`. Construction can therefore reclaim
+/// both old namespaces by prefix without parsing an untrusted payload or
+/// leaving unreachable rows to eviction.
+fn availability_prefix(partition: &str) -> String {
+    format!("{partition}\u{4}")
+}
+
 fn availability_index_key(partition: &str, address: &Url) -> String {
-    format!("{partition}\u{2}{address}")
+    format!("{}{address}", availability_prefix(partition))
 }
 
-/// Key prefix of the abandoned availability-index namespaces.
-fn legacy_availability_prefix(partition: &str) -> String {
-    format!("{partition}\u{1}")
+/// Key prefixes of the abandoned availability-index namespaces.
+fn legacy_availability_prefixes(partition: &str) -> [String; 2] {
+    [format!("{partition}\u{1}"), format!("{partition}\u{2}")]
 }
 
-/// Drop every row left under the abandoned availability-index namespace, and
-/// the partition's cached bodies with them. Runs once per wrapper construction.
+/// Drop every row left under the abandoned availability-index and content-key
+/// namespaces. Runs once per wrapper construction.
 ///
 /// # Why the bodies go too
 ///
@@ -1243,45 +1342,58 @@ fn legacy_availability_prefix(partition: &str) -> String {
 /// body was filled under, and it is in an encoding this build refuses to
 /// interpret — see [`availability_index_key`]. So the validator cannot be
 /// recovered to prune that body precisely: removing the row destroys the last
-/// pointer to it. Content keys are unchanged, so the body stays reachable while
-/// the object still has its old validator, but the moment it changes, nothing
-/// keys on the old etag again, the strict path cannot see the row, and the
-/// default no-budget cache never evicts it. That is one stranded object per
-/// legacy address, permanently, on upgrade of a warm cache.
+/// pointer to it. Independently, every body in the pre-strength `\0` content
+/// namespace is untrusted because its key carries no strength evidence. The
+/// whole old content namespace is therefore unreachable and reclaimable,
+/// including rows whose availability pointer was already evicted.
 ///
-/// The cost is one cold start for a cache written by a version whose
-/// availability state this build already declines to trust. The alternative —
-/// keeping bodies whose reclaim pointer has been destroyed — is the leak this
-/// whole change exists to close.
+/// The cost is one cold start for a cache written before strength-gated content
+/// keys. The alternative — keeping bodies whose reclaim pointer has been
+/// destroyed — is the leak this whole change exists to close.
 ///
 /// # Why this needs no migration marker
 ///
-/// The legacy rows are the marker. They are removed in the same pass, so a
-/// later construction finds none and leaves a freshly populated cache alone.
-/// The content flush runs FIRST for crash-safety: interrupted between the two,
-/// the legacy rows survive and the next construction repeats the migration (by
-/// then a no-op on content). The other order would strand exactly what this
-/// exists to reclaim.
+/// The namespaces themselves distinguish legacy from current state, so no
+/// migration marker is needed. The content flush runs FIRST for crash-safety:
+/// interrupted between the two, legacy availability rows survive and the next
+/// construction repeats the migration (by then a no-op on content). The other
+/// order would strand exactly what this exists to reclaim.
 ///
 /// Best-effort throughout — a read-only cache cannot remove, and failing to
 /// reclaim dead rows must not fail the build.
-fn sweep_legacy_availability_rows(cache: &Cache, partition: &str) {
-    let legacy = legacy_availability_prefix(partition);
-    if !cache.has_any_with_prefix(&legacy).unwrap_or(false) {
+fn sweep_legacy_cache_rows(cache: &Cache, partition: &str) {
+    let legacy_availability = legacy_availability_prefixes(partition);
+    let legacy_content = legacy_content_prefix(partition);
+    let has_legacy_availability = legacy_availability
+        .iter()
+        .any(|prefix| cache.has_any_with_prefix(prefix).unwrap_or(false));
+    let has_legacy_content = cache.has_any_with_prefix(&legacy_content).unwrap_or(false);
+    if !has_legacy_availability && !has_legacy_content {
         return;
     }
-    let _ = cache.remove_prefix(&content_prefix(partition));
-    let _ = cache.remove_prefix(&legacy);
+    let _ = cache.remove_prefix(&legacy_content);
+    for prefix in legacy_availability {
+        let _ = cache.remove_prefix(&prefix);
+    }
 }
 
-/// Key prefix of every content row in `partition`. Disjoint from both
-/// availability namespaces, which use `\u{2}` and `\u{1}`.
+/// Key prefix of every current content row in `partition`. The `\u{3}` marker
+/// is the strength-gated namespace version and is disjoint from the current and
+/// abandoned availability namespaces, which use `\u{4}`, `\u{2}`, and `\u{1}`.
 fn content_prefix(partition: &str) -> String {
+    format!("{partition}\u{3}")
+}
+
+/// Key prefix of the pre-strength content namespace. Rows here may have been
+/// admitted under weak or undeclared validators, so current lookups never use
+/// this prefix.
+fn legacy_content_prefix(partition: &str) -> String {
     format!("{partition}\0")
 }
 
-/// Encoding version of an availability row.
-const AVAIL_VERSION: u8 = 1;
+/// Encoding version of an availability row. Version 2 rows name only strong
+/// validators, so a differently-versioned row cannot enter the fallback.
+const AVAIL_VERSION: u8 = 2;
 
 /// Width of the publication nonce.
 const AVAIL_NONCE_LEN: usize = 16;
@@ -1309,6 +1421,8 @@ const AVAIL_CAS_ATTEMPTS: usize = 8;
 
 /// An availability row is `version || nonce (16 bytes) || etag (UTF-8)`. An
 /// empty etag is a **tombstone** — the address has no current validator.
+/// Every nonempty row is published from a [`ProvenValidator`], so its etag is
+/// strong by construction and the declaration does not need persisted bytes.
 ///
 /// `nonce` is fresh random on every write of the row and carries no ordering;
 /// its only job is to make the row's bytes **non-reusable**, so that "the row
@@ -1425,7 +1539,7 @@ struct ContentReclaim {
     /// The address the reclaimed body belongs to, REDACTED, for the drop
     /// diagnostic.
     ///
-    /// The content key is `{partition}\0{address}\0{etag}` and embeds the raw
+    /// The content key is `{partition}\u{3}{address}\0{etag}` and embeds the raw
     /// `Url`, so logging the key would publish userinfo and signed-URL
     /// credentials -- the same reason `AvailabilityClear` carries a redacted
     /// address rather than its own key.
@@ -2013,14 +2127,15 @@ struct ProvenValidator(String);
 impl ProvenValidator {
     /// The validator a completed read reported, if it reported a usable one.
     ///
-    /// An empty etag is rejected. The availability encoding already treats it
-    /// as a tombstone, so it can never be published there; the strict path has
-    /// no such filter and would key a content row on the empty string, which
-    /// never changes between versions -- an out-of-band update would then be
-    /// served from the first fill indefinitely. A validator that cannot
-    /// distinguish two versions is not a validator.
+    /// Only a declared-strong, nonempty etag is accepted. The availability
+    /// encoding already treats an empty etag as a tombstone, while weak and
+    /// unspecified validators do not provide a trusted content identity.
     fn proved(info: &ObjectInfo) -> Option<Self> {
-        info.etag.clone().filter(|etag| !etag.is_empty()).map(Self)
+        (info.etag_strength == EtagStrength::Strong)
+            .then(|| info.etag.clone())
+            .flatten()
+            .filter(|etag| !etag.is_empty())
+            .map(Self)
     }
 
     fn etag(&self) -> &str {
@@ -2261,7 +2376,7 @@ fn clear_watched_object(
 /// the tee cannot re-publish a cleared row. Shared by the directory-mutation
 /// overrides ([`ByteCacheWrapper::clear_subtree`]) and `watch_directory`'s
 /// Deleted/Lapsed invalidation. The appended `/` keeps a sibling prefix (`dir`
-/// vs `dir2`) out of the sweep; the `\u{2}` / `\0` separators keep the
+/// vs `dir2`) out of the sweep; the `\u{4}` / `\u{3}` separators keep the
 /// availability-index and content namespaces disjoint.
 ///
 /// Removing an availability row rather than tombstoning it is safe for the
@@ -2289,8 +2404,8 @@ fn clear_subtree_impl(
     // already committed at the backend, so returning between them would leave
     // one of the two namespaces still naming pre-delete state. The first error
     // is reported after both have been attempted.
-    let availability = cache.remove_prefix(&format!("{partition}\u{2}{dir}"));
-    let content = cache.remove_prefix(&format!("{partition}\0{dir}"));
+    let availability = cache.remove_prefix(&format!("{}{dir}", availability_prefix(partition)));
+    let content = cache.remove_prefix(&format!("{}{dir}", content_prefix(partition)));
     availability.and(content)
 }
 
@@ -2604,6 +2719,43 @@ async fn clear_latest_impl(
     // transaction, so a concurrent publisher cannot make this reclaim act on
     // an earlier observation. The detached blocking task owns both steps.
     remove_availability_and_reclaim_off_runtime(cache, &key, partition, address).await
+}
+
+/// Invalidate only the live fallback this observation actually saw.
+///
+/// Successful weak/unspecified validator observations are read-family evidence,
+/// not backend mutations. A row that is absent or already a tombstone is
+/// therefore settled and needs no nonce rotation, generation bump, fsync, or
+/// SQLite transaction. When a live row exists, compare-and-tombstone its exact
+/// bytes once and reclaim its content. If a strong fill publishes a different
+/// row between the read and the swap, the comparison refuses and the later
+/// proof wins; the read/materialize completion performs the same check again,
+/// covering a publisher that races the initial stat-side settlement.
+async fn clear_live_fallback_impl(
+    cache: &Arc<Cache>,
+    partition: &str,
+    generations: &Mutex<GenerationMap>,
+    address: &Url,
+) -> Result<()> {
+    let Ok((current @ Some(_), Some(previous))) = read_avail(cache, partition, address).await
+    else {
+        return Ok(());
+    };
+
+    bump_generation_key(generations, address.as_str());
+    let key = availability_index_key(partition, address);
+    let previous_content_key = Some(content_cache_key(partition, address, &previous));
+    let _ = clear_compare_off_runtime(
+        cache,
+        &key,
+        current,
+        encode_avail(""),
+        partition,
+        address,
+        previous_content_key,
+    )
+    .await?;
+    Ok(())
 }
 
 /// What a committed streamed write-through tee needs to decide publication:
@@ -2947,8 +3099,8 @@ impl Layer for ByteCacheWrapper {
         request: Request<StatRequest>,
         cancel: Option<CancellationToken>,
     ) -> Result<ObjectInfo> {
-        let watching = self.watch_state.watches()
-            && crate::routing::stat_is_cacheable(&request.input.address, &request.input.options);
+        let watching =
+            self.watch_state.watches() && crate::routing::stat_is_cacheable(&request.input.address);
         let address = watching.then(|| request.input.address.clone());
         let info = self.inner.stat(request, cancel).await;
         // `NotFound` counts, which is why this does not exit through `?`. The
@@ -3012,6 +3164,20 @@ impl Layer for ByteCacheWrapper {
         Ok(page)
     }
 
+    /// Pass streaming listings through without observing or draining them.
+    ///
+    /// The buffered path registers a watch scope only because a completed list
+    /// may have populated the metadata cache below. Streaming metadata listings
+    /// are intentionally uncached: a caller can stop at any entry, so there is
+    /// no completed cache row for this layer's watch registry to protect.
+    async fn list_stream(
+        &self,
+        request: Request<ListRequest>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ListStream> {
+        self.inner.list_stream(request, cancel).await
+    }
+
     async fn read(
         &self,
         request: Request<ReadRequest>,
@@ -3056,6 +3222,8 @@ impl Layer for ByteCacheWrapper {
         } else {
             ValidatorProbe::silent()
         };
+        let snapshot_fence = probe.snapshot_fence;
+        let untrusted_stat_settled = probe.untrusted_stat_settled;
         let validator = probe.validator;
         // Registered on the way in, for the entry the inner `stat` leaves in
         // the metadata cache below: that row exists whether or not this read
@@ -3124,14 +3292,16 @@ impl Layer for ByteCacheWrapper {
         // publishes its validator only against these exact bytes, so any
         // mutation landing during the read fences it out.
         //
-        // Gated on the read being cacheable, and NOT on the stat's validator.
-        // The publish below is gated on the READ's validator, and the two are
-        // not the same backend answer: a redirecting backend names versions on
-        // its read (the follower below this layer resolves the redirect and
-        // carries the validator back with the bytes) while its stat may name
-        // none. Gating the snapshot on the stat's would leave every such
-        // address with no fallback at all -- exactly the brokered
-        // survive-backing-loss path the index exists for.
+        // Gated on the read being cacheable and the stat not having explicitly
+        // disproved trusted-validator caching. The publish below is gated on
+        // the READ's validator, and the two are not always the same backend
+        // answer: a redirecting backend can name a strong version on its read
+        // while its stat names none, so an ABSENT stat validator still permits
+        // a fence. A present weak/unspecified/empty stat validator is different:
+        // it deliberately suppresses the fence, avoiding cache writes on every
+        // read from an untrusted-stat backend. A later strong read may still
+        // fill the strict content row, but it cannot safely publish the
+        // availability row without a read-start snapshot.
         //
         // Snapshotting an absent row SEEDS it, so the exits that will never
         // publish against that seed take it back: the read's own error path,
@@ -3142,7 +3312,7 @@ impl Layer for ByteCacheWrapper {
         // size budget to reclaim them. Every exit that DOES prove a validator
         // is covered by the guard below instead, which clears rather than
         // discards.
-        let snapshot = if cacheable {
+        let snapshot = if cacheable && snapshot_fence {
             self.snapshot(&address).await
         } else {
             None
@@ -3175,7 +3345,7 @@ impl Layer for ByteCacheWrapper {
         // No validator: nothing below can publish, and no guard is armed to
         // clear on the way out.
         //
-        // The two ways to have none are not the same evidence. A backend that
+        // The three ways to have none are not the same evidence. A backend that
         // reports NO etag has said nothing about versions, so a row an earlier
         // fill established still stands and only this read's own seed is
         // residue -- an in-tree example is an HTTP origin serving no `ETag`
@@ -3183,10 +3353,15 @@ impl Layer for ByteCacheWrapper {
         // version and named it with a string that cannot be told from any
         // other. A row naming an older, real validator no longer describes the
         // object, so leaving it is the one outcome that serves bytes this read
-        // disproved, once a stat outage engages the fallback.
-        if proof.is_none() {
+        // disproved, once a stat outage engages the fallback. A present but
+        // non-strong validator provides the same clearing evidence: it cannot
+        // establish byte identity for the row it names. When the successful
+        // stat already supplied that evidence, its settlement is final for
+        // this operation; repeating it here could erase a newer strong
+        // publication that landed during the read.
+        if proof.is_none() && !untrusted_stat_settled {
             let reported = if cacheable {
-                result_info(&result).and_then(|info| info.etag.as_deref())
+                result_info(&result)
             } else {
                 None
             };
@@ -3204,10 +3379,11 @@ impl Layer for ByteCacheWrapper {
         });
         match result {
             ReadResult::Bytes { bytes, info } => {
-                // Fill only under the result's own validator; unversioned
-                // content is never inserted. The per-object cap gates the
-                // byte-path fill too, or an over-cap object returned as `Bytes`
-                // would bypass the broker's cache-DoS gate.
+                // Fill only under the result's own strong validator; weak,
+                // unspecified, and unversioned content is never inserted. The
+                // per-object cap gates the byte-path fill too, or an over-cap
+                // object returned as `Bytes` would bypass the broker's
+                // cache-DoS gate.
                 if let Some(proof) = &proof {
                     let etag = proof.etag();
                     self.fill_and_publish(&address, etag, &bytes, snapshot, &mut guard)
@@ -3375,6 +3551,8 @@ impl Layer for ByteCacheWrapper {
         } else {
             ValidatorProbe::silent()
         };
+        let snapshot_fence = probe.snapshot_fence;
+        let untrusted_stat_settled = probe.untrusted_stat_settled;
         let validator = probe.validator;
         // See `read`: registered for the metadata row the inner `stat` leaves
         // below, and only where that stat answered for this address — the body's
@@ -3398,11 +3576,14 @@ impl Layer for ByteCacheWrapper {
         // landing during `inner.materialize` fences the publish below:
         // materialize is a read-family op with no preceding mutation and no S2
         // generation guard, so a post-fetch snapshot would miss the race.
-        // Gated on the op being cacheable, as in `read`, and on nothing else:
-        // the publish is gated on the STAGED result's validator, which a
-        // backend can name where its stat does not. Snapshotting an absent row
-        // seeds it, so the exits that never publish take the seed back.
-        let snapshot = if cacheable {
+        // Gated as in `read`: an absent stat validator still permits a strong
+        // staged result, while a present untrusted stat validator suppresses
+        // the tombstone seed. A strong staged result may still fill the strict
+        // content row, but cannot safely publish the availability row without
+        // that read-start fence.
+        // Snapshotting an absent row seeds it, so the exits that never publish
+        // take the seed back.
+        let snapshot = if cacheable && snapshot_fence {
             self.snapshot(&address).await
         } else {
             None
@@ -3415,7 +3596,7 @@ impl Layer for ByteCacheWrapper {
                 return Err(error);
             }
         };
-        // Fill only under the staged result's own validator. NOTE: unlike
+        // Fill only under the staged result's own strong validator. NOTE: unlike
         // the read-path fills, this spool is NOT gated by `max_object_bytes` —
         // the delegate is already on disk, so the cap (a DoS gate against
         // *fetching* oversize objects into the CAS) is less load-bearing here,
@@ -3427,14 +3608,12 @@ impl Layer for ByteCacheWrapper {
             None
         };
         // Nothing will publish against the seed, and no guard is armed to clear
-        // it. Settled exactly as `read` settles it -- an empty validator is an
-        // answer that supersedes the row, an absent one is not.
-        if proof.is_none() {
-            let reported = if cacheable {
-                local.info.etag.as_deref()
-            } else {
-                None
-            };
+        // it. Settled exactly as `read` settles it -- an empty or non-strong
+        // validator is an answer that supersedes the row, an absent one is not.
+        // A successful untrusted stat has already performed that settlement;
+        // do not let completion erase a newer strong publication.
+        if proof.is_none() && !untrusted_stat_settled {
+            let reported = if cacheable { Some(&local.info) } else { None };
             self.settle_without_validator(&address, reported, snapshot.as_deref())
                 .await;
         }
@@ -3478,7 +3657,7 @@ impl Layer for ByteCacheWrapper {
             self.watch_state.note_cached(&address);
             Ok(LocalDelegate {
                 path: put.entry.path,
-                info: local.info,
+                info: without_backing_mtime(local.info),
                 guard: Some(Arc::new(lease) as Arc<dyn Send + Sync>),
             })
         } else {
@@ -3742,6 +3921,138 @@ impl Layer for ByteCacheWrapper {
                     clear_subtree_impl(&gap_cache, &gap_partition, &gap_generations, &gap_prefix);
             },
         )))
+    }
+}
+
+#[cfg(test)]
+mod list_stream_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::StreamExt as _;
+
+    use super::*;
+
+    const STREAM_ITEMS: usize = 128;
+    const CONSUMED_ITEMS: usize = 3;
+
+    #[derive(Clone, Default)]
+    struct FlowCounters {
+        produced: Arc<AtomicUsize>,
+        released: Arc<AtomicUsize>,
+        peak_in_flight: Arc<AtomicUsize>,
+    }
+
+    struct PullListingLayer {
+        counters: FlowCounters,
+    }
+
+    #[async_trait]
+    impl Layer for PullListingLayer {
+        fn name(&self) -> &str {
+            "pull-listing"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            descriptor("pull-listing", LayerType::Backend, false)
+        }
+
+        async fn list_stream(
+            &self,
+            _request: Request<ListRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ListStream> {
+            let counters = self.counters.clone();
+            Ok(Box::pin(futures::stream::unfold(0usize, move |index| {
+                let counters = counters.clone();
+                async move {
+                    if index == STREAM_ITEMS {
+                        return None;
+                    }
+                    let produced = counters.produced.fetch_add(1, Ordering::SeqCst) + 1;
+                    let in_flight =
+                        produced.saturating_sub(counters.released.load(Ordering::SeqCst));
+                    counters
+                        .peak_in_flight
+                        .fetch_max(in_flight, Ordering::SeqCst);
+                    Some((Ok(item(index)), index + 1))
+                }
+            })))
+        }
+    }
+
+    fn item(index: usize) -> ObjectInfo {
+        ObjectInfo::from((
+            Url::parse(&format!("test:///root/item-{index}")).unwrap(),
+            BackendItemInfo {
+                kind: ObjectKind::File,
+                ..BackendItemInfo::default()
+            },
+        ))
+    }
+
+    fn request() -> Request<ListRequest> {
+        Request::new(ListRequest {
+            prefix: Url::parse("test:///root/").unwrap(),
+            options: ListOptions::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn streaming_invariant_passes_entries_without_cache_accumulation() {
+        let counters = FlowCounters::default();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            Cache::open(CacheConfig {
+                state_root: dir.path().join("state"),
+                cache_root: dir.path().join("cache"),
+            })
+            .unwrap(),
+        );
+        let entries_before = cache.status().unwrap().entries;
+        let wrapper = ByteCacheWrapperFactory::with_cache(Arc::clone(&cache))
+            .create_wrapper(
+                "byte-cache",
+                &LayerConfig::new(),
+                Arc::new(PullListingLayer {
+                    counters: counters.clone(),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut stream = wrapper.list_stream(request(), None).await.unwrap();
+        assert_eq!(
+            counters.produced.load(Ordering::SeqCst),
+            0,
+            "opening the wrapper must not prefetch the inner stream"
+        );
+
+        for index in 0..CONSUMED_ITEMS {
+            assert_eq!(stream.next().await.unwrap().unwrap(), item(index));
+            assert_eq!(
+                counters.produced.load(Ordering::SeqCst),
+                index + 1,
+                "one consumer pull must produce exactly one inner entry"
+            );
+            counters.released.fetch_add(1, Ordering::SeqCst);
+        }
+        drop(stream);
+
+        assert_eq!(
+            counters.produced.load(Ordering::SeqCst),
+            CONSUMED_ITEMS,
+            "dropping a partial stream must stop inner production"
+        );
+        assert!(
+            counters.peak_in_flight.load(Ordering::SeqCst) <= 1,
+            "the wrapper accumulated more than one entry"
+        );
+        assert_eq!(
+            cache.status().unwrap().entries,
+            entries_before,
+            "streaming a listing must not write byte-cache state"
+        );
     }
 }
 
@@ -4068,9 +4379,10 @@ mod availability_index_tests {
     //! The availability index's publication integrity: the fence a read-path
     //! fill publishes under, its behaviour when the row moves underneath the
     //! read (mutation, eviction, subtree removal, delete/re-upload cycles), and
-    //! the abandoned key namespace that keeps two earlier row encodings from
-    //! being misread.
+    //! the abandoned availability and content namespaces that keep earlier row
+    //! encodings and pre-strength bodies from being reused.
     use super::*;
+    use ovstorage_cache::CompareAndPutPhase;
 
     fn open_cache() -> (Arc<Cache>, tempfile::TempDir) {
         open_capped_cache(None)
@@ -4094,6 +4406,149 @@ mod availability_index_tests {
 
     fn generations() -> Arc<Mutex<GenerationMap>> {
         Arc::new(Mutex::new(GenerationMap::new()))
+    }
+
+    struct StatInfoLayer {
+        info: ObjectInfo,
+    }
+
+    #[async_trait::async_trait]
+    impl Layer for StatInfoLayer {
+        fn name(&self) -> &str {
+            "stat-info"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            crate::layers::descriptor("stat-info", LayerType::Backend, false)
+        }
+
+        async fn stat(
+            &self,
+            _request: Request<StatRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ObjectInfo> {
+            Ok(self.info.clone())
+        }
+    }
+
+    struct StaticReadLayer {
+        info: ObjectInfo,
+        bytes: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl Layer for StaticReadLayer {
+        fn name(&self) -> &str {
+            "static-read"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            crate::layers::descriptor("static-read", LayerType::Backend, false)
+        }
+
+        async fn stat(
+            &self,
+            _request: Request<StatRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ObjectInfo> {
+            Ok(self.info.clone())
+        }
+
+        async fn read(
+            &self,
+            _request: Request<ReadRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ReadResult> {
+            Ok(ReadResult::Bytes {
+                bytes: self.bytes.clone(),
+                info: self.info.clone(),
+            })
+        }
+    }
+
+    struct PublishBetweenSettlementsLayer {
+        info: ObjectInfo,
+        cache: Arc<Cache>,
+    }
+
+    #[async_trait::async_trait]
+    impl Layer for PublishBetweenSettlementsLayer {
+        fn name(&self) -> &str {
+            "publish-between-settlements"
+        }
+
+        fn descriptor(&self) -> LayerKindDescriptor {
+            crate::layers::descriptor("publish-between-settlements", LayerType::Backend, false)
+        }
+
+        async fn stat(
+            &self,
+            _request: Request<StatRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ObjectInfo> {
+            Ok(self.info.clone())
+        }
+
+        async fn read(
+            &self,
+            request: Request<ReadRequest>,
+            _cancel: Option<CancellationToken>,
+        ) -> Result<ReadResult> {
+            let etag = "later-strong";
+            self.cache
+                .put(
+                    &content_cache_key("p", &request.input.address, etag),
+                    b"new bytes",
+                )
+                .expect("stage the concurrent fill's content");
+            let snapshot = snapshot_avail(&self.cache, "p", &request.input.address).await;
+            assert_eq!(
+                record_latest_impl(&self.cache, "p", &request.input.address, snapshot, etag,).await,
+                PublishOutcome::Settled,
+                "the concurrent strong fill publishes between settlements"
+            );
+            Ok(ReadResult::Bytes {
+                bytes: b"untrusted bytes".to_vec(),
+                info: self.info.clone(),
+            })
+        }
+    }
+
+    fn wrapper_with_inner(cache: Arc<Cache>, inner: LayerHandle) -> ByteCacheWrapper {
+        ByteCacheWrapper {
+            name: "byte-cache-test".to_string(),
+            descriptor: ByteCacheWrapperFactory::default().descriptor(),
+            watch_state: CacheWatchState::new(false),
+            inner,
+            cache,
+            partition: "p".to_string(),
+            lost_backing_fallback: false,
+            max_object_bytes: None,
+            max_cache_bytes: None,
+            warm_delegates: false,
+            generations: generations(),
+        }
+    }
+
+    fn wrapper_with_stat(cache: Arc<Cache>, info: ObjectInfo) -> ByteCacheWrapper {
+        wrapper_with_inner(cache, Arc::new(StatInfoLayer { info }))
+    }
+
+    async fn seed_fallback(cache: &Arc<Cache>, address: &Url, etag: &str) -> String {
+        let content_key = content_cache_key("p", address, etag);
+        cache
+            .put(&content_key, b"old bytes")
+            .expect("seed cached content");
+        let snapshot = snapshot_avail(cache, "p", address).await;
+        assert_eq!(
+            record_latest_impl(cache, "p", address, snapshot, etag).await,
+            PublishOutcome::Settled
+        );
+        content_key
+    }
+
+    fn legacy_content_cache_key(partition: &str, address: &Url, etag: &str) -> String {
+        format!("{partition}\0{address}\0{etag}")
     }
 
     #[test]
@@ -4134,7 +4589,7 @@ mod availability_index_tests {
     }
 
     #[tokio::test]
-    async fn legacy_encodings_are_unreachable_and_reclaimed() {
+    async fn legacy_availability_namespaces_are_unreachable_and_reclaimed() {
         // Both abandoned encodings are ambiguous against each other and against
         // the current one: an untagged small-epoch row leads with NUL bytes,
         // which decode as valid UTF-8, so reading it as a bare etag hands back
@@ -4144,7 +4599,8 @@ mod availability_index_tests {
         let (cache, _dir) = open_cache();
         let partition = "p";
         let address = Url::parse("mem:///legacy").unwrap();
-        let legacy_key = format!("{}{}", legacy_availability_prefix(partition), address);
+        let [oldest_prefix, pre_strength_prefix] = legacy_availability_prefixes(partition);
+        let oldest_key = format!("{oldest_prefix}{address}");
 
         for row in [
             legacy_v1_row("v1-abcde"),
@@ -4157,7 +4613,7 @@ mod availability_index_tests {
             // the tail of a real etag.
             legacy_v2_row(1, "0123456789abcdef0123456789abcdef"),
         ] {
-            cache.put(&legacy_key, &row).expect("seed a legacy row");
+            cache.put(&oldest_key, &row).expect("seed a legacy row");
             assert_eq!(
                 last_known_validator_impl(&cache, partition, &address).await,
                 None,
@@ -4165,62 +4621,81 @@ mod availability_index_tests {
             );
         }
 
-        sweep_legacy_availability_rows(&cache, partition);
+        // Version 1 of the strength-gating payload occupies `\u{2}`. Version 2
+        // uses a distinct namespace, so the v1 row is reclaimable by prefix
+        // without trusting or scanning its payload.
+        let pre_strength_key = format!("{pre_strength_prefix}{address}");
+        let mut pre_strength_row = encode_avail("weak-origin-validator");
+        pre_strength_row[0] = 1;
+        cache
+            .put(&pre_strength_key, &pre_strength_row)
+            .expect("seed a version-1 availability row");
+
+        sweep_legacy_cache_rows(&cache, partition);
         assert!(
-            cache.get_entry_async(&legacy_key).await.unwrap().is_none(),
-            "the sweep must reclaim abandoned rows rather than wait on eviction"
+            cache.get_entry_async(&oldest_key).await.unwrap().is_none(),
+            "the sweep must reclaim the oldest availability namespace"
+        );
+        assert!(
+            cache
+                .get_entry_async(&pre_strength_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "the sweep must reclaim version-1 rows from the pre-strength namespace"
         );
     }
 
     #[tokio::test]
-    async fn the_legacy_sweep_reclaims_the_bodies_those_rows_named() {
-        // The legacy availability row is the only record of which validator a
-        // legacy body was filled under, and it is in an encoding this build
-        // refuses to interpret -- so the validator cannot be recovered to prune
-        // that body precisely. Removing the row without the body strands one
-        // full object per legacy address: nothing keys on the old etag once the
-        // object changes, and the default cache has no budget to evict it.
+    async fn the_legacy_sweep_reclaims_pre_strength_content_without_a_pointer() {
+        // Availability rows can be evicted independently, so construction must
+        // recognize the old content namespace directly. Otherwise an orphaned
+        // pre-strength body remains forever in an unbudgeted cache even though
+        // no current lookup can reach it.
         let (cache, _dir) = open_cache();
         let partition = "p";
         let address = Url::parse("mem:///legacy").unwrap();
 
-        let content_key = content_cache_key(partition, &address, "v1");
+        let content_key = legacy_content_cache_key(partition, &address, "v1");
         cache
             .put(&content_key, b"legacy body")
             .expect("seed a body");
-        cache
-            .put(
-                &format!("{}{address}", legacy_availability_prefix(partition)),
-                b"legacy row",
-            )
-            .expect("seed a legacy row");
 
-        sweep_legacy_availability_rows(&cache, partition);
+        sweep_legacy_cache_rows(&cache, partition);
 
         assert!(
             cache.get_entry_async(&content_key).await.unwrap().is_none(),
-            "the sweep must reclaim the bodies whose only reclaim pointer it removes"
+            "the sweep must reclaim pre-strength content without an availability pointer"
         );
     }
 
     #[tokio::test]
     async fn the_legacy_sweep_leaves_a_cache_that_has_no_legacy_rows_alone() {
-        // The legacy rows are the migration marker: with none present there is
-        // nothing to migrate, and flushing content would cold-start a healthy
-        // cache on every construction.
+        // The namespace identifies legacy content directly. A cache holding
+        // only current rows has nothing to migrate, so construction must not
+        // cold-start it.
         let (cache, _dir) = open_cache();
         let partition = "p";
         let address = Url::parse("mem:///current").unwrap();
         let content_key = content_cache_key(partition, &address, "v1");
+        let availability_key = availability_index_key(partition, &address);
         cache
             .put(&content_key, b"current body")
             .expect("seed a body");
+        cache
+            .put(&availability_key, &encode_avail("v1"))
+            .expect("seed a current availability row");
 
-        sweep_legacy_availability_rows(&cache, partition);
+        sweep_legacy_cache_rows(&cache, partition);
 
         assert!(
             cache.get_entry_async(&content_key).await.unwrap().is_some(),
             "a cache with no legacy rows must keep its content"
+        );
+        assert_eq!(
+            last_known_validator_impl(&cache, partition, &address).await,
+            Some("v1".to_string()),
+            "the sweep must keep current version-2 availability rows"
         );
     }
 
@@ -4239,6 +4714,305 @@ mod availability_index_tests {
             last_known_validator_impl(&cache, partition, &address).await,
             None,
             "a row this build cannot interpret must not answer the fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_strength_gating_row_reports_no_validator() {
+        let (cache, _dir) = open_cache();
+        let partition = "p";
+        let address = Url::parse("mem:///pre-strength-gating").unwrap();
+        assert_eq!(AVAIL_VERSION, 2);
+        let mut row = encode_avail("weak-origin-validator");
+        row[0] = 1;
+        cache
+            .put(&availability_index_key(partition, &address), &row)
+            .expect("seed a pre-strength-gating row");
+
+        assert_eq!(
+            last_known_validator_impl(&cache, partition, &address).await,
+            None,
+            "a row minted before strength gating must not answer the fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_strength_gating_content_is_unreachable_to_a_strong_lookup() {
+        let (cache, _dir) = open_cache();
+        let partition = "p";
+        let address = Url::parse("mem:///pre-strength-content").unwrap();
+        let etag = "shared-wire-token";
+        let legacy_key = legacy_content_cache_key(partition, &address, etag);
+        cache
+            .put(&legacy_key, b"historical weak bytes")
+            .expect("seed pre-strength content");
+
+        let info = cached_object_info(address.clone(), 19, Some(etag.to_string()));
+        let wrapper = wrapper_with_stat(Arc::clone(&cache), info);
+        let mut request = Request::new(ReadRequest {
+            address: address.clone(),
+            options: ReadOptions::default(),
+        });
+        request
+            .extensions
+            .insert(READ_TO_BYTES_EXTENSION, Vec::new());
+
+        let error = match wrapper.read(request, None).await {
+            Ok(_) => panic!("the strict lookup served pre-strength content"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.code(),
+            ErrorCode::Unsupported,
+            "a cache miss must reach the test layer's unsupported read"
+        );
+        assert!(
+            cache
+                .get_entry_async(&legacy_key)
+                .await
+                .expect("look up legacy content")
+                .is_some(),
+            "the test must prove key unreachability, not accidental removal"
+        );
+        assert!(
+            cache
+                .get_entry_async(&content_cache_key(partition, &address, etag))
+                .await
+                .expect("look up current content")
+                .is_none(),
+            "no current-namespace content was seeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_untrusted_stat_invalidates_a_strong_fallback() {
+        for (name, etag, strength) in [
+            ("weak", "v2", EtagStrength::Weak),
+            ("unspecified", "v2", EtagStrength::Unspecified),
+            ("empty", "", EtagStrength::Strong),
+        ] {
+            let (cache, _dir) = open_cache();
+            let address = Url::parse(&format!("mem:///{name}")).unwrap();
+            let old_content = seed_fallback(&cache, &address, "v1").await;
+            let mut info = cached_object_info(address.clone(), 9, Some(etag.to_string()));
+            info.etag_strength = strength;
+            let wrapper = wrapper_with_stat(Arc::clone(&cache), info);
+
+            let probe = wrapper
+                .lookup_etag(&Extensions::new(), &address, None)
+                .await
+                .expect("stat succeeds");
+
+            assert_eq!(probe.validator, None, "{name} etag must bypass lookup");
+            assert_eq!(
+                last_known_validator_impl(&cache, "p", &address).await,
+                None,
+                "{name} etag must invalidate the older fallback"
+            );
+            assert!(
+                cache
+                    .get_entry_async(&old_content)
+                    .await
+                    .expect("lookup old content")
+                    .is_none(),
+                "{name} etag must reclaim the content the fallback named"
+            );
+
+            let key = availability_index_key("p", &address);
+            let settled = cache
+                .get_entry_async(&key)
+                .await
+                .expect("read settled availability row")
+                .expect("clearing a live fallback leaves a tombstone")
+                .bytes;
+            let second = wrapper
+                .lookup_etag(&Extensions::new(), &address, None)
+                .await
+                .expect("the repeated stat succeeds");
+            assert_eq!(second.validator, None);
+            assert_eq!(
+                cache
+                    .get_entry_async(&key)
+                    .await
+                    .expect("read repeated availability row")
+                    .expect("the existing tombstone remains")
+                    .bytes,
+                settled,
+                "{name} etag must not rotate an already-settled tombstone"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_untrusted_reads_leave_a_cold_address_out_of_the_index() {
+        for (name, strength) in [
+            ("weak", EtagStrength::Weak),
+            ("unspecified", EtagStrength::Unspecified),
+        ] {
+            let (cache, _dir) = open_cache();
+            let address = Url::parse(&format!("mem:///{name}-cold")).unwrap();
+            let mut info = cached_object_info(address.clone(), 4, Some("opaque".to_string()));
+            info.etag_strength = strength;
+            let wrapper = wrapper_with_inner(
+                Arc::clone(&cache),
+                Arc::new(StaticReadLayer {
+                    info,
+                    bytes: b"body".to_vec(),
+                }),
+            );
+            let key = availability_index_key("p", &address);
+            let availability_swaps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seam_swaps = Arc::clone(&availability_swaps);
+            let seam_key = key.clone();
+            cache.set_compare_and_put_seam(Arc::new(move |target, _phase| {
+                if target == seam_key {
+                    seam_swaps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+
+            for _ in 0..2 {
+                let result = wrapper
+                    .read(
+                        Request::new(ReadRequest {
+                            address: address.clone(),
+                            options: ReadOptions::default(),
+                        }),
+                        None,
+                    )
+                    .await
+                    .expect("the untrusted backend read succeeds");
+                let ReadResult::Bytes { bytes, .. } = result else {
+                    panic!("the static backend returns bytes");
+                };
+                assert_eq!(bytes, b"body");
+                assert!(
+                    cache.get_entry_async(&key).await.unwrap().is_none(),
+                    "{name} reads must not seed or rewrite an availability tombstone"
+                );
+            }
+            assert_eq!(
+                availability_swaps.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{name} reads must not stage any availability CAS write"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn untrusted_settlement_preserves_a_later_strong_publication() {
+        let (cache, dir) = open_cache();
+        let partition = "p";
+        let address = Url::parse("mem:///racing-strength").unwrap();
+        let key = availability_index_key(partition, &address);
+        seed_fallback(&cache, &address, "old").await;
+
+        cache
+            .put(&content_cache_key(partition, &address, "new"), b"new bytes")
+            .expect("seed the later fill's content");
+        let later_row = encode_avail("new");
+        let later_entry = cache
+            .put("seam://availability/later", &later_row)
+            .expect("stage the later availability row");
+        let side = Arc::new(Mutex::new(
+            rusqlite::Connection::open(dir.path().join("state").join("index.sqlite"))
+                .expect("side connection opens"),
+        ));
+        let seam_side = Arc::clone(&side);
+        let seam_key = key.clone();
+        cache.set_compare_and_put_seam(Arc::new(move |target, phase| {
+            if target == seam_key && phase == CompareAndPutPhase::Observed {
+                seam_side
+                    .lock()
+                    .expect("side connection lock")
+                    .execute(
+                        "UPDATE entries SET cas_key = ?2, size = ?3 WHERE resolved_target = ?1",
+                        rusqlite::params![target, later_entry.cas_key, later_row.len() as u64],
+                    )
+                    .expect("the later strong fill publishes");
+            }
+        }));
+
+        clear_live_fallback_impl(&cache, partition, &generations(), &address)
+            .await
+            .expect("untrusted settlement completes");
+
+        assert_eq!(
+            last_known_validator_impl(&cache, partition, &address).await,
+            Some("new".to_string()),
+            "the exact-row comparison must preserve a strong fill published after the observation"
+        );
+        assert!(
+            cache
+                .get_entry_async(&content_cache_key(partition, &address, "new"))
+                .await
+                .unwrap()
+                .is_some(),
+            "preserving the later publication must preserve the body it names"
+        );
+    }
+
+    #[tokio::test]
+    async fn untrusted_read_completion_preserves_a_post_stat_strong_publication() {
+        let (cache, _dir) = open_cache();
+        let address = Url::parse("mem:///between-settlements").unwrap();
+        seed_fallback(&cache, &address, "old").await;
+        let mut info = cached_object_info(address.clone(), 15, Some("weak".to_string()));
+        info.etag_strength = EtagStrength::Weak;
+        let wrapper = wrapper_with_inner(
+            Arc::clone(&cache),
+            Arc::new(PublishBetweenSettlementsLayer {
+                info,
+                cache: Arc::clone(&cache),
+            }),
+        );
+
+        let result = wrapper
+            .read(
+                Request::new(ReadRequest {
+                    address: address.clone(),
+                    options: ReadOptions::default(),
+                }),
+                None,
+            )
+            .await
+            .expect("the untrusted read succeeds");
+        let ReadResult::Bytes { bytes, .. } = result else {
+            panic!("the fixture returns bytes");
+        };
+        assert_eq!(bytes, b"untrusted bytes");
+        assert_eq!(
+            last_known_validator_impl(&cache, "p", &address).await,
+            Some("later-strong".to_string()),
+            "completion must not clear a strong row published after stat settlement"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_stat_without_an_etag_preserves_a_strong_fallback() {
+        let (cache, _dir) = open_cache();
+        let address = Url::parse("mem:///statless").unwrap();
+        let old_content = seed_fallback(&cache, &address, "v1").await;
+        let info = cached_object_info(address.clone(), 9, None);
+        let wrapper = wrapper_with_stat(Arc::clone(&cache), info);
+
+        let probe = wrapper
+            .lookup_etag(&Extensions::new(), &address, None)
+            .await
+            .expect("stat succeeds");
+
+        assert_eq!(probe.validator, None);
+        assert_eq!(
+            last_known_validator_impl(&cache, "p", &address).await,
+            Some("v1".to_string()),
+            "an absent stat etag carries no evidence against the fallback"
+        );
+        assert!(
+            cache
+                .get_entry_async(&old_content)
+                .await
+                .expect("lookup old content")
+                .is_some(),
+            "the preserved fallback must keep the content it names"
         );
     }
 
@@ -4792,28 +5566,40 @@ mod availability_index_tests {
     }
 
     #[test]
-    fn an_empty_etag_is_not_a_provable_validator() {
-        // The availability encoding treats an empty etag as a tombstone, so a
-        // backend reporting `Some("")` can never have a validator published.
-        // The strict path has no such filter: it would key a content row on the
-        // empty string, and since every version reports the same empty etag the
-        // key never changes -- so an out-of-band update would go on being
-        // served from the first fill indefinitely. Reject it at the type whose
+    fn only_a_strong_nonempty_etag_is_a_provable_validator() {
+        // Empty etags cannot distinguish versions, and weak or unspecified
+        // etags do not declare byte identity. Reject all three at the type whose
         // whole job is to mean "a validator I can rely on".
         let address = Url::parse("mem:///obj").unwrap();
+        let empty = cached_object_info(address.clone(), 1, Some(String::new()));
+        assert_eq!(empty.etag_strength, EtagStrength::Unspecified);
         assert!(
-            ProvenValidator::proved(&cached_object_info(address.clone(), 1, Some(String::new())))
-                .is_none(),
+            ProvenValidator::proved(&empty).is_none(),
             "an empty etag is not a usable validator"
         );
+        let absent = cached_object_info(address.clone(), 1, None);
+        assert_eq!(absent.etag_strength, EtagStrength::Unspecified);
         assert!(
-            ProvenValidator::proved(&cached_object_info(address.clone(), 1, None)).is_none(),
+            ProvenValidator::proved(&absent).is_none(),
             "an absent etag is not a validator"
+        );
+        let mut weak = cached_object_info(address.clone(), 1, Some("weak-v1".to_string()));
+        weak.etag_strength = EtagStrength::Weak;
+        assert!(
+            ProvenValidator::proved(&weak).is_none(),
+            "a weak etag is not a trusted content identity"
+        );
+        let mut unspecified =
+            cached_object_info(address.clone(), 1, Some("unknown-v1".to_string()));
+        unspecified.etag_strength = EtagStrength::Unspecified;
+        assert!(
+            ProvenValidator::proved(&unspecified).is_none(),
+            "an unspecified etag is not a trusted content identity"
         );
         assert!(
             ProvenValidator::proved(&cached_object_info(address, 1, Some("v1".to_string())))
                 .is_some(),
-            "an ordinary validator is usable"
+            "a strong validator is usable"
         );
     }
 
@@ -5016,7 +5802,7 @@ mod availability_index_tests {
             .expect("side connection");
         side.execute_batch(
             "CREATE TRIGGER block_availability BEFORE DELETE ON entries \
-             WHEN OLD.resolved_target LIKE 'p' || char(2) || '%' \
+             WHEN OLD.resolved_target LIKE 'p' || char(4) || '%' \
              BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
         )
         .expect("install trigger");

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
@@ -23,6 +24,10 @@ from _repo import (
 )
 
 _C_SOURCE_DIR = Path("ovstorage-c-source")
+# The auth substrate's root override. Every binary this gate runs initialises
+# the substrate when nothing pins it, and the default root is the developer's
+# real per-user auth directory, so the gate pins this for every leg it runs.
+_AUTH_DIR_ENV = "OVSTORAGE_AUTH_DIR"
 _HEADER = Path("ovstorage-c-source/include/ovstorage.h")
 _PLUGIN_HEADER = Path("ovstorage-c-source/include/ovstorage_plugin.h")
 # The defaults header ships the request-release entry points a declining slot
@@ -461,9 +466,11 @@ _EMBEDDED_SUITE_MODULES = (
     "dispatch",
     "streams",
     "stack",
+    "stack_config",
     "runtime",
     "registry",
     "host_callbacks",
+    "credential_store",
     "file_backend",
     "values_conn",
     "temp_dir",
@@ -482,7 +489,12 @@ _EMBEDDED_SUITE_EXCLUSIONS: dict[str, tuple[str, ...]] = {
     # host half and deliberately links no registry, Stack builder, or
     # dispatcher (registry.c owns ovc_registry_register_builtin_kind, and
     # stack.c/dispatch.c would then reference the excluded registry).
-    "file_backend": ("registry.c", "stack.c", "dispatch.c"),
+    "file_backend": (
+        "registry.c",
+        "stack.c",
+        "stack_config.c",
+        "dispatch.c",
+    ),
 }
 
 
@@ -552,6 +564,10 @@ def build_and_run_embedded_suites(root: Path | None = None) -> None:
             run_command(
                 [str(executable)],
                 cwd=temporary_root,
+                # Suites pin scratch roots explicitly, and `run()` pins the
+                # whole gate; this keeps the floor under a suite that is run
+                # through this function alone.
+                env={_AUTH_DIR_ENV: str(temporary_root / "auth")},
                 label=f"{module} *_TEST_MAIN suite",
             )
             suites_run += 1
@@ -1073,14 +1089,42 @@ def build_and_run_secret_wipe_seam(root: Path | None = None) -> None:
         )
 
 
+@contextlib.contextmanager
+def _pinned_auth_dir(auth_dir: Path):
+    """Pin `OVSTORAGE_AUTH_DIR` to `auth_dir` for the block, then restore it.
+
+    A child process inherits an environment variable and nothing else, so the
+    process environment is the one place a pin reaches every binary a leg
+    spawns. Whatever the developer had set is put back afterwards: the gate
+    must not leave its scratch root behind in the shell that ran it.
+    """
+    previous = os.environ.get(_AUTH_DIR_ENV)
+    os.environ[_AUTH_DIR_ENV] = str(auth_dir)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_AUTH_DIR_ENV, None)
+        else:
+            os.environ[_AUTH_DIR_ENV] = previous
+
+
 def run() -> None:
     """Run the pure-C source completeness, purity, and example-build gate."""
 
     root = repo_root()
     verify_completeness_table(root)
     verify_dependency_purity(root)
-    build_and_run_examples(root)
-    build_and_run_embedded_suites(root)
-    build_and_run_secret_wipe_seam(root)
-    build_and_run_leak_contracts(root)
+    # All four legs run binaries that initialise the auth substrate. The
+    # embedded suites pin their own scratch roots; the examples, the
+    # secret-wipe seam, and the leak contracts do not, and a developer running
+    # the gate locally would otherwise write into their real auth directory.
+    # CI never shows that: its home directory is disposable. So the pin sits
+    # above every leg, not inside one of them.
+    with tempfile.TemporaryDirectory(prefix="ovstorage-c-source-gate-") as scratch:
+        with _pinned_auth_dir(Path(scratch) / "auth"):
+            build_and_run_examples(root)
+            build_and_run_embedded_suites(root)
+            build_and_run_secret_wipe_seam(root)
+            build_and_run_leak_contracts(root)
     print("pure-C source example gate passed", flush=True)

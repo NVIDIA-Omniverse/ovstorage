@@ -342,8 +342,10 @@ enum KeyState {
 /// coalescer per owner (e.g. per backend connection); dropping it (or
 /// `cancel_all`) cancels every live and future upstream. The coalescer is
 /// **principal-blind** and cap-free: it never reads the principal and enforces
-/// no per-principal or total subscriber limit (limits live at a central
-/// chokepoint, not in each backend's own coalescer instance).
+/// no per-principal or total subscriber limit. The broker daemon provides the
+/// central chokepoint with its broker-native `watch_limit` Layer, shared across
+/// the process's backends and connections; the REST gateway's embedded Stack
+/// is explicitly outside that broker-only admission chokepoint.
 ///
 /// # Why coalescing lives in the backend, not the host Layer
 ///
@@ -366,7 +368,9 @@ enum KeyState {
 /// - **The adopter supplies the key as an opaque `String`.** Single-queue
 ///   backends (S3/GCS/Azure) use a connection-constant [`CoalesceKey`] (one
 ///   upstream total, all prefixes filtered per subscriber); the broker/services
-///   client keys by connection id + prefix (one gRPC `Watch` per prefix).
+///   client scopes a registry to one connection credential-identity generation,
+///   then keys by prefix (one gRPC `Watch` per prefix). It replaces the registry
+///   when that identity generation changes.
 /// - **The coalescer is principal-blind.** It never reads the principal; the
 ///   upstream stays single regardless of which principal subscribes.
 /// - **Competing-consumer backends MUST self-coalesce.** This is enforced by a
