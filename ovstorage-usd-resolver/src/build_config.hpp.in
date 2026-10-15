@@ -1,0 +1,22 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Generated from src/build_config.hpp.in by CMake.
+//
+// The values below are populated from the `OVS_USD_RESOLVER_URI_SCHEMES`
+// CMake cache variable at configure time and shared between the OpenUSD
+// plugInfo advertisement and the compiled claim gate so the two views of
+// what schemes this build handles cannot diverge.
+
+#pragma once
+
+#include <array>
+#include <string_view>
+
+namespace ovstorage::usd_resolver
+{
+
+inline constexpr std::array<std::string_view, @OVS_USD_RESOLVER_URI_SCHEMES_COUNT@>
+    kBuildTimeRemoteUriSchemes = { @OVS_USD_RESOLVER_URI_SCHEMES_CPP@ };
+
+} // namespace ovstorage::usd_resolver

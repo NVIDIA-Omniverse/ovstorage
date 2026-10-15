@@ -1,0 +1,21 @@
+{
+    "Plugins": [
+        {
+            "Info": {
+                "Types": {
+                    "OvStorageUsdResolver": {
+                        "bases": [ "ArResolver" ],
+                        "implementsContexts": true,
+                        "implementsScopedCaches": false,
+                        "uriSchemes": @OVS_USD_RESOLVER_URI_SCHEMES_JSON@
+                    }
+                }
+            },
+            "LibraryPath": "@OVS_USD_RESOLVER_LIBRARY_PATH@",
+            "Name": "ovstorage USD Resolver",
+            "ResourcePath": "@OVS_USD_RESOLVER_RESOURCE_PATH@",
+            "Root": "@OVS_USD_RESOLVER_PLUGIN_ROOT@",
+            "Type": "library"
+        }
+    ]
+}

@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set(Imath_FOUND TRUE)
+
+# NvidiaKitUsd.cmake defines the native DLL/import-library or Unix pair.
+if(NOT TARGET Imath::Imath)
+    message(FATAL_ERROR "NvidiaKitUsd.cmake must define Imath::Imath first")
+endif()
+
+if(NOT TARGET Imath::ImathConfig)
+    add_library(Imath::ImathConfig INTERFACE IMPORTED)
+    target_link_libraries(Imath::ImathConfig INTERFACE Imath::Imath)
+endif()

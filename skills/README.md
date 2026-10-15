@@ -1,30 +1,25 @@
-<!--
-SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-SPDX-License-Identifier: CC-BY-4.0
--->
+# Skills
 
-# ovstorage Skills
+These routes apply to the assembled public checkout. Shared skills describe
+user/operator workflows and state their working directory in their
+`compatibility` metadata. Component skills use paths relative to their own
+component unless their instructions say otherwise. Run storage component commands
+from `ovstorage/` and resolver component commands from `ovstorage-usd-resolver/`.
 
-This directory is the external-publication review surface for ovstorage agent
-skills. Public skill names are product-scoped so they can be registered in a
-shared catalog without colliding with other libraries.
+Use these guides to select the workflow for your task:
 
-These skills cover the ovstorage library, MCP server, plugins, daemon
-operations, and repo workflows. They are not the deployment skills for the
-heavier `ovstorage-services` Kubernetes stack; those remain under
-`ovstorage-services/skills/` in source checkouts.
+- [ovstorage expert](ovstorage-expert/SKILL.md): start here for using,
+  building, configuring, or validating ovstorage and the USD
+  resolver, embedding the resolver, or changing its OpenUSD SDK. It routes to
+  the component skills below.
+- [Storage skill inventory](../ovstorage/AGENTS.md#invocable-skills): linked runtime, operator
+  and contributor skills. Broker operator routes apply to existing deployments.
+- [Resolver agent guide](../ovstorage-usd-resolver/AGENTS.md): USD resolution,
+  embedding, and integration verification.
 
-## Groups
-
-- `ovstorage-user-*` — runtime storage-client workflows. These are the only
-  skills that should be considered for a future `pip install ovstorage`
-  bundle.
-- `ovstorage-operator-*` — daemon deployment, policy, monitoring, and
-  debugging workflows. These ship in release archives and can be cataloged
-  after public-safe review.
-- `ovstorage-contributor-*` — source-tree workflows for repository developers.
-  These stay repo-only unless the contribution posture changes.
-
-Runtime wheels do not install skills today. Skills are distributed through the
-source tree and release archives unless a future packaging decision says
-otherwise.
+The [getting-started guide](../docs/getting-started.md) explains component
+working directories, and the [combined build guide](../docs/building.md) covers
+building both components together. Storage skills are `SKILL.md`
+packages; resolver `.agents` pages are component workflow guides. Do not
+register every nested service/reference skill as a storage library workflow.
+The [root agent entry](../AGENTS.md) routes work across the two components.

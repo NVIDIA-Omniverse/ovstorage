@@ -1,0 +1,18 @@
+{
+  "automation_sha": "132c4472217b5240b0a5652d430273b27435d67e",
+  "components": {
+    "ovstorage": {
+      "source_sha": "c06d05bedb0f86b08fdfb31d5ababdb57ea7b016",
+      "tree": "3e0040d225fe9e2346c80705c3e8648be8b5b175",
+      "version": "0.3.0"
+    },
+    "ovstorage-usd-resolver": {
+      "source_sha": "132c4472217b5240b0a5652d430273b27435d67e",
+      "tree": "f58965a539f93fdbe875810ba32ac89ad9a24adc",
+      "version": "0.1.0"
+    }
+  },
+  "release_label": "v0.4.0",
+  "repository_version": "0.4.0",
+  "schema": 1
+}

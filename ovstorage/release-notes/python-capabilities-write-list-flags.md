@@ -1,0 +1,1 @@
+**Python's `Capabilities` publishes `supports_write` and `supports_list`.** The two primary verb-availability flags join the booleans the binding already exposes, so a Python caller can gate write and listing paths on a connection's advertised capabilities instead of probing with a call and catching `UnsupportedError`.

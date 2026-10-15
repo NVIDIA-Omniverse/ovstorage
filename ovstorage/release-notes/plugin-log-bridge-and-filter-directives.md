@@ -1,0 +1,2 @@
+**Logs protect Nucleus connection credentials while preserving explicit verbosity controls.**
+Websocket-library TRACE records stop at the plugin boundary, preventing rendered connect URLs, including embedded access credentials, from reaching the host log callback. Explicit `OVSTORAGE_LOG` or `RUST_LOG` directives naming a silenced transport or UI crate root are honored, while bare catch-all directives continue to exclude those noisy crates.

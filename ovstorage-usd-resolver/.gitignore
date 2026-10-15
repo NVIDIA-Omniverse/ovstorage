@@ -1,0 +1,34 @@
+# Build outputs
+build/
+build-*/
+_build/
+.deps/
+dist/
+install/
+cmake-build-*/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+uv.lock
+
+# Test and coverage outputs
+.coverage
+coverage/
+htmlcov/
+Testing/
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

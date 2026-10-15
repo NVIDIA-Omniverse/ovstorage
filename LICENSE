@@ -1,19 +1,19 @@
 Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-Unless otherwise noted in this file, in a subdirectory-specific license file,
-or in a source-file license identifier, active ovstorage source code in this
-repository is licensed under the Apache License, Version 2.0.
+NVIDIA-authored source code and shared root documentation are licensed under
+Apache-2.0, except where a subtree license or source-file identifier states
+otherwise. Component-specific terms remain in force:
 
-Separate licensing:
+- ovstorage/LICENSE governs the storage subtree.
+- ovstorage-usd-resolver/LICENSE governs the resolver subtree.
+- ovstorage/skills/ uses CC BY 4.0; preserve ovstorage/skills/LICENSE.txt
+  and ovstorage/skills/NOTICE.txt.
+- ovstorage/ovstorage-services/ contains separately licensed service material;
+  consult its preserved license files and ovstorage/THIRD_PARTY_NOTICES.md.
+- Shared skills under skills/ follow this Apache-2.0 default unless their own
+  license files and metadata explicitly state otherwise.
 
-- The agent skills under skills/ are licensed under Creative Commons
-  Attribution 4.0 International (CC BY 4.0); see skills/LICENSE.txt and
-  skills/NOTICE.txt.
-- Vendored service/API material under ovstorage-services/ is not covered by
-  this Apache-2.0 grant. That subtree includes material under
-  LicenseRef-NvidiaProprietary and NVIDIA Software License Agreement /
-  Omniverse product terms. See the license files preserved under
-  ovstorage-services/ and THIRD_PARTY_NOTICES.md.
+See THIRD_PARTY_NOTICES.md and the component notices before redistribution.
 
                                  Apache License
                            Version 2.0, January 2004

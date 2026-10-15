@@ -1,0 +1,2 @@
+**A read-only Hugging Face Hub backend serves model, dataset, and space repositories.**
+The `huggingface` plugin maps one connection to one repository under `hf://{models|datasets|spaces}/<namespace>/<name>/`, with stat, streamed reads that follow LFS CDN redirects in-process, one-level and recursive listing, and paginated commit-history version listing pinned by `?revision=`; a single `token` credential (defaulting from `HF_TOKEN`) unlocks private and gated repositories, and anonymous connections serve public ones.

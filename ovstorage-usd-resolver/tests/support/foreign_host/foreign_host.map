@@ -1,0 +1,9 @@
+/* Export only the foreign-host entry points. Every ovstorage_* symbol of the
+ * embedded C-runtime copy stays local, so it can coexist in one process with
+ * the resolver bridge's own copy without symbol interposition. */
+{
+  global:
+    ovs_foreign_host_*;
+  local:
+    *;
+};

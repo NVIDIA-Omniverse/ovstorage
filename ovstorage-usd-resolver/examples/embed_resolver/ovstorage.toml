@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Identity route for public USD content on NVIDIA's S3-backed HTTPS sample
+# origin. The C++ example is provider agnostic; replace this graph with another
+# HTTP origin, S3, Hugging Face, Azure, or any other ovstorage configuration
+# without changing the resolver integration code. See the compatibility matrix
+# for which provider configurations are release-qualified by the resolver.
+[ovstorage]
+root = "http"
+
+[ovstorage.layers.http]
+
+[[ovstorage.connections]]
+backend_kind = "http"
+config = { root_url = "https://omniverse-content-production.s3.us-west-2.amazonaws.com/", prefix = "https://omniverse-content-production.s3.us-west-2.amazonaws.com/" }

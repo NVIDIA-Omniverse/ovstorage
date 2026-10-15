@@ -1,0 +1,12 @@
+# Documentation toolchain for the combined ovstorage Sphinx site.
+#
+# Kept outside any pyproject.toml so the docs can require a newer Python than the
+# packages: Sphinx 8.2 requires Python >= 3.11. These are floors; requirements.txt
+# is the hash-locked resolution the build installs (see documentation-site.md).
+
+sphinx>=8.2
+nvidia-sphinx-theme
+myst-parser
+sphinx-copybutton
+sphinx-design
+sphinxcontrib-mermaid

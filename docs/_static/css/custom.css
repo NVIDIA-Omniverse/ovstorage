@@ -1,0 +1,19 @@
+/* SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. */
+/* SPDX-License-Identifier: Apache-2.0 */
+
+/* GitHub logo next to "GitHub Repository" sidebar link */
+.bd-sidebar-primary a.reference.external[href*="github.com"]::before {
+    font-family: "Font Awesome 6 Brands";
+    content: "\f09b"; /* fa-github */
+    margin-right: 0.4em;
+    font-style: normal;
+    font-weight: 400;
+}
+
+/* Compact reference tables */
+.compact-table {
+    font-size: 0.85rem;
+}
+.compact-table td, .compact-table th {
+    padding: 0.3rem 0.5rem;
+}

@@ -65,3 +65,7 @@ swarmtools/
 # not pick up, and say "copy to ./ovstorage.toml"; this entry is what keeps that
 # convention from being undone by a `git add -A` during a local repro.
 /ovstorage.toml
+/build/
+/.deps/
+/.venv/
+/docs/_build/

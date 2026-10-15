@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+[build-system]
+requires = ["scikit-build-core>=0.10,<1"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "ovstorage-usd-resolver-kit-25-11"
+dynamic = ["version"]
+description = "ovstorage resolver for the NVIDIA Kit OpenUSD 25.11 monolithic ABI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = ["ovstorage>=0.3.0,<0.4.0"]
+
+[project.urls]
+Repository = "https://github.com/NVIDIA-Omniverse/ovstorage"
+Documentation = "https://github.com/NVIDIA-Omniverse/ovstorage/tree/main/ovstorage-usd-resolver/docs"
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version = ">=3.22"
+cmake.args = [
+    "-DOVS_USD_RESOLVER_BUILD_OPENUSD_PLUGIN=ON",
+    "-DOVS_USD_RESOLVER_BUILD_TESTS=OFF",
+    "-DOVS_USD_RESOLVER_INSTALL_WHEEL=ON",
+    "-DOVS_OVSTORAGE_REQUIRED=ON",
+]
+metadata.version.provider = "scikit_build_core.metadata.regex"
+metadata.version.input = "VERSION"
+metadata.version.regex = "^(?P<value>[0-9]+\\.[0-9]+\\.[0-9]+)$"
+wheel.py-api = "py3"
+wheel.packages = ["python/ovstorage_usd_resolver"]
+wheel.install-dir = "ovstorage_usd_resolver"
+wheel.exclude = ["**/*.a", "**/*.lib", "**/*.la"]
+wheel.license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
+install.components = ["wheel"]
